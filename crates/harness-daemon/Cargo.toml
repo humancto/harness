@@ -21,6 +21,9 @@ tokio               = { workspace = true }
 tracing             = { workspace = true }
 tracing-subscriber  = { workspace = true }
 parking_lot         = { workspace = true }
+futures             = { workspace = true }
+serde_json          = { workspace = true }
+hostname            = { workspace = true }
 harness-core        = { workspace = true }
 harness-cli         = { workspace = true }
 harness-mesh        = { workspace = true }
@@ -30,6 +33,7 @@ harness-capabilities = { workspace = true }
 harness-policy       = { workspace = true }
 
 [dev-dependencies]
-assert_cmd = { workspace = true }
-predicates = { workspace = true }
-tempfile   = { workspace = true }
+assert_cmd  = { workspace = true }
+predicates  = { workspace = true }
+tempfile    = { workspace = true }
+async-trait = "0.1"

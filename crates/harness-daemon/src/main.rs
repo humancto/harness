@@ -2,13 +2,14 @@
 //! surface into a real `harness` binary.
 #![forbid(unsafe_code)]
 
+mod executor;
 mod lifecycle;
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use harness_cli::{run, Cli, DaemonArgs, SyncOutcome};
+use harness_cli::{run, run_run, Cli, DaemonArgs, RunArgs, RunOutcome, SyncOutcome};
 
 use crate::lifecycle::{DaemonOrchestrator, DaemonRuntimeConfig};
 
@@ -25,7 +26,34 @@ fn main() -> Result<()> {
         SyncOutcome::DaemonRequested(args) => run_daemon(args),
         SyncOutcome::SubmitRequested(args) => run_async_cli(harness_cli::run_submit(args)),
         SyncOutcome::TasksRequested(args) => run_async_cli(harness_cli::run_tasks(args)),
+        SyncOutcome::RunRequested(args) => dispatch_run(args),
     }
+}
+
+/// Dispatch `harness run`. Like `run_async_cli` but emits to both stdout
+/// and stderr and uses the outcome's exit code.
+fn dispatch_run(args: RunArgs) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
+    let outcome: RunOutcome = runtime.block_on(run_run(args))?;
+    if !outcome.stdout.is_empty() {
+        #[allow(clippy::print_stdout)]
+        {
+            print!("{}", outcome.stdout);
+        }
+    }
+    if !outcome.stderr.is_empty() {
+        #[allow(clippy::print_stderr)]
+        {
+            eprint!("{}", outcome.stderr);
+        }
+    }
+    if outcome.code != 0 {
+        std::process::exit(outcome.code);
+    }
+    Ok(())
 }
 
 fn run_async_cli<F>(fut: F) -> Result<()>
