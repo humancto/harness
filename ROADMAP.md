@@ -10,9 +10,9 @@ When an item lands, flip its checkbox **in the same PR** as `STATE.md` is update
 
 **Demo:** `cargo run --bin harness -- --version` prints a real version string. CI is green on macOS + Linux.
 
-- [ ] **0.1** Cargo workspace + empty crate stubs per PRD §22 + `rust-toolchain.toml` (stable, MSRV declared) + `.gitignore` Rust additions
-- [ ] **0.2** GitHub Actions CI: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --workspace` matrix on `macos-latest` + `ubuntu-latest`
-- [ ] **0.3** `harness-daemon` binary: `--version` output (clap or hand-rolled), LICENSE + README. Smoke test asserts version string format.
+- [x] **0.1** Cargo workspace + empty crate stubs per PRD §22 + `rust-toolchain.toml` (stable, MSRV declared) + `.gitignore` Rust additions — shipped in #1 (`85551d3`).
+- [x] **0.2** GitHub Actions CI: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --workspace` matrix on `macos-latest` + `ubuntu-latest` — shipped in #1 (`85551d3`).
+- [x] **0.3** `harness-daemon` binary: `--version` output (clap or hand-rolled), LICENSE + README. Smoke test asserts version string format — shipped in #1 (`85551d3`).
 
 ## Phase 1 — Mesh skeleton
 
