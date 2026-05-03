@@ -9,6 +9,7 @@
 
 pub mod capabilities;
 pub mod error;
+pub mod leases;
 pub mod manifests;
 mod migrations;
 pub mod open;
@@ -17,5 +18,6 @@ pub mod tasks;
 
 pub use crate::capabilities::nodes_for_versioned_capability;
 pub use crate::error::StoreError;
+pub use crate::leases::{Lease, LeaseId, LeaseState};
 pub use crate::open::{Store, StoreConfig};
 pub use crate::tasks::{TaskRow, TaskState};
