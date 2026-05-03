@@ -1,0 +1,13 @@
+[package]
+name         = "harness-api"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+description  = "HTTP and WebSocket API surface (axum)."
+
+[lints]
+workspace = true
+
+[dependencies]

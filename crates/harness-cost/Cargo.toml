@@ -1,0 +1,13 @@
+[package]
+name         = "harness-cost"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+description  = "Estimated and actual cost tracking."
+
+[lints]
+workspace = true
+
+[dependencies]

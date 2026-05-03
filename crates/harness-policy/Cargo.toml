@@ -1,0 +1,13 @@
+[package]
+name         = "harness-policy"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+description  = "Policy engine for capability allow/deny."
+
+[lints]
+workspace = true
+
+[dependencies]

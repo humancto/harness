@@ -1,0 +1,13 @@
+[package]
+name         = "harness-merge"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+description  = "Federated result merge strategies."
+
+[lints]
+workspace = true
+
+[dependencies]

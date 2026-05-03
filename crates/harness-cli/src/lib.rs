@@ -1,0 +1,10 @@
+//! clap-based CLI subcommand surface. Phase 1 fills this in.
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn crate_compiles() {
+        // Replaced with real tests in Phase 1.
+        assert_eq!(2 + 2, 4);
+    }
+}

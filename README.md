@@ -2,7 +2,7 @@
 
 > A LAN-native agent mesh. A single Rust binary on every machine you own; auto-discovers peers; elects a brain; runs typed, capability-routed tasks across the fleet.
 
-**Status: pre-implementation.** The full design lives in [`HARNESS_PRD_v2.md`](./HARNESS_PRD_v2.md). The shipping plan is in [`ROADMAP.md`](./ROADMAP.md). Where we are right now is in [`STATE.md`](./STATE.md). Operating instructions for AI agents working in this repo are in [`CLAUDE.md`](./CLAUDE.md).
+**Status: Phase 0 — workspace bootstrap.** The full design lives in [`HARNESS_PRD_v2.md`](./HARNESS_PRD_v2.md). The shipping plan is in [`ROADMAP.md`](./ROADMAP.md). Where we are right now is in [`STATE.md`](./STATE.md). Operating instructions for AI agents working in this repo are in [`CLAUDE.md`](./CLAUDE.md).
 
 ## The pitch
 
@@ -16,12 +16,15 @@ Harness is a local-first agent mesh for the machines you already own. A small Ru
 
 ## Building
 
-There is nothing to build yet. Phase 0 is in flight — see `ROADMAP.md` item `0.1`. Once it lands:
+Requires Rust `1.85.0` (pinned in [`rust-toolchain.toml`](./rust-toolchain.toml); `rustup` will auto-install on first `cargo` invocation).
 
 ```bash
-cargo build --release
-cargo run --bin harness -- --version
+cargo build --workspace
+cargo test --workspace --all-features
+cargo run --bin harness -- --version   # → harness 0.0.0
 ```
+
+CI runs `fmt --check`, `clippy -D warnings`, and the full test suite on macOS + Linux.
 
 ## Contributing
 
@@ -29,4 +32,4 @@ See `CLAUDE.md` for the operating model (it applies to humans too — the workfl
 
 ## License
 
-To be decided in roadmap item `0.3`. Default expectation: dual MIT / Apache-2.0.
+Dual licensed under [MIT](./LICENSE-MIT) **OR** [Apache-2.0](./LICENSE-APACHE), at your option. This matches the Rust ecosystem default and lets downstream consumers pick whichever fits their project.

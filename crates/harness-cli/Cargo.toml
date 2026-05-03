@@ -1,0 +1,13 @@
+[package]
+name         = "harness-cli"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+description  = "clap-based CLI subcommand surface."
+
+[lints]
+workspace = true
+
+[dependencies]
