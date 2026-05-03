@@ -25,7 +25,7 @@ When an item lands, flip its checkbox **in the same PR** as `STATE.md` is update
 - [ ] **1.5** Heartbeat broadcast loop (every 2s) + signature validation + leader-belief field carried.
 - [ ] **1.6** Weighted brain election (PRD §12.2): planner-aware, battery-aware, anti-flap. Property tests on convergence + no split-brain on connected LAN.
 - [ ] **1.7** Pairing flow: `harness init` (creates mesh, prints pairing code, sets admin password) and `harness join` (scans LAN, pairing-code-approved exchange of pubkeys).
-- [ ] **1.8** Trust file `~/.harness/peers.toml` (read/write/gossip on join).
+- [x] **1.8** Trust file `~/.harness/peers.toml` (read/write/gossip on join) — shipped in #4 (`6bb2474`).
 - [ ] **1.9** CLI: `harness peers`, `harness status`.
 - [ ] **1.10** Web UI Mesh page (read-only, live topology over WebSocket relay).
 

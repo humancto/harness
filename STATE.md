@@ -1,7 +1,7 @@
 # Harness Implementation State
 
 **Current phase:** 1 (mesh skeleton)
-**Last updated:** 2026-05-03 (post-1.2)
+**Last updated:** 2026-05-03 (post-1.8)
 
 ## Done
 
@@ -16,11 +16,13 @@
 - Phase 1 — mesh skeleton.
   - `1.1` shipped (PR #2, `e395d9f`): identity primitives + `~/.harness/` filesystem layout.
   - `1.2` shipped (PR #3, `fa5d23b`): the §13.1–§13.2 wire types (`Heartbeat`, `NodeManifest`, `Capability`, `Cardinality`, `MergeStrategy`, `PartialPolicy`, `Scope`, `ResourceHints`, `Resources`, `TaskId`, `PlanId`, `SemVer`) + `Signable` trait (canonical-encoding-with-sig-zeroed, routes through `verify_strict`) + `ProtocolError`. ADR-0001 records the v1→v2 carry-forward of `Resources`/`CostHint`/`RateLimit`/`GpuInfo`. 17 unit + 4 property tests (256 cases each) + 2 insta wire-format fixtures (`heartbeat_wire_v0`, `node_manifest_wire_v0`) + size-budget regression gate.
+  - `1.8` shipped (PR #4, `6bb2474`): `harness_mesh::trust` with `Peer` / `TrustTier` / `AddedVia` / `TrustEvent` / `TrustError` / `TrustStore` (open / add / remove / tier / lookup_by_pubkey / all_peers / contains / subscribe). Hex-encoded TOML on disk (`format_version = 1`); hard-error on every inconsistency including self-add, self-in-loaded-file, mode≠0600, format-version mismatch, node_id/pubkey mismatch, duplicate node_ids. Persist-then-commit semantics in add/remove (cache stays at the prior state on persist failure) — review-driven correction with a regression test that locks the invariant. Refactor commit pulls `create_root_dir` / `write_atomic` / `enforce_mode_0600` out of `identity.rs` into `harness_mesh::fs_util` so 1.1 and 1.8 share one implementation; existing 1.1 tests pass unchanged. 5 fs_util unit + 12 trust-file unit + 14 integration + 1 property (64×32 ops). Workspace dep `parking_lot 0.12` added (also unlocks 1.5).
 
 ## Next
 
-- **`1.3` (mDNS)**, **`1.4` (QUIC transport)**, and **`1.8` (peers.toml trust file)** are now genuinely independent — three concurrent feature branches at the next loop iteration.
-- After those: `1.5` (heartbeat broadcast loop) depends on 1.3+1.4; `1.6` (election) depends on 1.5; `1.7` (pairing) depends on 1.4; `1.9` (CLI peers/status) depends on 1.8; `1.10` (UI Mesh page) depends on 1.5.
+- **`1.4` (QUIC transport)** — the largest single PR in Phase 1 (5 commits per plan: TLS over Noise via rustls + custom `PinnedKeyVerifier` against `expected_pubkey`, cert deterministic from `Identity` via `rcgen`, cancel-safe `RecvFramer` state machine on `Connection<Mutex>`, per-channel replay protection via `Sequenced` trait on top of `Signable`, 0-RTT disabled, dedupe deferred to 1.5). Plan ready at `.planning/phase-1.4-quic.plan.md`.
+- **`1.3` (mDNS)** — runs after 1.4 lands; advertises the QUIC port discovered by 1.4. Plan ready.
+- After those: `1.5` (heartbeat broadcast loop) depends on 1.3+1.4; `1.6` (election) depends on 1.5; `1.7` (pairing) depends on 1.4; `1.9` (CLI peers/status) depends on 1.8 (just shipped); `1.10` (UI Mesh page) depends on 1.5.
 
 ## Blocked
 
@@ -40,6 +42,9 @@
   3. Heartbeat size budget at 512 B leaves only ~30 B headroom over the real-world ~480 B encoding. Acceptable now (well under any QUIC datagram); a future PR can swap struct field names for stable numeric IDs to drop ~60% — wire-format change requiring a separate ADR + version bump.
   4. `Heartbeat::leader_belief: NodeId` has no "no belief yet" sentinel (other than zeroed bytes). Consider `Option<NodeId>` in 1.6 if pre-election heartbeats are real. Wire-format change.
 - **Missing in 1.2**, queued for 1.3+: `NodeManifest` property tests (no-capabilities form is mechanical), `ed25519` deterministic-signature property test (one line — catches a future swap to randomized signing).
+- **Phase 1.8 review surfaced two carried Risks** (the cache-vs-disk drift was fixed in this PR; remaining items are minor):
+  1. `add` / `remove` clone the entire cache on every successful mutation. O(N) per call. Fine at PRD scale (hundreds of peers); revisit with `im::HashMap` if Phase 6 multi-tenant pushes counts into the thousands.
+  2. Lagged-subscriber test deferred (would require flooding the 256-event broadcast). The property test (random_add_remove × 64 cases × ≤32 ops × reopen) covers the more important file/cache invariant. Land a dedicated lag test before 1.5's gossip wires up subscribers.
 - **`profile.release.panic = "abort"`** may need to flip to `"unwind"` for cost-tracker / brain-handover work in Phase 5. Revisit then.
 - **PRD §27 open questions** remain deferred to their relevant phase (mDNS resilience → Phase 1, UI framework → Phase 6, CRDT vs Raft → Phase 2, etc.).
 
