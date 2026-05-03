@@ -1,7 +1,7 @@
 # Harness Implementation State
 
 **Current phase:** 1 (mesh skeleton)
-**Last updated:** 2026-05-03
+**Last updated:** 2026-05-03 (post-1.2)
 
 ## Done
 
@@ -14,11 +14,13 @@
 ## In progress
 
 - Phase 1 — mesh skeleton.
-  - `1.1` shipped (PR #2, squash-merged as `e395d9f`): `harness-core::identity` with `NodeId` (`blake3(pubkey)[..16]`, lowercase-hex `Display`/`FromStr`), `PublicKey`/`Signature` newtypes (wire-stable raw-bytes serde), `Identity` (non-`Clone`, non-`Serialize`, zeroize-on-drop, `Debug`-redacted with byte-window leak test), `verify` using `verify_strict`. `harness-mesh::identity` with `~/.harness/identity.key` (mode 0600 born atomic, hard-error on `0644`, refuse-overwrite on save). 15 unit + 6 proptest properties (256 cases each) + 8 filesystem integration tests via `tempfile`.
+  - `1.1` shipped (PR #2, `e395d9f`): identity primitives + `~/.harness/` filesystem layout.
+  - `1.2` shipped (PR #3, `fa5d23b`): the §13.1–§13.2 wire types (`Heartbeat`, `NodeManifest`, `Capability`, `Cardinality`, `MergeStrategy`, `PartialPolicy`, `Scope`, `ResourceHints`, `Resources`, `TaskId`, `PlanId`, `SemVer`) + `Signable` trait (canonical-encoding-with-sig-zeroed, routes through `verify_strict`) + `ProtocolError`. ADR-0001 records the v1→v2 carry-forward of `Resources`/`CostHint`/`RateLimit`/`GpuInfo`. 17 unit + 4 property tests (256 cases each) + 2 insta wire-format fixtures (`heartbeat_wire_v0`, `node_manifest_wire_v0`) + size-budget regression gate.
 
 ## Next
 
-- `1.2` — Protocol types in `harness-core`: `Heartbeat`, `NodeManifest`, `Capability`, `Cardinality`, `Scope`, `ResourceHints`, `Resources`. CBOR round-trip + signature property tests. Re-planning underway with the real (rather than stubbed) `NodeId` API now that 1.1 is on `main`.
+- **`1.3` (mDNS)**, **`1.4` (QUIC transport)**, and **`1.8` (peers.toml trust file)** are now genuinely independent — three concurrent feature branches at the next loop iteration.
+- After those: `1.5` (heartbeat broadcast loop) depends on 1.3+1.4; `1.6` (election) depends on 1.5; `1.7` (pairing) depends on 1.4; `1.9` (CLI peers/status) depends on 1.8; `1.10` (UI Mesh page) depends on 1.5.
 
 ## Blocked
 
@@ -32,6 +34,12 @@
 - **Phase 1.1 review surfaced two Risks** carried as follow-ups:
   1. `write_atomic` does not `fsync` the parent directory after rename. Crash-durability gap on Linux/macOS. Plan §7.3 #8 descoped this; file as a follow-up issue once the issue tracker is in active use.
   2. Windows ACL enforcement on `identity.key` (currently `tracing::warn` only). PRD §10.1 wants 0600-equivalent; needs `windows-acl` integration. Acceptable for the "two laptops" demo per plan §11 R1.
+- **Phase 1.2 review surfaced four Risks** carried as follow-ups:
+  1. Wire-format insta fixtures don't lock the externally-tagged `Cardinality` / `MergeStrategy` shape (the two `_v0` fixtures are a `Heartbeat` with no `Cardinality` field and a `NodeManifest` with empty `capabilities`). Add a `cardinality_wire_v0` fixture in 1.5 to pin the on-wire bytes.
+  2. `getrandom` is pulled transitively by the `uuid` `v7` cargo feature regardless of whether we generate UUIDs (only deserialize). No functional impact (~20 KB, builds clean on Darwin/Linux/Windows); update plan/ADR comments when 2.1 lands `TaskId::new_v7()`.
+  3. Heartbeat size budget at 512 B leaves only ~30 B headroom over the real-world ~480 B encoding. Acceptable now (well under any QUIC datagram); a future PR can swap struct field names for stable numeric IDs to drop ~60% — wire-format change requiring a separate ADR + version bump.
+  4. `Heartbeat::leader_belief: NodeId` has no "no belief yet" sentinel (other than zeroed bytes). Consider `Option<NodeId>` in 1.6 if pre-election heartbeats are real. Wire-format change.
+- **Missing in 1.2**, queued for 1.3+: `NodeManifest` property tests (no-capabilities form is mechanical), `ed25519` deterministic-signature property test (one line — catches a future swap to randomized signing).
 - **`profile.release.panic = "abort"`** may need to flip to `"unwind"` for cost-tracker / brain-handover work in Phase 5. Revisit then.
 - **PRD §27 open questions** remain deferred to their relevant phase (mDNS resilience → Phase 1, UI framework → Phase 6, CRDT vs Raft → Phase 2, etc.).
 
