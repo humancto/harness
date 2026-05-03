@@ -146,6 +146,29 @@ impl DaemonOrchestrator {
         };
         let auth = std::sync::Arc::new(harness_api::AuthProvider::new(admin));
 
+        // Phase 3.1: load `~/.harness/policy.toml` if present. Missing
+        // file → deny-all (PRD §10.4 default). Parse / validate errors
+        // are fatal — refusing to start with a clear message is better
+        // than silently bypassing policy.
+        let policy_path = config.harness_root.join("policy.toml");
+        let policy_engine = match harness_policy::load_from_path(&policy_path) {
+            Ok(p) => harness_policy::PolicyEngine::from_policy_at(policy_path.clone(), p),
+            Err(harness_policy::PolicyError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    path = %policy_path.display(),
+                    "no policy.toml found; defaulting to deny-all"
+                );
+                harness_policy::PolicyEngine::new(harness_policy::Policy::deny_all())
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "policy load failed at {}: {e}",
+                    policy_path.display()
+                ));
+            }
+        };
+        let policy_engine = std::sync::Arc::new(policy_engine);
+
         // Build the capability registry (echo + future Phase 3
         // additions feature-gated). The daemon advertises every
         // registered capability via NodeManifest.
@@ -158,6 +181,7 @@ impl DaemonOrchestrator {
                 .with_capabilities(cap_ids)
                 .with_auth(auth)
                 .with_store(store)
+                .with_policy(policy_engine)
                 .build();
         let api_handle = harness_api::serve(config.api_bind, api_state.clone())
             .await
