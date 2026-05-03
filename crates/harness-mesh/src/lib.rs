@@ -12,6 +12,7 @@
 //!   stream.
 
 pub mod discovery;
+pub mod election;
 pub mod heartbeat;
 pub mod identity;
 pub mod transport;
@@ -21,6 +22,9 @@ mod fs_util;
 
 pub use discovery::{
     DiscoveredPeer, Discovery, DiscoveryConfig, DiscoveryError, DiscoveryEvent, DiscoverySource,
+};
+pub use election::{
+    brain_score, BrainScoreInput, Election, ElectionConfig, ElectionResult, ANTI_FLAP_WINDOW,
 };
 pub use heartbeat::{
     BroadcasterHandle, HeartbeatPublisher, HeartbeatPublisherConfig, HeartbeatService,
