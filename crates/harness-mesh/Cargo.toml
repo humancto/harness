@@ -31,6 +31,7 @@ dashmap      = { workspace = true }
 x509-parser  = { workspace = true }
 pki-types    = { workspace = true }
 bytes        = { workspace = true }
+mdns-sd      = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
