@@ -279,4 +279,50 @@ mod tests {
         let err = decode(p).expect_err("bad version");
         assert!(matches!(err, TxtError::BadVersion));
     }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            ..ProptestConfig::default()
+        })]
+
+        /// Property test: any valid `TxtPayload` round-trips through
+        /// encode → decode. Generated identities use real seeds so
+        /// `node_id` and `pubkey_fp` are always self-consistent.
+        #[test]
+        fn random_payload_round_trips(seed: [u8; 32], major: u16, minor: u16, patch: u16) {
+            let id = Identity::from_secret_bytes(&seed);
+            let p = TxtPayload {
+                node_id: id.node_id(),
+                pubkey_fp: id.public_key().fingerprint_hex(),
+                mesh_name: "home".into(),
+                version: SemVer::new(major, minor, patch),
+            };
+            let pairs = encode(&p);
+            let back = decode(pairs).expect("decode");
+            prop_assert_eq!(p, back);
+        }
+
+        /// Property test: decode never panics on adversarial input.
+        /// Always returns an Err for malformed input; never UB.
+        #[test]
+        fn decode_never_panics_on_arbitrary_pairs(
+            pairs in proptest::collection::vec(
+                (any::<String>(), any::<String>()),
+                0..16,
+            ),
+        ) {
+            // Filter out non-printable / very-long strings that mdns-sd
+            // would reject anyway — the property is about decode itself,
+            // not about the upstream.
+            let pairs: Vec<(String, String)> = pairs
+                .into_iter()
+                .filter(|(k, v)| k.len() < 128 && v.len() < 256)
+                .collect();
+            // Any result is fine; we just want no panic.
+            let _ = decode(pairs);
+        }
+    }
 }

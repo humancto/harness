@@ -56,9 +56,12 @@ pub enum DiscoverySource {
 
 /// Discovery events broadcast to all subscribers.
 ///
-/// Static peers don't carry a `node_id` until a handshake confirms it,
-/// so they get their own variant. mDNS peers are full
-/// [`DiscoveredPeer`]s.
+/// **Static peers are NOT in this event stream.** They're surfaced via
+/// [`Discovery::static_hints`] as a one-shot snapshot at startup. The
+/// reason: the broadcast channel doesn't replay events for late
+/// subscribers, and emitting `StaticHint`s before any subscriber exists
+/// would silently drop them. Callers wire static peers into their dial
+/// loop via `static_hints()`; they wire mDNS peers via `subscribe()`.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 #[allow(clippy::large_enum_variant)]
@@ -67,9 +70,6 @@ pub enum DiscoveryEvent {
     Added(DiscoveredPeer),
     /// An mDNS peer departed (TTL expiry / goodbye packet).
     Removed(NodeId),
-    /// A static-peer dial hint. Identity is unknown until handshake;
-    /// item 1.4's `Transport::dial` confirms the pubkey via TLS pinning.
-    StaticHint { addr: SocketAddr },
 }
 
 /// Errors from discovery setup or operation.
@@ -223,18 +223,20 @@ impl Discovery {
             None
         };
 
-        // Emit StaticHint for every configured static peer (best-effort
-        // — broadcast send on an empty subscriber list is fine).
-        for addr in &config.static_peers {
-            let _ = events_tx.send(DiscoveryEvent::StaticHint { addr: *addr });
-        }
+        // Static peers are exposed via `static_hints()` — see the
+        // `DiscoveryEvent` doc-comment for why they're NOT in the
+        // broadcast stream. De-dup before storing so callers don't
+        // see the same address twice.
+        let mut static_addrs = config.static_peers;
+        static_addrs.sort();
+        static_addrs.dedup();
 
         Ok(Self {
             events_tx,
             state,
             inner: parking_lot::Mutex::new(Some(DiscoveryInner {
                 mdns: mdns_task,
-                static_addrs: config.static_peers,
+                static_addrs,
             })),
         })
     }
@@ -253,7 +255,11 @@ impl Discovery {
         v
     }
 
-    /// Static-peer dial hints supplied at config time.
+    /// Static-peer dial hints supplied at config time. Returns the
+    /// de-duplicated set; callers wire these into their dial loop
+    /// alongside mDNS [`Self::subscribe`] events. **Not** in
+    /// [`DiscoveryEvent`] because static peers carry no `node_id`
+    /// until 1.4's TLS handshake confirms it.
     pub fn static_hints(&self) -> Vec<SocketAddr> {
         self.inner
             .lock()
@@ -263,7 +269,17 @@ impl Discovery {
     }
 
     /// Shut down the daemon, drain in-flight events, and join the
-    /// listener task. Idempotent.
+    /// listener task.
+    ///
+    /// `&self` (not `self`) so callers holding `Arc<Discovery>` can
+    /// invoke shutdown from any reference; idempotent under repeated
+    /// calls. After shutdown:
+    /// - `peers()` continues to return the snapshot at shutdown time.
+    /// - `static_hints()` returns an empty vec.
+    /// - `subscribe()` returns a Receiver that will see no further
+    ///   events (the broadcast channel is intact but no senders
+    ///   remain, so `recv` returns `RecvError::Closed` once any
+    ///   buffered events drain).
     pub async fn shutdown(&self) -> Result<(), DiscoveryError> {
         let inner = self.inner.lock().take();
         if let Some(inner) = inner {

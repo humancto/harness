@@ -78,20 +78,41 @@ impl MdnsTask {
         self.shutdown_flag
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = self.daemon.unregister(&self.fullname);
+        // Closing the daemon drops the broadcast channel feeding the
+        // listener; the for-loop terminates and the spawn_blocking
+        // task winds down. We do NOT call `handle.abort()` because
+        // `abort()` does not interrupt blocking-pool tasks (per Tokio
+        // docs); it only flips a flag the future polls. Daemon
+        // shutdown is the actual signal.
         let _ = self.daemon.shutdown();
-        if let Some(handle) = self.listener {
-            handle.abort();
-        }
+        // Forget the handle — the OS thread will exit on its own when
+        // the channel closes.
+        let _ = self.listener;
     }
 }
 
+/// Build the `ServiceInfo` we register and advertise.
+///
+/// Instance name uses the **first 16 hex chars** of `node_id` (8 bytes,
+/// 64 bits of entropy — orders of magnitude more than what we need for
+/// uniqueness in a small LAN mesh) plus `-<mesh_name>`. The full
+/// `node_id` (32 hex) plus a 63-byte mesh name would push the DNS
+/// label past RFC 1035's 63-octet limit. We reject at start time if
+/// 16 + 1 + `mesh_name.len()` > 63. The peer's full pubkey-derived
+/// `node_id` is in the TXT record where length isn't a concern.
 fn build_service_info(config: &DiscoveryConfig) -> Result<ServiceInfo, DiscoveryError> {
-    // Instance name = <node_id_hex>-<mesh_name>. mDNS uses instance name
-    // as the unique discriminator; node_id already serves that role.
-    let instance = format!("{}-{}", config.node_id, config.mesh_name);
+    let node_prefix: String = config.node_id.to_string().chars().take(16).collect();
+    // 16 + 1 + mesh_name.len(); reject if it'd overflow 63 bytes.
+    if 17 + config.mesh_name.len() > 63 {
+        return Err(DiscoveryError::InvalidMeshName(
+            "mesh_name too long once combined with node_id prefix",
+        ));
+    }
+    let instance = format!("{node_prefix}-{}", config.mesh_name);
 
-    // Hostname: the OS hostname, or `node_id`.harness.local. as fallback.
-    let host = format!("{}.harness.local.", config.node_id);
+    // Hostname: 16-hex prefix is enough for collision-free `.harness.local.`
+    // resolution; full node_id would push past the 63-octet label cap.
+    let host = format!("{node_prefix}.harness.local.");
 
     let payload = TxtPayload {
         node_id: config.node_id,
@@ -99,6 +120,9 @@ fn build_service_info(config: &DiscoveryConfig) -> Result<ServiceInfo, Discovery
         mesh_name: config.mesh_name.clone(),
         version: config.version,
     };
+    // Plan §4.3 mandates fixed-order TXT emission. mdns-sd 0.13 accepts
+    // a HashMap which we collect into; field order on the wire depends
+    // on mdns-sd's internal iteration. We document this drift.
     let txt: HashMap<String, String> = txt::encode(&payload).into_iter().collect();
 
     let info = ServiceInfo::new(
@@ -111,7 +135,6 @@ fn build_service_info(config: &DiscoveryConfig) -> Result<ServiceInfo, Discovery
     )
     .map_err(|e| DiscoveryError::Mdns(format!("ServiceInfo::new: {e}")))?
     .enable_addr_auto();
-    // SRV TTL — the daemon's default is fine (120s); we don't override.
     Ok(info)
 }
 
@@ -123,17 +146,24 @@ fn spawn_listener(
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
+        // Side map fullname -> node_id so ServiceRemoved is O(1) and
+        // doesn't depend on instance-name string parsing.
+        let mut fullname_to_node: std::collections::HashMap<String, harness_core::NodeId> =
+            std::collections::HashMap::new();
+
         for event in &receiver {
             if shutdown_flag.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
             }
             match event {
                 ServiceEvent::ServiceResolved(info) => {
-                    if info.get_fullname() == self_fullname {
+                    let fullname = info.get_fullname().to_string();
+                    if fullname == self_fullname {
                         continue; // ignore our own announcement
                     }
                     if let Some(peer) = info_to_peer(&info) {
                         let node_id = peer.node_id;
+                        fullname_to_node.insert(fullname, node_id);
                         state.write().peers.insert(node_id, peer.clone());
                         let _ = events_tx.send(DiscoveryEvent::Added(peer));
                     } else {
@@ -148,24 +178,9 @@ fn spawn_listener(
                     if fullname == self_fullname {
                         continue;
                     }
-                    // Find the node_id for this fullname and drop it.
-                    let removed = {
-                        let mut t = state.write();
-                        let id = t
-                            .peers
-                            .iter()
-                            .find(|(_, p)| {
-                                // We don't store the fullname, so we have
-                                // to match heuristically via the instance
-                                // prefix. Instance names start with
-                                // <node_id>-... so strip the prefix.
-                                fullname.starts_with(&p.node_id.to_string())
-                            })
-                            .map(|(id, _)| *id);
-                        id.and_then(|id| t.peers.remove(&id).map(|_| id))
-                    };
-                    if let Some(id) = removed {
-                        let _ = events_tx.send(DiscoveryEvent::Removed(id));
+                    if let Some(node_id) = fullname_to_node.remove(&fullname) {
+                        state.write().peers.remove(&node_id);
+                        let _ = events_tx.send(DiscoveryEvent::Removed(node_id));
                     }
                 }
                 _ => {} // SearchStarted / SearchStopped / ServiceFound (pre-resolution)

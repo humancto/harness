@@ -19,7 +19,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use harness_core::{Identity, SemVer};
-use harness_mesh::{Discovery, DiscoveryConfig, DiscoveryError, DiscoveryEvent};
+use harness_mesh::{DiscoveredPeer, Discovery, DiscoveryConfig, DiscoveryError, DiscoveryEvent};
 
 fn make_config(port: u16, mesh: &str) -> DiscoveryConfig {
     let id = Identity::generate();
@@ -100,30 +100,78 @@ async fn static_peers_surface_as_static_hints() {
         .with_event_buffer(8);
 
     let d = Discovery::start(cfg).expect("start");
-    // Subscribe AFTER start? broadcast emits StaticHint at start, so
-    // there's a race — let's check static_hints() snapshot instead,
-    // which is deterministic.
     let hints = d.static_hints();
+    // Sorted + de-duped on construction; addresses are already sorted.
     assert_eq!(hints, static_addrs);
     d.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]
-async fn static_hints_event_arrives_when_subscribed_synchronously() {
-    // To avoid the race in the previous test, subscribe BEFORE
-    // start cannot — Discovery owns the channel until construction.
-    // Instead we verify by checking peers() (mDNS-only snapshot)
-    // is empty + static_hints() returns the right addrs.
+async fn static_peers_are_deduplicated_at_config_time() {
+    let dup_addr = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 10).into(), 19199);
+    let static_addrs = vec![dup_addr, dup_addr, dup_addr];
+    let cfg = make_config(8007, "home")
+        .with_mdns_enabled(false)
+        .with_static_peers(static_addrs);
+    let d = Discovery::start(cfg).expect("start");
+    assert_eq!(d.static_hints().len(), 1, "duplicates must collapse");
+    assert_eq!(d.static_hints()[0], dup_addr);
+    d.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn discovery_event_added_carries_node_id() {
+    // Smoke test that the public `DiscoveryEvent::Added(DiscoveredPeer)`
+    // shape is reachable from outside the crate. We don't actually
+    // exchange peers in this test — the two-instance test is
+    // #[ignore]-d for CI multicast flakes — but we verify the type
+    // signatures compile.
+    fn _typecheck(evt: DiscoveryEvent) -> Option<DiscoveredPeer> {
+        if let DiscoveryEvent::Added(p) = evt {
+            Some(p)
+        } else {
+            None
+        }
+    }
+    // Make-config to keep the test from being entirely vacuous.
+    let cfg = make_config(8008, "home").with_mdns_enabled(false);
+    let _ = Discovery::start(cfg).expect("start");
+}
+
+#[tokio::test]
+async fn config_rejects_mesh_name_too_long_for_label() {
+    // 16-hex node prefix + '-' + 47-byte mesh_name = 64 bytes, exceeds
+    // RFC 1035's 63-octet DNS label limit. Validation should catch
+    // this at start time, not silently produce an invalid mDNS
+    // announcement.
+    let id = Identity::generate();
+    let too_long = "a".repeat(47);
+    let cfg = DiscoveryConfig::new(
+        too_long,
+        id.node_id(),
+        id.public_key().fingerprint_hex(),
+        SemVer::new(0, 1, 0),
+        9999,
+    )
+    .expect("valid by validate_mesh_name (≤63 bytes)");
+    // start should fail because 16 + 1 + 47 = 64 > 63.
+    let res = Discovery::start(cfg);
+    match res {
+        Err(DiscoveryError::InvalidMeshName(_)) => {} // expected
+        other => panic!("expected InvalidMeshName, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn peers_snapshot_excludes_static_hints() {
+    // peers() reflects mDNS only; static peers live in static_hints().
     let static_addrs = vec![SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 7000)];
     let cfg = make_config(8004, "home")
         .with_mdns_enabled(false)
         .with_static_peers(static_addrs.clone())
         .with_event_buffer(64);
-
     let d = Discovery::start(cfg).expect("start");
-    // peers() reflects mDNS only; static peers are exposed via
-    // static_hints() (their identity isn't known until handshake).
-    assert!(d.peers().is_empty());
+    assert!(d.peers().is_empty(), "no mDNS peers expected");
     assert_eq!(d.static_hints(), static_addrs);
     d.shutdown().await.expect("shutdown");
 }
