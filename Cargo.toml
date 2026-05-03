@@ -84,6 +84,7 @@ tracing-subscriber   = { version = "0.3", features = ["env-filter", "json"] }
 # Concurrency primitives
 parking_lot          = { version = "0.12" }
 dashmap              = { version = "6" }
+arc-swap             = { version = "1.7" }
 
 # TLS / certificate machinery for QUIC transport
 rustls               = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

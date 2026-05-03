@@ -6,6 +6,7 @@ use std::time::SystemTime;
 
 use harness_core::{Identity, NodeId, PublicKey};
 use harness_mesh::heartbeat::PeerTable;
+use harness_policy::PolicyEngine;
 use parking_lot::RwLock;
 use tokio::sync::{broadcast, watch};
 
@@ -52,6 +53,9 @@ pub struct ApiState {
     /// the public read endpoints without a DB. Production daemons always
     /// pass `Some(store)`.
     pub store: Option<harness_store::Store>,
+    /// Local policy engine — consulted by the executor before running
+    /// privileged actions (Phase 3.1, used by `shell.exec` in 3.2).
+    pub policy: Arc<PolicyEngine>,
 }
 
 impl std::fmt::Debug for ApiState {
@@ -100,6 +104,7 @@ pub struct ApiStateBuilder {
     capabilities: Vec<String>,
     auth: Option<Arc<crate::auth::AuthProvider>>,
     store: Option<harness_store::Store>,
+    policy: Option<Arc<PolicyEngine>>,
 }
 
 impl ApiStateBuilder {
@@ -113,6 +118,7 @@ impl ApiStateBuilder {
             capabilities: vec![],
             auth: None,
             store: None,
+            policy: None,
         }
     }
 
@@ -147,6 +153,12 @@ impl ApiStateBuilder {
     }
 
     #[must_use]
+    pub fn with_policy(mut self, policy: Arc<PolicyEngine>) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> ApiState {
         let local_node_id = self.identity.public_key().node_id();
         let mut status = LocalStatus::new(self.mesh_name);
@@ -157,6 +169,11 @@ impl ApiStateBuilder {
         let auth = self
             .auth
             .unwrap_or_else(|| Arc::new(crate::auth::AuthProvider::new(None)));
+        // Default to deny-all policy when not set — tests and dev paths
+        // get a safe default; production daemon supplies a real one.
+        let policy = self
+            .policy
+            .unwrap_or_else(|| Arc::new(PolicyEngine::new(harness_policy::Policy::deny_all())));
         ApiState {
             identity: self.identity,
             local_node_id,
@@ -165,6 +182,7 @@ impl ApiStateBuilder {
             events,
             auth,
             store: self.store,
+            policy,
         }
     }
 }

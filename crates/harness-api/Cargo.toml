@@ -11,10 +11,11 @@ description  = "HTTP and WebSocket API surface (axum)."
 workspace = true
 
 [dependencies]
-harness-core  = { workspace = true }
-harness-mesh  = { workspace = true }
-harness-store = { workspace = true }
-harness-ui    = { workspace = true }
+harness-core   = { workspace = true }
+harness-mesh   = { workspace = true }
+harness-policy = { workspace = true }
+harness-store  = { workspace = true }
+harness-ui     = { workspace = true }
 
 axum          = { workspace = true }
 tokio         = { workspace = true }

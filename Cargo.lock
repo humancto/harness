@@ -80,6 +80,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "argon2"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -963,6 +972,7 @@ dependencies = [
  "futures",
  "harness-core",
  "harness-mesh",
+ "harness-policy",
  "harness-store",
  "harness-ui",
  "hex",
@@ -1049,6 +1059,7 @@ dependencies = [
  "harness-cli",
  "harness-core",
  "harness-mesh",
+ "harness-policy",
  "harness-store",
  "parking_lot",
  "predicates",
@@ -1097,6 +1108,7 @@ name = "harness-orchestrator"
 version = "0.0.0"
 dependencies = [
  "harness-core",
+ "harness-policy",
  "parking_lot",
  "rstest",
  "serde",
@@ -1108,6 +1120,14 @@ dependencies = [
 [[package]]
 name = "harness-policy"
 version = "0.0.0"
+dependencies = [
+ "arc-swap",
+ "dirs",
+ "serde",
+ "thiserror 2.0.18",
+ "toml",
+ "tracing",
+]
 
 [[package]]
 name = "harness-store"
