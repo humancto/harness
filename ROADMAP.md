@@ -48,7 +48,7 @@ When an item lands, flip its checkbox **in the same PR** as `STATE.md` is update
 
 **Demo:** `harness run --all -- uname -a`; `harness search "term sheet"` federates across nodes.
 
-- [ ] **3.1** Policy engine: parse `~/.harness/policy.toml`, allow/deny matching, evaluated **on the executing node** (PRD §10.4).
+- [x] **3.1** Policy engine: parse `~/.harness/policy.toml`, allow/deny matching, evaluated **on the executing node** (PRD §10.4).
 - [ ] **3.2** `shell.exec` capability with streaming output (line-frames over QUIC) + policy check.
 - [ ] **3.3** CLI: `harness run --all|--on <node>|--where <expr>`. UI Remote Shell mode with `[node-name]` interleaving.
 - [ ] **3.4** `llm.local.<model>` auto-registration from `ollama list`.
