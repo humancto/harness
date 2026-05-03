@@ -53,6 +53,9 @@ When an item lands, flip its checkbox **in the same PR** as `STATE.md` is update
   - [x] **3.2a** synchronous form (PR #24) — capability + policy gate + bounded buffers + timeout. ADR-0008.
   - [ ] **3.2-stream** line-frame streaming output over QUIC (`harness.task.partial.<task_id>`).
 - [ ] **3.3** CLI: `harness run --all|--on <node>|--where <expr>`. UI Remote Shell mode with `[node-name]` interleaving.
+  - [x] **3.3a** Local executor loop + `harness run --on self` + `GET /tasks/<id>` + `node_name` plumbing (PR #25). ADR-0009.
+  - [ ] **3.3-fanout** Cross-node dispatch over QUIC (`--all`, `--where`, dispatcher async runtime).
+  - [ ] **3.3-ui** UI Remote Shell mode with `[node-name]` interleaving.
 - [ ] **3.4** `llm.local.<model>` auto-registration from `ollama list`.
 - [ ] **3.5** Local-LLM micro-batcher (configurable `batch_window_ms`, default 50).
 - [ ] **3.6** `llm.cloud.{claude,openai,gemini}` capabilities + secrets-by-tag reference.
