@@ -20,6 +20,17 @@ toml         = { workspace = true }
 hex          = { workspace = true }
 parking_lot  = { workspace = true }
 tokio        = { workspace = true }
+ciborium     = { workspace = true }
+
+# QUIC transport stack (item 1.4)
+quinn        = { workspace = true }
+rustls       = { workspace = true }
+rcgen        = { workspace = true }
+tokio-stream = { workspace = true }
+dashmap      = { workspace = true }
+x509-parser  = { workspace = true }
+pki-types    = { workspace = true }
+bytes        = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
