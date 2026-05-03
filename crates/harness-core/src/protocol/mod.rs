@@ -9,7 +9,13 @@
 //! item 2.1 and are not yet present.
 
 pub mod cardinality;
+pub mod heartbeat;
+pub mod manifest;
+pub mod signable;
 pub mod support;
 
 pub use cardinality::{AggregateOp, Cardinality, MergeStrategy, PartialPolicy};
+pub use heartbeat::Heartbeat;
+pub use manifest::{Capability, NodeManifest, ResourceHints, Resources, Scope};
+pub use signable::Signable;
 pub use support::{CostHint, CpuClass, DiskIoClass, GpuInfo, NetworkClass, RateLimit};

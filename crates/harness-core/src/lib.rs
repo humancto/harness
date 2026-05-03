@@ -16,4 +16,7 @@ pub use crate::ids::{PlanId, SemVer, TaskId};
 pub use identity::{
     verify, Identity, KeyError, NodeId, ParseNodeIdError, PublicKey, Signature, VerifyError,
 };
-pub use protocol::{Cardinality, MergeStrategy, PartialPolicy};
+pub use protocol::{
+    Capability, Cardinality, Heartbeat, MergeStrategy, NodeManifest, PartialPolicy, ResourceHints,
+    Resources, Scope, Signable,
+};
