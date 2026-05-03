@@ -18,7 +18,7 @@ When an item lands, flip its checkbox **in the same PR** as `STATE.md` is update
 
 **Demo:** install on two laptops, watch them discover each other, elect a brain, see the brain reweight when a stronger node joins.
 
-- [ ] **1.1** Identity generation: Ed25519 keypair, `~/.harness/` layout, `identity.key` mode 0600, `node_id = blake3(pubkey)[..16]`. Property test: round-trip sign/verify.
+- [x] **1.1** Identity generation: Ed25519 keypair, `~/.harness/` layout, `identity.key` mode 0600, `node_id = blake3(pubkey)[..16]`. Property test: round-trip sign/verify — shipped in #2 (`e395d9f`).
 - [ ] **1.2** Protocol types in `harness-core` (PRD §13): `Heartbeat`, `NodeManifest`, `Capability`, `Cardinality`, `Scope`, `ResourceHints`, `Resources`. CBOR round-trip + signature property tests.
 - [ ] **1.3** mDNS discovery: advertise `_harness._tcp.local`, TXT record (`mesh_name`, `node_id`, `pubkey_fp`, `version`). Static peer list fallback.
 - [ ] **1.4** QUIC transport via `quinn` with Noise/TLS, one connection per peer pair, signed message envelope. Replay protection via monotonic seq.

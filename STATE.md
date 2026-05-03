@@ -1,7 +1,7 @@
 # Harness Implementation State
 
 **Current phase:** 1 (mesh skeleton)
-**Last updated:** 2026-05-02
+**Last updated:** 2026-05-03
 
 ## Done
 
@@ -13,11 +13,12 @@
 
 ## In progress
 
-- (between phases) — Phase 1 kickoff is queued; first item is `1.1` (identity generation).
+- Phase 1 — mesh skeleton.
+  - `1.1` shipped (PR #2, squash-merged as `e395d9f`): `harness-core::identity` with `NodeId` (`blake3(pubkey)[..16]`, lowercase-hex `Display`/`FromStr`), `PublicKey`/`Signature` newtypes (wire-stable raw-bytes serde), `Identity` (non-`Clone`, non-`Serialize`, zeroize-on-drop, `Debug`-redacted with byte-window leak test), `verify` using `verify_strict`. `harness-mesh::identity` with `~/.harness/identity.key` (mode 0600 born atomic, hard-error on `0644`, refuse-overwrite on save). 15 unit + 6 proptest properties (256 cases each) + 8 filesystem integration tests via `tempfile`.
 
 ## Next
 
-- `1.1` — Identity: Ed25519 keypair, `~/.harness/` layout, `identity.key` mode 0600, `node_id = blake3(pubkey)[..16]`. Property test for sign/verify round-trip.
+- `1.2` — Protocol types in `harness-core`: `Heartbeat`, `NodeManifest`, `Capability`, `Cardinality`, `Scope`, `ResourceHints`, `Resources`. CBOR round-trip + signature property tests. Re-planning underway with the real (rather than stubbed) `NodeId` API now that 1.1 is on `main`.
 
 ## Blocked
 
@@ -28,6 +29,9 @@
 - **Phase 0 review surfaced two Risks** to address before Phase 3 (not blocking now):
   1. `harness-capabilities` shape (single crate with feature flags, not sub-crates) is decided but not physically discoverable in the empty `lib.rs`. Add `pub mod registry;` + a `[features]` section in Phase 1 or early Phase 3 prep so a fresh contributor doesn't drift into spawning sub-crates.
   2. `tokio = ["full"]` in `[workspace.dependencies]` is free at Phase 0 (Cargo doesn't resolve unused) but will propagate heavy features to every consuming crate in Phase 1+ unless we override per-crate with `default-features = false` + minimal features.
+- **Phase 1.1 review surfaced two Risks** carried as follow-ups:
+  1. `write_atomic` does not `fsync` the parent directory after rename. Crash-durability gap on Linux/macOS. Plan §7.3 #8 descoped this; file as a follow-up issue once the issue tracker is in active use.
+  2. Windows ACL enforcement on `identity.key` (currently `tracing::warn` only). PRD §10.1 wants 0600-equivalent; needs `windows-acl` integration. Acceptable for the "two laptops" demo per plan §11 R1.
 - **`profile.release.panic = "abort"`** may need to flip to `"unwind"` for cost-tracker / brain-handover work in Phase 5. Revisit then.
 - **PRD §27 open questions** remain deferred to their relevant phase (mDNS resilience → Phase 1, UI framework → Phase 6, CRDT vs Raft → Phase 2, etc.).
 
