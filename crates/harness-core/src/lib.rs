@@ -1,15 +1,19 @@
 //! Protocol types, traits, and shared glue for Harness.
 //!
-//! Phase 1 is filling this in incrementally. The first piece is the
-//! [`identity`] module — Ed25519 keys, [`NodeId`], sign/verify. Subsequent
-//! items in Phase 1 will add the wire types ([`Heartbeat`], [`NodeManifest`],
-//! etc.) in a `protocol` module (item 1.2 — pending).
+//! Phase 1 is filling this in incrementally:
 //!
-//! [`Heartbeat`]: https://github.com/humancto/harness/blob/main/HARNESS_PRD_v2.md
-//! [`NodeManifest`]: https://github.com/humancto/harness/blob/main/HARNESS_PRD_v2.md
+//! - **1.1** (shipped): [`identity`] — Ed25519 keys, [`NodeId`], sign/verify.
+//! - **1.2** (in progress): [`protocol`] — wire types from PRD §13.
+//! - **1.3+**: mDNS, QUIC, gossip, election (in `harness-mesh`).
 
+pub mod error;
 pub mod identity;
+pub mod ids;
+pub mod protocol;
 
+pub use crate::error::ProtocolError;
+pub use crate::ids::{PlanId, SemVer, TaskId};
 pub use identity::{
     verify, Identity, KeyError, NodeId, ParseNodeIdError, PublicKey, Signature, VerifyError,
 };
+pub use protocol::{Cardinality, MergeStrategy, PartialPolicy};

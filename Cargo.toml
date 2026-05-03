@@ -60,6 +60,7 @@ serde_json   = { version = "1.0" }
 ciborium     = { version = "0.2" }
 schemars     = { version = "0.8" }
 toml         = { version = "0.8" }
+uuid         = { version = "1", features = ["serde", "v7"] }
 
 # Crypto
 ed25519-dalek = { version = "2.1", features = ["rand_core", "pkcs8", "zeroize"] }
