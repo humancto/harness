@@ -72,6 +72,9 @@ pub(crate) struct DaemonRuntimeConfig {
     pub mesh_bind: SocketAddr,
     pub mdns_enabled: bool,
     pub static_peers: Vec<SocketAddr>,
+    /// `~/.harness/` (or `--root` override). The store, identity, and
+    /// admin.toml all live under here.
+    pub harness_root: std::path::PathBuf,
 }
 
 impl Default for DaemonRuntimeConfig {
@@ -82,6 +85,7 @@ impl Default for DaemonRuntimeConfig {
             mesh_bind: SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 19199),
             mdns_enabled: true,
             static_peers: Vec::new(),
+            harness_root: std::path::PathBuf::from("/tmp/harness"),
         }
     }
 }
@@ -125,10 +129,29 @@ impl DaemonOrchestrator {
         let heartbeat = Arc::new(HeartbeatService::new(identity.clone()));
         let election = Arc::new(Election::new(ElectionConfig::new(identity.node_id())));
 
+        // Open the persistent store rooted under ~/.harness/. The
+        // exact path lives next to identity.key.
+        let mut db_path = config.harness_root.clone();
+        db_path.push("harness.db");
+        let store = harness_store::Store::open(&harness_store::StoreConfig::at(&db_path))
+            .context("open harness-store")?;
+
+        // Load the admin file if present; absence means the operator
+        // hasn't run `harness admin set-password` yet, and mutating
+        // endpoints will surface a 503 until they do.
+        let admin = match harness_mesh::admin::load(&config.harness_root) {
+            Ok(a) => Some(a),
+            Err(harness_mesh::admin::AdminError::NotInitialized) => None,
+            Err(e) => return Err(anyhow::Error::from(e).context("load admin.toml")),
+        };
+        let auth = std::sync::Arc::new(harness_api::AuthProvider::new(admin));
+
         let api_state =
             harness_api::ApiStateBuilder::new(identity.clone(), config.mesh_name.clone())
                 .with_peers(heartbeat.peers())
                 .with_capabilities(vec!["builtin.echo".to_string()])
+                .with_auth(auth)
+                .with_store(store)
                 .build();
         let api_handle = harness_api::serve(config.api_bind, api_state.clone())
             .await
@@ -551,6 +574,7 @@ mod tests {
             mesh_bind: SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 0),
             mdns_enabled: false,
             static_peers: vec![],
+            harness_root: tmp.path().to_path_buf(),
         };
 
         let orch = DaemonOrchestrator::build(identity, trust, cfg)

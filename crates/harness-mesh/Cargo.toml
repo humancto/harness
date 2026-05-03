@@ -34,6 +34,9 @@ bytes        = { workspace = true }
 mdns-sd      = { workspace = true }
 rand         = { workspace = true }
 
+# Admin auth (item 2.6)
+argon2       = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = { workspace = true }

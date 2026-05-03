@@ -11,21 +11,23 @@ description  = "HTTP and WebSocket API surface (axum)."
 workspace = true
 
 [dependencies]
-harness-core = { workspace = true }
-harness-mesh = { workspace = true }
-harness-ui   = { workspace = true }
+harness-core  = { workspace = true }
+harness-mesh  = { workspace = true }
+harness-store = { workspace = true }
+harness-ui    = { workspace = true }
 
-axum         = { workspace = true }
-tokio        = { workspace = true }
-tower        = { workspace = true }
-tower-http   = { workspace = true }
-serde        = { workspace = true }
-serde_json   = { workspace = true }
-parking_lot  = { workspace = true }
-tracing      = { workspace = true }
-thiserror    = { workspace = true }
-hex          = { workspace = true }
-futures      = { workspace = true }
+axum          = { workspace = true }
+tokio         = { workspace = true }
+tower         = { workspace = true }
+tower-http    = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+parking_lot   = { workspace = true }
+tracing       = { workspace = true }
+thiserror     = { workspace = true }
+hex           = { workspace = true }
+futures       = { workspace = true }
+rand          = { workspace = true }
 
 [dev-dependencies]
 tokio-tungstenite = { workspace = true }

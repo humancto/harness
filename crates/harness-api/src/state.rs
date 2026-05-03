@@ -45,6 +45,13 @@ pub struct ApiState {
     pub local_status: Arc<RwLock<LocalStatus>>,
     pub peers: PeerTable,
     pub events: broadcast::Sender<MeshEvent>,
+    /// Auth provider — `is_initialized()` is `false` until `harness admin
+    /// set-password` has been run.
+    pub auth: Arc<crate::auth::AuthProvider>,
+    /// Persistent task store. `None` only in narrow tests that exercise
+    /// the public read endpoints without a DB. Production daemons always
+    /// pass `Some(store)`.
+    pub store: Option<harness_store::Store>,
 }
 
 impl std::fmt::Debug for ApiState {
@@ -91,6 +98,8 @@ pub struct ApiStateBuilder {
     peers: Option<PeerTable>,
     events: Option<broadcast::Sender<MeshEvent>>,
     capabilities: Vec<String>,
+    auth: Option<Arc<crate::auth::AuthProvider>>,
+    store: Option<harness_store::Store>,
 }
 
 impl ApiStateBuilder {
@@ -102,6 +111,8 @@ impl ApiStateBuilder {
             peers: None,
             events: None,
             capabilities: vec![],
+            auth: None,
+            store: None,
         }
     }
 
@@ -124,6 +135,18 @@ impl ApiStateBuilder {
     }
 
     #[must_use]
+    pub fn with_auth(mut self, auth: Arc<crate::auth::AuthProvider>) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
+    #[must_use]
+    pub fn with_store(mut self, store: harness_store::Store) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> ApiState {
         let local_node_id = self.identity.public_key().node_id();
         let mut status = LocalStatus::new(self.mesh_name);
@@ -131,12 +154,17 @@ impl ApiStateBuilder {
         let events = self
             .events
             .unwrap_or_else(|| broadcast::channel::<MeshEvent>(1024).0);
+        let auth = self
+            .auth
+            .unwrap_or_else(|| Arc::new(crate::auth::AuthProvider::new(None)));
         ApiState {
             identity: self.identity,
             local_node_id,
             local_status: Arc::new(RwLock::new(status)),
             peers: self.peers.unwrap_or_default(),
             events,
+            auth,
+            store: self.store,
         }
     }
 }

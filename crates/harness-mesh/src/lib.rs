@@ -11,6 +11,7 @@
 //!   browse, with a static-peer fallback merged into the same event
 //!   stream.
 
+pub mod admin;
 pub mod discovery;
 pub mod election;
 pub mod heartbeat;
@@ -21,6 +22,7 @@ pub mod trust;
 
 mod fs_util;
 
+pub use admin::{AdminError, AdminFile};
 pub use discovery::{
     DiscoveredPeer, Discovery, DiscoveryConfig, DiscoveryError, DiscoveryEvent, DiscoverySource,
 };

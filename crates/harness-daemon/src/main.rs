@@ -56,6 +56,7 @@ async fn daemon_main(args: DaemonArgs) -> Result<()> {
     let mut config = DaemonRuntimeConfig {
         mesh_name,
         api_bind: args.bind,
+        harness_root: root.clone(),
         ..DaemonRuntimeConfig::default()
     };
     if let Ok(peers) = std::env::var("HARNESS_STATIC_PEERS") {
