@@ -2,17 +2,52 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Repository state — read this first
+## How to operate in this repo (read this first — no exceptions)
 
-This repo is **PRD-only**. There is no Rust code, no `Cargo.toml`, no `ROADMAP.md`, no tests, no CI yet. The directory currently contains exactly three files:
+**This is a serious product, not a toy. Ship every phase the PRD describes. Do not stop at Phase 1 / "laptops see each other".** The user has been emphatic, repeatedly: do the full Phases 1→6 march, then Product Hunt. You are authorized to proceed without asking.
+
+### Default behavior — autopilot
+
+1. **Don't ask permission to continue.** Pick the next unchecked `ROADMAP.md` item, plan it, get rust-expert review, branch, implement, PR, expert-review the diff, merge, flip the checkbox, move on. Loop until either (a) the roadmap is fully checked, (b) a Hard Gate stops you (see `~/.claude/CLAUDE.md`), or (c) the user explicitly says stop.
+2. **No analysis paralysis.** If a decision is reasonable and reversible, make it and proceed. Document the choice in the plan file or an ADR. Examples of decisions you should make on your own: bind addresses, default ports, log paths, file naming, CSS framework choice (Tailwind), serialization detail (camelCase vs snake_case in DTOs), test count.
+3. **External-service items are not blockers — call them out, scaffold the integration, move on.** When you hit Phase 5.5/5.6/5.7 (WhatsApp/SMS/iOS Shortcuts), you implement the webhook handler + signature verification + tests using mock signatures, document in the PR description that production cutover requires a Twilio/Apple-Developer account. You do not stop and ask.
+4. **Use parallel agents when items are independent.** Phase 3 capability implementations (3.2/3.4/3.6/3.7/3.10), Phase 5 external adapters (5.5/5.6/5.7), Phase 6 packaging (6.8/6.9/6.10) — these are leaves and can be drafted/implemented by parallel rust-expert agents. The spine (Phase 2 → 3.1 → 4 → 5.8-5.13) is sequential.
+5. **Tests with every PR. Real tests. No `#[ignore]` to hide bugs.** "Trust CI" is not a test plan. The user has been explicit about this in all caps.
+6. **Production-grade quality. No fake successes, no half-implementations, no `unimplemented!()` left in `main` paths.** External reviewers (Codex, etc.) read this code.
+7. **One PR per roadmap item** unless ROADMAP groups them. Squash-merge with `gh pr merge --squash --delete-branch`. Flip the checkbox in `ROADMAP.md` on `main` after merge.
+8. **STATE.md is the running log.** Update it on every merge. Carry forward unfinished sub-items as explicit "Open decisions / carried risks" — never silently drop work.
+
+### What you should NOT do
+
+- Do **not** repeatedly check in with the user asking "should I continue?" / "any more blockers?" / "should I do phase X?". The answer is always **yes, keep going**.
+- Do **not** propose to ship a reduced scope ("just the MVP", "just laptops seeing each other") and call it done. The full product per PRD is the bar.
+- Do **not** stop the loop because a phase is "multi-day work." Multi-PR is fine; one PR per item lets the loop progress visibly. Sleep / context exhaustion will end the session naturally; until then, keep merging.
+- Do **not** treat external-account-required items as blockers. Build the code, mock the external. Document the production cutover.
+- Do **not** edit the PRDs to align with code. If code drifts, fix the code or write an ADR.
+
+### When you genuinely must stop
+
+Only the **Hard Gates** in `~/.claude/CLAUDE.md` step 11 stop the loop:
+
+- All ROADMAP items checked.
+- No matching expert agent exists for the next item's stack — propose one.
+- Tests persistently fail (after good-faith fixes).
+- Merge conflicts you cannot cleanly resolve.
+- A Hard Gate from the PRD's "Stopping conditions" section below (protocol break, security regression, etc.).
+
+In any of those cases, write the blocker into `STATE.md`, then stop and surface the question. Otherwise: keep going.
+
+## Repository state — historical
+
+This repo started PRD-only. As of 2026-05 Phase 1 is complete (mesh skeleton: identity, protocol, mDNS, QUIC, heartbeats, election, pairing, peers.toml, CLI). Phase 1.10 (UI) and Phases 2–6 are in flight.
+
+Source documents (do not edit):
 
 - `HARNESS_PRD_v2.md` — **canonical spec**. v1 + addendum consolidated. Read this.
 - `HARNESS_PRD.md` — v1, kept for diff/history. Superseded.
-- `HARNESS_PRD_v2_addendum.md` — the design rationale that drove v1 → v2. Useful for _why_ decisions were made.
+- `HARNESS_PRD_v2_addendum.md` — the design rationale that drove v1 → v2.
 
-Treat v2 as authoritative. When v1 and v2 disagree, v2 wins. Do not edit v1 or the addendum to "fix" inconsistencies — they are historical.
-
-The repo structure described in v2 §22 (`Cargo.toml` workspace, `crates/harness-*`, `ui/`, `installers/`, etc.) is the **target** structure. None of it exists yet. Phase 0 (project setup) hasn't been done.
+Treat v2 as authoritative. When v1 and v2 disagree, v2 wins.
 
 ## What "the project" actually is
 
