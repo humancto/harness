@@ -15,6 +15,7 @@ pub mod discovery;
 pub mod election;
 pub mod heartbeat;
 pub mod identity;
+pub mod pairing;
 pub mod transport;
 pub mod trust;
 
@@ -31,4 +32,8 @@ pub use heartbeat::{
     ListenerHandle, PeerEntry, PeerTable, SnapshotFn, HEARTBEAT_INTERVAL, PEER_TIMEOUT,
 };
 pub use identity::{default_root, init_or_load, load, save, IdentityError};
+pub use pairing::{
+    PairingCode, PairingCodeError, PairingError, PairingRequest, PairingResponse, PairingStatus,
+    PendingPairings,
+};
 pub use trust::{AddedVia, Peer, TrustError, TrustEvent, TrustStore, TrustTier};

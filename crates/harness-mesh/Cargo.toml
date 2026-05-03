@@ -32,6 +32,7 @@ x509-parser  = { workspace = true }
 pki-types    = { workspace = true }
 bytes        = { workspace = true }
 mdns-sd      = { workspace = true }
+rand         = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
