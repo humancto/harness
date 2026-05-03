@@ -27,6 +27,9 @@ use clap::{Parser, Subcommand};
 use harness_mesh::pairing::PairingCode;
 use harness_mesh::{identity, PendingPairings, TrustStore};
 
+pub mod run;
+pub use run::{run_run, RunOutcome};
+
 /// Top-level harness CLI.
 #[derive(Debug, Parser)]
 #[command(name = "harness", version, about, long_about = None)]
@@ -55,6 +58,10 @@ pub enum Command {
     Submit(SubmitArgs),
     /// List submitted tasks.
     Tasks(TasksArgs),
+    /// Run a shell command on this node (Phase 3.3a).
+    /// `harness run -- uname -a`. `--all`/`--on <node>`/`--where` are
+    /// parsed; cross-node dispatch lands in 3.3-fanout.
+    Run(RunArgs),
     /// Placeholder — clean teardown of `~/.harness/` is a Phase 6 concern.
     Leave(LeaveArgs),
 }
@@ -147,6 +154,44 @@ pub struct TasksArgs {
     pub api: String,
 }
 
+/// `harness run [--on <node>] [--timeout-ms N] [--cwd P] -- <cmd> <args>...`
+#[derive(Debug, clap::Args)]
+#[command(group(
+    clap::ArgGroup::new("target").args(["all", "on", "where_"]).multiple(false)
+))]
+pub struct RunArgs {
+    /// Run on every reachable node. Lands in 3.3-fanout.
+    #[arg(long)]
+    pub all: bool,
+
+    /// Run on a specific node by hostname (or `self`).
+    #[arg(long)]
+    pub on: Option<String>,
+
+    /// Predicate over node tags. Lands in 3.3-fanout.
+    #[arg(long = "where")]
+    pub where_: Option<String>,
+
+    /// Capability execution timeout in milliseconds. Default `60_000`.
+    #[arg(long)]
+    pub timeout_ms: Option<u64>,
+
+    /// Working directory for the command. Canonicalized client-side so
+    /// relative paths resolve from the user's cwd, not the daemon's.
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+
+    #[arg(long)]
+    pub root: Option<PathBuf>,
+
+    #[arg(long, default_value = "http://127.0.0.1:19198")]
+    pub api: String,
+
+    /// `--` then the command and args.
+    #[arg(last = true, required = true, num_args = 1..)]
+    pub argv: Vec<String>,
+}
+
 #[derive(Debug, clap::Args)]
 pub struct DaemonArgs {
     #[arg(long)]
@@ -160,7 +205,7 @@ pub struct DaemonArgs {
 
 /// Resolve the harness root: explicit `--root` wins, otherwise
 /// `~/.harness/`.
-fn resolve_root(root: Option<PathBuf>) -> Result<PathBuf> {
+pub(crate) fn resolve_root(root: Option<PathBuf>) -> Result<PathBuf> {
     match root {
         Some(p) => Ok(p),
         None => identity::default_root().context("locate ~/.harness/"),
@@ -181,6 +226,7 @@ pub fn run(cli: Cli) -> Result<SyncOutcome> {
         Command::Admin(args) => cmd_admin(args).map(SyncOutcome::Print),
         Command::Submit(args) => Ok(SyncOutcome::SubmitRequested(args)),
         Command::Tasks(args) => Ok(SyncOutcome::TasksRequested(args)),
+        Command::Run(args) => Ok(SyncOutcome::RunRequested(args)),
         Command::Daemon(args) => Ok(SyncOutcome::DaemonRequested(args)),
     }
 }
@@ -194,6 +240,7 @@ pub enum SyncOutcome {
     DaemonRequested(DaemonArgs),
     SubmitRequested(SubmitArgs),
     TasksRequested(TasksArgs),
+    RunRequested(RunArgs),
 }
 
 fn cmd_init(args: InitArgs) -> Result<String> {
@@ -428,7 +475,7 @@ pub async fn run_tasks(args: TasksArgs) -> Result<String> {
     Ok(body)
 }
 
-async fn obtain_session_token(root: &std::path::Path, api: &str) -> Result<String> {
+pub(crate) async fn obtain_session_token(root: &std::path::Path, api: &str) -> Result<String> {
     if let Some(cached) = read_cached_session(root) {
         return Ok(cached);
     }

@@ -1,7 +1,7 @@
 //! `POST /api/v1/tasks` and `GET /api/v1/tasks` — submit + list.
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
@@ -169,4 +169,105 @@ pub async fn list_handler(
                 .into_response()
         }
     }
+}
+
+/// `GET /api/v1/tasks/{id}` — full envelope + state + output (if Done)
+/// or error (if Failed). The CLI's `harness run` polls this until terminal.
+pub async fn get_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id_str): Path<String>,
+) -> axum::response::Response {
+    if !is_authenticated(&state.auth, &headers) {
+        return unauthorized();
+    }
+    let Some(store) = state.store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "store_not_configured" })),
+        )
+            .into_response();
+    };
+
+    let Ok(task_id) = parse_task_id(&id_str) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid_task_id" })),
+        )
+            .into_response();
+    };
+
+    let task = match store.load_task(task_id) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "not_found" })),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            tracing::error!(target: "harness.api.tasks", ?err, "load_task");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "load_failed" })),
+            )
+                .into_response();
+        }
+    };
+
+    let task_state = match store.task_state(task_id) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "not_found" })),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            tracing::error!(target: "harness.api.tasks", ?err, "task_state");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "state_failed" })),
+            )
+                .into_response();
+        }
+    };
+
+    let result = match store.load_task_result(task_id) {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::error!(target: "harness.api.tasks", ?err, "load_task_result");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "result_failed" })),
+            )
+                .into_response();
+        }
+    };
+
+    // Build the response — output and error are OMITTED (not null) when
+    // the task isn't terminal, so consumers' type narrowing stays tight.
+    let mut body = serde_json::json!({
+        "id":           format!("{}", task.id.0.as_hyphenated()),
+        "capability":   task.capability,
+        "state":        task_state.as_str(),
+        "input":        task.input,
+        "issued_at_ms": task.issued_at,
+    });
+    if let Some(r) = result {
+        body["completed_at_ms"] = serde_json::json!(r.completed_at_ms);
+        if let Some(out) = r.output {
+            body["output"] = out;
+        }
+        if let Some(err) = r.error {
+            body["error"] = serde_json::json!(err);
+        }
+    }
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+fn parse_task_id(s: &str) -> Result<TaskId, ()> {
+    uuid::Uuid::parse_str(s).map(TaskId).map_err(|_| ())
 }
