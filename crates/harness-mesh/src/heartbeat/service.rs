@@ -7,17 +7,32 @@ use std::time::Duration;
 
 use harness_core::{Heartbeat, NodeId};
 use parking_lot::Mutex;
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::transport::{channels, Connection, TransportError};
 
 use super::{
-    HeartbeatPublisher, HeartbeatPublisherConfig, PeerTable, HEARTBEAT_INTERVAL, PEER_TIMEOUT,
+    HeartbeatPublisher, HeartbeatPublisherConfig, PeerTable, EVENT_CHANNEL_CAPACITY,
+    HEARTBEAT_INTERVAL, PEER_TIMEOUT,
 };
 
 /// How the daemon supplies a fresh per-tick snapshot to the publisher.
 pub type SnapshotFn =
     Box<dyn Fn() -> (HeartbeatPublisherConfig, NodeId, i32) + Send + Sync + 'static>;
+
+/// Events published by [`HeartbeatService`] every time the local
+/// [`PeerTable`] mutates. The API layer (1.10) subscribes and translates
+/// these into the public WebSocket protocol.
+#[derive(Debug, Clone)]
+pub enum TableEvent {
+    /// A heartbeat was just recorded. `was_new = true` if it was the
+    /// first heartbeat we'd seen from this peer.
+    Recorded { node_id: NodeId, was_new: bool },
+    /// A peer was evicted because their last heartbeat is older than
+    /// [`PEER_TIMEOUT`].
+    Evicted { node_id: NodeId },
+}
 
 /// Per-connection registration handle. Drop to deregister + abort the
 /// listener task; explicit `shutdown` joins cleanly.
@@ -62,6 +77,7 @@ impl Drop for ListenerHandle {
 pub struct HeartbeatService {
     publisher: HeartbeatPublisher,
     peers: PeerTable,
+    events: broadcast::Sender<TableEvent>,
 }
 
 impl std::fmt::Debug for HeartbeatService {
@@ -69,15 +85,17 @@ impl std::fmt::Debug for HeartbeatService {
         f.debug_struct("HeartbeatService")
             .field("publisher", &self.publisher)
             .field("peer_count", &self.peers.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl HeartbeatService {
     pub fn new(identity: Arc<harness_core::Identity>) -> Self {
+        let (events, _) = broadcast::channel::<TableEvent>(EVENT_CHANNEL_CAPACITY);
         Self {
             publisher: HeartbeatPublisher::new(identity),
             peers: PeerTable::new(),
+            events,
         }
     }
 
@@ -85,6 +103,21 @@ impl HeartbeatService {
     /// read from this.
     pub fn peers(&self) -> PeerTable {
         self.peers.clone()
+    }
+
+    /// Subscribe to [`TableEvent`]s. Each subscriber gets every event
+    /// published after they call this. Lagged subscribers see
+    /// `RecvError::Lagged(n)` and should refetch the snapshot.
+    #[must_use]
+    pub fn subscribe(&self) -> broadcast::Receiver<TableEvent> {
+        self.events.subscribe()
+    }
+
+    /// Clone of the events sender — for direct publishing from external
+    /// machinery (e.g., tests or 1.6 election integration).
+    #[must_use]
+    pub fn events_sender(&self) -> broadcast::Sender<TableEvent> {
+        self.events.clone()
     }
 
     /// Build + sign a heartbeat from `snapshot`, then `send` it to
@@ -112,15 +145,19 @@ impl HeartbeatService {
     }
 
     /// Spawn a listener task that loops `recv_sequenced` on this
-    /// connection, recording each heartbeat into the peer table.
+    /// connection, recording each heartbeat into the peer table and
+    /// publishing a [`TableEvent::Recorded`] for every successful read.
     /// Returns a handle for shutdown.
     pub fn register_peer(&self, conn: Arc<Connection>) -> ListenerHandle {
         let table = self.peers.clone();
+        let events = self.events.clone();
         let task = tokio::spawn(async move {
             loop {
                 match conn.recv_sequenced::<Heartbeat>(channels::HEARTBEAT).await {
                     Ok(hb) => {
-                        table.record(hb);
+                        let node_id = hb.node_id;
+                        let was_new = table.record(hb);
+                        let _ = events.send(TableEvent::Recorded { node_id, was_new });
                     }
                     Err(TransportError::Closed | TransportError::Read(_)) => break,
                     Err(e) => {
@@ -197,9 +234,12 @@ impl HeartbeatService {
     }
 
     /// Convenience: spawn an evict-stale loop that runs every
-    /// `interval` (recommended `PEER_TIMEOUT`). Returns the handle.
+    /// `interval` (recommended `PEER_TIMEOUT`). Publishes a
+    /// [`TableEvent::Evicted`] for every dropped peer so the API
+    /// layer can fan out a `peer_evicted` to UI subscribers.
     pub fn spawn_evictor(&self, interval: Duration) -> BroadcasterHandle {
         let peers = self.peers.clone();
+        let events = self.events.clone();
         let task = tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval);
             tick.tick().await;
@@ -212,6 +252,9 @@ impl HeartbeatService {
                         dropped = ?dropped,
                         "evicted stale peers"
                     );
+                    for node_id in dropped {
+                        let _ = events.send(TableEvent::Evicted { node_id });
+                    }
                 }
             }
         });

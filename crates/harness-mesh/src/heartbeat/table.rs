@@ -35,15 +35,21 @@ impl PeerTable {
     /// Insert or update a peer's heartbeat. The caller is expected to
     /// have already verified the signature against the peer's pubkey
     /// (1.4's transport does this on `recv_sequenced`).
-    pub fn record(&self, hb: Heartbeat) {
+    ///
+    /// Returns `true` if this was the first heartbeat for this peer
+    /// (i.e. a *new* peer joined). Callers (1.5's listener task) use
+    /// the return value to decide whether to publish a `peer_added`
+    /// vs `peer_updated` event on the API channel.
+    pub fn record(&self, hb: Heartbeat) -> bool {
         let id = hb.node_id;
-        self.inner.write().insert(
+        let prior = self.inner.write().insert(
             id,
             PeerEntry {
                 heartbeat: hb,
                 last_seen: Instant::now(),
             },
         );
+        prior.is_none()
     }
 
     /// Remove the peer with this id, returning the entry if present.
