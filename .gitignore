@@ -1,0 +1,25 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+/.idea/
+/.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local working state — plans live with the developer, not on `main`
+/.planning/
+
+# Build artifacts that don't belong in source
+/dist/
+/out/
+
+# Local config that shouldn't be shared
+.env
+.env.local
+*.local
