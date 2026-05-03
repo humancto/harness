@@ -62,3 +62,13 @@ fn peers_subcommand_is_recognized() {
         .success()
         .stdout(str::contains("peers.toml"));
 }
+
+#[test]
+fn daemon_subcommand_is_recognized() {
+    Command::cargo_bin("harness")
+        .expect("binary `harness` should be built by `cargo test`")
+        .args(["daemon", "--help"])
+        .assert()
+        .success()
+        .stdout(str::contains("long-lived"));
+}

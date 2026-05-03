@@ -13,13 +13,19 @@
 //!
 //! The peer table is the local snapshot 1.6's election reads to compute
 //! `brain_score` aggregates.
+//!
+//! ## Events
+//!
+//! 1.10 added a `tokio::sync::broadcast` channel that fires [`TableEvent`]s
+//! whenever the table mutates (peer added, peer evicted). The API layer
+//! subscribes to translate them into the public WS protocol.
 
 mod publisher;
 mod service;
 mod table;
 
 pub use publisher::{HeartbeatPublisher, HeartbeatPublisherConfig};
-pub use service::{BroadcasterHandle, HeartbeatService, ListenerHandle, SnapshotFn};
+pub use service::{BroadcasterHandle, HeartbeatService, ListenerHandle, SnapshotFn, TableEvent};
 pub use table::{PeerEntry, PeerTable};
 
 use std::time::Duration;
@@ -31,3 +37,7 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 /// PRD §12.1 says >6s missed for leader timeout; we use 6s for general
 /// liveness too.
 pub const PEER_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// Default capacity of the `TableEvent` broadcast channel. Larger than
+/// expected fan-out so a slow subscriber rarely lags.
+pub const EVENT_CHANNEL_CAPACITY: usize = 1024;

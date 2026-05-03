@@ -1,7 +1,7 @@
 # Harness Implementation State
 
-**Current phase:** 1 (mesh skeleton)
-**Last updated:** 2026-05-03 (post-1.4)
+**Current phase:** 1 → 2 (mesh skeleton complete; tasks flow next)
+**Last updated:** 2026-05-03 (post-1.10)
 
 ## Done
 
@@ -46,7 +46,13 @@
   1. `add` / `remove` clone the entire cache on every successful mutation. O(N) per call. Fine at PRD scale (hundreds of peers); revisit with `im::HashMap` if Phase 6 multi-tenant pushes counts into the thousands.
   2. Lagged-subscriber test deferred (would require flooding the 256-event broadcast). The property test (random_add_remove × 64 cases × ≤32 ops × reopen) covers the more important file/cache invariant. Land a dedicated lag test before 1.5's gossip wires up subscribers.
 - **`profile.release.panic = "abort"`** may need to flip to `"unwind"` for cost-tracker / brain-handover work in Phase 5. Revisit then.
-- **PRD §27 open questions** remain deferred to their relevant phase (mDNS resilience → Phase 1, UI framework → Phase 6, CRDT vs Raft → Phase 2, etc.).
+- **PRD §27 open questions** remain deferred to their relevant phase (mDNS resilience → Phase 1, UI framework → Phase 6, CRDT vs Raft → Phase 2, etc.). UI framework is now decided as **SvelteKit 2 + Svelte 5 + TypeScript + Tailwind 3** (Phase 1.10).
+- **Phase 1.10 carried risks (post-merge follow-ups):**
+  1. **Daemon lifecycle wiring is incomplete.** The `harness daemon` subcommand starts only the API + UI server. Discovery (1.3), Transport (1.4), HeartbeatService (1.5), Pairing (1.7), and Election (1.6) are NOT yet wired into the `daemon_main` task. The Phase 1 demo gate ("two laptops discover each other, brain reweights when stronger node joins") therefore is NOT runnable from a single binary as-shipped. **This is the FIRST Phase 2 follow-up PR** — daemon lifecycle wiring before any new feature work. Tracking: a dedicated `feat/phase-2.0-daemon-lifecycle` branch + PR.
+  2. `~/.harness/config.toml` parsing was promised in the 1.10 plan §3 but not implemented; the only knob is `--bind` / `HARNESS_API_BIND`. `[api]`, `[mesh]`, `[discovery]` sections will land alongside the daemon-lifecycle PR.
+  3. `npm audit --audit-level=high` is `continue-on-error: true` (advisory). Phase 6.8 hardening MUST flip this to blocking.
+  4. `ApiState::set_local_status` calls a caller-supplied closure while holding a write guard. A future caller that re-enters ApiState methods would deadlock (`parking_lot::RwLock` is not reentrant). Documented in code; potential refactor to two-step (mutate-into-buffer, then write) if a real caller hits this.
+  5. The Mesh page is a card grid sorted by `brain_score desc` — not a true topology graph. The roadmap line says "live topology over WebSocket relay" but the Phase 1 demo gate only requires visual confirmation of brain rebalancing; the card grid satisfies that. A topology graph (Cytoscape.js or sigma.js) is a Phase 6 polish item if needed.
 
 ## How this file is updated
 

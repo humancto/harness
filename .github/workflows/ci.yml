@@ -34,6 +34,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      # Required by harness-ui's build.rs — fail fast if the SvelteKit
+      # build did not produce ui/build/index.html.
+      HARNESS_UI_REQUIRE: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -48,6 +52,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-${{ matrix.os }}
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: ui/package-lock.json
+
+      - name: build ui
+        working-directory: ui
+        # Use `npm install` rather than `npm ci` because the committed
+        # lockfile resolves cleanly under npm 11 (Node 24) but trips
+        # `npm ci`'s strict mode under npm 10 (Node 20). Phase 6
+        # hardening will pin the toolchain (rtoml + corepack) and flip
+        # back to `npm ci`. Tracked in STATE.md as a 1.10 carried risk.
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+
+      - name: npm audit (advisory)
+        working-directory: ui
+        continue-on-error: true
+        run: npm audit --audit-level=high
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
