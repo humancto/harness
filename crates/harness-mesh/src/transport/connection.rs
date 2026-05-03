@@ -62,9 +62,12 @@ impl IncomingConnection {
     /// a `TrustStore::contains`); on `false` the connection is closed and
     /// `Err(TransportError::CertMismatch)` is returned.
     ///
-    /// On approval, accepts the peer's first bidi stream as the single
-    /// application stream this `Connection` uses for the rest of its life.
-    pub async fn accept(
+    /// **Returns immediately on approval** — the bidi stream is accepted
+    /// lazily on first `recv` (and opened lazily on first `send`). Eager
+    /// stream open/accept here would deadlock with the dialer pattern,
+    /// since `accept_bi` blocks until the peer writes its first byte but
+    /// the peer cannot write until this method returns.
+    pub fn accept(
         self,
         allow_pubkey: impl FnOnce(&PublicKey) -> bool,
     ) -> Result<Connection, TransportError> {
@@ -72,12 +75,7 @@ impl IncomingConnection {
             self.inner.close(1u32.into(), b"untrusted-peer");
             return Err(TransportError::CertMismatch);
         }
-        let (send, recv) = self
-            .inner
-            .accept_bi()
-            .await
-            .map_err(TransportError::from_quinn_connection_error)?;
-        Ok(Connection::new(self.inner, self.pubkey, send, recv))
+        Ok(Connection::accepter(self.inner, self.pubkey))
     }
 }
 
@@ -92,19 +90,36 @@ impl TransportError {
     }
 }
 
+/// Which side of the connection we are. Determines whether `send`'s
+/// first call opens a bidi stream (`Dialer`) or accepts one (`Accepter`).
+#[derive(Debug, Clone, Copy)]
+enum Side {
+    Dialer,
+    Accepter,
+}
+
 /// One peer-to-peer harness connection. Cheap to clone is intentionally
 /// **not** offered — this type owns the per-connection mutexes.
+///
+/// Stream open/accept is lazy. On the dialer, the first `send` calls
+/// `quinn::Connection::open_bi`; on the accepter, the first `recv` (or
+/// `send` — whichever comes first) calls `quinn::Connection::accept_bi`.
+/// This avoids the deadlock where eagerly accepting in
+/// `IncomingConnection::accept` blocks on the dialer's first write,
+/// but the dialer cannot write until the accept call returns.
 pub struct Connection {
     pubkey: PublicKey,
     addr: SocketAddr,
-    /// Held so the connection isn't dropped while streams are alive.
-    /// Underscore-prefixed because the type's lifetime is what we care
-    /// about, not its API; we read it only in `close()`.
     inner: quinn::Connection,
-    out: Mutex<quinn::SendStream>,
+    side: Side,
+    streams: Mutex<Option<StreamPair>>,
     framer: Mutex<RecvFramer>,
-    recv: Mutex<quinn::RecvStream>,
     replay: ReplayTable,
+}
+
+struct StreamPair {
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
 }
 
 impl std::fmt::Debug for Connection {
@@ -117,33 +132,48 @@ impl std::fmt::Debug for Connection {
 }
 
 impl Connection {
-    pub(crate) fn new(
-        inner: quinn::Connection,
-        pubkey: PublicKey,
-        send: quinn::SendStream,
-        recv: quinn::RecvStream,
-    ) -> Self {
+    fn new(inner: quinn::Connection, pubkey: PublicKey, side: Side) -> Self {
         let addr = inner.remote_address();
         Self {
             pubkey,
             addr,
             inner,
-            out: Mutex::new(send),
+            side,
+            streams: Mutex::new(None),
             framer: Mutex::new(RecvFramer::new()),
-            recv: Mutex::new(recv),
             replay: ReplayTable::new(),
         }
     }
 
-    pub(crate) async fn from_quinn_dialer(
-        connection: quinn::Connection,
-        pubkey: PublicKey,
-    ) -> Result<Self, TransportError> {
-        let (send, recv) = connection
-            .open_bi()
-            .await
-            .map_err(TransportError::from_quinn_connection_error)?;
-        Ok(Self::new(connection, pubkey, send, recv))
+    pub(crate) fn dialer(connection: quinn::Connection, pubkey: PublicKey) -> Self {
+        Self::new(connection, pubkey, Side::Dialer)
+    }
+
+    pub(crate) fn accepter(connection: quinn::Connection, pubkey: PublicKey) -> Self {
+        Self::new(connection, pubkey, Side::Accepter)
+    }
+
+    /// Lazily ensure the bidi stream pair exists. Called by `send` and `recv`
+    /// on first use. Idempotent.
+    async fn ensure_streams(&self) -> Result<(), TransportError> {
+        let mut guard = self.streams.lock().await;
+        if guard.is_some() {
+            return Ok(());
+        }
+        let (send, recv) = match self.side {
+            Side::Dialer => self
+                .inner
+                .open_bi()
+                .await
+                .map_err(TransportError::from_quinn_connection_error)?,
+            Side::Accepter => self
+                .inner
+                .accept_bi()
+                .await
+                .map_err(TransportError::from_quinn_connection_error)?,
+        };
+        *guard = Some(StreamPair { send, recv });
+        Ok(())
     }
 
     #[must_use]
@@ -168,8 +198,12 @@ impl Connection {
         let mut payload = Vec::with_capacity(512);
         ciborium::ser::into_writer(msg, &mut payload)?;
         let framed = encode_frame(&payload)?;
-        let mut out = self.out.lock().await;
-        out.write_all(&framed).await?;
+        self.ensure_streams().await?;
+        let mut guard = self.streams.lock().await;
+        let pair = guard.as_mut().ok_or_else(|| {
+            TransportError::Protocol("streams not initialized after ensure".into())
+        })?;
+        pair.send.write_all(&framed).await?;
         Ok(())
     }
 
@@ -217,11 +251,15 @@ impl Connection {
     /// bytes than the current frame needs, the excess is fed back to the
     /// framer on the same call.
     async fn recv_one_frame(&self) -> Result<Vec<u8>, TransportError> {
+        self.ensure_streams().await?;
         // Hold the framer lock for the entire frame assembly. This means
         // two concurrent recv() calls on the same Connection will queue,
         // which is correct — frames are ordered.
         let mut framer = self.framer.lock().await;
-        let mut recv = self.recv.lock().await;
+        let mut streams = self.streams.lock().await;
+        let pair = streams.as_mut().ok_or_else(|| {
+            TransportError::Protocol("streams not initialized after ensure".into())
+        })?;
 
         // Try to extract a frame from any leftover bytes (none on first
         // call; future calls may have residue if we ever pipeline).
@@ -233,7 +271,8 @@ impl Connection {
         loop {
             // 64 KiB max chunk — arbitrary; quinn will return whatever's
             // available up to this size.
-            let chunk = recv
+            let chunk = pair
+                .recv
                 .read_chunk(64 * 1024, true)
                 .await?
                 .ok_or(TransportError::FrameTruncated)?;

@@ -176,7 +176,7 @@ impl Transport {
             return Err(TransportError::CertMismatch);
         }
 
-        Connection::from_quinn_dialer(connection, pubkey).await
+        Ok(Connection::dialer(connection, pubkey))
     }
 
     /// Stream of incoming connection attempts. The caller decides per

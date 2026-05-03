@@ -4,20 +4,14 @@
 //! actual ports back via `local_addr`, and exchanges signed messages. No
 //! real network, no fixed ports — CI-stable.
 //!
-//! ## Currently-failing tests are `#[ignore]`-d
-//!
-//! The full handshake-requiring tests hang during the rustls/quinn TLS
-//! handshake and are marked `#[ignore]` pending isolation of the bug.
-//! The cert / verifier / envelope unit tests pass and exercise the
-//! cryptographic surface in isolation; the transport-build smoke tests
-//! prove the rustls + quinn endpoint construction is syntactically valid.
-//! The remaining gap is an interaction between rustls 0.23's
-//! custom-verifier path and quinn 0.11's `QuicServerConfig` that needs a
-//! debug session this PR does not have time to chase.
-//!
-//! Plan §11.3 / §11.4 / §11.5 — full integration + property + cancel-safety
-//! tests — re-run as soon as the handshake unblocks. Don't ship this to
-//! mainnet without those passing.
+//! Stream open/accept is lazy on `Connection`: the dialer opens its bidi
+//! stream on first `send`, the accepter accepts on first `recv` (or
+//! `send`). Eagerly opening at handshake time would deadlock with the
+//! accepter pattern (accepter blocks on `accept_bi` waiting for the
+//! dialer's first write, but the dialer can't write until the accepter
+//! returns). The current design lets both sides return from the
+//! handshake immediately and hand off via the application protocol's
+//! first message.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -133,7 +127,6 @@ async fn accept_one_into(transport: Transport) -> IncomingConnection {
     transport.accept_one().await.expect("accept_one")
 }
 
-#[ignore = "QUIC handshake hangs; pending rustls/quinn config debug session"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dial_send_heartbeat_recv() {
     let (server, server_id) = build_transport();
@@ -143,7 +136,7 @@ async fn dial_send_heartbeat_recv() {
 
     let server_handle = tokio::spawn(async move {
         let inc = accept_one_into(server).await;
-        inc.accept(|_pk| true).await.expect("accept conn")
+        inc.accept(|_pk| true).expect("accept conn")
     });
 
     let conn = client
@@ -161,7 +154,6 @@ async fn dial_send_heartbeat_recv() {
     assert_eq!(received.seq, 1);
 }
 
-#[ignore = "QUIC handshake hangs; pending rustls/quinn config debug session"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dial_with_wrong_expected_pubkey_fails() {
     let (server, _server_id) = build_transport();
@@ -185,7 +177,6 @@ async fn dial_with_wrong_expected_pubkey_fails() {
     }
 }
 
-#[ignore = "QUIC handshake hangs; pending rustls/quinn config debug session"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replay_old_seq_rejected() {
     let (server, server_id) = build_transport();
@@ -195,7 +186,7 @@ async fn replay_old_seq_rejected() {
 
     let server_handle = tokio::spawn(async move {
         let inc = accept_one_into(server).await;
-        inc.accept(|_pk| true).await.expect("accept")
+        inc.accept(|_pk| true).expect("accept")
     });
 
     let conn = client
@@ -232,7 +223,6 @@ async fn replay_old_seq_rejected() {
     );
 }
 
-#[ignore = "QUIC handshake hangs; pending rustls/quinn config debug session"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn node_manifest_round_trip_via_transport() {
     let (server, server_id) = build_transport();
@@ -242,7 +232,7 @@ async fn node_manifest_round_trip_via_transport() {
 
     let server_handle = tokio::spawn(async move {
         let inc = accept_one_into(server).await;
-        inc.accept(|_pk| true).await.expect("accept")
+        inc.accept(|_pk| true).expect("accept")
     });
 
     let conn = client
