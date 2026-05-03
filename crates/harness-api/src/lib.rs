@@ -19,11 +19,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod auth;
 pub mod dto;
 pub mod event;
 pub mod routes;
 pub mod state;
 
+pub use auth::{AuthProvider, SessionStore};
 pub use dto::{LocalDto, PeerDto, PeersSnapshot, ResourcesDto, StatusDto};
 pub use event::{MeshEvent, TableEventBridge};
 pub use state::{ApiState, ApiStateBuilder, LocalStatus, ServerHandle};

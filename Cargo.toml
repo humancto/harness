@@ -103,6 +103,10 @@ clap = { version = "4.5", features = ["derive", "env"] }
 rust-embed   = { version = "8.5", features = ["interpolate-folder-path"] }
 mime_guess   = { version = "2.0" }
 
+# Admin auth (item 2.6)
+argon2       = { version = "0.5" }
+constant_time_eq = { version = "0.3" }
+
 # Test deps (used as dev-dependencies in crates that need them)
 assert_cmd        = { version = "2.0" }
 predicates        = { version = "3.1" }
