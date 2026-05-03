@@ -11,3 +11,18 @@ description  = "SQLite persistence, replication, checkpoints."
 workspace = true
 
 [dependencies]
+harness-core = { workspace = true }
+rusqlite     = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+parking_lot  = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+ciborium     = { workspace = true }
+hex          = { workspace = true }
+dirs         = { workspace = true }
+uuid         = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rstest   = { workspace = true }
