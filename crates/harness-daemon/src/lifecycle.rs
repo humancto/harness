@@ -146,10 +146,16 @@ impl DaemonOrchestrator {
         };
         let auth = std::sync::Arc::new(harness_api::AuthProvider::new(admin));
 
+        // Build the capability registry (echo + future Phase 3
+        // additions feature-gated). The daemon advertises every
+        // registered capability via NodeManifest.
+        let capabilities = harness_capabilities::default_registry();
+        let cap_ids = capabilities.ids();
+
         let api_state =
             harness_api::ApiStateBuilder::new(identity.clone(), config.mesh_name.clone())
                 .with_peers(heartbeat.peers())
-                .with_capabilities(vec!["builtin.echo".to_string()])
+                .with_capabilities(cap_ids)
                 .with_auth(auth)
                 .with_store(store)
                 .build();
