@@ -59,6 +59,7 @@ pub struct LlmLocalCapability {
     policy: Arc<PolicyEngine>,
     host: Url,
     client: reqwest::Client,
+    batcher: Arc<crate::llm_batcher::LlmBatcher>,
 }
 
 impl LlmLocalCapability {
@@ -68,6 +69,7 @@ impl LlmLocalCapability {
         model: String,
         host: Url,
         client: reqwest::Client,
+        batcher: Arc<crate::llm_batcher::LlmBatcher>,
     ) -> Self {
         let id = format!("{ID_PREFIX}{model}");
         Self {
@@ -76,11 +78,17 @@ impl LlmLocalCapability {
             policy,
             host,
             client,
+            batcher,
         }
     }
 }
 
-#[derive(Debug, Deserialize)]
+// FINGERPRINT_FIELDS — every output-affecting field listed below must
+// also appear in `fingerprint_for` so the batcher correctly distinguishes
+// requests with different output. Adding `seed`, `top_p`, `top_k`, etc.
+// in the future REQUIRES updating both this struct AND `fingerprint_for`.
+// `timeout_ms` is excluded (a wait-bound, not output-determining).
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LlmLocalInput {
     prompt: String,
@@ -170,23 +178,7 @@ impl Capability for LlmLocalCapability {
     ) -> Result<JsonValue, CapabilityError> {
         let input: LlmLocalInput = serde_json::from_value(input)
             .map_err(|e| CapabilityError::InvalidInput(format!("decode input: {e}")))?;
-        if input.prompt.trim().is_empty() {
-            return Err(CapabilityError::InvalidInput("prompt is empty".to_string()));
-        }
-        if let Some(t) = input.max_tokens {
-            if !(1..=MAX_TOKENS_CAP).contains(&t) {
-                return Err(CapabilityError::InvalidInput(format!(
-                    "max_tokens must be in 1..={MAX_TOKENS_CAP}"
-                )));
-            }
-        }
-        if let Some(t) = input.timeout_ms {
-            if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&t) {
-                return Err(CapabilityError::InvalidInput(format!(
-                    "timeout_ms must be in {MIN_TIMEOUT_MS}..={MAX_TIMEOUT_MS}"
-                )));
-            }
-        }
+        validate_input(&input)?;
 
         // Policy gate. Inline against the engine — same pattern as shell.
         let decision = self.policy.evaluate(&EvalContext {
@@ -206,63 +198,145 @@ impl Capability for LlmLocalCapability {
             }
         }
 
-        let timeout = Duration::from_millis(input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
-        let url = self
-            .host
-            .join("api/generate")
-            .map_err(|e| CapabilityError::Failed(format!("bad ollama host: {e}")))?;
+        // Phase 3.5: tag:interactive bypasses the batcher. Otherwise
+        // submit to the batcher; identical (model, fingerprint) calls
+        // within the window coalesce into one backend invocation.
+        let interactive = ctx.tags.iter().any(|t| t == "interactive");
+        if interactive {
+            return dispatch_direct_owned(
+                self.model.clone(),
+                self.host.clone(),
+                self.client.clone(),
+                input,
+            )
+            .await;
+        }
 
-        let body = serde_json::json!({
-            "model": &self.model,
-            "prompt": input.prompt,
-            "stream": false,
-            "options": ollama_options(&input),
-        });
-
-        let started = Instant::now();
-        let resp = self
-            .client
-            .post(url)
-            .json(&body)
-            .timeout(timeout)
-            .send()
+        let fp = fingerprint_for(&self.model, &input);
+        // Capture for the dispatch closure: clone the cheap bits so the
+        // closure has 'static lifetime and can be moved into the
+        // batcher's spawned timer task.
+        let model = self.model.clone();
+        let host = self.host.clone();
+        let client = self.client.clone();
+        self.batcher
+            .submit(fp, move || async move {
+                dispatch_direct_owned(model, host, client, input).await
+            })
             .await
-            .map_err(|e| CapabilityError::Failed(format!("ollama serve not reachable: {e}")))?;
+    }
+}
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(CapabilityError::Failed(format!(
-                "ollama returned {status}: {text}"
+fn validate_input(input: &LlmLocalInput) -> Result<(), CapabilityError> {
+    if input.prompt.trim().is_empty() {
+        return Err(CapabilityError::InvalidInput("prompt is empty".to_string()));
+    }
+    if let Some(t) = input.max_tokens {
+        if !(1..=MAX_TOKENS_CAP).contains(&t) {
+            return Err(CapabilityError::InvalidInput(format!(
+                "max_tokens must be in 1..={MAX_TOKENS_CAP}"
             )));
         }
-
-        // Ollama field is `response`; we rename it to `text` in our
-        // output schema for forward-compat with `llm.cloud.*` (3.6).
-        #[derive(Deserialize)]
-        struct OllamaResp {
-            response: String,
-            #[serde(default)]
-            prompt_eval_count: Option<u64>,
-            #[serde(default)]
-            eval_count: Option<u64>,
-        }
-        let r: OllamaResp = resp
-            .json()
-            .await
-            .map_err(|e| CapabilityError::Failed(format!("decode ollama response: {e}")))?;
-
-        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let out = LlmLocalOutput {
-            text: r.response,
-            model: self.model.clone(),
-            duration_ms,
-            prompt_tokens: r.prompt_eval_count,
-            completion_tokens: r.eval_count,
-        };
-        serde_json::to_value(&out)
-            .map_err(|e| CapabilityError::Failed(format!("encode output: {e}")))
     }
+    if let Some(t) = input.timeout_ms {
+        if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&t) {
+            return Err(CapabilityError::InvalidInput(format!(
+                "timeout_ms must be in {MIN_TIMEOUT_MS}..={MAX_TIMEOUT_MS}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Compute the batcher fingerprint for `(model, input)`. Two callers
+/// with the same fingerprint share a backend call.
+///
+/// **Hand-listed fields** — see the `// FINGERPRINT_FIELDS` marker on
+/// `LlmLocalInput`. `timeout_ms` is excluded (wait-bound, not output-
+/// determining); `tags` is on `ExecutionContext`, not the input.
+fn fingerprint_for(model: &str, input: &LlmLocalInput) -> crate::llm_batcher::Fingerprint {
+    // Fixed-shape `json!` literal: serializing produces deterministic
+    // bytes per build. The `serde_json::Map` underlying `json!` is
+    // BTreeMap-backed unless `preserve_order` is enabled (we don't
+    // enable it in the workspace), so key order is deterministic.
+    let canonical = serde_json::json!({
+        "model":       model,
+        "prompt":      input.prompt,
+        "system":      input.system,
+        "temperature": input.temperature,
+        "max_tokens":  input.max_tokens,
+    });
+    // Encoding a fixed-shape json! literal cannot fail in practice
+    // (serde_json::Value is always serializable; the only failure mode
+    // is non-string Map keys, which we don't have). Use unwrap_or to
+    // produce a degenerate-but-deterministic empty hash if it ever
+    // does — siblings still coalesce, and the output is wrong for
+    // exactly that pathological input. Better than panicking the
+    // daemon's hot path.
+    let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
+    let hash = blake3::hash(&bytes);
+    crate::llm_batcher::Fingerprint(*hash.as_bytes())
+}
+
+/// `dispatch_direct` extracted to a free fn so the batcher's spawned
+/// task can call it without borrowing `self`. All inputs owned.
+async fn dispatch_direct_owned(
+    model: String,
+    host: Url,
+    client: reqwest::Client,
+    input: LlmLocalInput,
+) -> Result<JsonValue, CapabilityError> {
+    let timeout = Duration::from_millis(input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
+    let url = host
+        .join("api/generate")
+        .map_err(|e| CapabilityError::Failed(format!("bad ollama host: {e}")))?;
+
+    let body = serde_json::json!({
+        "model":   &model,
+        "prompt":  input.prompt,
+        "stream":  false,
+        "options": ollama_options(&input),
+    });
+
+    let started = Instant::now();
+    let resp = client
+        .post(url)
+        .json(&body)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|e| CapabilityError::Failed(format!("ollama serve not reachable: {e}")))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(CapabilityError::Failed(format!(
+            "ollama returned {status}: {text}"
+        )));
+    }
+
+    #[derive(Deserialize)]
+    struct OllamaResp {
+        response: String,
+        #[serde(default)]
+        prompt_eval_count: Option<u64>,
+        #[serde(default)]
+        eval_count: Option<u64>,
+    }
+    let r: OllamaResp = resp
+        .json()
+        .await
+        .map_err(|e| CapabilityError::Failed(format!("decode ollama response: {e}")))?;
+
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let out = LlmLocalOutput {
+        text: r.response,
+        model,
+        duration_ms,
+        prompt_tokens: r.prompt_eval_count,
+        completion_tokens: r.eval_count,
+    };
+    serde_json::to_value(&out).map_err(|e| CapabilityError::Failed(format!("encode output: {e}")))
 }
 
 fn ollama_options(input: &LlmLocalInput) -> JsonValue {
