@@ -24,6 +24,10 @@ pub struct SubmitRequest {
     pub input: JsonValue,
     #[serde(default)]
     pub constraints: Option<Constraints>,
+    /// Caller hints (3.5). Optional. Honored variably by capabilities;
+    /// e.g. `["interactive"]` opts out of the LLM micro-batcher.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -85,6 +89,7 @@ pub async fn submit_handler(
         trace_ctx: TraceContext::default(),
         issued_by: state.local_node_id,
         issued_at: now_ms,
+        tags: req.tags,
         sig: Signature::from_bytes([0u8; 64]),
     };
 

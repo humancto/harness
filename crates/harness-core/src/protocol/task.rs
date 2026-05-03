@@ -95,6 +95,13 @@ pub struct Task {
     pub issued_by: NodeId,
     /// Unix milliseconds.
     pub issued_at: u64,
+    /// Caller hints — task-level routing/policy/scheduling metadata,
+    /// distinct from capability-input arguments. Honored variably by
+    /// capabilities; e.g. `llm.local.*` reads `"interactive"` to
+    /// bypass the micro-batcher (3.5). Default empty for backward
+    /// compatibility with old senders.
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub sig: Signature,
 }
 
@@ -140,6 +147,7 @@ mod tests {
             trace_ctx: TraceContext::default(),
             issued_by: NodeId::from_bytes([0x11; 16]),
             issued_at: 1_700_000_000_000,
+            tags: Vec::new(),
             sig: Signature::from_bytes([0u8; 64]),
         }
     }

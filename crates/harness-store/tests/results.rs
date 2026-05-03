@@ -40,6 +40,7 @@ fn dummy_task(id: TaskId, capability: &str) -> Task {
         trace_ctx: TraceContext::default(),
         issued_by: NodeId::from_bytes([1; 16]),
         issued_at: 1_700_000_000_000,
+        tags: Vec::new(),
         sig: Signature::from_bytes([0u8; 64]),
     };
     let id_priv = harness_core::Identity::generate();
