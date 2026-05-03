@@ -13,9 +13,9 @@
 //!
 //! Static peers are merged with mDNS results, **not** failover-only —
 //! both sources contribute. Static peers don't carry a `node_id` until
-//! a handshake confirms it; they surface as
-//! `DiscoveryEvent::StaticHint { addr }` and are dial-only hints for
-//! item 1.4's transport.
+//! a handshake confirms it; they surface via [`Discovery::static_hints`]
+//! as a one-shot snapshot at startup (NOT in [`DiscoveryEvent`]) and
+//! are dial-only hints for item 1.4's transport.
 
 mod mdns;
 mod static_peers;
@@ -202,8 +202,8 @@ impl std::fmt::Debug for Discovery {
 
 impl Discovery {
     /// Spawn discovery: start the mDNS daemon (if enabled), advertise
-    /// our service, browse for peers, and emit `StaticHint` for every
-    /// configured static peer once.
+    /// our service, browse for peers, and stash de-duplicated
+    /// `static_peers` for retrieval via [`Self::static_hints`].
     ///
     /// Sync today (mdns-sd init is sync). Kept as a regular fn rather
     /// than async because there's nothing to await on the happy path;

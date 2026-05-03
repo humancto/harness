@@ -101,7 +101,13 @@ impl MdnsTask {
 /// 16 + 1 + `mesh_name.len()` > 63. The peer's full pubkey-derived
 /// `node_id` is in the TXT record where length isn't a concern.
 fn build_service_info(config: &DiscoveryConfig) -> Result<ServiceInfo, DiscoveryError> {
-    let node_prefix: String = config.node_id.to_string().chars().take(16).collect();
+    debug_assert!(
+        config.mesh_name.is_ascii(),
+        "mesh_name must be ASCII per validate_mesh_name"
+    );
+    // node_id Display is guaranteed ASCII hex (32 chars), so byte slicing is safe.
+    let node_id_str = config.node_id.to_string();
+    let node_prefix = &node_id_str[..16];
     // 16 + 1 + mesh_name.len(); reject if it'd overflow 63 bytes.
     if 17 + config.mesh_name.len() > 63 {
         return Err(DiscoveryError::InvalidMeshName(

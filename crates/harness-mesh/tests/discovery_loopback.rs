@@ -6,7 +6,8 @@
 //!
 //! - `Discovery::start` succeeds with `mdns_enabled = true` and
 //!   `mdns_enabled = false`.
-//! - `static_peers` surface as `StaticHint` events.
+//! - `static_peers` surface via `Discovery::static_hints()` (one-shot
+//!   snapshot; not in the broadcast event stream).
 //! - `peers()` snapshot is empty until mDNS discovers something.
 //! - `shutdown` is idempotent and clean.
 //!
