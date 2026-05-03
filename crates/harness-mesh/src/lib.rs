@@ -14,4 +14,4 @@ pub mod trust;
 mod fs_util;
 
 pub use identity::{default_root, init_or_load, load, save, IdentityError};
-pub use trust::{AddedVia, Peer, TrustError, TrustTier};
+pub use trust::{AddedVia, Peer, TrustError, TrustEvent, TrustStore, TrustTier};

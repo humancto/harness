@@ -25,6 +25,9 @@
 //!   subscribes to.
 
 mod file;
+mod store;
+
+pub use store::{TrustEvent, TrustStore};
 
 use std::path::PathBuf;
 
@@ -99,9 +102,6 @@ pub enum TrustError {
 }
 
 impl TrustError {
-    // Used by `TrustStore` in the next commit; tests in `file.rs` exercise
-    // the variants directly.
-    #[allow(dead_code)]
     pub(crate) fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         Self::Io {
             path: path.into(),
@@ -132,14 +132,12 @@ impl From<crate::fs_util::Mode0600Error> for TrustError {
 /// Convert a [`PublicKey`] to its 64-character lowercase hex form (the
 /// on-disk encoding). Used by `file::PeerOnDisk` and (next commit)
 /// `TrustStore`.
-#[allow(dead_code)]
 pub(crate) fn pubkey_to_hex(pk: &PublicKey) -> String {
     hex::encode(pk.as_bytes())
 }
 
 /// Parse a 64-character lowercase hex string back into a [`PublicKey`],
 /// validating curve membership via `PublicKey::from_bytes`.
-#[allow(dead_code)]
 pub(crate) fn pubkey_from_hex(s: &str) -> Result<PublicKey, TrustError> {
     if s.len() != 64 {
         return Err(TrustError::Parse(format!(
@@ -154,7 +152,6 @@ pub(crate) fn pubkey_from_hex(s: &str) -> Result<PublicKey, TrustError> {
 }
 
 /// Parse a 32-character lowercase hex string back into a [`NodeId`].
-#[allow(dead_code)]
 pub(crate) fn node_id_from_hex(s: &str) -> Result<NodeId, TrustError> {
     s.parse::<NodeId>()
         .map_err(|e| TrustError::Parse(format!("node_id hex: {e}")))

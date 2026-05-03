@@ -1,11 +1,6 @@
 //! On-disk representation of `peers.toml`. Private — `Peer` is the public
 //! type; this module's `PeerOnDisk` exists only to control the wire-format
 //! encoding (lowercase hex, integer epoch seconds, `snake_case` enum strings).
-//!
-//! Items here are exercised by this file's own `#[cfg(test)] mod tests` and
-//! consumed by `TrustStore` in the next commit; the
-//! `#![allow(dead_code)]` reflects that scaffolding split.
-#![allow(dead_code)]
 
 use harness_core::NodeId;
 use serde::{Deserialize, Serialize};
