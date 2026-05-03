@@ -10,9 +10,13 @@ pub mod error;
 pub mod identity;
 pub mod ids;
 pub mod protocol;
+pub mod replica;
 
 pub use crate::error::ProtocolError;
 pub use crate::ids::{PlanId, SemVer, TaskId};
+pub use crate::replica::{
+    ReplicaApplier, ReplicaError, ReplicaSyncEnvelope, ReplicatedState, ReplicatedTaskState,
+};
 pub use identity::{
     verify, Identity, KeyError, NodeId, ParseNodeIdError, PublicKey, Signature, VerifyError,
 };

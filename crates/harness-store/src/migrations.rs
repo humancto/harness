@@ -15,6 +15,11 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         include_str!("../migrations/V0001__initial_schema.sql"),
     ),
     (2, "leases", include_str!("../migrations/V0002__leases.sql")),
+    (
+        3,
+        "replica",
+        include_str!("../migrations/V0003__replica.sql"),
+    ),
 ];
 
 pub(crate) fn run(conn: &Connection) -> Result<(), StoreError> {
