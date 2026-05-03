@@ -1,7 +1,7 @@
 # Harness Implementation State
 
 **Current phase:** 1 (mesh skeleton)
-**Last updated:** 2026-05-03 (post-1.8)
+**Last updated:** 2026-05-03 (post-1.4)
 
 ## Done
 
