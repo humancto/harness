@@ -46,6 +46,9 @@ pub enum Command {
     Peers(PeersArgs),
     /// Print local node info: `node_id`, pubkey fingerprint, version.
     Status(StatusArgs),
+    /// Run the long-lived daemon: HTTP/WS API on 127.0.0.1:19198, mesh
+    /// peers, embedded UI. Blocks until SIGINT/SIGTERM.
+    Daemon(DaemonArgs),
     /// Placeholder — clean teardown of `~/.harness/` is a Phase 6 concern.
     Leave(LeaveArgs),
 }
@@ -92,6 +95,17 @@ pub struct LeaveArgs {
     pub root: Option<PathBuf>,
 }
 
+#[derive(Debug, clap::Args)]
+pub struct DaemonArgs {
+    #[arg(long)]
+    pub root: Option<PathBuf>,
+    /// Override `[api].bind_addr` from `config.toml`. Defaults to
+    /// 127.0.0.1:19198. Bind 0.0.0.0:* explicitly to expose the UI on
+    /// the LAN — by default only loopback is bound for safety.
+    #[arg(long, default_value = "127.0.0.1:19198", env = "HARNESS_API_BIND")]
+    pub bind: SocketAddr,
+}
+
 /// Resolve the harness root: explicit `--root` wins, otherwise
 /// `~/.harness/`.
 fn resolve_root(root: Option<PathBuf>) -> Result<PathBuf> {
@@ -101,18 +115,28 @@ fn resolve_root(root: Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
-/// Dispatch to the subcommand handler. Returns the human-readable
-/// stdout the daemon should print. Tests call this directly with
-/// pre-configured roots; production calls it via `harness-daemon`'s
-/// `main`.
-pub fn run(cli: Cli) -> Result<String> {
+/// Dispatch to a synchronous subcommand handler. Returns the
+/// human-readable stdout. The `Daemon` subcommand returns
+/// [`SyncOutcome::DaemonRequested`] so the binary can hand off to an
+/// async runtime; all other variants resolve to a printable string.
+pub fn run(cli: Cli) -> Result<SyncOutcome> {
     match cli.command {
-        Command::Init(args) => cmd_init(args),
-        Command::Join(args) => cmd_join(args),
-        Command::Peers(args) => cmd_peers(args),
-        Command::Status(args) => cmd_status(args),
-        Command::Leave(args) => cmd_leave(args),
+        Command::Init(args) => cmd_init(args).map(SyncOutcome::Print),
+        Command::Join(args) => cmd_join(args).map(SyncOutcome::Print),
+        Command::Peers(args) => cmd_peers(args).map(SyncOutcome::Print),
+        Command::Status(args) => cmd_status(args).map(SyncOutcome::Print),
+        Command::Leave(args) => cmd_leave(args).map(SyncOutcome::Print),
+        Command::Daemon(args) => Ok(SyncOutcome::DaemonRequested(args)),
     }
+}
+
+/// Result of the synchronous CLI dispatch. The daemon subcommand returns
+/// its parsed args so the caller can pull up the async runtime; all
+/// other subcommands return their printable stdout.
+#[derive(Debug)]
+pub enum SyncOutcome {
+    Print(String),
+    DaemonRequested(DaemonArgs),
 }
 
 fn cmd_init(args: InitArgs) -> Result<String> {
