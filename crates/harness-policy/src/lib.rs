@@ -11,8 +11,8 @@ pub mod error;
 mod validate;
 
 pub use config::{
-    CapabilityPolicy, DenyCmd, DenyPattern, DenyRule, PlanningPolicy, Policy, ShellAllow,
-    ShellPolicy, TrustLevel,
+    CapabilityPolicy, DenyCmd, DenyPattern, DenyRule, LlmAllow, LlmAllowModel, LlmAllowPrefix,
+    LlmPolicy, PlanningPolicy, Policy, ShellAllow, ShellPolicy, TrustLevel,
 };
 pub use engine::{
     default_path, load_default_path, load_from_path, load_from_str, Action, Decision, EvalContext,

@@ -23,13 +23,23 @@ pub enum Decision {
 }
 
 /// What the executor is asking permission for. New variants are added
-/// alongside their evaluators (e.g. `Capability` lands with 3.6, not 3.1).
+/// alongside their evaluators.
+///
+/// **All variants must remain `Copy`.** `EvalContext` is cheap to share
+/// across evaluator branches; a non-`Copy` variant would require a
+/// rewrite of every match site. Use `&'a str` / `&'a [T]`, not
+/// `String` / `Vec<T>`.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub enum Action<'a> {
     /// Per-command shell gate, evaluated on the executing node before
     /// `shell.exec` invokes the command.
     Shell { cmd: &'a str, args: &'a [String] },
+
+    /// Per-model LLM gate, evaluated on the executing node before
+    /// `llm.local.<model>` (3.4) or `llm.cloud.<provider>` (3.6)
+    /// invokes the underlying inference engine.
+    Llm { model: &'a str },
 }
 
 /// Per-call evaluation context. Cheap to build; borrows everything.
@@ -132,6 +142,7 @@ pub fn load_default_path() -> Result<Policy, PolicyError> {
 fn evaluate_against(policy: &Policy, ctx: &EvalContext<'_>) -> Decision {
     match ctx.action {
         Action::Shell { cmd, args } => evaluate_shell(policy, ctx.from_node, cmd, args),
+        Action::Llm { model } => evaluate_llm(policy, ctx.from_node, model),
     }
 }
 
@@ -223,4 +234,67 @@ fn allow_matches(rule: &ShellAllow, cmd: &str, args: &[String]) -> bool {
         return true;
     }
     args.is_empty()
+}
+
+// ─────────────────────────────────────────── LLM evaluation (3.4)
+
+/// Evaluate `Action::Llm { model }` against `policy.llm` per the matrix:
+///
+/// | `[llm]` section | `allow` rules                  | Result          |
+/// |-----------------|--------------------------------|-----------------|
+/// | absent          | n/a                            | **Allow**       |
+/// | present, empty  | `allow=[]` and `deny=[]`       | **Deny**        |
+/// | present         | match-based                    | first match     |
+///
+/// Default-allow when `[llm]` is absent matches the PRD §10.4 example,
+/// which assumes ollama works without explicit configuration.
+fn evaluate_llm(policy: &Policy, from_node: &str, model: &str) -> Decision {
+    let Some(llm) = policy.llm.as_ref() else {
+        // Section absent → default-allow.
+        return Decision::Allow;
+    };
+
+    // Trust short-circuit (symmetric with shell).
+    let trust = resolve_trust(&llm.from, from_node);
+    if matches!(trust, TrustLevel::Untrusted) {
+        return Decision::Deny {
+            reason: format!("untrusted source node {from_node:?}"),
+        };
+    }
+
+    // Section present, both lists empty → default-deny (operator wrote
+    // the section; respect the intent).
+    if llm.allow.is_empty() && llm.deny.is_empty() {
+        return Decision::Deny {
+            reason: format!("[llm] section present but no rules; denying {model}"),
+        };
+    }
+
+    // Deny pass first, declaration order.
+    for rule in &llm.deny {
+        if llm_rule_matches(rule, model) {
+            return Decision::Deny {
+                reason: format!("denied by [llm].deny rule for model {model:?}"),
+            };
+        }
+    }
+
+    // Allow pass.
+    for rule in &llm.allow {
+        if llm_rule_matches(rule, model) {
+            return Decision::Allow;
+        }
+    }
+
+    // No rule matched in a non-empty allow list.
+    Decision::Deny {
+        reason: format!("no [llm].allow rule matched {model}"),
+    }
+}
+
+fn llm_rule_matches(rule: &crate::config::LlmAllow, model: &str) -> bool {
+    match rule {
+        crate::config::LlmAllow::Model(m) => m.model == model,
+        crate::config::LlmAllow::Prefix(p) => model.starts_with(&p.model_prefix),
+    }
 }
