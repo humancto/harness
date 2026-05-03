@@ -36,7 +36,7 @@ When an item lands, flip its checkbox **in the same PR** as `STATE.md` is update
 
 - [x] **2.1** Task / Result / Plan envelopes in `harness-core` (PRD §13.3–13.5). Sign + verify. Property tests — shipped in #13 (`168f776`).
 - [x] **2.2** Cardinality enforcement at dispatcher: `Anyone` / `Owner { scope_field }` / `Federated { merge, on_node_failure }` — shipped in #14 (`1aa6305`).
-- [ ] **2.3** SQLite schema for tasks, capability index, scopes (in `harness-store`, WAL mode).
+- [x] **2.3** SQLite schema for tasks, capability index, scopes (in `harness-store`, WAL mode) — shipped in #15 (`b07156c`).
 - [ ] **2.4** Round-robin dispatcher (no scoring yet) + lease-based claiming.
 - [ ] **2.5** Task state replication via gossip (CRDT — `automerge` or custom).
 - [ ] **2.6** HTTP submit API: `POST /api/v1/tasks` + WebSocket result stream (`harness-api`).
