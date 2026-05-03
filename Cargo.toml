@@ -83,6 +83,15 @@ tracing-subscriber   = { version = "0.3", features = ["env-filter", "json"] }
 
 # Concurrency primitives
 parking_lot          = { version = "0.12" }
+dashmap              = { version = "6" }
+
+# TLS / certificate machinery for QUIC transport
+rustls               = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen                = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+tokio-stream         = { version = "0.1" }
+x509-parser          = { version = "0.16" }
+pki-types            = { package = "rustls-pki-types", version = "1" }
+bytes                = { version = "1" }
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }

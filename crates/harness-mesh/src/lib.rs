@@ -9,6 +9,7 @@
 //!   election follow in 1.3+.
 
 pub mod identity;
+pub mod transport;
 pub mod trust;
 
 mod fs_util;
