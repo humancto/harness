@@ -1,10 +1,30 @@
-//! Policy engine for capability allow/deny. Phase 3 fills this in.
+//! Policy engine for capability allow/deny.
+//!
+//! See PRD §10.4. The engine parses `~/.harness/policy.toml` into a
+//! typed `Policy`, evaluates `Action`s against it on the executing
+//! node (brains cannot override worker policy), and supports lock-free
+//! reload via `arc_swap::ArcSwap`.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_compiles() {
-        // Replaced with real tests in Phase 3.
-        assert_eq!(2 + 2, 4);
-    }
-}
+pub mod config;
+pub mod engine;
+pub mod error;
+mod validate;
+
+pub use config::{
+    CapabilityPolicy, DenyCmd, DenyPattern, DenyRule, PlanningPolicy, Policy, ShellAllow,
+    ShellPolicy, TrustLevel,
+};
+pub use engine::{
+    default_path, load_default_path, load_from_path, load_from_str, Action, Decision, EvalContext,
+    PolicyEngine,
+};
+pub use error::PolicyError;
+
+// Compile-time guarantee that the engine + policy are safe to share
+// across executor tasks.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<PolicyEngine>();
+    assert_send_sync::<Policy>();
+    assert_send_sync::<Decision>();
+};
