@@ -8,11 +8,14 @@ use crate::error::StoreError;
 
 /// Each migration: `(version, name, sql)`. Append-only; never edit a
 /// shipped migration's bytes — write a new one.
-const MIGRATIONS: &[(u32, &str, &str)] = &[(
-    1,
-    "initial_schema",
-    include_str!("../migrations/V0001__initial_schema.sql"),
-)];
+const MIGRATIONS: &[(u32, &str, &str)] = &[
+    (
+        1,
+        "initial_schema",
+        include_str!("../migrations/V0001__initial_schema.sql"),
+    ),
+    (2, "leases", include_str!("../migrations/V0002__leases.sql")),
+];
 
 pub(crate) fn run(conn: &Connection) -> Result<(), StoreError> {
     conn.execute_batch(

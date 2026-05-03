@@ -2,7 +2,7 @@
 
 use harness_core::{Cardinality, NodeId, Task};
 
-use crate::dispatcher::{filter, live_set::LiveSet, DispatchPlan};
+use crate::dispatcher::{filter, live_set::LiveSet, round_robin::RoundRobin, DispatchPlan};
 use crate::error::DispatchError;
 use crate::index::{CapabilityIndex, ScopeIndex};
 
@@ -90,6 +90,42 @@ impl Dispatcher {
             other => Err(DispatchError::Owner {
                 reason: format!("unsupported cardinality variant: {other:?}"),
             }),
+        }
+    }
+
+    /// Like [`Self::eligible`] but use a round-robin selector to break
+    /// ties in `Anyone` cardinality. The selector's cursor advances on
+    /// every successful call. Pass the same `RoundRobin` across
+    /// dispatches to actually round-robin.
+    ///
+    /// `Owner` and `Federated` paths are unchanged from
+    /// [`Self::eligible`] — the round-robin selector only applies to
+    /// `Anyone`.
+    ///
+    /// # Errors
+    /// Same set as [`Self::eligible`].
+    pub fn eligible_with_rr<L: LiveSet>(
+        &self,
+        task: &Task,
+        cardinality: &Cardinality,
+        live: &L,
+        rr: &RoundRobin,
+    ) -> Result<DispatchPlan, DispatchError> {
+        let mut candidates = self.capabilities.nodes_for(&task.capability);
+        candidates = live.live_subset(&candidates);
+        candidates = filter::apply_constraints(candidates, &task.constraints, &self.scopes, live)?;
+        if candidates.is_empty() {
+            return Err(DispatchError::NoEligibleNodes {
+                capability: task.capability.clone(),
+            });
+        }
+        match cardinality {
+            Cardinality::Anyone => {
+                candidates.sort();
+                let chosen = rr.next(&task.capability, &candidates)?;
+                Ok(DispatchPlan::Single { node: chosen })
+            }
+            other => self.eligible(task, other, live),
         }
     }
 }

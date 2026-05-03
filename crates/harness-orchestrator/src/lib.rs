@@ -11,6 +11,6 @@ pub mod dispatcher;
 pub mod error;
 pub mod index;
 
-pub use dispatcher::{DispatchPlan, Dispatcher, LiveSet, StaticLiveSet};
+pub use dispatcher::{DispatchPlan, Dispatcher, LiveSet, RoundRobin, StaticLiveSet};
 pub use error::DispatchError;
 pub use index::{CapabilityIndex, ScopeIndex};
