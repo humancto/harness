@@ -1,26 +1,20 @@
-//! Harness daemon entry point. Phase 0 implements `--version` only.
-//! Phase 1 will replace `Cli` with real subcommands (init, join, status, peers, ...).
+//! Harness daemon entry point. Wires `harness-cli`'s subcommand
+//! surface into a real `harness` binary.
 #![forbid(unsafe_code)]
 
 use clap::Parser;
+use harness_cli::{run, Cli};
 
-/// Harness — a LAN-native agent mesh.
-#[derive(Debug, Parser)]
-#[command(
-    name = "harness",
-    version = env!("CARGO_PKG_VERSION"),
-    about,
-    long_about = None,
-)]
-struct Cli {
-    // Phase 1 will add subcommands: init, join, status, peers, ...
-}
-
-fn main() {
-    let _cli = Cli::parse();
-    // Phase 0: parsing the args is the entire program. With no subcommands,
-    // a successful parse means the user asked for --help or --version
-    // (which clap handles and exits) or invoked with no args (no-op success).
-    // Phase 1 will introduce error returns when subcommands like `init` and
-    // `join` start touching the filesystem and network.
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let stdout = run(cli)?;
+    // The CLI dispatcher returns a String; the daemon's job is to put
+    // it on stdout for the operator. clippy::print_stdout would
+    // normally fire; this is the one place a CLI binary legitimately
+    // owns stdout.
+    #[allow(clippy::print_stdout)]
+    {
+        println!("{stdout}");
+    }
+    Ok(())
 }

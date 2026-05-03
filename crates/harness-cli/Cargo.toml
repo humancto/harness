@@ -11,3 +11,11 @@ description  = "clap-based CLI subcommand surface."
 workspace = true
 
 [dependencies]
+clap         = { workspace = true }
+harness-core = { workspace = true }
+harness-mesh = { workspace = true }
+anyhow       = { workspace = true }
+tracing      = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

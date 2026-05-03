@@ -15,9 +15,9 @@ name = "harness"
 path = "src/main.rs"
 
 [dependencies]
-clap = { workspace = true }
-# anyhow will be added back in Phase 1 when subcommands introduce real
-# error paths. Phase 0's `main` is infallible.
+clap         = { workspace = true }
+anyhow       = { workspace = true }
+harness-cli  = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
