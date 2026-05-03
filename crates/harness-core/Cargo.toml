@@ -11,3 +11,14 @@ description  = "Protocol types, traits, and shared glue for Harness."
 workspace = true
 
 [dependencies]
+ed25519-dalek = { workspace = true }
+blake3        = { workspace = true }
+rand          = { workspace = true }
+serde         = { workspace = true }
+thiserror     = { workspace = true }
+zeroize       = { workspace = true }
+hex           = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+ciborium = { workspace = true }
