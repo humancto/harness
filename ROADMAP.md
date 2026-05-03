@@ -24,7 +24,7 @@ When an item lands, flip its checkbox **in the same PR** as `STATE.md` is update
 - [x] **1.4** QUIC transport via `quinn` with Noise/TLS, one connection per peer pair, signed message envelope. Replay protection via monotonic seq — shipped in #5 (`42e2107`).
 - [x] **1.5** Heartbeat broadcast loop (every 2s) + signature validation + leader-belief field carried — shipped in #7 (`24612ce`).
 - [x] **1.6** Weighted brain election (PRD §12.2): planner-aware, battery-aware, anti-flap. Property tests on convergence + no split-brain on connected LAN — shipped in #8 (`5e520f2`).
-- [ ] **1.7** Pairing flow: `harness init` (creates mesh, prints pairing code, sets admin password) and `harness join` (scans LAN, pairing-code-approved exchange of pubkeys).
+- [x] **1.7** Pairing flow: `harness init` (creates mesh, prints pairing code, sets admin password) and `harness join` (scans LAN, pairing-code-approved exchange of pubkeys) — protocol layer shipped in #9 (`1cdb225`); CLI wiring in 1.9.
 - [x] **1.8** Trust file `~/.harness/peers.toml` (read/write/gossip on join) — shipped in #4 (`6bb2474`).
 - [ ] **1.9** CLI: `harness peers`, `harness status`.
 - [ ] **1.10** Web UI Mesh page (read-only, live topology over WebSocket relay).
