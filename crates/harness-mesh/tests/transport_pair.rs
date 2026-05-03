@@ -266,6 +266,61 @@ async fn node_manifest_round_trip_via_transport() {
     assert_eq!(received.hostname, "test");
 }
 
+/// Regression test for the cancel-safety hole the reviewer caught
+/// after the leftover-residue fix: when a chunk straddles two frames,
+/// the framer must keep the residue ON the framer across any await
+/// point so a `select!`-cancelled `recv` doesn't lose the head of
+/// frame N+1. Test sends two frames back-to-back, receives frame 1,
+/// then races `recv` for frame 2 against an immediate cancellation,
+/// then calls `recv` again — frame 2's bytes must still be there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recv_with_pending_leftover_survives_cancellation() {
+    let (server, server_id) = build_transport();
+    let (client, client_id) = build_transport();
+    let server_addr = server.local_addr().expect("local_addr");
+    let server_pubkey = *server_id.public_key();
+
+    let server_handle = tokio::spawn(async move {
+        let inc = accept_one_into(server).await;
+        inc.accept(|_pk| true).expect("accept")
+    });
+    let conn = client
+        .dial(server_addr, &server_pubkey)
+        .await
+        .expect("dial");
+    let server_conn = server_handle.await.expect("join");
+
+    // Send two heartbeats back-to-back. quinn typically coalesces
+    // these into one STREAM frame on the wire, so the server's first
+    // read_chunk produces both — exercising the leftover path.
+    let mut hb1 = sample_heartbeat(client_id.node_id(), 1);
+    hb1.sign(&client_id).expect("sign 1");
+    let mut hb2 = sample_heartbeat(client_id.node_id(), 2);
+    hb2.sign(&client_id).expect("sign 2");
+    conn.send(&hb1).await.expect("send 1");
+    conn.send(&hb2).await.expect("send 2");
+
+    // Receive frame 1 (drains the chunk; frame 2's bytes go to leftover).
+    let r1: Heartbeat = server_conn.recv().await.expect("recv 1");
+    assert_eq!(r1.seq, 1);
+
+    // Race recv for frame 2 against an immediate cancellation. With
+    // the fix, the leftover stays on the framer across the cancel and
+    // the next call extracts frame 2.
+    let cancelled: Result<Heartbeat, TransportError> = tokio::select! {
+        biased;
+        // Cancel-now branch fires first (no await, ready immediately).
+        () = std::future::ready(()) => Err(TransportError::Closed),
+        msg = server_conn.recv::<Heartbeat>() => msg,
+    };
+    assert!(cancelled.is_err(), "cancel branch should win");
+
+    // Now actually receive frame 2. With the bug, frame 2's bytes
+    // would be lost when the cancelled future was dropped.
+    let r2: Heartbeat = server_conn.recv().await.expect("recv 2 after cancel");
+    assert_eq!(r2.seq, 2);
+}
+
 /// Regression test for the single-`streams`-mutex deadlock the
 /// reviewer caught: a `recv` blocked on `read_chunk` must not gate a
 /// concurrent `send` on the same `Connection`. Item 1.5's heartbeat

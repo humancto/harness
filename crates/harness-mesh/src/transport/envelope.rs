@@ -14,8 +14,11 @@
 //!    opt in; [`harness_core::Heartbeat`] does, [`harness_core::NodeManifest`]
 //!    does not (gossip-on-change is idempotent).
 //! 3. **[`ReplayTable`]** — per-channel `last_seen_seq` storage. Strict
-//!    `<=` rejection. Backed by `DashMap<&'static str, u64>` so concurrent
-//!    `recv_sequenced` calls on different channels don't block each other.
+//!    `<=` rejection. Backed by `DashMap<&'static str, Option<u64>>` so
+//!    `seq=0` on a freshly-opened channel is correctly accepted exactly
+//!    once (a naive `last==0` sentinel would let it replay forever) and
+//!    concurrent `recv_sequenced` calls on different channels don't
+//!    block each other.
 //!
 //! Channel names are `&'static str` constants in [`channels`]; we never
 //! accept a runtime-sourced channel name from a peer, so the `'static`

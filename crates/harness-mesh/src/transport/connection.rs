@@ -274,6 +274,14 @@ impl Connection {
     /// (under `recv_state: Mutex<RecvState>`). If a `read_chunk` returns
     /// more bytes than the current frame needs, the residue is stashed on
     /// the framer's `leftover` slot and consumed on the next call.
+    ///
+    /// Cancel-safety invariant: leftover bytes are NEVER off the framer
+    /// across an `.await`. Every place we extract leftover, run the
+    /// (sync) state machine, and re-stash any remainder is bracketed by
+    /// no await points. If the future is dropped at the
+    /// `stream.read_chunk(...)` await, the framer still has the
+    /// pre-await leftover and the next call resumes from the same byte
+    /// position.
     async fn recv_one_frame(&self) -> Result<Vec<u8>, TransportError> {
         self.ensure_streams().await?;
         // Hold the recv-state lock for the entire frame assembly. Two
@@ -285,49 +293,72 @@ impl Connection {
             TransportError::Protocol("recv stream not initialized after ensure".into())
         })?;
 
-        // Drain any bytes left over from a previous chunk that straddled
-        // a frame boundary. If they assemble a full frame on their own,
-        // return it without ever blocking on `read_chunk`.
-        let mut residue = framer.take_leftover();
-        if !residue.is_empty() {
-            if let Some(frame) = framer.try_decode(&mut residue)? {
-                if !residue.is_empty() {
-                    framer.put_leftover(residue);
-                }
-                return Ok(frame);
-            }
-            // Leftover wasn't enough — fall through to read more, but
-            // remember to feed it before the next chunk.
+        // Step A (sync, no await): try to assemble a frame from any
+        // leftover alone. take_leftover + try_decode + put_leftover is
+        // an atomic sync block — cancellation can't happen between them.
+        if let Some(frame) = try_decode_from_leftover(framer)? {
+            return Ok(frame);
         }
 
         loop {
-            // 64 KiB max chunk — arbitrary; quinn will return whatever's
-            // available up to this size.
+            // Step B (await): read a chunk. At this point the framer
+            // either has zero leftover (if Step A drained it dry) or
+            // has the unconsumed tail of a prior chunk (if Step A
+            // couldn't assemble a frame and re-stashed the partial).
+            // Either way the framer is in a consistent state and a
+            // cancellation here loses nothing.
             let chunk = stream
                 .read_chunk(64 * 1024, true)
                 .await?
                 .ok_or(TransportError::FrameTruncated)?;
-            let mut bytes = chunk.bytes;
-            // Prepend any residue from a partial earlier frame.
-            if !residue.is_empty() {
-                let mut combined = bytes::BytesMut::with_capacity(residue.len() + bytes.len());
-                combined.extend_from_slice(&residue);
-                combined.extend_from_slice(&bytes);
-                bytes = combined.freeze();
-                residue = Bytes::new();
-            }
-            // Consume into the framer; it returns Some(frame) when complete.
-            if let Some(frame) = framer.try_decode(&mut bytes)? {
-                // Stash any tail (start of frame N+1) so the next call
-                // sees it before doing another read_chunk.
-                if !bytes.is_empty() {
-                    framer.put_leftover(bytes);
-                }
+
+            // Step C (sync, no await): combine leftover + new chunk,
+            // run the state machine, stash any tail back to leftover.
+            if let Some(frame) = try_decode_combined(framer, chunk.bytes)? {
                 return Ok(frame);
             }
-            // Frame still incomplete; loop and read more.
+            // Frame still incomplete — leftover already updated by
+            // try_decode_combined. Loop and read more.
         }
     }
+}
+
+/// Sync helper: drain `framer.leftover` into a working buffer, run the
+/// state machine, stash remainder. Returns `Some(frame)` if a complete
+/// frame fell out, `None` if leftover wasn't enough.
+fn try_decode_from_leftover(framer: &mut RecvFramer) -> Result<Option<Vec<u8>>, TransportError> {
+    let mut buf = framer.take_leftover();
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    let frame = framer.try_decode(&mut buf)?;
+    if !buf.is_empty() {
+        framer.put_leftover(buf);
+    }
+    Ok(frame)
+}
+
+/// Sync helper: combine `framer.leftover` (if any) with a freshly-read
+/// `chunk`, run the state machine, stash remainder. Returns
+/// `Some(frame)` on completion, `None` if more chunks are needed.
+fn try_decode_combined(
+    framer: &mut RecvFramer,
+    chunk: Bytes,
+) -> Result<Option<Vec<u8>>, TransportError> {
+    let leftover = framer.take_leftover();
+    let mut buf = if leftover.is_empty() {
+        chunk
+    } else {
+        let mut combined = bytes::BytesMut::with_capacity(leftover.len() + chunk.len());
+        combined.extend_from_slice(&leftover);
+        combined.extend_from_slice(&chunk);
+        combined.freeze()
+    };
+    let frame = framer.try_decode(&mut buf)?;
+    if !buf.is_empty() {
+        framer.put_leftover(buf);
+    }
+    Ok(frame)
 }
 
 const INITIAL_SEND_CAPACITY: usize = 512;
