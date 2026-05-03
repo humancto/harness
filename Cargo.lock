@@ -989,6 +989,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1024,6 +1025,7 @@ dependencies = [
  "rpassword",
  "serde_json",
  "tempfile",
+ "tokio",
  "tracing",
 ]
 
@@ -1055,7 +1057,9 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "async-trait",
  "clap",
+ "futures",
  "harness-api",
  "harness-capabilities",
  "harness-cli",
@@ -1063,8 +1067,10 @@ dependencies = [
  "harness-mesh",
  "harness-policy",
  "harness-store",
+ "hostname",
  "parking_lot",
  "predicates",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
@@ -1205,6 +1211,17 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hostname"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "617aaa3557aef3810a6369d0a99fac8a080891b68bd9f9812a1eeda0c0730cbd"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "windows-link",
+]
 
 [[package]]
 name = "http"

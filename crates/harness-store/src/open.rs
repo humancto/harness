@@ -147,6 +147,6 @@ mod tests {
         let count: i64 = s
             .with_conn(|c| Ok(c.query_row("SELECT count(*) FROM _migrations", [], |r| r.get(0))?))
             .expect("count");
-        assert_eq!(count, 3);
+        assert_eq!(count, 4);
     }
 }

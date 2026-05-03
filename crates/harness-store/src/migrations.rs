@@ -20,6 +20,11 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "replica",
         include_str!("../migrations/V0003__replica.sql"),
     ),
+    (
+        4,
+        "task_results",
+        include_str!("../migrations/V0004__task_results.sql"),
+    ),
 ];
 
 pub(crate) fn run(conn: &Connection) -> Result<(), StoreError> {

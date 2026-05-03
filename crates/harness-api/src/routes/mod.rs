@@ -36,6 +36,7 @@ pub fn api_router(state: ApiState) -> Router {
             "/tasks",
             post(tasks::submit_handler).get(tasks::list_handler),
         )
+        .route("/tasks/{id}", get(tasks::get_handler))
         .fallback(api_not_found)
         .with_state(state)
 }

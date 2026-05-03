@@ -33,7 +33,7 @@ use harness_mesh::heartbeat::{
 use harness_mesh::transport::{self as transport, Connection, Transport, TransportError};
 use harness_mesh::{TrustEvent, TrustStore};
 use parking_lot::Mutex as ParkingMutex;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
 /// One-shot factory + run-loop for the daemon. Holds owned references
@@ -46,6 +46,11 @@ pub(crate) struct DaemonOrchestrator {
     heartbeat: Arc<HeartbeatService>,
     election: Arc<Election>,
     persistent_trust: TrustStore,
+    /// Local executor for running tasks the daemon picks up. Phase 3.3a.
+    executor: crate::executor::LocalExecutor,
+    /// Coordinated shutdown — flipped to `true` on ctrl-c. The executor
+    /// loop watches this; future loops can subscribe too.
+    shutdown_tx: watch::Sender<bool>,
     /// All spawned tasks live here; aborted on shutdown.
     tasks: ParkingMutex<Vec<JoinHandle<()>>>,
     /// Per-connection listener handles; drop on shutdown.
@@ -67,6 +72,10 @@ impl std::fmt::Debug for DaemonOrchestrator {
 #[derive(Debug, Clone)]
 pub(crate) struct DaemonRuntimeConfig {
     pub mesh_name: String,
+    /// Local node's mesh hostname (e.g. `"macbook-archy"`). DISTINCT
+    /// from `mesh_name` (the cluster name). Defaults to OS hostname;
+    /// override via `HARNESS_NODE_NAME`.
+    pub node_name: String,
     pub api_bind: SocketAddr,
     /// QUIC bind address — defaults to 0.0.0.0:19199.
     pub mesh_bind: SocketAddr,
@@ -81,6 +90,7 @@ impl Default for DaemonRuntimeConfig {
     fn default() -> Self {
         Self {
             mesh_name: "harness".to_string(),
+            node_name: crate::executor::default_node_name(),
             api_bind: SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 19198),
             mesh_bind: SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 19199),
             mdns_enabled: true,
@@ -175,6 +185,17 @@ impl DaemonOrchestrator {
         let capabilities = harness_capabilities::default_registry(policy_engine.clone());
         let cap_ids = capabilities.ids();
 
+        // Phase 3.3a: local executor loop. Picks Submitted tasks off
+        // the queue, walks the lifecycle ladder, invokes the capability,
+        // writes results.
+        let local_node_name: Arc<str> = Arc::from(config.node_name.as_str());
+        let executor = crate::executor::LocalExecutor::with_default_concurrency(
+            store.clone(),
+            capabilities.clone(),
+            identity.node_id(),
+            local_node_name.clone(),
+        );
+
         let api_state =
             harness_api::ApiStateBuilder::new(identity.clone(), config.mesh_name.clone())
                 .with_peers(heartbeat.peers())
@@ -187,6 +208,8 @@ impl DaemonOrchestrator {
             .await
             .context("bind harness-api")?;
 
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+
         Ok(Self {
             api_state,
             api_handle,
@@ -195,6 +218,8 @@ impl DaemonOrchestrator {
             heartbeat,
             election,
             persistent_trust,
+            executor,
+            shutdown_tx,
             tasks: ParkingMutex::new(Vec::new()),
             listeners: Arc::new(ParkingMutex::new(Vec::new())),
             broadcaster: ParkingMutex::new(None),
@@ -282,8 +307,18 @@ impl DaemonOrchestrator {
         );
         self.tasks.lock().push(dial_loop);
 
+        // Phase 3.3a: local executor loop. Subscribes to the same
+        // shutdown channel so ctrl-c drains it cleanly.
+        let exec_shutdown_rx = self.shutdown_tx.subscribe();
+        let exec = self.executor.clone();
+        let exec_handle = tokio::spawn(async move {
+            exec.run_forever(exec_shutdown_rx).await;
+        });
+        self.tasks.lock().push(exec_handle);
+
         tokio::signal::ctrl_c().await.ok();
         tracing::info!(target: "harness.daemon", "shutdown requested");
+        let _ = self.shutdown_tx.send(true);
         self.shutdown().await;
         Ok(())
     }
@@ -600,6 +635,7 @@ mod tests {
 
         let cfg = DaemonRuntimeConfig {
             mesh_name: "test-mesh".into(),
+            node_name: "test-node".into(),
             api_bind: SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 0),
             mesh_bind: SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 0),
             mdns_enabled: false,
