@@ -12,6 +12,7 @@
 //!   stream.
 
 pub mod discovery;
+pub mod heartbeat;
 pub mod identity;
 pub mod transport;
 pub mod trust;
@@ -20,6 +21,10 @@ mod fs_util;
 
 pub use discovery::{
     DiscoveredPeer, Discovery, DiscoveryConfig, DiscoveryError, DiscoveryEvent, DiscoverySource,
+};
+pub use heartbeat::{
+    BroadcasterHandle, HeartbeatPublisher, HeartbeatPublisherConfig, HeartbeatService,
+    ListenerHandle, PeerEntry, PeerTable, SnapshotFn, HEARTBEAT_INTERVAL, PEER_TIMEOUT,
 };
 pub use identity::{default_root, init_or_load, load, save, IdentityError};
 pub use trust::{AddedVia, Peer, TrustError, TrustEvent, TrustStore, TrustTier};
