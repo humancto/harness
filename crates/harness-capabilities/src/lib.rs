@@ -35,8 +35,9 @@ pub use shell::ShellExecCapability;
 /// `mcp.proxy`, `fs.*`, `mesh.*` as their feature flags activate.
 #[must_use]
 pub fn default_registry(
-    #[cfg_attr(not(all(feature = "shell", unix)), allow(unused_variables))]
-    policy: std::sync::Arc<harness_policy::PolicyEngine>,
+    #[cfg_attr(not(all(feature = "shell", unix)), allow(unused_variables))] policy: std::sync::Arc<
+        harness_policy::PolicyEngine,
+    >,
 ) -> CapabilityRegistry {
     let registry = CapabilityRegistry::new();
     #[cfg(feature = "echo")]
