@@ -229,8 +229,9 @@ mod tests {
             d.capability_index().upsert_node(&m);
             d.scope_index().upsert_node(&m);
         }
-        let live =
-            StaticLiveSet::from_node_ids(nodes.iter().map(|(n, _, _)| NodeId::from_bytes([*n; 16])));
+        let live = StaticLiveSet::from_node_ids(
+            nodes.iter().map(|(n, _, _)| NodeId::from_bytes([*n; 16])),
+        );
         (d, live)
     }
 
