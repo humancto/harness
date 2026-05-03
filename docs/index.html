@@ -3,606 +3,1080 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>harness — a LAN-native agent mesh</title>
+    <title>harness — a local-first agent mesh for the machines you already own</title>
     <meta
       name="description"
-      content="A single Rust binary that turns the laptops, desktops, and servers you already own into a private agent fleet. Local-first brain. Capability-routed tasks. Nothing leaves your network."
+      content="A single Rust binary that turns your laptops, desktops, and idle servers into a private agent fleet. Local-first planner. Capability-routed tasks. No broker, no cloud-by-default, no third party."
     />
-    <meta property="og:title" content="harness — a LAN-native agent mesh" />
+    <meta property="og:title" content="harness — a local-first agent mesh" />
     <meta
       property="og:description"
-      content="Single Rust binary on every machine. Auto-discovers peers. Elects a brain. Runs typed, capability-routed tasks across the fleet."
+      content="One Rust binary on every machine you own. The mesh elects a brain, routes tasks by cardinality, and runs your work on hardware you control."
     />
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://humancto.github.io/harness/" />
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🕸️%3C/text%3E%3C/svg%3E" />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght,SOFT@0,9..144,300..900,0..100;1,9..144,300..900,0..100&family=JetBrains+Mono:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+
+    <link
+      rel="icon"
+      href='data:image/svg+xml;utf8,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Crect width=%22100%22 height=%22100%22 fill=%22%23f4efe6%22/%3E%3Ctext x=%2250%22 y=%2272%22 text-anchor=%22middle%22 font-family=%22Georgia,serif%22 font-size=%2280%22 font-weight=%22900%22 fill=%22%23b8401e%22%3Eh%3C/text%3E%3C/svg%3E'
+    />
+
     <style>
       :root {
-        --bg: #fafafa;
-        --fg: #18181b;
-        --muted: #71717a;
-        --border: #e4e4e7;
-        --card: #ffffff;
-        --accent: #18181b;
-        --accent-fg: #fafafa;
-        --code-bg: #f4f4f5;
-        --emerald: #059669;
-        --amber: #d97706;
-        --rose: #e11d48;
+        --paper: #f4efe6;
+        --paper-deep: #ebe4d6;
+        --ink: #0a0908;
+        --rust: #b8401e;
+        --safety: #f5b800;
+        --mute: #6b6660;
+        --rule: #0a0908;
       }
       @media (prefers-color-scheme: dark) {
         :root {
-          --bg: #09090b;
-          --fg: #fafafa;
-          --muted: #a1a1aa;
-          --border: #27272a;
-          --card: #18181b;
-          --accent: #fafafa;
-          --accent-fg: #09090b;
-          --code-bg: #18181b;
-          --emerald: #34d399;
-          --amber: #fbbf24;
-          --rose: #fb7185;
+          --paper: #0e0c0a;
+          --paper-deep: #181412;
+          --ink: #f4efe6;
+          --rust: #e0552c;
+          --safety: #f5b800;
+          --mute: #8a857d;
+          --rule: #f4efe6;
         }
       }
+
       * {
         box-sizing: border-box;
-      }
-      html,
-      body {
         margin: 0;
         padding: 0;
       }
-      body {
-        font-family:
-          -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Helvetica, Arial, sans-serif;
-        background: var(--bg);
-        color: var(--fg);
-        line-height: 1.55;
+
+      html {
+        background: var(--paper);
+        color: var(--ink);
         -webkit-font-smoothing: antialiased;
       }
-      .container {
-        max-width: 1024px;
-        margin: 0 auto;
-        padding: 0 24px;
-      }
-      header.nav {
-        border-bottom: 1px solid var(--border);
-        backdrop-filter: blur(12px);
-        background: color-mix(in srgb, var(--bg) 70%, transparent);
-        position: sticky;
-        top: 0;
-        z-index: 10;
-      }
-      header.nav .container {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding-top: 14px;
-        padding-bottom: 14px;
-      }
-      .brand {
-        font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
-        font-weight: 700;
-        font-size: 16px;
-        letter-spacing: -0.02em;
-      }
-      .brand-pill {
-        display: inline-block;
-        margin-left: 8px;
-        padding: 2px 6px;
-        font-size: 10px;
-        background: var(--code-bg);
-        color: var(--muted);
-        border-radius: 4px;
-        font-family: ui-monospace, monospace;
-      }
-      nav.links {
-        display: flex;
-        gap: 20px;
+
+      body {
+        font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
         font-size: 14px;
+        line-height: 1.55;
+        font-feature-settings: 'tnum' on, 'cv01' on, 'ss01' on;
+        position: relative;
+        overflow-x: hidden;
       }
-      nav.links a {
-        color: var(--muted);
-        text-decoration: none;
+
+      /* film-grain noise overlay */
+      body::before {
+        content: '';
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        z-index: 100;
+        opacity: 0.06;
+        mix-blend-mode: multiply;
+        background-image: url("data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence baseFrequency='1.5' numOctaves='2' seed='7'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.6'/%3E%3C/svg%3E");
       }
-      nav.links a:hover {
-        color: var(--fg);
+      @media (prefers-color-scheme: dark) {
+        body::before {
+          mix-blend-mode: screen;
+          opacity: 0.07;
+        }
       }
-      .hero {
-        padding: 80px 0 60px;
-        text-align: center;
+
+      .display {
+        font-family: 'Fraunces', Georgia, 'Times New Roman', serif;
+        font-variation-settings: 'opsz' 144, 'SOFT' 30, 'wght' 800;
+        letter-spacing: -0.04em;
+        line-height: 0.85;
       }
-      .hero h1 {
-        font-size: 56px;
-        line-height: 1.05;
-        margin: 0 0 16px;
-        letter-spacing: -0.03em;
-        font-weight: 700;
-      }
-      .hero .tagline {
-        font-size: 22px;
-        color: var(--muted);
-        max-width: 720px;
-        margin: 0 auto 36px;
-        line-height: 1.4;
-      }
-      .hero .cta {
-        display: inline-flex;
-        gap: 12px;
-        align-items: center;
-        flex-wrap: wrap;
-        justify-content: center;
-      }
-      .btn {
-        display: inline-block;
-        padding: 12px 20px;
-        border-radius: 8px;
-        font-size: 14px;
+
+      .mono-caps {
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        font-size: 11px;
         font-weight: 500;
+      }
+
+      a {
+        color: var(--ink);
         text-decoration: none;
-        border: 1px solid transparent;
-        transition: transform 100ms ease;
-      }
-      .btn:hover {
-        transform: translateY(-1px);
-      }
-      .btn-primary {
-        background: var(--accent);
-        color: var(--accent-fg);
-      }
-      .btn-secondary {
-        background: var(--card);
-        color: var(--fg);
-        border-color: var(--border);
-      }
-      .demo-line {
-        display: inline-block;
-        padding: 14px 18px;
-        background: var(--code-bg);
-        border-radius: 8px;
-        font-family: ui-monospace, monospace;
-        font-size: 14px;
-        margin-top: 32px;
-      }
-      .demo-line .prompt {
-        color: var(--muted);
-        user-select: none;
-      }
-      section {
-        padding: 64px 0;
-        border-top: 1px solid var(--border);
-      }
-      h2 {
-        font-size: 32px;
-        letter-spacing: -0.02em;
-        margin: 0 0 8px;
-        font-weight: 700;
-      }
-      .section-lead {
-        color: var(--muted);
-        margin: 0 0 36px;
-        max-width: 640px;
-      }
-      .pillars {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-        gap: 24px;
-      }
-      .pillar {
-        padding: 24px;
-        background: var(--card);
-        border: 1px solid var(--border);
-        border-radius: 12px;
-      }
-      .pillar h3 {
-        margin: 0 0 8px;
-        font-size: 16px;
-        letter-spacing: -0.01em;
-      }
-      .pillar p {
-        margin: 0;
-        color: var(--muted);
-        font-size: 14px;
-      }
-      .pillar .icon {
-        display: inline-block;
-        width: 32px;
-        height: 32px;
-        line-height: 32px;
-        text-align: center;
-        background: var(--code-bg);
-        border-radius: 8px;
-        font-size: 18px;
-        margin-bottom: 12px;
-      }
-      .pre {
-        background: var(--code-bg);
-        padding: 18px 20px;
-        border-radius: 10px;
-        font-family: ui-monospace, monospace;
-        font-size: 13px;
-        line-height: 1.65;
-        overflow-x: auto;
-        white-space: pre;
-        color: var(--fg);
-      }
-      .pre .c {
-        color: var(--muted);
-      }
-      .pre .k {
-        color: var(--emerald);
-      }
-      .roadmap {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-        gap: 12px;
-      }
-      .phase {
-        padding: 16px 18px;
-        border: 1px solid var(--border);
-        border-radius: 10px;
-        background: var(--card);
         position: relative;
       }
-      .phase .label {
+
+      .underline-on-hover::after {
+        content: '';
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: -3px;
+        height: 1.5px;
+        background: var(--rust);
+        transform: scaleX(0);
+        transform-origin: left;
+        transition: transform 240ms cubic-bezier(0.65, 0, 0.35, 1);
+      }
+      .underline-on-hover:hover::after {
+        transform: scaleX(1);
+      }
+
+      /* ─── Top tape ─── */
+      .tape {
+        background: var(--ink);
+        color: var(--paper);
+        border-bottom: 1px solid var(--rule);
+        overflow: hidden;
+        white-space: nowrap;
+        font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        color: var(--muted);
-        font-weight: 600;
+        font-weight: 500;
+        letter-spacing: 0.08em;
       }
-      .phase .name {
-        font-weight: 600;
-        margin: 4px 0 6px;
+      .tape-track {
+        display: inline-flex;
+        gap: 48px;
+        padding: 8px 0;
+        animation: tape-scroll 50s linear infinite;
       }
-      .phase .desc {
-        font-size: 13px;
-        color: var(--muted);
-        line-height: 1.45;
+      .tape-item {
+        display: inline-flex;
+        gap: 16px;
+        align-items: center;
       }
-      .phase.done {
-        border-color: color-mix(in srgb, var(--emerald) 40%, var(--border));
-      }
-      .phase.next {
-        border-color: color-mix(in srgb, var(--amber) 40%, var(--border));
-      }
-      .badge {
+      .tape-item .dot {
+        width: 6px;
+        height: 6px;
+        background: var(--rust);
         display: inline-block;
-        padding: 1px 6px;
-        font-size: 10px;
-        border-radius: 4px;
-        font-weight: 600;
+      }
+      .tape-item .dot.green {
+        background: #16a34a;
+      }
+      @keyframes tape-scroll {
+        0% { transform: translateX(0); }
+        100% { transform: translateX(-50%); }
+      }
+
+      /* ─── Top nav ─── */
+      .nav {
+        border-bottom: 1px solid var(--rule);
+        background: var(--paper);
+        position: sticky;
+        top: 0;
+        z-index: 50;
+        backdrop-filter: blur(2px);
+      }
+      .nav-inner {
+        max-width: 1280px;
+        margin: 0 auto;
+        padding: 18px 32px;
+        display: grid;
+        grid-template-columns: 1fr auto 1fr;
+        align-items: center;
+        gap: 32px;
+      }
+      .brand-mark {
+        font-family: 'Fraunces', serif;
+        font-variation-settings: 'opsz' 24, 'SOFT' 100, 'wght' 700;
+        font-size: 22px;
+        letter-spacing: -0.03em;
+      }
+      .brand-mark .dot {
+        color: var(--rust);
+      }
+      .nav-meta {
+        text-align: center;
+        color: var(--mute);
+      }
+      .nav-links {
+        display: flex;
+        gap: 24px;
+        justify-content: flex-end;
+      }
+
+      /* ─── Hero ─── */
+      .hero {
+        padding: 80px 32px 60px;
+        max-width: 1280px;
+        margin: 0 auto;
+        position: relative;
+      }
+      .hero-grid {
+        display: grid;
+        grid-template-columns: repeat(12, 1fr);
+        gap: 24px;
+      }
+      .hero-display {
+        grid-column: 1 / -1;
+        font-size: clamp(120px, 22vw, 320px);
+        font-variation-settings: 'opsz' 144, 'SOFT' 0, 'wght' 800;
+        position: relative;
+        margin-bottom: 24px;
+      }
+      .hero-display .word {
+        display: inline-block;
+        clip-path: inset(0 100% 0 0);
+        animation: reveal-word 1100ms cubic-bezier(0.25, 0.1, 0, 1) 200ms forwards;
+      }
+      .hero-display .punct {
+        color: var(--rust);
+        display: inline-block;
+        clip-path: inset(0 100% 0 0);
+        animation: reveal-word 600ms cubic-bezier(0.25, 0.1, 0, 1) 1100ms forwards;
+      }
+      @keyframes reveal-word {
+        to { clip-path: inset(0 0% 0 0); }
+      }
+      .hero-tag {
+        grid-column: 1 / 8;
         text-transform: uppercase;
-        letter-spacing: 0.04em;
-      }
-      .badge.done {
-        background: color-mix(in srgb, var(--emerald) 20%, transparent);
-        color: var(--emerald);
-      }
-      .badge.next {
-        background: color-mix(in srgb, var(--amber) 20%, transparent);
-        color: var(--amber);
-      }
-      .badge.todo {
-        background: var(--code-bg);
-        color: var(--muted);
-      }
-      .archi {
-        background: var(--card);
-        border: 1px solid var(--border);
-        border-radius: 12px;
-        padding: 24px;
-        font-family: ui-monospace, monospace;
+        letter-spacing: 0.1em;
         font-size: 13px;
+        font-weight: 500;
+        line-height: 1.55;
+        max-width: 540px;
+        opacity: 0;
+        animation: fade-in 900ms cubic-bezier(0.25, 0.1, 0, 1) 1300ms forwards;
+      }
+      .hero-tag b {
+        color: var(--rust);
+        font-weight: 700;
+      }
+      .hero-side {
+        grid-column: 9 / 13;
+        align-self: end;
+        font-family: 'Fraunces', serif;
+        font-variation-settings: 'opsz' 18, 'SOFT' 50, 'wght' 400;
+        font-style: italic;
+        font-size: 16px;
+        line-height: 1.5;
+        color: var(--mute);
+        text-align: right;
+        opacity: 0;
+        animation: fade-in 900ms cubic-bezier(0.25, 0.1, 0, 1) 1500ms forwards;
+      }
+      @keyframes fade-in {
+        to { opacity: 1; }
+      }
+
+      .cta-row {
+        margin-top: 40px;
+        display: flex;
+        gap: 14px;
+        flex-wrap: wrap;
+        align-items: center;
+        opacity: 0;
+        animation: fade-in 900ms cubic-bezier(0.25, 0.1, 0, 1) 1700ms forwards;
+      }
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        padding: 14px 22px;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 12px;
+        font-weight: 600;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        border: 1.5px solid var(--ink);
+        background: var(--paper);
+        color: var(--ink);
+        transition: transform 140ms ease, box-shadow 140ms ease, background 140ms ease;
+        cursor: pointer;
+        position: relative;
+      }
+      .btn:hover {
+        transform: translate(-2px, -2px);
+        box-shadow: 4px 4px 0 0 var(--ink);
+      }
+      .btn-primary {
+        background: var(--ink);
+        color: var(--paper);
+      }
+      .btn-primary:hover {
+        background: var(--rust);
+        border-color: var(--rust);
+        box-shadow: 4px 4px 0 0 var(--ink);
+      }
+      .btn-arrow {
+        font-family: 'Fraunces', serif;
+        font-style: italic;
+        font-variation-settings: 'wght' 500;
+        text-transform: none;
+        letter-spacing: 0;
+        font-size: 14px;
+      }
+
+      /* ─── Section frame ─── */
+      section.block {
+        max-width: 1280px;
+        margin: 0 auto;
+        padding: 96px 32px;
+        position: relative;
+        border-top: 1px solid var(--rule);
+      }
+      .section-meta {
+        position: absolute;
+        top: 40px;
+        right: 32px;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.18em;
+        color: var(--mute);
+      }
+      .section-num {
+        font-family: 'Fraunces', serif;
+        font-variation-settings: 'opsz' 144, 'SOFT' 100, 'wght' 700;
+        font-size: clamp(80px, 14vw, 200px);
+        line-height: 0.85;
+        color: var(--paper-deep);
+        position: absolute;
+        top: 24px;
+        left: 16px;
+        user-select: none;
+        pointer-events: none;
+        z-index: 0;
+      }
+      .section-title {
+        font-family: 'Fraunces', serif;
+        font-variation-settings: 'opsz' 80, 'SOFT' 0, 'wght' 600;
+        font-size: clamp(40px, 6vw, 76px);
+        letter-spacing: -0.03em;
+        line-height: 0.95;
+        margin-bottom: 56px;
+        position: relative;
+        z-index: 1;
+        max-width: 900px;
+      }
+      .section-title em {
+        color: var(--rust);
+        font-style: italic;
+        font-variation-settings: 'opsz' 80, 'SOFT' 100, 'wght' 700;
+      }
+
+      /* ─── Manifesto ─── */
+      .manifesto {
+        display: grid;
+        grid-template-columns: repeat(12, 1fr);
+        gap: 32px 24px;
+        position: relative;
+        z-index: 1;
+      }
+      .tenet {
+        grid-column: span 6;
+        display: grid;
+        grid-template-columns: 88px 1fr;
+        gap: 16px;
+        padding: 24px 0;
+        border-top: 1px solid var(--rule);
+      }
+      .tenet-num {
+        font-family: 'Fraunces', serif;
+        font-variation-settings: 'opsz' 60, 'SOFT' 0, 'wght' 700;
+        font-size: 56px;
+        line-height: 0.85;
+        color: var(--rust);
+        letter-spacing: -0.04em;
+      }
+      .tenet h3 {
+        font-family: 'Fraunces', serif;
+        font-variation-settings: 'opsz' 28, 'SOFT' 30, 'wght' 600;
+        font-size: 22px;
+        letter-spacing: -0.02em;
+        margin-bottom: 8px;
+        line-height: 1.15;
+      }
+      .tenet p {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 13px;
+        color: var(--mute);
+        line-height: 1.6;
+      }
+      .tenet code {
+        background: var(--paper-deep);
+        padding: 1px 5px;
+        font-size: 0.92em;
+        color: var(--ink);
+      }
+
+      /* ─── Specimen plate ─── */
+      .specimen {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 0;
+        border: 1.5px solid var(--ink);
+        position: relative;
+        z-index: 1;
+      }
+      .spec-cell {
+        padding: 32px 28px;
+        border-right: 1px solid var(--ink);
+      }
+      .spec-cell:last-child {
+        border-right: 0;
+      }
+      .spec-cell .label {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 9px;
+        text-transform: uppercase;
+        letter-spacing: 0.18em;
+        color: var(--mute);
+        margin-bottom: 16px;
+      }
+      .spec-cell .value {
+        font-family: 'Fraunces', serif;
+        font-variation-settings: 'opsz' 144, 'SOFT' 0, 'wght' 800;
+        font-size: clamp(48px, 7vw, 88px);
+        line-height: 0.85;
+        letter-spacing: -0.05em;
+        font-feature-settings: 'tnum' on, 'lnum' on;
+      }
+      .spec-cell .value sup {
+        font-size: 0.4em;
+        vertical-align: super;
+        color: var(--rust);
+        font-variation-settings: 'wght' 600;
+      }
+      .spec-cell .sub {
+        font-family: 'Fraunces', serif;
+        font-variation-settings: 'opsz' 14, 'SOFT' 100, 'wght' 400;
+        font-style: italic;
+        font-size: 13px;
+        color: var(--mute);
+        margin-top: 6px;
+      }
+
+      /* ─── How / code blocks ─── */
+      .how-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 24px;
+        position: relative;
+        z-index: 1;
+      }
+      .frame {
+        border: 1.5px solid var(--ink);
+        background: var(--paper);
+        position: relative;
+        padding: 0;
+      }
+      .frame-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 10px 18px;
+        background: var(--ink);
+        color: var(--paper);
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.18em;
+      }
+      .frame-head .dots {
+        display: flex;
+        gap: 5px;
+      }
+      .frame-head .dots span {
+        width: 8px;
+        height: 8px;
+        background: var(--paper);
+        opacity: 0.5;
+      }
+      .frame-head .dots span.live {
+        background: var(--safety);
+        opacity: 1;
+      }
+      .frame-body {
+        padding: 24px 22px;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 13px;
+        line-height: 1.7;
+        white-space: pre;
+        overflow-x: auto;
+      }
+      .c-comment { color: var(--mute); }
+      .c-cmd     { color: var(--ink); font-weight: 600; }
+      .c-flag    { color: var(--rust); }
+      .c-arg     { color: var(--ink); }
+      .c-str     { color: var(--rust); font-weight: 500; }
+      .c-out     { color: var(--mute); }
+      .c-prompt  { color: var(--rust); user-select: none; }
+
+      .ascii {
+        padding: 28px 22px;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 12px;
         line-height: 1.55;
         white-space: pre;
         overflow-x: auto;
-        color: var(--muted);
+        color: var(--mute);
       }
-      .archi b {
-        color: var(--fg);
+      .ascii b {
+        color: var(--rust);
+        font-weight: 600;
       }
-      footer {
-        border-top: 1px solid var(--border);
-        padding: 40px 0 60px;
-        color: var(--muted);
-        font-size: 14px;
+      .ascii em {
+        color: var(--ink);
+        font-style: normal;
+        font-weight: 600;
       }
-      footer a {
-        color: var(--muted);
+
+      /* ─── Roadmap ─── */
+      .roadmap-rail {
+        display: grid;
+        grid-template-columns: repeat(8, minmax(220px, 1fr));
+        gap: 0;
+        border-top: 1.5px solid var(--ink);
+        border-bottom: 1.5px solid var(--ink);
+        position: relative;
+        z-index: 1;
+        overflow-x: auto;
       }
-      footer .container {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        flex-wrap: wrap;
-        gap: 12px;
+      .phase {
+        padding: 28px 22px 32px;
+        border-right: 1px solid var(--ink);
+        position: relative;
+        background: var(--paper);
+        min-width: 220px;
       }
-      .stats {
-        display: flex;
-        justify-content: center;
-        gap: 36px;
-        flex-wrap: wrap;
-        margin-top: 32px;
-        padding-top: 24px;
-        border-top: 1px solid var(--border);
+      .phase:last-child {
+        border-right: 0;
       }
-      .stat .v {
-        font-size: 28px;
-        font-weight: 700;
+      .phase.done {
+        background: var(--paper-deep);
+      }
+      .phase.next::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 4px;
+        background: repeating-linear-gradient(
+          135deg,
+          var(--ink),
+          var(--ink) 6px,
+          var(--safety) 6px,
+          var(--safety) 12px
+        );
+      }
+      .phase .ph-num {
+        font-family: 'Fraunces', serif;
+        font-variation-settings: 'opsz' 60, 'SOFT' 0, 'wght' 700;
+        font-size: 44px;
+        line-height: 1;
+        letter-spacing: -0.04em;
+        margin-bottom: 8px;
+      }
+      .phase.done .ph-num {
+        color: var(--rust);
+      }
+      .phase.next .ph-num {
+        color: var(--ink);
+      }
+      .phase .ph-status {
+        font-size: 9px;
+        text-transform: uppercase;
+        letter-spacing: 0.2em;
+        color: var(--mute);
+        margin-bottom: 14px;
+      }
+      .phase.done .ph-status {
+        color: var(--rust);
+      }
+      .phase .ph-name {
+        font-family: 'Fraunces', serif;
+        font-variation-settings: 'opsz' 24, 'SOFT' 30, 'wght' 600;
+        font-size: 17px;
+        letter-spacing: -0.01em;
+        margin-bottom: 8px;
+        line-height: 1.15;
+      }
+      .phase .ph-desc {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 11px;
+        line-height: 1.6;
+        color: var(--mute);
+      }
+
+      /* ─── Pull-quote ─── */
+      .pullquote {
+        margin: 0 auto;
+        max-width: 1100px;
+        padding: 96px 32px;
+      }
+      .pullquote .quote {
+        font-family: 'Fraunces', serif;
+        font-variation-settings: 'opsz' 96, 'SOFT' 100, 'wght' 400;
+        font-style: italic;
+        font-size: clamp(28px, 4.5vw, 56px);
+        line-height: 1.1;
         letter-spacing: -0.02em;
       }
-      .stat .l {
+      .pullquote .quote::before {
+        content: '“';
+        color: var(--rust);
+        font-style: normal;
+        font-variation-settings: 'wght' 700;
+      }
+      .pullquote .quote::after {
+        content: '”';
+        color: var(--rust);
+        font-style: normal;
+        font-variation-settings: 'wght' 700;
+      }
+      .pullquote cite {
+        display: block;
+        margin-top: 24px;
+        font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
         text-transform: uppercase;
-        letter-spacing: 0.05em;
-        color: var(--muted);
+        letter-spacing: 0.18em;
+        font-style: normal;
+        color: var(--mute);
       }
-      @media (max-width: 640px) {
-        .hero h1 {
-          font-size: 40px;
-        }
-        .hero .tagline {
-          font-size: 18px;
-        }
+
+      /* ─── Stamp ─── */
+      .stamp {
+        position: fixed;
+        right: 24px;
+        top: 110px;
+        z-index: 30;
+        width: 130px;
+        height: 130px;
+        border: 1.5px solid var(--rust);
+        color: var(--rust);
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-family: 'Fraunces', serif;
+        font-style: italic;
+        font-variation-settings: 'wght' 600;
+        font-size: 16px;
+        letter-spacing: -0.01em;
+        text-align: center;
+        line-height: 1.3;
+        opacity: 0.85;
+        background: color-mix(in srgb, var(--paper) 95%, transparent);
+        animation: stamp-spin 80s linear infinite;
+        pointer-events: none;
+      }
+      @keyframes stamp-spin {
+        from { transform: rotate(-12deg); }
+        to   { transform: rotate(348deg); }
+      }
+      @media (max-width: 980px) {
+        .stamp { display: none; }
+      }
+
+      /* ─── Footer / colophon ─── */
+      footer.colophon {
+        border-top: 1.5px solid var(--rule);
+        margin-top: 64px;
+        background: var(--paper-deep);
+        padding: 56px 32px 64px;
+      }
+      .colophon-inner {
+        max-width: 1280px;
+        margin: 0 auto;
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 24px;
+      }
+      .colophon h4 {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.18em;
+        color: var(--mute);
+        margin-bottom: 12px;
+        font-weight: 500;
+      }
+      .colophon p,
+      .colophon a {
+        font-family: 'Fraunces', serif;
+        font-variation-settings: 'opsz' 14, 'SOFT' 50, 'wght' 400;
+        font-size: 14px;
+        line-height: 1.55;
+      }
+      .colophon ul {
+        list-style: none;
+      }
+      .colophon ul li {
+        margin-bottom: 6px;
+      }
+      .colophon-bottom {
+        max-width: 1280px;
+        margin: 48px auto 0;
+        padding-top: 24px;
+        border-top: 1px solid var(--rule);
+        display: flex;
+        justify-content: space-between;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.18em;
+        color: var(--mute);
+        flex-wrap: wrap;
+        gap: 16px;
+      }
+
+      /* responsive */
+      @media (max-width: 760px) {
+        .hero-grid { gap: 16px; }
+        .hero-display { font-size: clamp(80px, 28vw, 200px); }
+        .hero-tag, .hero-side { grid-column: 1 / -1; text-align: left; }
+        .hero-side { font-size: 14px; }
+        .specimen { grid-template-columns: 1fr 1fr; }
+        .spec-cell { border-right: 1px solid var(--ink); border-bottom: 1px solid var(--ink); }
+        .spec-cell:nth-child(2n) { border-right: 0; }
+        .spec-cell:nth-last-child(-n+2) { border-bottom: 0; }
+        .how-grid { grid-template-columns: 1fr; }
+        .tenet { grid-column: 1 / -1; grid-template-columns: 60px 1fr; }
+        .tenet-num { font-size: 40px; }
+        .nav-inner { grid-template-columns: 1fr 1fr; }
+        .nav-meta { display: none; }
+        .nav-links { font-size: 12px; }
+        .colophon-inner { grid-template-columns: 1fr 1fr; }
       }
     </style>
   </head>
+
   <body>
-    <header class="nav">
-      <div class="container">
-        <div>
-          <span class="brand">harness</span>
-          <span class="brand-pill">phase 2 ✓</span>
+    <!-- TOP TAPE -->
+    <div class="tape">
+      <div class="tape-track">
+        <span class="tape-item"><span class="dot green"></span>BUILD: 410 GREEN</span>
+        <span class="tape-item"><span class="dot"></span>PHASE 2 / 6 SHIPPED</span>
+        <span class="tape-item"><span class="dot"></span>LOCAL-FIRST PLANNER</span>
+        <span class="tape-item"><span class="dot green"></span>NO BROKER · NO DB SERVER</span>
+        <span class="tape-item"><span class="dot"></span>MIT / APACHE-2.0</span>
+        <span class="tape-item"><span class="dot"></span>RUST 1.85</span>
+        <span class="tape-item"><span class="dot"></span>BIN ≈ 30 MB STRIPPED</span>
+        <span class="tape-item"><span class="dot green"></span>TWO LAPTOPS · ONE BRAIN</span>
+        <!-- duplicate for seamless loop -->
+        <span class="tape-item"><span class="dot green"></span>BUILD: 410 GREEN</span>
+        <span class="tape-item"><span class="dot"></span>PHASE 2 / 6 SHIPPED</span>
+        <span class="tape-item"><span class="dot"></span>LOCAL-FIRST PLANNER</span>
+        <span class="tape-item"><span class="dot green"></span>NO BROKER · NO DB SERVER</span>
+        <span class="tape-item"><span class="dot"></span>MIT / APACHE-2.0</span>
+        <span class="tape-item"><span class="dot"></span>RUST 1.85</span>
+        <span class="tape-item"><span class="dot"></span>BIN ≈ 30 MB STRIPPED</span>
+        <span class="tape-item"><span class="dot green"></span>TWO LAPTOPS · ONE BRAIN</span>
+      </div>
+    </div>
+
+    <!-- NAV -->
+    <nav class="nav">
+      <div class="nav-inner">
+        <div class="brand-mark">harness<span class="dot">.</span></div>
+        <div class="nav-meta mono-caps">№ 002 — agent mesh, local-first</div>
+        <div class="nav-links mono-caps">
+          <a class="underline-on-hover" href="#manifesto">Manifesto</a>
+          <a class="underline-on-hover" href="#specimen">Specs</a>
+          <a class="underline-on-hover" href="#how">How</a>
+          <a class="underline-on-hover" href="#roadmap">Roadmap</a>
+          <a class="underline-on-hover" href="https://github.com/humancto/harness">Source ↗</a>
         </div>
-        <nav class="links">
-          <a href="#what">what</a>
-          <a href="#why">why</a>
-          <a href="#how">how</a>
-          <a href="#roadmap">roadmap</a>
-          <a href="https://github.com/humancto/harness">GitHub →</a>
-        </nav>
+      </div>
+    </nav>
+
+    <!-- ROTATING STAMP -->
+    <div class="stamp" aria-hidden="true">local-first<br/>since now.</div>
+
+    <!-- HERO -->
+    <header class="hero">
+      <div class="hero-grid">
+        <h1 class="display hero-display">
+          <span class="word">harness</span><span class="punct">.</span>
+        </h1>
+        <p class="hero-tag">
+          A local-first <b>agent mesh</b> for the laptops, desktops, and servers you already own.
+          One Rust binary. Auto-discovers peers. Elects a brain. Routes work by capability.
+          Cloud is escalation, not baseline.
+        </p>
+        <p class="hero-side">
+          The default for an AI workflow today is to send your data to someone else's GPU.
+          We&nbsp;think the&nbsp;machines you already own can do most of it.
+        </p>
+      </div>
+
+      <div class="cta-row">
+        <a class="btn btn-primary" href="https://github.com/humancto/harness#getting-started">
+          Get started <span class="btn-arrow">→</span>
+        </a>
+        <a class="btn" href="https://github.com/humancto/harness">Read the source</a>
+        <a class="btn" style="border-color: var(--rust); color: var(--rust);" href="#manifesto">
+          Manifesto
+        </a>
       </div>
     </header>
 
-    <section class="hero" style="border-top: 0">
-      <div class="container">
-        <h1>your idle laptops, an agent fleet</h1>
-        <p class="tagline">
-          A single Rust binary that turns the machines you already own into a private agent
-          mesh. Local-first brain. Capability-routed tasks. Nothing leaves your network unless
-          you ask it to.
-        </p>
-        <div class="cta">
-          <a class="btn btn-primary" href="https://github.com/humancto/harness#getting-started">
-            Get started
-          </a>
-          <a class="btn btn-secondary" href="https://github.com/humancto/harness">
-            Source on GitHub
-          </a>
-        </div>
-        <div class="demo-line">
-          <span class="prompt">$</span>
-          harness submit echo
-          <span style="color: var(--muted)">--input</span>
-          <span style="color: var(--emerald)">'{"msg":"hi"}'</span>
-        </div>
-        <div class="stats">
-          <div class="stat">
-            <div class="v">410+</div>
-            <div class="l">tests passing</div>
-          </div>
-          <div class="stat">
-            <div class="v">11</div>
-            <div class="l">crates</div>
-          </div>
-          <div class="stat">
-            <div class="v">~20</div>
-            <div class="l">PRs merged</div>
-          </div>
-          <div class="stat">
-            <div class="v">2</div>
-            <div class="l">phases shipped</div>
-          </div>
-        </div>
-      </div>
-    </section>
+    <!-- MANIFESTO -->
+    <section id="manifesto" class="block">
+      <div class="section-num">01</div>
+      <div class="section-meta">§ I — manifesto</div>
+      <h2 class="section-title">
+        Five things we believe&nbsp;<em>before&nbsp;we&nbsp;write&nbsp;a&nbsp;line&nbsp;of&nbsp;code.</em>
+      </h2>
 
-    <section id="what">
-      <div class="container">
-        <h2>What it is</h2>
-        <p class="section-lead">
-          You have machines. They sit idle 95% of the time. harness installs as a single binary
-          on each, finds its peers on your LAN, agrees on a brain, and accepts typed task
-          submissions from any of them.
-        </p>
-
-        <div class="pillars">
-          <div class="pillar">
-            <span class="icon">🧠</span>
-            <h3>Local-first brain</h3>
+      <div class="manifesto">
+        <div class="tenet">
+          <div class="tenet-num">01</div>
+          <div>
+            <h3>The planner runs locally.</h3>
             <p>
-              The planner runs on a local LLM by default. Cloud (Claude / GPT / Gemini) is
-              escalation, requires policy approval, surfaces the cost.
+              Cloud LLMs are escalation, not baseline. They require a <code>cloud_ok</code> tag
+              and policy approval. Their cost is surfaced in the audit log. Your laptop is the
+              default.
             </p>
           </div>
-          <div class="pillar">
-            <span class="icon">🎯</span>
-            <h3>Cardinality-aware routing</h3>
+        </div>
+        <div class="tenet">
+          <div class="tenet-num">02</div>
+          <div>
+            <h3>Cardinality is first-class.</h3>
             <p>
-              Every capability declares <code>Anyone</code> / <code>Owner</code> /
-              <code>Federated</code>. The dispatcher enforces it — scoped work lands where the
-              data is, search fans out, stateless jobs go anywhere.
+              Every capability declares <code>Anyone</code>, <code>Owner</code>, or
+              <code>Federated</code>. The dispatcher routes automatically; the brain doesn't
+              override.
             </p>
           </div>
-          <div class="pillar">
-            <span class="icon">📈</span>
-            <h3>N×X scaling</h3>
+        </div>
+        <div class="tenet">
+          <div class="tenet-num">03</div>
+          <div>
+            <h3>Idle compute is theft.</h3>
             <p>
-              Streaming dispatch (no full materialization), bounded channels (backpressure
-              tested), resource-aware scheduling, checkpoint/resume, batched local inference,
-              real-time cost tracking.
+              Every machine you own is at 5% utilization. Embed 100k docs. Grade 5k LLM outputs.
+              Triage 50 issues. The cost of a mesh of your own hardware approaches zero.
             </p>
           </div>
-          <div class="pillar">
-            <span class="icon">🔐</span>
-            <h3>Trust-by-default mesh</h3>
+        </div>
+        <div class="tenet">
+          <div class="tenet-num">04</div>
+          <div>
+            <h3>Trust by pubkey.</h3>
             <p>
               QUIC + mutual cert pinning. Ed25519 identity per node. Pairing codes for first
               join. <code>peers.toml</code> on disk. No CA, no IdP, no third party.
             </p>
           </div>
-          <div class="pillar">
-            <span class="icon">💸</span>
-            <h3>Cost is a first-class citizen</h3>
+        </div>
+        <div class="tenet">
+          <div class="tenet-num">05</div>
+          <div>
+            <h3>One binary. No broker.</h3>
             <p>
-              Every cloud call has a budget; every plan has a soft + hard limit. Realtime
-              spend graph (Phase 5) and a big red stop button.
-            </p>
-          </div>
-          <div class="pillar">
-            <span class="icon">📦</span>
-            <h3>One binary. Single file DB.</h3>
-            <p>
-              ~30 MB stripped, cross-compiled for {linux, macos, windows} × {x86_64, aarch64}.
-              SQLite + WAL at <code>~/.harness/harness.db</code>. No broker, no message bus, no
-              external DB server.
+              ~30 MB stripped. SQLite + WAL at <code>~/.harness/harness.db</code>. No Redis,
+              no Postgres-as-a-service, no Kafka. Install with <code>curl|sh</code>; uninstall
+              with <code>rm</code>.
             </p>
           </div>
         </div>
       </div>
     </section>
 
-    <section id="why">
-      <div class="container">
-        <h2>Why does this exist?</h2>
-        <p class="section-lead">
-          The default for &ldquo;an AI workflow&rdquo; today is to send your data to someone
-          else&rsquo;s GPU. harness is the bet that <strong>a small mesh of your own
-            machines is a real alternative</strong> for the 80% of tasks that don&rsquo;t need
-          GPT-4-class capability — and that for the 20% that do, you should still control the
-          routing, the cost, and the audit log.
-        </p>
-        <p class="section-lead">
-          Three properties are load-bearing and will not be weakened: local-first planner,
-          first-class capability cardinality, and N×X scaling. Everything else is up for
-          discussion in a PRD-grade ADR.
-        </p>
-      </div>
+    <!-- PULL QUOTE -->
+    <section class="pullquote">
+      <p class="quote">
+        Most workflows don't need someone else's GPU. They need <em>your</em> machines, working
+        in concert.
+      </p>
+      <cite>— PRD §1, the pitch</cite>
     </section>
 
-    <section id="how">
-      <div class="container">
-        <h2>How it&rsquo;s built</h2>
-        <p class="section-lead">
-          Strict Rust workspace, 11 crates, one binary. SvelteKit + Tailwind for the
-          embedded web UI (rust-embed at compile time). 410+ tests, 100% on macOS + Linux CI.
-        </p>
+    <!-- SPECIMEN PLATE -->
+    <section id="specimen" class="block">
+      <div class="section-num">02</div>
+      <div class="section-meta">§ II — current state</div>
+      <h2 class="section-title">By the numbers,&nbsp;<em>this&nbsp;week.</em></h2>
 
-        <div class="archi">
-                      ┌──────────────┐  mDNS  ┌──────────────┐
-                      │   <b>harness</b>    │◀──────▶│   <b>harness</b>    │
-                      │   on laptop  │  QUIC  │   on desktop │
-                      │      A       │◀──────▶│      B       │
-                      └───────┬──────┘        └──────────────┘
-                              │ http://localhost:19198
-                              ▼
-                      ┌────────────────┐
-                      │ <b>axum API</b>       │  POST /api/v1/tasks
-                      │ + <b>SvelteKit UI</b> │  GET  /api/v1/tasks
-                      │ (rust-embed)   │  WS   /api/v1/events
-                      └────────────────┘
+      <div class="specimen">
+        <div class="spec-cell">
+          <div class="label">tests passing</div>
+          <div class="value">410<sup>+</sup></div>
+          <div class="sub">macOS + Linux, every PR.</div>
         </div>
-
-        <div class="pre" style="margin-top: 16px">
-<span class="c"># first-run on the host</span>
-$ harness init                        <span class="c"># identity + pairing code</span>
-$ harness admin set-password
-$ harness daemon                      <span class="c"># UI on http://localhost:19198/</span>
-
-<span class="c"># on a second machine on the same LAN</span>
-$ harness join 192.168.1.42:19199 --code <span class="k">NNNN-NNNN</span>
-$ harness daemon
-
-<span class="c"># submit work from anywhere</span>
-$ harness submit echo --input <span class="k">'{"msg":"hi"}'</span>
-$ harness tasks
+        <div class="spec-cell">
+          <div class="label">phases shipped</div>
+          <div class="value">2<span style="color: var(--mute);">/6</span></div>
+          <div class="sub">Roadmap is the whole product.</div>
+        </div>
+        <div class="spec-cell">
+          <div class="label">crates</div>
+          <div class="value">11</div>
+          <div class="sub">A workspace, no monolith.</div>
+        </div>
+        <div class="spec-cell">
+          <div class="label">binary size</div>
+          <div class="value">≈30<sup>mb</sup></div>
+          <div class="sub">Stripped &amp; LTO'd.</div>
         </div>
       </div>
     </section>
 
-    <section id="roadmap">
-      <div class="container">
-        <h2>Roadmap</h2>
-        <p class="section-lead">
-          Each phase ends with a working, demoable artifact. No phase advances until its demo
-          is reproducible on real hardware. Tests in CI are necessary; the demo is the gate.
-        </p>
+    <!-- HOW -->
+    <section id="how" class="block">
+      <div class="section-num">03</div>
+      <div class="section-meta">§ III — operation</div>
+      <h2 class="section-title">Two laptops,&nbsp;<em>five&nbsp;commands.</em></h2>
 
-        <div class="roadmap">
-          <div class="phase done">
-            <div class="label"><span class="badge done">shipped</span> phase 0–1</div>
-            <div class="name">Mesh skeleton</div>
-            <div class="desc">
-              Two laptops discover, sign, elect a brain, reweight under churn.
-            </div>
+      <div class="how-grid">
+        <div class="frame">
+          <div class="frame-head">
+            <span>terminal · host A</span>
+            <span class="dots"><span class="live"></span><span></span><span></span></span>
           </div>
-          <div class="phase done">
-            <div class="label"><span class="badge done">shipped</span> phase 2</div>
-            <div class="name">Tasks flow</div>
-            <div class="desc">
-              Submit echo from CLI / UI, persist, list, replicate state.
-            </div>
+          <div class="frame-body"><span class="c-comment"># first-run on the host</span>
+<span class="c-prompt">$</span> <span class="c-cmd">harness</span> <span class="c-arg">init</span>
+<span class="c-out">  Identity:    a3b9c12d…
+  Pubkey FP:   a3b9c12d…
+  Pairing code: 4821-9036</span>
+
+<span class="c-prompt">$</span> <span class="c-cmd">harness</span> <span class="c-arg">admin set-password</span>
+<span class="c-prompt">$</span> <span class="c-cmd">harness</span> <span class="c-arg">daemon</span>
+<span class="c-out">  ui:  http://127.0.0.1:19198/
+  api: http://127.0.0.1:19198/api/v1/</span>
+
+<span class="c-comment"># on a second machine, same LAN</span>
+<span class="c-prompt">$</span> <span class="c-cmd">harness</span> <span class="c-arg">join</span> <span class="c-flag">192.168.1.42:19199</span> <span class="c-flag">--code</span> <span class="c-str">4821-9036</span>
+
+<span class="c-comment"># submit work from anywhere</span>
+<span class="c-prompt">$</span> <span class="c-cmd">harness</span> <span class="c-arg">submit echo</span> <span class="c-flag">--input</span> <span class="c-str">'{"msg":"hi"}'</span>
+<span class="c-out">  {"task_id":"…","state":"submitted"}</span></div>
+        </div>
+
+        <div class="frame">
+          <div class="frame-head">
+            <span>diagram · the mesh</span>
+            <span class="dots"><span class="live"></span><span class="live"></span><span></span></span>
           </div>
-          <div class="phase next">
-            <div class="label"><span class="badge next">next</span> phase 3</div>
-            <div class="name">Fleet exec + brain</div>
-            <div class="desc">
-              <code>harness run --all</code>, local LLM planner, MCP proxy, federated search.
-            </div>
-          </div>
-          <div class="phase">
-            <div class="label"><span class="badge todo">soon</span> phase 4</div>
-            <div class="name">Distribution patterns</div>
-            <div class="desc">
-              Fan-out controller, DAG executor, resource-aware scheduler, partial streams.
-            </div>
-          </div>
-          <div class="phase">
-            <div class="label"><span class="badge todo">soon</span> phase 5</div>
-            <div class="name">Planner + cost + external</div>
-            <div class="desc">
-              WhatsApp / SMS / iOS Shortcuts, budgets, checkpoint resume, audit log.
-            </div>
-          </div>
-          <div class="phase">
-            <div class="label"><span class="badge todo">launch</span> phase 6</div>
-            <div class="name">Hardening + installers</div>
-            <div class="desc">
-              curl|sh + Homebrew tap, signed binaries, self-updater, mobile-responsive UI.
-            </div>
-          </div>
+          <div class="ascii">                  ┌──────────────┐  <em>mDNS</em>  ┌──────────────┐
+                  │   <b>harness</b>    │◀──────▶│   <b>harness</b>    │
+                  │   on laptop  │  <em>QUIC</em>  │   on desktop │
+                  │      A       │◀──────▶│      B       │
+                  └───────┬──────┘        └──────────────┘
+                          │
+                          ▼
+                  ┌──────────────────┐
+                  │ <em>axum API</em>         │  POST /api/v1/tasks
+                  │ + <em>SvelteKit UI</em>   │  GET  /api/v1/tasks
+                  │  (rust-embed)    │  WS   /api/v1/events
+                  └──────────────────┘
+
+                  one binary. one file db.
+                  no broker. no third party.</div>
         </div>
       </div>
     </section>
 
-    <footer>
-      <div class="container">
+    <!-- ROADMAP -->
+    <section id="roadmap" class="block">
+      <div class="section-num">04</div>
+      <div class="section-meta">§ IV — roadmap</div>
+      <h2 class="section-title">The whole product, on one&nbsp;<em>page.</em></h2>
+
+      <div class="roadmap-rail">
+        <div class="phase done">
+          <div class="ph-num">00</div>
+          <div class="ph-status">▣ shipped</div>
+          <div class="ph-name">Workspace</div>
+          <div class="ph-desc">Cargo, CI, clippy, license. The skeleton.</div>
+        </div>
+        <div class="phase done">
+          <div class="ph-num">01</div>
+          <div class="ph-status">▣ shipped</div>
+          <div class="ph-name">Mesh skeleton</div>
+          <div class="ph-desc">Discovery · QUIC + mTLS · heartbeats · brain election · pairing · UI.</div>
+        </div>
+        <div class="phase done">
+          <div class="ph-num">02</div>
+          <div class="ph-status">▣ shipped</div>
+          <div class="ph-name">Tasks flow</div>
+          <div class="ph-desc">Wire types · cardinality · SQLite · leases · admin auth · CLI · echo · UI.</div>
+        </div>
+        <div class="phase next">
+          <div class="ph-num">03</div>
+          <div class="ph-status">◉ in flight</div>
+          <div class="ph-name">Fleet exec</div>
+          <div class="ph-desc"><code>harness run --all</code>, local LLM planner, MCP proxy, federated search.</div>
+        </div>
+        <div class="phase">
+          <div class="ph-num">04</div>
+          <div class="ph-status">▢ next</div>
+          <div class="ph-name">Distribution</div>
+          <div class="ph-desc">FanoutController · DAG executor · resource scheduler · partial streams.</div>
+        </div>
+        <div class="phase">
+          <div class="ph-num">05</div>
+          <div class="ph-status">▢ planned</div>
+          <div class="ph-name">Planner + cost</div>
+          <div class="ph-desc">WhatsApp / SMS / Shortcuts adapters. Budgets. Checkpoint resume.</div>
+        </div>
+        <div class="phase">
+          <div class="ph-num">06</div>
+          <div class="ph-status">▢ launch</div>
+          <div class="ph-name">Hardening</div>
+          <div class="ph-desc">curl|sh, Homebrew tap, signed binaries, self-updater, mobile UI.</div>
+        </div>
+        <div class="phase">
+          <div class="ph-num">07</div>
+          <div class="ph-status">▢ v2 backlog</div>
+          <div class="ph-name">Federation</div>
+          <div class="ph-desc">Cross-LAN sync, WASM caps, capability marketplace.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- COLOPHON / FOOTER -->
+    <footer class="colophon">
+      <div class="colophon-inner">
         <div>
-          <span class="brand">harness</span>
-          &nbsp;·&nbsp;
-          MIT or Apache-2.0 at your option
+          <h4>Project</h4>
+          <ul>
+            <li><a class="underline-on-hover" href="https://github.com/humancto/harness">Source</a></li>
+            <li><a class="underline-on-hover" href="https://github.com/humancto/harness/issues">Issues</a></li>
+            <li><a class="underline-on-hover" href="https://github.com/humancto/harness/blob/main/HARNESS_PRD_v2.md">PRD</a></li>
+            <li><a class="underline-on-hover" href="https://github.com/humancto/harness/blob/main/ROADMAP.md">Roadmap</a></li>
+          </ul>
         </div>
         <div>
-          <a href="https://github.com/humancto/harness">GitHub</a>
-          &nbsp;·&nbsp;
-          <a href="https://github.com/humancto/harness/blob/main/HARNESS_PRD_v2.md">PRD</a>
-          &nbsp;·&nbsp;
-          <a href="https://github.com/humancto/harness/blob/main/ROADMAP.md">Roadmap</a>
-          &nbsp;·&nbsp;
-          <a href="https://github.com/humancto/harness/tree/main/docs/decisions">ADRs</a>
+          <h4>Built with</h4>
+          <ul>
+            <li>Rust 1.85</li>
+            <li>tokio · axum · quinn</li>
+            <li>SvelteKit 2 · Tailwind 3</li>
+            <li>SQLite · ed25519-dalek · blake3</li>
+          </ul>
         </div>
+        <div>
+          <h4>Decisions</h4>
+          <ul>
+            <li><a class="underline-on-hover" href="https://github.com/humancto/harness/blob/main/docs/decisions/0006-task-state-replication-strategy.md">ADR-0006 — LWW over automerge</a></li>
+            <li><a class="underline-on-hover" href="https://github.com/humancto/harness/blob/main/docs/decisions/0007-admin-auth.md">ADR-0007 — argon2id sessions</a></li>
+            <li><a class="underline-on-hover" href="https://github.com/humancto/harness/tree/main/docs/decisions">All ADRs ↗</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Colophon</h4>
+          <p style="color: var(--mute); font-size: 13px;">
+            Set in <em>Fraunces</em> (display) and <em>JetBrains Mono</em> (data). Hand-written
+            HTML/CSS, no build step. Grain courtesy of an inline SVG turbulence filter.
+          </p>
+        </div>
+      </div>
+      <div class="colophon-bottom">
+        <span>© 2026 — humancto/harness</span>
+        <span>MIT or Apache-2.0 at your option</span>
+        <span>Made on machines you already own.</span>
       </div>
     </footer>
   </body>
