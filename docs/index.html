@@ -1,0 +1,609 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>harness — a LAN-native agent mesh</title>
+    <meta
+      name="description"
+      content="A single Rust binary that turns the laptops, desktops, and servers you already own into a private agent fleet. Local-first brain. Capability-routed tasks. Nothing leaves your network."
+    />
+    <meta property="og:title" content="harness — a LAN-native agent mesh" />
+    <meta
+      property="og:description"
+      content="Single Rust binary on every machine. Auto-discovers peers. Elects a brain. Runs typed, capability-routed tasks across the fleet."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://humancto.github.io/harness/" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🕸️%3C/text%3E%3C/svg%3E" />
+    <style>
+      :root {
+        --bg: #fafafa;
+        --fg: #18181b;
+        --muted: #71717a;
+        --border: #e4e4e7;
+        --card: #ffffff;
+        --accent: #18181b;
+        --accent-fg: #fafafa;
+        --code-bg: #f4f4f5;
+        --emerald: #059669;
+        --amber: #d97706;
+        --rose: #e11d48;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #09090b;
+          --fg: #fafafa;
+          --muted: #a1a1aa;
+          --border: #27272a;
+          --card: #18181b;
+          --accent: #fafafa;
+          --accent-fg: #09090b;
+          --code-bg: #18181b;
+          --emerald: #34d399;
+          --amber: #fbbf24;
+          --rose: #fb7185;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Helvetica, Arial, sans-serif;
+        background: var(--bg);
+        color: var(--fg);
+        line-height: 1.55;
+        -webkit-font-smoothing: antialiased;
+      }
+      .container {
+        max-width: 1024px;
+        margin: 0 auto;
+        padding: 0 24px;
+      }
+      header.nav {
+        border-bottom: 1px solid var(--border);
+        backdrop-filter: blur(12px);
+        background: color-mix(in srgb, var(--bg) 70%, transparent);
+        position: sticky;
+        top: 0;
+        z-index: 10;
+      }
+      header.nav .container {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding-top: 14px;
+        padding-bottom: 14px;
+      }
+      .brand {
+        font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+        font-weight: 700;
+        font-size: 16px;
+        letter-spacing: -0.02em;
+      }
+      .brand-pill {
+        display: inline-block;
+        margin-left: 8px;
+        padding: 2px 6px;
+        font-size: 10px;
+        background: var(--code-bg);
+        color: var(--muted);
+        border-radius: 4px;
+        font-family: ui-monospace, monospace;
+      }
+      nav.links {
+        display: flex;
+        gap: 20px;
+        font-size: 14px;
+      }
+      nav.links a {
+        color: var(--muted);
+        text-decoration: none;
+      }
+      nav.links a:hover {
+        color: var(--fg);
+      }
+      .hero {
+        padding: 80px 0 60px;
+        text-align: center;
+      }
+      .hero h1 {
+        font-size: 56px;
+        line-height: 1.05;
+        margin: 0 0 16px;
+        letter-spacing: -0.03em;
+        font-weight: 700;
+      }
+      .hero .tagline {
+        font-size: 22px;
+        color: var(--muted);
+        max-width: 720px;
+        margin: 0 auto 36px;
+        line-height: 1.4;
+      }
+      .hero .cta {
+        display: inline-flex;
+        gap: 12px;
+        align-items: center;
+        flex-wrap: wrap;
+        justify-content: center;
+      }
+      .btn {
+        display: inline-block;
+        padding: 12px 20px;
+        border-radius: 8px;
+        font-size: 14px;
+        font-weight: 500;
+        text-decoration: none;
+        border: 1px solid transparent;
+        transition: transform 100ms ease;
+      }
+      .btn:hover {
+        transform: translateY(-1px);
+      }
+      .btn-primary {
+        background: var(--accent);
+        color: var(--accent-fg);
+      }
+      .btn-secondary {
+        background: var(--card);
+        color: var(--fg);
+        border-color: var(--border);
+      }
+      .demo-line {
+        display: inline-block;
+        padding: 14px 18px;
+        background: var(--code-bg);
+        border-radius: 8px;
+        font-family: ui-monospace, monospace;
+        font-size: 14px;
+        margin-top: 32px;
+      }
+      .demo-line .prompt {
+        color: var(--muted);
+        user-select: none;
+      }
+      section {
+        padding: 64px 0;
+        border-top: 1px solid var(--border);
+      }
+      h2 {
+        font-size: 32px;
+        letter-spacing: -0.02em;
+        margin: 0 0 8px;
+        font-weight: 700;
+      }
+      .section-lead {
+        color: var(--muted);
+        margin: 0 0 36px;
+        max-width: 640px;
+      }
+      .pillars {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+        gap: 24px;
+      }
+      .pillar {
+        padding: 24px;
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+      }
+      .pillar h3 {
+        margin: 0 0 8px;
+        font-size: 16px;
+        letter-spacing: -0.01em;
+      }
+      .pillar p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 14px;
+      }
+      .pillar .icon {
+        display: inline-block;
+        width: 32px;
+        height: 32px;
+        line-height: 32px;
+        text-align: center;
+        background: var(--code-bg);
+        border-radius: 8px;
+        font-size: 18px;
+        margin-bottom: 12px;
+      }
+      .pre {
+        background: var(--code-bg);
+        padding: 18px 20px;
+        border-radius: 10px;
+        font-family: ui-monospace, monospace;
+        font-size: 13px;
+        line-height: 1.65;
+        overflow-x: auto;
+        white-space: pre;
+        color: var(--fg);
+      }
+      .pre .c {
+        color: var(--muted);
+      }
+      .pre .k {
+        color: var(--emerald);
+      }
+      .roadmap {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 12px;
+      }
+      .phase {
+        padding: 16px 18px;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background: var(--card);
+        position: relative;
+      }
+      .phase .label {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--muted);
+        font-weight: 600;
+      }
+      .phase .name {
+        font-weight: 600;
+        margin: 4px 0 6px;
+      }
+      .phase .desc {
+        font-size: 13px;
+        color: var(--muted);
+        line-height: 1.45;
+      }
+      .phase.done {
+        border-color: color-mix(in srgb, var(--emerald) 40%, var(--border));
+      }
+      .phase.next {
+        border-color: color-mix(in srgb, var(--amber) 40%, var(--border));
+      }
+      .badge {
+        display: inline-block;
+        padding: 1px 6px;
+        font-size: 10px;
+        border-radius: 4px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      .badge.done {
+        background: color-mix(in srgb, var(--emerald) 20%, transparent);
+        color: var(--emerald);
+      }
+      .badge.next {
+        background: color-mix(in srgb, var(--amber) 20%, transparent);
+        color: var(--amber);
+      }
+      .badge.todo {
+        background: var(--code-bg);
+        color: var(--muted);
+      }
+      .archi {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 24px;
+        font-family: ui-monospace, monospace;
+        font-size: 13px;
+        line-height: 1.55;
+        white-space: pre;
+        overflow-x: auto;
+        color: var(--muted);
+      }
+      .archi b {
+        color: var(--fg);
+      }
+      footer {
+        border-top: 1px solid var(--border);
+        padding: 40px 0 60px;
+        color: var(--muted);
+        font-size: 14px;
+      }
+      footer a {
+        color: var(--muted);
+      }
+      footer .container {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 12px;
+      }
+      .stats {
+        display: flex;
+        justify-content: center;
+        gap: 36px;
+        flex-wrap: wrap;
+        margin-top: 32px;
+        padding-top: 24px;
+        border-top: 1px solid var(--border);
+      }
+      .stat .v {
+        font-size: 28px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+      }
+      .stat .l {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--muted);
+      }
+      @media (max-width: 640px) {
+        .hero h1 {
+          font-size: 40px;
+        }
+        .hero .tagline {
+          font-size: 18px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="nav">
+      <div class="container">
+        <div>
+          <span class="brand">harness</span>
+          <span class="brand-pill">phase 2 ✓</span>
+        </div>
+        <nav class="links">
+          <a href="#what">what</a>
+          <a href="#why">why</a>
+          <a href="#how">how</a>
+          <a href="#roadmap">roadmap</a>
+          <a href="https://github.com/humancto/harness">GitHub →</a>
+        </nav>
+      </div>
+    </header>
+
+    <section class="hero" style="border-top: 0">
+      <div class="container">
+        <h1>your idle laptops, an agent fleet</h1>
+        <p class="tagline">
+          A single Rust binary that turns the machines you already own into a private agent
+          mesh. Local-first brain. Capability-routed tasks. Nothing leaves your network unless
+          you ask it to.
+        </p>
+        <div class="cta">
+          <a class="btn btn-primary" href="https://github.com/humancto/harness#getting-started">
+            Get started
+          </a>
+          <a class="btn btn-secondary" href="https://github.com/humancto/harness">
+            Source on GitHub
+          </a>
+        </div>
+        <div class="demo-line">
+          <span class="prompt">$</span>
+          harness submit echo
+          <span style="color: var(--muted)">--input</span>
+          <span style="color: var(--emerald)">'{"msg":"hi"}'</span>
+        </div>
+        <div class="stats">
+          <div class="stat">
+            <div class="v">410+</div>
+            <div class="l">tests passing</div>
+          </div>
+          <div class="stat">
+            <div class="v">11</div>
+            <div class="l">crates</div>
+          </div>
+          <div class="stat">
+            <div class="v">~20</div>
+            <div class="l">PRs merged</div>
+          </div>
+          <div class="stat">
+            <div class="v">2</div>
+            <div class="l">phases shipped</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="what">
+      <div class="container">
+        <h2>What it is</h2>
+        <p class="section-lead">
+          You have machines. They sit idle 95% of the time. harness installs as a single binary
+          on each, finds its peers on your LAN, agrees on a brain, and accepts typed task
+          submissions from any of them.
+        </p>
+
+        <div class="pillars">
+          <div class="pillar">
+            <span class="icon">🧠</span>
+            <h3>Local-first brain</h3>
+            <p>
+              The planner runs on a local LLM by default. Cloud (Claude / GPT / Gemini) is
+              escalation, requires policy approval, surfaces the cost.
+            </p>
+          </div>
+          <div class="pillar">
+            <span class="icon">🎯</span>
+            <h3>Cardinality-aware routing</h3>
+            <p>
+              Every capability declares <code>Anyone</code> / <code>Owner</code> /
+              <code>Federated</code>. The dispatcher enforces it — scoped work lands where the
+              data is, search fans out, stateless jobs go anywhere.
+            </p>
+          </div>
+          <div class="pillar">
+            <span class="icon">📈</span>
+            <h3>N×X scaling</h3>
+            <p>
+              Streaming dispatch (no full materialization), bounded channels (backpressure
+              tested), resource-aware scheduling, checkpoint/resume, batched local inference,
+              real-time cost tracking.
+            </p>
+          </div>
+          <div class="pillar">
+            <span class="icon">🔐</span>
+            <h3>Trust-by-default mesh</h3>
+            <p>
+              QUIC + mutual cert pinning. Ed25519 identity per node. Pairing codes for first
+              join. <code>peers.toml</code> on disk. No CA, no IdP, no third party.
+            </p>
+          </div>
+          <div class="pillar">
+            <span class="icon">💸</span>
+            <h3>Cost is a first-class citizen</h3>
+            <p>
+              Every cloud call has a budget; every plan has a soft + hard limit. Realtime
+              spend graph (Phase 5) and a big red stop button.
+            </p>
+          </div>
+          <div class="pillar">
+            <span class="icon">📦</span>
+            <h3>One binary. Single file DB.</h3>
+            <p>
+              ~30 MB stripped, cross-compiled for {linux, macos, windows} × {x86_64, aarch64}.
+              SQLite + WAL at <code>~/.harness/harness.db</code>. No broker, no message bus, no
+              external DB server.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="why">
+      <div class="container">
+        <h2>Why does this exist?</h2>
+        <p class="section-lead">
+          The default for &ldquo;an AI workflow&rdquo; today is to send your data to someone
+          else&rsquo;s GPU. harness is the bet that <strong>a small mesh of your own
+            machines is a real alternative</strong> for the 80% of tasks that don&rsquo;t need
+          GPT-4-class capability — and that for the 20% that do, you should still control the
+          routing, the cost, and the audit log.
+        </p>
+        <p class="section-lead">
+          Three properties are load-bearing and will not be weakened: local-first planner,
+          first-class capability cardinality, and N×X scaling. Everything else is up for
+          discussion in a PRD-grade ADR.
+        </p>
+      </div>
+    </section>
+
+    <section id="how">
+      <div class="container">
+        <h2>How it&rsquo;s built</h2>
+        <p class="section-lead">
+          Strict Rust workspace, 11 crates, one binary. SvelteKit + Tailwind for the
+          embedded web UI (rust-embed at compile time). 410+ tests, 100% on macOS + Linux CI.
+        </p>
+
+        <div class="archi">
+                      ┌──────────────┐  mDNS  ┌──────────────┐
+                      │   <b>harness</b>    │◀──────▶│   <b>harness</b>    │
+                      │   on laptop  │  QUIC  │   on desktop │
+                      │      A       │◀──────▶│      B       │
+                      └───────┬──────┘        └──────────────┘
+                              │ http://localhost:19198
+                              ▼
+                      ┌────────────────┐
+                      │ <b>axum API</b>       │  POST /api/v1/tasks
+                      │ + <b>SvelteKit UI</b> │  GET  /api/v1/tasks
+                      │ (rust-embed)   │  WS   /api/v1/events
+                      └────────────────┘
+        </div>
+
+        <div class="pre" style="margin-top: 16px">
+<span class="c"># first-run on the host</span>
+$ harness init                        <span class="c"># identity + pairing code</span>
+$ harness admin set-password
+$ harness daemon                      <span class="c"># UI on http://localhost:19198/</span>
+
+<span class="c"># on a second machine on the same LAN</span>
+$ harness join 192.168.1.42:19199 --code <span class="k">NNNN-NNNN</span>
+$ harness daemon
+
+<span class="c"># submit work from anywhere</span>
+$ harness submit echo --input <span class="k">'{"msg":"hi"}'</span>
+$ harness tasks
+        </div>
+      </div>
+    </section>
+
+    <section id="roadmap">
+      <div class="container">
+        <h2>Roadmap</h2>
+        <p class="section-lead">
+          Each phase ends with a working, demoable artifact. No phase advances until its demo
+          is reproducible on real hardware. Tests in CI are necessary; the demo is the gate.
+        </p>
+
+        <div class="roadmap">
+          <div class="phase done">
+            <div class="label"><span class="badge done">shipped</span> phase 0–1</div>
+            <div class="name">Mesh skeleton</div>
+            <div class="desc">
+              Two laptops discover, sign, elect a brain, reweight under churn.
+            </div>
+          </div>
+          <div class="phase done">
+            <div class="label"><span class="badge done">shipped</span> phase 2</div>
+            <div class="name">Tasks flow</div>
+            <div class="desc">
+              Submit echo from CLI / UI, persist, list, replicate state.
+            </div>
+          </div>
+          <div class="phase next">
+            <div class="label"><span class="badge next">next</span> phase 3</div>
+            <div class="name">Fleet exec + brain</div>
+            <div class="desc">
+              <code>harness run --all</code>, local LLM planner, MCP proxy, federated search.
+            </div>
+          </div>
+          <div class="phase">
+            <div class="label"><span class="badge todo">soon</span> phase 4</div>
+            <div class="name">Distribution patterns</div>
+            <div class="desc">
+              Fan-out controller, DAG executor, resource-aware scheduler, partial streams.
+            </div>
+          </div>
+          <div class="phase">
+            <div class="label"><span class="badge todo">soon</span> phase 5</div>
+            <div class="name">Planner + cost + external</div>
+            <div class="desc">
+              WhatsApp / SMS / iOS Shortcuts, budgets, checkpoint resume, audit log.
+            </div>
+          </div>
+          <div class="phase">
+            <div class="label"><span class="badge todo">launch</span> phase 6</div>
+            <div class="name">Hardening + installers</div>
+            <div class="desc">
+              curl|sh + Homebrew tap, signed binaries, self-updater, mobile-responsive UI.
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <div class="container">
+        <div>
+          <span class="brand">harness</span>
+          &nbsp;·&nbsp;
+          MIT or Apache-2.0 at your option
+        </div>
+        <div>
+          <a href="https://github.com/humancto/harness">GitHub</a>
+          &nbsp;·&nbsp;
+          <a href="https://github.com/humancto/harness/blob/main/HARNESS_PRD_v2.md">PRD</a>
+          &nbsp;·&nbsp;
+          <a href="https://github.com/humancto/harness/blob/main/ROADMAP.md">Roadmap</a>
+          &nbsp;·&nbsp;
+          <a href="https://github.com/humancto/harness/tree/main/docs/decisions">ADRs</a>
+        </div>
+      </div>
+    </footer>
+  </body>
+</html>

@@ -15,6 +15,12 @@
         <a href="/" class="text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100">
           mesh
         </a>
+        <a href="/submit" class="text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100">
+          submit
+        </a>
+        <a href="/runs" class="text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100">
+          runs
+        </a>
       </nav>
     </div>
   </header>

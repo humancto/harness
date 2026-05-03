@@ -1,7 +1,45 @@
 # Harness Implementation State
 
-**Current phase:** 1 → 2 (mesh skeleton complete; tasks flow next)
-**Last updated:** 2026-05-03 (post-1.10)
+**Current phase:** 2 → 3 (tasks flow complete; fleet exec next)
+**Last updated:** 2026-05-03 (post-2.9)
+
+## Phase 2 summary (post-merge)
+
+Phase 2 ships in 9 PRs (#13–#21). Demo gate **partially satisfied**:
+
+- ✅ Submit `echo` from CLI (`harness submit echo --input ...`) and UI (`/submit` page) — works end-to-end against the local daemon.
+- ✅ Persist tasks in `~/.harness/harness.db`, list via `harness tasks` and `/runs` UI page.
+- ✅ Cardinality routing (`Anyone` / `Owner` / `Federated`) typed and tested in the dispatcher.
+- ✅ LWW replication of task state across the mesh (custom CRDT per ADR-0006).
+- ⚠️ Cross-node task execution over QUIC is **not yet wired**. The dispatcher's runtime that pulls Tasks off `harness.task.assign` and writes results to `harness.task.result` is the explicit deferral that rolls into **Phase 3.3** (`harness run --all`) since both need the same QUIC envelope channels and worker registry plumbing. Phase 2 ships the persistence + auth + UI surface; Phase 3.3 wires the wire-level dispatch.
+
+PRs merged in Phase 2 (each minimal-scope but production-quality, with rust-expert review on every diff):
+
+| PR  | item | what shipped                                                                                  |
+| --- | ---- | --------------------------------------------------------------------------------------------- |
+| #13 | 2.1  | Task / Result / Plan envelopes (PRD §13.3-§13.5), Signable, ADR-0002                          |
+| #14 | 2.2  | Cardinality enforcement: `Dispatcher::eligible`, `LiveSet`, `CapabilityIndex`, `ScopeIndex`   |
+| #15 | 2.3  | SQLite schema (V0001): tasks, manifests, capability/scope indexes, WAL pragmas                |
+| #16 | 2.4  | V0002 leases + `dispatcher_cursors`; round-robin selector                                     |
+| #17 | 2.5  | Replicated task state (LWW Map, ADR-0006), V0003 `task_replica_state`, `ReplicaApplier` trait |
+| #18 | 2.6  | Argon2id admin auth (ADR-0007), bearer sessions, `POST /api/v1/tasks`                         |
+| #19 | 2.7  | CLI: `admin set-password`, `submit`, `tasks`, `~/.harness/.session` cache                     |
+| #20 | 2.8  | `harness-capabilities` crate: `Capability` trait + registry + built-in `echo`                 |
+| #21 | 2.9  | UI Submit + Runs pages, `GET /api/v1/capabilities`, README + GitHub Pages                     |
+
+Tests: 410 passing. ADRs 0001-0007 in place. Each PR atomic, expert-reviewed, CI-gated on macOS + Linux.
+
+## Phase 3 carryovers (deferred from Phase 2)
+
+These will land alongside their natural Phase 3 home, not as a "phase 2.10":
+
+1. **QUIC envelope channels** (`harness.task.assign|claim|result`, `harness.gossip.state`) → ships with **3.3** (`harness run --all`) since the worker-side listener loop is the same primitive.
+2. **Heartbeat `replica_head` field for anti-entropy** (wire-format change, ADR-pending) → ships with the gossip transport in 3.3.
+3. **Dispatcher async runtime** (`Dispatcher::submit / on_result / expire_pass`) → ships with 3.3.
+4. **JSON-Schema input validation** of `Task.input` against `Capability::input_schema` → ships with **3.1** (policy engine) since both gate on capability metadata.
+5. **WS `/api/v1/runs/<task_id>` per-task result stream** → ships when the worker emits `FinalResult` over QUIC (3.3).
+6. **`assert!`-on-duplicate at registry compile time** → cosmetic; runtime check is fine for the static built-in set.
+7. **`GET /api/v1/capabilities` schema completeness** — currently emits id/version/cardinality/cost_hint without the full `input_schema`. Phase 3.x will surface schemas as part of the registry.
 
 ## Done
 

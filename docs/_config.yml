@@ -1,0 +1,5 @@
+title: harness
+description: A LAN-native agent mesh
+theme: jekyll-theme-minimal
+include:
+  - decisions
