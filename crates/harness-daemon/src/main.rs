@@ -2,11 +2,15 @@
 //! surface into a real `harness` binary.
 #![forbid(unsafe_code)]
 
+mod lifecycle;
+
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use harness_cli::{run, Cli, DaemonArgs, SyncOutcome};
+
+use crate::lifecycle::{DaemonOrchestrator, DaemonRuntimeConfig};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -44,36 +48,47 @@ async fn daemon_main(args: DaemonArgs) -> Result<()> {
     };
     let identity = harness_mesh::identity::init_or_load(&root).context("init/load identity")?;
     let identity = Arc::new(identity);
+    let trust =
+        harness_mesh::TrustStore::open(&root, identity.node_id()).context("open peers.toml")?;
 
     let mesh_name = std::env::var("HARNESS_MESH_NAME").unwrap_or_else(|_| "harness".to_string());
 
-    let state = harness_api::ApiStateBuilder::new(identity.clone(), mesh_name.clone())
-        .with_capabilities(vec!["builtin.echo".to_string()])
-        .build();
+    let mut config = DaemonRuntimeConfig {
+        mesh_name,
+        api_bind: args.bind,
+        ..DaemonRuntimeConfig::default()
+    };
+    if let Ok(peers) = std::env::var("HARNESS_STATIC_PEERS") {
+        config.static_peers = peers
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+    }
+    if std::env::var("HARNESS_MDNS_DISABLED").is_ok() {
+        config.mdns_enabled = false;
+    }
+    if let Ok(bind) = std::env::var("HARNESS_MESH_BIND") {
+        if let Ok(addr) = bind.parse() {
+            config.mesh_bind = addr;
+        }
+    }
 
-    let server = harness_api::serve(args.bind, state.clone())
+    let orchestrator = DaemonOrchestrator::build(identity.clone(), trust, config)
         .await
-        .context("bind harness-api")?;
-    let bound = server.local_addr();
-    tracing::info!(target: "harness.daemon", addr = %bound, "harness-api listening");
+        .context("build daemon orchestrator")?;
+    let api_addr = orchestrator.api_addr();
+
     #[allow(clippy::print_stdout)]
     {
         println!(
             "harness daemon\n  node_id: {}\n  pubkey:  {}\n  ui:      http://{}/\n  api:     http://{}/api/v1/",
             identity.node_id(),
             identity.public_key().fingerprint_hex(),
-            bound,
-            bound
+            api_addr,
+            api_addr,
         );
         println!("press ctrl-c to stop");
     }
 
-    // Phase 1.10 ships the API + UI server. The mesh-side wiring
-    // (Discovery + Transport + HeartbeatService + Election) is a
-    // larger lift carried as a Phase 2 follow-up — without it, the UI
-    // shows only the local node and a "no peers yet" hint.
-    tokio::signal::ctrl_c().await.ok();
-    tracing::info!(target: "harness.daemon", "shutdown requested");
-    server.shutdown().await;
-    Ok(())
+    orchestrator.run_until_signal().await
 }
