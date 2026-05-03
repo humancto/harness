@@ -183,6 +183,11 @@ impl DaemonOrchestrator {
         // additions feature-gated). The daemon advertises every
         // registered capability via NodeManifest.
         let capabilities = harness_capabilities::default_registry(policy_engine.clone());
+        // Phase 3.4: discover locally-installed Ollama models and
+        // register one `llm.local.<model>` cap per. Best-effort —
+        // failures log + return; daemon continues without LLM caps.
+        #[cfg(feature = "llm")]
+        harness_capabilities::enrich_with_llm_local(&capabilities, policy_engine.clone()).await;
         let cap_ids = capabilities.ids();
 
         // Phase 3.3a: local executor loop. Picks Submitted tasks off

@@ -52,6 +52,7 @@ hyper       = { version = "1.5" }
 tower       = { version = "0.5" }
 tower-http  = { version = "0.6", features = ["trace", "fs"] }
 reqwest     = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+url         = { version = "2.5" }
 quinn       = { version = "0.11" }
 
 # Serialization
@@ -116,6 +117,8 @@ assert_cmd        = { version = "2.0" }
 predicates        = { version = "3.1" }
 proptest          = { version = "1.5" }
 insta             = { version = "1.40", features = ["yaml"] }
+# pinned: 0.6.5+ uses let-chains (Rust 1.86+); workspace MSRV is 1.85.
+wiremock          = { version = "=0.6.2" }
 rstest            = { version = "0.23" }
 tempfile          = { version = "3.13" }
 tokio-tungstenite = { version = "0.24" }

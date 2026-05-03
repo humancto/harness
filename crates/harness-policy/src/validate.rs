@@ -29,10 +29,42 @@ pub(crate) fn validate(policy: &Policy) -> Result<(), PolicyError> {
         }
     }
 
+    if let Some(llm) = policy.llm.as_ref() {
+        check_llm_rules("llm.allow", &llm.allow, &mut errors);
+        check_llm_rules("llm.deny", &llm.deny, &mut errors);
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
         Err(PolicyError::Validate { errors })
+    }
+}
+
+fn check_llm_rules(prefix: &str, rules: &[crate::config::LlmAllow], errors: &mut Vec<String>) {
+    for (i, rule) in rules.iter().enumerate() {
+        match rule {
+            crate::config::LlmAllow::Model(m) => {
+                check_llm_field(&format!("{prefix}[{i}].model"), &m.model, errors);
+            }
+            crate::config::LlmAllow::Prefix(p) => {
+                check_llm_field(
+                    &format!("{prefix}[{i}].model_prefix"),
+                    &p.model_prefix,
+                    errors,
+                );
+            }
+        }
+    }
+}
+
+fn check_llm_field(field: &str, value: &str, errors: &mut Vec<String>) {
+    if value.is_empty() {
+        errors.push(format!("{field} is empty"));
+        return;
+    }
+    if value.chars().any(char::is_whitespace) {
+        errors.push(format!("{field} contains whitespace ({value:?})"));
     }
 }
 

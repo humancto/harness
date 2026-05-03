@@ -23,6 +23,12 @@ pub struct Policy {
 
     #[serde(default)]
     pub planning: PlanningPolicy,
+
+    /// `[llm]` section — `None` = section absent → default-allow,
+    /// `Some(p)` = section present → matrix in `evaluate_llm`.
+    /// (Deliberately `Option` to distinguish "absent" from "empty".)
+    #[serde(default)]
+    pub llm: Option<LlmPolicy>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -109,6 +115,45 @@ pub struct PlanningPolicy {
 
     #[serde(default)]
     pub local_only_for_tags: HashSet<String>,
+}
+
+/// `[llm]` policy section — Phase 3.4. Optional. When absent on the
+/// parent `Policy`, `llm.local.*` actions default-allow. When present
+/// but empty, default-deny (operator wrote the section; respect intent).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmPolicy {
+    #[serde(default)]
+    pub allow: Vec<LlmAllow>,
+
+    #[serde(default)]
+    pub deny: Vec<LlmAllow>,
+
+    #[serde(default)]
+    pub from: HashMap<String, TrustLevel>,
+}
+
+/// One `[llm].allow` (or `[llm].deny`) rule. Same untagged-with-
+/// `deny_unknown_fields` discipline as `DenyRule` in shell, so a typo
+/// surfaces at parse time instead of silently matching the wrong shape.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+#[non_exhaustive]
+pub enum LlmAllow {
+    Model(LlmAllowModel),
+    Prefix(LlmAllowPrefix),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmAllowModel {
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmAllowPrefix {
+    pub model_prefix: String,
 }
 
 impl Policy {
