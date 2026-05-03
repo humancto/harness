@@ -265,3 +265,99 @@ async fn node_manifest_round_trip_via_transport() {
     assert_eq!(received.node_id, manifest.node_id);
     assert_eq!(received.hostname, "test");
 }
+
+/// Regression test for the single-`streams`-mutex deadlock the
+/// reviewer caught: a `recv` blocked on `read_chunk` must not gate a
+/// concurrent `send` on the same `Connection`. Item 1.5's heartbeat
+/// loop will run send and recv from independent tokio tasks; if they
+/// share one mutex the loop deadlocks the moment the recv awaits a
+/// chunk.
+///
+/// Test shape: client opens the conversation (so the lazy `accept_bi`
+/// on the server resolves), then we run a chatty exchange:
+///
+///   * Client task A: park in `recv` (waiting for the server to
+///     respond).
+///   * Server task B: receive the client's first heartbeat.
+///   * Server task C: spawn a concurrent send back to the client
+///     while task B's recv is in flight on a separate piece of state.
+///
+/// With one mutex covering both halves, task C would block on task B
+/// until B's recv returned (which already returned in this shape, so
+/// the failure mode is more obvious in 1.5 — but the test still
+/// proves split-mutex behavior by running send AND recv concurrently
+/// on the same `Arc<Connection>` from two tasks).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_send_and_recv_do_not_deadlock() {
+    let (server, server_id) = build_transport();
+    let (client, client_id) = build_transport();
+    let server_addr = server.local_addr().expect("local_addr");
+    let server_pubkey = *server_id.public_key();
+
+    let server_handle = tokio::spawn(async move {
+        let inc = accept_one_into(server).await;
+        inc.accept(|_pk| true).expect("accept")
+    });
+
+    let conn = Arc::new(
+        client
+            .dial(server_addr, &server_pubkey)
+            .await
+            .expect("dial"),
+    );
+    let server_conn = Arc::new(server_handle.await.expect("join"));
+
+    // Step 1: client sends the first heartbeat. This wakes up the
+    // server's lazy `accept_bi` and gives both sides a real stream
+    // pair under their independent mutexes.
+    let mut hb_initial = sample_heartbeat(client_id.node_id(), 1);
+    hb_initial.sign(&client_id).expect("sign initial");
+    conn.send(&hb_initial).await.expect("client send 1");
+
+    // Step 2: server receives the initial heartbeat.
+    let received: Heartbeat = server_conn.recv().await.expect("server recv 1");
+    assert_eq!(received.seq, 1);
+
+    // Step 3: park the server in recv. With single-mutex it would
+    // hold the streams lock for the duration; split-mutex frees the
+    // send half.
+    let server_conn_clone = server_conn.clone();
+    let recv_park = tokio::spawn(async move {
+        let h: Heartbeat = server_conn_clone.recv().await.expect("server recv 2");
+        h
+    });
+
+    // Step 4: while server-recv is parked, send server -> client. If
+    // the streams mutex covered both halves, this send would block
+    // forever because recv is holding the lock waiting for bytes.
+    let mut server_reply = sample_heartbeat(server_id.node_id(), 1);
+    server_reply.sign(&server_id).expect("sign server reply");
+    let server_conn_send = server_conn.clone();
+    let send_concurrent = tokio::spawn(async move {
+        // Tiny delay so the recv has definitely parked on read_chunk.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        server_conn_send
+            .send(&server_reply)
+            .await
+            .expect("server send during recv");
+    });
+
+    // Step 5: client receives the server's reply (proves send went
+    // through despite the parked recv).
+    let client_recv: Heartbeat = conn.recv().await.expect("client recv reply");
+    assert_eq!(client_recv.node_id, server_id.node_id());
+
+    // Step 6: client sends so the server's parked recv unblocks.
+    let mut hb_unblock = sample_heartbeat(client_id.node_id(), 2);
+    hb_unblock.sign(&client_id).expect("sign unblock");
+    conn.send(&hb_unblock).await.expect("client send 2");
+
+    // Both background tasks must complete promptly.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        send_concurrent.await.expect("send task");
+        let unblocked = recv_park.await.expect("recv task");
+        assert_eq!(unblocked.seq, 2);
+    })
+    .await
+    .expect("send+recv must not deadlock");
+}

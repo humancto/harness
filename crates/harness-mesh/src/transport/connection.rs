@@ -103,23 +103,35 @@ enum Side {
 ///
 /// Stream open/accept is lazy. On the dialer, the first `send` calls
 /// `quinn::Connection::open_bi`; on the accepter, the first `recv` (or
-/// `send` — whichever comes first) calls `quinn::Connection::accept_bi`.
-/// This avoids the deadlock where eagerly accepting in
-/// `IncomingConnection::accept` blocks on the dialer's first write,
-/// but the dialer cannot write until the accept call returns.
+/// `send`) calls `quinn::Connection::accept_bi`. This avoids the
+/// deadlock where eagerly accepting in `IncomingConnection::accept`
+/// blocks on the dialer's first write, but the dialer cannot write
+/// until the accept call returns.
+///
+/// **Send and recv use independent mutexes** so a `recv` blocked on
+/// `read_chunk` does not gate a concurrent `send` (item 1.5's heartbeat
+/// loop has both directions on one `Connection` and would deadlock
+/// otherwise).
 pub struct Connection {
     pubkey: PublicKey,
     addr: SocketAddr,
     inner: quinn::Connection,
     side: Side,
-    streams: Mutex<Option<StreamPair>>,
-    framer: Mutex<RecvFramer>,
+    /// One-shot init for the bidi-stream pair. Holds quinn's send stream
+    /// after init.
+    send_stream: Mutex<Option<quinn::SendStream>>,
+    /// Framer + recv stream pair. Both protected by the same mutex
+    /// because the framer's state and the underlying read are
+    /// inseparable in the recv state machine.
+    recv_state: Mutex<RecvState>,
+    /// Synchronizes lazy stream initialization across send/recv tasks.
+    init: tokio::sync::OnceCell<()>,
     replay: ReplayTable,
 }
 
-struct StreamPair {
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
+struct RecvState {
+    framer: RecvFramer,
+    stream: Option<quinn::RecvStream>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -139,8 +151,12 @@ impl Connection {
             addr,
             inner,
             side,
-            streams: Mutex::new(None),
-            framer: Mutex::new(RecvFramer::new()),
+            send_stream: Mutex::new(None),
+            recv_state: Mutex::new(RecvState {
+                framer: RecvFramer::new(),
+                stream: None,
+            }),
+            init: tokio::sync::OnceCell::new(),
             replay: ReplayTable::new(),
         }
     }
@@ -153,26 +169,34 @@ impl Connection {
         Self::new(connection, pubkey, Side::Accepter)
     }
 
-    /// Lazily ensure the bidi stream pair exists. Called by `send` and `recv`
-    /// on first use. Idempotent.
+    /// Lazily open or accept the bidi stream pair exactly once, then
+    /// install the half-streams into `send_stream` and `recv_state`.
+    /// Subsequent calls are O(1) — `OnceCell::get_or_try_init` short-circuits.
+    ///
+    /// Held mutexes during init are minimal: the `OnceCell`'s internal
+    /// semaphore serializes initialization across concurrent send+recv
+    /// callers, but the per-half mutexes are NEVER both held at the same
+    /// time after init returns.
     async fn ensure_streams(&self) -> Result<(), TransportError> {
-        let mut guard = self.streams.lock().await;
-        if guard.is_some() {
-            return Ok(());
-        }
-        let (send, recv) = match self.side {
-            Side::Dialer => self
-                .inner
-                .open_bi()
-                .await
-                .map_err(TransportError::from_quinn_connection_error)?,
-            Side::Accepter => self
-                .inner
-                .accept_bi()
-                .await
-                .map_err(TransportError::from_quinn_connection_error)?,
-        };
-        *guard = Some(StreamPair { send, recv });
+        self.init
+            .get_or_try_init(|| async {
+                let (send, recv) = match self.side {
+                    Side::Dialer => self
+                        .inner
+                        .open_bi()
+                        .await
+                        .map_err(TransportError::from_quinn_connection_error)?,
+                    Side::Accepter => self
+                        .inner
+                        .accept_bi()
+                        .await
+                        .map_err(TransportError::from_quinn_connection_error)?,
+                };
+                *self.send_stream.lock().await = Some(send);
+                self.recv_state.lock().await.stream = Some(recv);
+                Ok::<(), TransportError>(())
+            })
+            .await?;
         Ok(())
     }
 
@@ -195,15 +219,15 @@ impl Connection {
             msg.sig_field().to_bytes() != [0u8; 64],
             "Connection::send received an unsigned message — caller must call .sign(&identity) first"
         );
-        let mut payload = Vec::with_capacity(512);
+        let mut payload = Vec::with_capacity(INITIAL_SEND_CAPACITY);
         ciborium::ser::into_writer(msg, &mut payload)?;
         let framed = encode_frame(&payload)?;
         self.ensure_streams().await?;
-        let mut guard = self.streams.lock().await;
-        let pair = guard.as_mut().ok_or_else(|| {
-            TransportError::Protocol("streams not initialized after ensure".into())
+        let mut guard = self.send_stream.lock().await;
+        let send = guard.as_mut().ok_or_else(|| {
+            TransportError::Protocol("send stream not initialized after ensure".into())
         })?;
-        pair.send.write_all(&framed).await?;
+        send.write_all(&framed).await?;
         Ok(())
     }
 
@@ -246,49 +270,64 @@ impl Connection {
     }
 
     /// Drive the framer until a complete frame is assembled. Cancel-safe:
-    /// the framer + the partially-consumed [`Bytes`] chunk live on `self`
-    /// (under `framer: Mutex<RecvFramer>`). If a `read_chunk` returns more
-    /// bytes than the current frame needs, the excess is fed back to the
-    /// framer on the same call.
+    /// the framer + any partially-consumed `Bytes` chunk live on `self`
+    /// (under `recv_state: Mutex<RecvState>`). If a `read_chunk` returns
+    /// more bytes than the current frame needs, the residue is stashed on
+    /// the framer's `leftover` slot and consumed on the next call.
     async fn recv_one_frame(&self) -> Result<Vec<u8>, TransportError> {
         self.ensure_streams().await?;
-        // Hold the framer lock for the entire frame assembly. This means
-        // two concurrent recv() calls on the same Connection will queue,
+        // Hold the recv-state lock for the entire frame assembly. Two
+        // concurrent recv() calls on the same Connection will queue,
         // which is correct — frames are ordered.
-        let mut framer = self.framer.lock().await;
-        let mut streams = self.streams.lock().await;
-        let pair = streams.as_mut().ok_or_else(|| {
-            TransportError::Protocol("streams not initialized after ensure".into())
+        let mut state = self.recv_state.lock().await;
+        let RecvState { framer, stream } = &mut *state;
+        let stream = stream.as_mut().ok_or_else(|| {
+            TransportError::Protocol("recv stream not initialized after ensure".into())
         })?;
 
-        // Try to extract a frame from any leftover bytes (none on first
-        // call; future calls may have residue if we ever pipeline).
-        let mut residue = Bytes::new();
-        if let Some(frame) = framer.try_decode(&mut residue)? {
-            return Ok(frame);
+        // Drain any bytes left over from a previous chunk that straddled
+        // a frame boundary. If they assemble a full frame on their own,
+        // return it without ever blocking on `read_chunk`.
+        let mut residue = framer.take_leftover();
+        if !residue.is_empty() {
+            if let Some(frame) = framer.try_decode(&mut residue)? {
+                if !residue.is_empty() {
+                    framer.put_leftover(residue);
+                }
+                return Ok(frame);
+            }
+            // Leftover wasn't enough — fall through to read more, but
+            // remember to feed it before the next chunk.
         }
 
         loop {
             // 64 KiB max chunk — arbitrary; quinn will return whatever's
             // available up to this size.
-            let chunk = pair
-                .recv
+            let chunk = stream
                 .read_chunk(64 * 1024, true)
                 .await?
                 .ok_or(TransportError::FrameTruncated)?;
             let mut bytes = chunk.bytes;
+            // Prepend any residue from a partial earlier frame.
+            if !residue.is_empty() {
+                let mut combined = bytes::BytesMut::with_capacity(residue.len() + bytes.len());
+                combined.extend_from_slice(&residue);
+                combined.extend_from_slice(&bytes);
+                bytes = combined.freeze();
+                residue = Bytes::new();
+            }
             // Consume into the framer; it returns Some(frame) when complete.
             if let Some(frame) = framer.try_decode(&mut bytes)? {
-                // If quinn handed us more bytes than this frame needed,
-                // we'd lose them here — but our protocol doesn't pipeline
-                // frames over a single stream concurrently in 1.4. Phase 4's
-                // multi-stream work revisits this. Asserting:
-                debug_assert!(
-                    bytes.is_empty(),
-                    "extra bytes after a frame on a single-frame stream"
-                );
+                // Stash any tail (start of frame N+1) so the next call
+                // sees it before doing another read_chunk.
+                if !bytes.is_empty() {
+                    framer.put_leftover(bytes);
+                }
                 return Ok(frame);
             }
+            // Frame still incomplete; loop and read more.
         }
     }
 }
+
+const INITIAL_SEND_CAPACITY: usize = 512;

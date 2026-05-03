@@ -87,10 +87,15 @@ impl Sequenced for Heartbeat {
 
 /// Per-stream byte-state machine. Cancel-safe by construction: all state
 /// lives on the framer, none in the futures that drive it.
+///
+/// `leftover` holds residual bytes from the previous `read_chunk` when the
+/// chunk straddled a frame boundary. Without it, two back-to-back frames
+/// coalesced into one quinn STREAM frame would silently lose the second.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct RecvFramer {
     state: FramerState,
+    leftover: Bytes,
 }
 
 #[derive(Debug)]
@@ -114,7 +119,22 @@ impl RecvFramer {
                 buf: [0u8; 4],
                 filled: 0,
             },
+            leftover: Bytes::new(),
         }
+    }
+
+    /// Drain any bytes that were consumed by a prior chunk but not yet
+    /// fed into the framer (e.g., the tail of a chunk that contained
+    /// frame N's last byte plus the start of frame N+1).
+    pub(crate) fn take_leftover(&mut self) -> Bytes {
+        std::mem::take(&mut self.leftover)
+    }
+
+    /// Stash residual bytes for the next call. Caller is the I/O loop in
+    /// `Connection::recv_one_frame`.
+    pub(crate) fn put_leftover(&mut self, b: Bytes) {
+        debug_assert!(self.leftover.is_empty(), "double put_leftover");
+        self.leftover = b;
     }
 
     /// Pure byte-pump. Feed `input` (possibly a partial chunk from
@@ -223,10 +243,16 @@ pub(crate) fn encode_frame(payload: &[u8]) -> Result<Vec<u8>, WireError> {
 // -----------------------------------------------------------------------------
 
 /// Per-channel last-seen-seq tracker. Used by `Connection::recv_sequenced`.
+///
+/// Storage is `Option<u64>` (not bare `u64` with sentinel) so the very
+/// first `seq=0` is correctly accepted exactly once and a second
+/// `seq=0` is rejected. A naive `last == 0` sentinel would let `seq=0`
+/// replay indefinitely on a freshly-opened channel — a real protocol
+/// hole even if today's `Heartbeat` happens to start its counter at 1.
 #[derive(Debug, Default)]
 #[allow(dead_code)]
 pub(crate) struct ReplayTable {
-    last_seen: DashMap<&'static str, u64>,
+    last_seen: DashMap<&'static str, Option<u64>>,
 }
 
 #[allow(dead_code)]
@@ -236,25 +262,26 @@ impl ReplayTable {
     }
 
     /// Strict `<=` rejection: re-receiving the same seq is a replay. On
-    /// success, updates the table to `seq` and returns Ok.
+    /// success, updates the table to `Some(seq)` and returns Ok.
     pub(crate) fn check(&self, channel: &'static str, seq: u64) -> Result<(), WireError> {
         // DashMap's entry API serializes the read-modify-write, no race.
-        let mut entry = self.last_seen.entry(channel).or_insert(0);
-        let last = *entry;
-        if last > 0 && seq <= last {
-            return Err(WireError::Replay {
-                channel,
-                got: seq,
-                last_seen: last,
-            });
+        let mut entry = self.last_seen.entry(channel).or_insert(None);
+        if let Some(last) = *entry {
+            if seq <= last {
+                return Err(WireError::Replay {
+                    channel,
+                    got: seq,
+                    last_seen: last,
+                });
+            }
         }
-        *entry = seq;
+        *entry = Some(seq);
         Ok(())
     }
 
     /// Peek without mutating. Diagnostics only.
     pub(crate) fn last_seen(&self, channel: &'static str) -> Option<u64> {
-        self.last_seen.get(channel).map(|r| *r)
+        self.last_seen.get(channel).and_then(|r| *r)
     }
 }
 
@@ -378,6 +405,44 @@ mod tests {
         assert!(input.is_empty());
     }
 
+    /// Regression test for the `read_chunk`-boundary residue bug.
+    /// Earlier `recv_one_frame` only `debug_assert!`-ed that `bytes` was
+    /// empty after extracting one frame; in release the residue was
+    /// silently dropped, losing the head of the next frame. Now the
+    /// framer stashes leftover via `put_leftover` / `take_leftover`,
+    /// which the I/O loop in `connection.rs` honors.
+    #[test]
+    fn framer_leftover_round_trips_two_concatenated_frames() {
+        let p1 = b"frame1".to_vec();
+        let p2 = b"frame2-bigger".to_vec();
+        let mut concat = encode_frame(&p1).expect("encode 1");
+        concat.extend_from_slice(&encode_frame(&p2).expect("encode 2"));
+        let combined = Bytes::from(concat);
+
+        // Simulate the connection.rs loop: feed all bytes once, get
+        // frame 1, observe leftover; feed nothing the second time but
+        // drain leftover, get frame 2.
+        let mut f = RecvFramer::new();
+        let mut input = combined;
+        let frame_a = f
+            .try_decode(&mut input)
+            .expect("decode 1")
+            .expect("frame 1");
+        assert_eq!(frame_a, p1);
+        // What recv_one_frame would do: stash residue.
+        if !input.is_empty() {
+            f.put_leftover(input);
+        }
+        // Next frame: take leftover, decode, no read_chunk needed.
+        let mut leftover = f.take_leftover();
+        assert!(!leftover.is_empty(), "leftover must carry frame 2's bytes");
+        let frame_b = f
+            .try_decode(&mut leftover)
+            .expect("decode 2")
+            .expect("frame 2");
+        assert_eq!(frame_b, p2);
+    }
+
     #[test]
     fn frame_partial_is_observable() {
         let payload = b"partial".to_vec();
@@ -408,6 +473,28 @@ mod tests {
             .check(channels::HEARTBEAT, 1)
             .expect_err("same seq must replay");
         assert!(matches!(err, WireError::Replay { got: 1, .. }));
+    }
+
+    /// Regression test for the `seq=0` bypass — earlier code used a
+    /// `last == 0` sentinel, so the first `seq=0` was accepted but the
+    /// table stayed at `0`, letting subsequent `seq=0` slip through
+    /// unboundedly. `Option<u64>` storage fixes this.
+    #[test]
+    fn replay_zero_seq_first_accepted_then_rejected() {
+        let t = ReplayTable::new();
+        t.check(channels::HEARTBEAT, 0)
+            .expect("first 0 must accept");
+        let err = t
+            .check(channels::HEARTBEAT, 0)
+            .expect_err("second 0 must replay");
+        assert!(matches!(
+            err,
+            WireError::Replay {
+                got: 0,
+                last_seen: 0,
+                ..
+            }
+        ));
     }
 
     #[test]
