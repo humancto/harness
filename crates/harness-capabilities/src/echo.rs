@@ -95,7 +95,9 @@ mod tests {
     fn ctx() -> ExecutionContext {
         ExecutionContext {
             local_node: NodeId::from_bytes([1; 16]),
+            local_node_name: std::sync::Arc::from("self"),
             issued_by: NodeId::from_bytes([2; 16]),
+            issued_by_name: std::sync::Arc::from("issuer"),
             task_id: TaskId::new_v7(),
         }
     }

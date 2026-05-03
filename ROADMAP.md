@@ -50,6 +50,8 @@ When an item lands, flip its checkbox **in the same PR** as `STATE.md` is update
 
 - [x] **3.1** Policy engine: parse `~/.harness/policy.toml`, allow/deny matching, evaluated **on the executing node** (PRD §10.4).
 - [ ] **3.2** `shell.exec` capability with streaming output (line-frames over QUIC) + policy check.
+  - [x] **3.2a** synchronous form (PR #24) — capability + policy gate + bounded buffers + timeout. ADR-0008.
+  - [ ] **3.2-stream** line-frame streaming output over QUIC (`harness.task.partial.<task_id>`).
 - [ ] **3.3** CLI: `harness run --all|--on <node>|--where <expr>`. UI Remote Shell mode with `[node-name]` interleaving.
 - [ ] **3.4** `llm.local.<model>` auto-registration from `ollama list`.
 - [ ] **3.5** Local-LLM micro-batcher (configurable `batch_window_ms`, default 50).

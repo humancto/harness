@@ -17,23 +17,36 @@ pub mod traits;
 #[cfg(feature = "echo")]
 pub mod echo;
 
+#[cfg(all(feature = "shell", unix))]
+pub mod shell;
+
 pub use registry::{CapabilityRegistry, RegistryError};
 pub use traits::{Capability, CapabilityError, ExecutionContext};
 
 #[cfg(feature = "echo")]
 pub use echo::EchoCapability;
 
+#[cfg(all(feature = "shell", unix))]
+pub use shell::ShellExecCapability;
+
 /// Build a registry preloaded with every built-in capability gated by
 /// the active feature set. Phase 3 expands this to include `shell.exec`
-/// and friends as their feature flags activate.
+/// (Unix-only — see ADR-0008) and `llm.local.*`, `llm.cloud.*`,
+/// `mcp.proxy`, `fs.*`, `mesh.*` as their feature flags activate.
 #[must_use]
-pub fn default_registry() -> CapabilityRegistry {
+pub fn default_registry(
+    #[cfg_attr(not(all(feature = "shell", unix)), allow(unused_variables))] policy: std::sync::Arc<
+        harness_policy::PolicyEngine,
+    >,
+) -> CapabilityRegistry {
     let registry = CapabilityRegistry::new();
     #[cfg(feature = "echo")]
     {
-        // Registration is infallible here — we just constructed the
-        // registry, so there's no prior `echo` entry to collide with.
         let _ = registry.register(std::sync::Arc::new(EchoCapability::new()));
+    }
+    #[cfg(all(feature = "shell", unix))]
+    {
+        let _ = registry.register(std::sync::Arc::new(ShellExecCapability::new(policy)));
     }
     registry
 }

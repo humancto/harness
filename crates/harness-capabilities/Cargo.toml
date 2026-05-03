@@ -11,16 +11,21 @@ description  = "Built-in capability implementations."
 workspace = true
 
 [features]
-default = ["echo"]
+default = ["echo", "shell"]
 echo = []
+shell = []
 
 [dependencies]
-harness-core = { workspace = true }
-async-trait  = "0.1"
-serde        = { workspace = true }
-serde_json   = { workspace = true }
-thiserror    = { workspace = true }
-tokio        = { workspace = true }
-tracing      = { workspace = true }
-blake3       = { workspace = true }
-parking_lot  = { workspace = true }
+harness-core   = { workspace = true }
+harness-policy = { workspace = true }
+async-trait    = "0.1"
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+thiserror      = { workspace = true }
+tokio          = { workspace = true }
+tracing        = { workspace = true }
+blake3         = { workspace = true }
+parking_lot    = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.29", default-features = false, features = ["signal"] }

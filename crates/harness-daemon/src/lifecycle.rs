@@ -172,7 +172,7 @@ impl DaemonOrchestrator {
         // Build the capability registry (echo + future Phase 3
         // additions feature-gated). The daemon advertises every
         // registered capability via NodeManifest.
-        let capabilities = harness_capabilities::default_registry();
+        let capabilities = harness_capabilities::default_registry(policy_engine.clone());
         let cap_ids = capabilities.ids();
 
         let api_state =
