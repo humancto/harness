@@ -28,7 +28,7 @@ When an item lands, flip its checkbox **in the same PR** as `STATE.md` is update
 - [x] **1.8** Trust file `~/.harness/peers.toml` (read/write/gossip on join) — shipped in #4 (`6bb2474`).
 - [x] **1.9** CLI: `harness peers`, `harness status` — and `init` / `join` / `leave` — shipped in #10 (`305c00b`).
 - [x] **1.10** Web UI Mesh page (read-only, card grid + brain badge + heartbeat pulse over WebSocket) — shipped in #11 (`db04cb7`).
-- [ ] **1.11** Daemon lifecycle integration — wire Discovery + Transport + HeartbeatService + Pairing + Election into `harness daemon` so two laptops actually discover each other and elect a brain end-to-end. (Carried over from 1.10; required before Phase 2 demo.)
+- [x] **1.11** Daemon lifecycle integration — wire Discovery + Transport + HeartbeatService + Pairing + Election into `harness daemon` so two laptops actually discover each other and elect a brain end-to-end. (Carried over from 1.10; required before Phase 2 demo.)
 
 ## Phase 2 — Tasks flow
 
