@@ -793,6 +793,7 @@ dependencies = [
  "tokio-stream",
  "toml",
  "tracing",
+ "uuid",
  "x509-parser",
 ]
 

@@ -12,4 +12,7 @@
 //! See `phase-1.4-quic.plan.md` for the full design.
 
 mod cert;
+mod envelope;
 mod verifier;
+
+pub use envelope::{channels, Sequenced, MAX_FRAME_BYTES};
