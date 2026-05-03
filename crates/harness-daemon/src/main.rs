@@ -23,7 +23,25 @@ fn main() -> Result<()> {
             Ok(())
         }
         SyncOutcome::DaemonRequested(args) => run_daemon(args),
+        SyncOutcome::SubmitRequested(args) => run_async_cli(harness_cli::run_submit(args)),
+        SyncOutcome::TasksRequested(args) => run_async_cli(harness_cli::run_tasks(args)),
     }
+}
+
+fn run_async_cli<F>(fut: F) -> Result<()>
+where
+    F: std::future::Future<Output = Result<String>>,
+{
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
+    let out = runtime.block_on(fut)?;
+    #[allow(clippy::print_stdout)]
+    {
+        println!("{out}");
+    }
+    Ok(())
 }
 
 fn run_daemon(args: DaemonArgs) -> Result<()> {
