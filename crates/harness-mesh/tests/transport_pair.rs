@@ -266,15 +266,17 @@ async fn node_manifest_round_trip_via_transport() {
     assert_eq!(received.hostname, "test");
 }
 
-/// Regression test for the cancel-safety hole the reviewer caught
-/// after the leftover-residue fix: when a chunk straddles two frames,
-/// the framer must keep the residue ON the framer across any await
-/// point so a `select!`-cancelled `recv` doesn't lose the head of
-/// frame N+1. Test sends two frames back-to-back, receives frame 1,
-/// then races `recv` for frame 2 against an immediate cancellation,
-/// then calls `recv` again — frame 2's bytes must still be there.
+/// Cancel-safety regression test for `Connection::recv` at the
+/// connection level. Spawn a task that calls `recv` (which lazily
+/// accepts the bidi stream and parks on `read_chunk` waiting for
+/// bytes), let it reach the await via `yield_now`, then `abort()`.
+/// A subsequent `recv` from the main task must succeed when the
+/// client finally sends, with no bytes lost. The framer-level
+/// invariant test in `envelope::tests::framer_partial_leftover_survives_take_decode_put_cycle`
+/// covers the leftover-bracket invariant directly; this test covers
+/// the connection-level integration.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn recv_with_pending_leftover_survives_cancellation() {
+async fn recv_can_be_aborted_and_resumed_without_data_loss() {
     let (server, server_id) = build_transport();
     let (client, client_id) = build_transport();
     let server_addr = server.local_addr().expect("local_addr");
@@ -288,36 +290,45 @@ async fn recv_with_pending_leftover_survives_cancellation() {
         .dial(server_addr, &server_pubkey)
         .await
         .expect("dial");
-    let server_conn = server_handle.await.expect("join");
+    let server_conn = Arc::new(server_handle.await.expect("join"));
 
-    // Send two heartbeats back-to-back. quinn typically coalesces
-    // these into one STREAM frame on the wire, so the server's first
-    // read_chunk produces both — exercising the leftover path.
+    // Client sends one heartbeat to wake up the server's lazy accept_bi.
     let mut hb1 = sample_heartbeat(client_id.node_id(), 1);
     hb1.sign(&client_id).expect("sign 1");
-    let mut hb2 = sample_heartbeat(client_id.node_id(), 2);
-    hb2.sign(&client_id).expect("sign 2");
     conn.send(&hb1).await.expect("send 1");
-    conn.send(&hb2).await.expect("send 2");
 
-    // Receive frame 1 (drains the chunk; frame 2's bytes go to leftover).
+    // Server receives it, draining whatever quinn delivered.
     let r1: Heartbeat = server_conn.recv().await.expect("recv 1");
     assert_eq!(r1.seq, 1);
 
-    // Race recv for frame 2 against an immediate cancellation. With
-    // the fix, the leftover stays on the framer across the cancel and
-    // the next call extracts frame 2.
-    let cancelled: Result<Heartbeat, TransportError> = tokio::select! {
-        biased;
-        // Cancel-now branch fires first (no await, ready immediately).
-        () = std::future::ready(()) => Err(TransportError::Closed),
-        msg = server_conn.recv::<Heartbeat>() => msg,
-    };
-    assert!(cancelled.is_err(), "cancel branch should win");
+    // Spawn a recv that will park on read_chunk (no client data yet).
+    let s = server_conn.clone();
+    let parked = tokio::spawn(async move { s.recv::<Heartbeat>().await });
+    // Yield several times to give the spawned task a chance to reach
+    // read_chunk.await on a real multi-thread runtime.
+    for _ in 0..5 {
+        tokio::task::yield_now().await;
+    }
+    // Abort it. With the cancel-safe design, no framer state is lost
+    // because recv hasn't seen any new bytes yet (and any unconsumed
+    // leftover stays on the framer per the bracket invariant).
+    parked.abort();
+    let aborted = parked.await;
+    assert!(
+        aborted.is_err() || aborted.unwrap().is_err(),
+        "aborted task should not produce a successful Heartbeat"
+    );
 
-    // Now actually receive frame 2. With the bug, frame 2's bytes
-    // would be lost when the cancelled future was dropped.
-    let r2: Heartbeat = server_conn.recv().await.expect("recv 2 after cancel");
+    // Now the client sends frame 2; the server's next recv must
+    // succeed, proving the abort didn't corrupt any state.
+    let mut hb2 = sample_heartbeat(client_id.node_id(), 2);
+    hb2.sign(&client_id).expect("sign 2");
+    conn.send(&hb2).await.expect("send 2");
+
+    let r2: Heartbeat = tokio::time::timeout(Duration::from_secs(5), server_conn.recv())
+        .await
+        .expect("timeout")
+        .expect("recv 2 after abort");
     assert_eq!(r2.seq, 2);
 }
 

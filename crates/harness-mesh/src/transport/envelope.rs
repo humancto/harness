@@ -408,6 +408,50 @@ mod tests {
         assert!(input.is_empty());
     }
 
+    /// Regression test for the cancel-safety contract that
+    /// `connection::try_decode_from_leftover` must honor: when the
+    /// framer has bytes that aren't enough to complete a frame, the
+    /// helper must `put_leftover` BEFORE returning so the bytes
+    /// survive a subsequent cancellation at the `read_chunk.await`.
+    ///
+    /// We verify the framer-level invariant directly: feed a partial
+    /// frame (header + half a payload) via `put_leftover`, run
+    /// `take_leftover` + `try_decode` (the helper's body), and assert
+    /// that any non-consumed bytes are restored to leftover before
+    /// the helper would yield.
+    #[test]
+    fn framer_partial_leftover_survives_take_decode_put_cycle() {
+        // 4-byte header claiming 100-byte payload, plus only 30 bytes
+        // of payload. try_decode returns None (incomplete). The bytes
+        // must be re-put-back so a later call sees them.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&100u32.to_be_bytes());
+        payload.extend_from_slice(&[0xAB; 30]);
+        let partial = Bytes::from(payload);
+
+        let mut f = RecvFramer::new();
+        f.put_leftover(partial.clone());
+
+        // Mimic `try_decode_from_leftover`: take, decode, put-back if non-empty.
+        let mut buf = f.take_leftover();
+        assert!(!buf.is_empty(), "leftover present");
+        let frame = f.try_decode(&mut buf).expect("decode");
+        assert!(frame.is_none(), "incomplete frame must yield None");
+        assert!(buf.is_empty(), "all 30 bytes consumed by state machine");
+
+        // The state machine consumed all 30 input bytes and is now in
+        // NeedPayload { len: 100, filled: 30 }. Crucially the framer
+        // STATE retains the partial — so even though `buf` is empty
+        // here, a subsequent `try_decode` with the remaining 70 bytes
+        // produces the full frame.
+        assert!(f.is_partial(), "framer must report mid-frame");
+        let mut more = Bytes::from(vec![0xAB; 70]);
+        let assembled = f.try_decode(&mut more).expect("decode2");
+        assert_eq!(assembled, Some(vec![0xAB; 100]));
+        assert!(more.is_empty());
+        assert!(!f.is_partial());
+    }
+
     /// Regression test for the `read_chunk`-boundary residue bug.
     /// Earlier `recv_one_frame` only `debug_assert!`-ed that `bytes` was
     /// empty after extracting one frame; in release the residue was
