@@ -11,3 +11,12 @@ description  = "DAG executor, scheduler, fanout controller."
 workspace = true
 
 [dependencies]
+harness-core = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+parking_lot  = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
