@@ -977,6 +977,7 @@ dependencies = [
  "harness-mesh",
  "parking_lot",
  "predicates",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

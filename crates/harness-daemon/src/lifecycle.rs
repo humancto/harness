@@ -28,8 +28,7 @@ use harness_core::Identity;
 use harness_mesh::discovery::{Discovery, DiscoveryConfig, DiscoveryError, DiscoveryEvent};
 use harness_mesh::election::{Election, ElectionConfig};
 use harness_mesh::heartbeat::{
-    BroadcasterHandle, HeartbeatPublisherConfig, HeartbeatService, ListenerHandle,
-    HEARTBEAT_INTERVAL, PEER_TIMEOUT,
+    BroadcasterHandle, HeartbeatPublisherConfig, HeartbeatService, ListenerHandle, PEER_TIMEOUT,
 };
 use harness_mesh::transport::{self as transport, Connection, Transport, TransportError};
 use harness_mesh::{TrustEvent, TrustStore};
@@ -43,7 +42,7 @@ pub(crate) struct DaemonOrchestrator {
     api_state: ApiState,
     api_handle: harness_api::ServerHandle,
     transport: Transport,
-    discovery: Discovery,
+    discovery: Arc<Discovery>,
     heartbeat: Arc<HeartbeatService>,
     election: Arc<Election>,
     persistent_trust: TrustStore,
@@ -121,7 +120,7 @@ impl DaemonOrchestrator {
         .map_err(|e| map_discovery(&e))?
         .with_static_peers(config.static_peers.clone())
         .with_mdns_enabled(config.mdns_enabled);
-        let discovery = Discovery::start(discovery_cfg).map_err(|e| map_discovery(&e))?;
+        let discovery = Arc::new(Discovery::start(discovery_cfg).map_err(|e| map_discovery(&e))?);
 
         let heartbeat = Arc::new(HeartbeatService::new(identity.clone()));
         let election = Arc::new(Election::new(ElectionConfig::new(identity.node_id())));
@@ -181,16 +180,23 @@ impl DaemonOrchestrator {
         // Connections to broadcast to — read from a shared registry.
         let conns: Arc<ParkingMutex<Vec<Arc<Connection>>>> =
             Arc::new(ParkingMutex::new(Vec::new()));
+        // Each entry is held by both the conns Vec and its listener task.
+        // When the listener exits (peer dropped), only conns retains the Arc;
+        // the broadcaster's targets_fn sweeps these dead entries every tick.
+        // Without this sweep the Vec grows monotonically and the broadcaster
+        // wastes time + log spam re-trying dead peers indefinitely.
         let conns_for_broadcaster = conns.clone();
         let targets_fn: Arc<dyn Fn() -> Vec<Arc<Connection>> + Send + Sync + 'static> =
-            Arc::new(move || conns_for_broadcaster.lock().clone());
+            Arc::new(move || {
+                let mut g = conns_for_broadcaster.lock();
+                g.retain(|c| Arc::strong_count(c) > 1);
+                g.clone()
+            });
 
         let broadcaster = self.heartbeat.spawn_broadcaster(snapshot_fn, targets_fn);
         *self.broadcaster.lock() = Some(broadcaster);
 
-        let evictor = self
-            .heartbeat
-            .spawn_evictor(PEER_TIMEOUT.checked_div(2).unwrap_or(HEARTBEAT_INTERVAL));
+        let evictor = self.heartbeat.spawn_evictor(PEER_TIMEOUT / 2);
         *self.evictor.lock() = Some(evictor);
 
         // Election pump.
@@ -217,9 +223,7 @@ impl DaemonOrchestrator {
             self.transport.clone(),
             self.heartbeat.clone(),
             self.persistent_trust.clone(),
-            self.discovery.subscribe(),
-            self.discovery.static_hints(),
-            self.discovery.peers(),
+            self.discovery.clone(),
             self.listeners.clone(),
             conns,
         );
@@ -273,9 +277,15 @@ fn spawn_election_pump(
             // resource sampling lands (Phase 6 hardening).
             let local_score = 100;
             let result = election.tick(&peers, local_score);
+            // IMPORTANT: only the leader_belief is updated from the
+            // election result. brain_score must always be the LOCAL
+            // node's score — `result.winning_score` is the leader's
+            // score, and writing it here would cause the heartbeat
+            // broadcaster to re-emit the leader's score as our own,
+            // poisoning every peer's PeerTable.
             api.set_local_status(|s| {
                 s.leader_belief = Some(result.leader);
-                s.brain_score = result.winning_score;
+                s.brain_score = local_score;
             });
         }
     })
@@ -313,24 +323,22 @@ fn spawn_accept_loop(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn spawn_dial_loop(
     transport: Transport,
     heartbeat: Arc<HeartbeatService>,
     trust: TrustStore,
-    mut discovery_events: broadcast::Receiver<DiscoveryEvent>,
-    static_hints: Vec<SocketAddr>,
-    initial_peers: Vec<harness_mesh::discovery::DiscoveredPeer>,
+    discovery: Arc<Discovery>,
     listeners: Arc<ParkingMutex<Vec<ListenerHandle>>>,
     conns: Arc<ParkingMutex<Vec<Arc<Connection>>>>,
 ) -> JoinHandle<()> {
+    let mut discovery_events = discovery.subscribe();
     let mut trust_events = trust.subscribe();
     tokio::spawn(async move {
         // Track who we've dialed so we don't redial on every event.
         let mut dialed: HashSet<harness_core::NodeId> = HashSet::new();
 
         // Initial sweep: try every static peer + currently-known mDNS peer.
-        for peer in initial_peers {
+        for peer in discovery.peers() {
             try_dial_known(
                 &transport,
                 &heartbeat,
@@ -344,7 +352,7 @@ fn spawn_dial_loop(
             )
             .await;
         }
-        for addr in static_hints {
+        for addr in discovery.static_hints() {
             // For static peers we don't know which node_id is at the
             // address — try every trusted pubkey. The transport's cert
             // pinning rejects all but the right one.
@@ -393,11 +401,40 @@ fn spawn_dial_loop(
                 }
                 t = trust_events.recv() => {
                     if let Ok(TrustEvent::Added(peer)) = t {
-                        // Re-scan — peer just got trusted; if we'd seen
-                        // them in mDNS earlier we'd have rejected; now we
-                        // can dial. This best-effort retry kicks once;
-                        // mDNS re-announcement covers any later miss.
+                        // Peer just got trusted (typical: pairing
+                        // completed). Proactively re-scan known mDNS
+                        // peers + static hints so we don't wait for
+                        // an mDNS re-announce (up to mdns_ttl=30s).
                         dialed.remove(&peer.node_id);
+                        let pubkey_fp = peer.pubkey.fingerprint_hex();
+                        for known in discovery.peers() {
+                            if known.pubkey_fp == pubkey_fp {
+                                try_dial_known(
+                                    &transport,
+                                    &heartbeat,
+                                    &trust,
+                                    &known.addrs,
+                                    Some(known.node_id),
+                                    &known.pubkey_fp,
+                                    &listeners,
+                                    &conns,
+                                    &mut dialed,
+                                )
+                                .await;
+                            }
+                        }
+                        for addr in discovery.static_hints() {
+                            try_dial_static(
+                                &transport,
+                                &heartbeat,
+                                &trust,
+                                addr,
+                                &listeners,
+                                &conns,
+                                &mut dialed,
+                            )
+                            .await;
+                        }
                     }
                 }
             }
@@ -486,5 +523,40 @@ async fn try_dial_static(
             dialed.insert(peer.node_id);
             return;
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// Boot an orchestrator against a tempdir + ephemeral ports +
+    /// mDNS-disabled. Confirms the full subsystem wiring compiles
+    /// and binds end-to-end. The test does NOT exercise the run
+    /// loop — that would require ctrl-c — but `build()` exercises
+    /// every API mismatch a future `harness-mesh` change would
+    /// introduce.
+    #[tokio::test]
+    async fn orchestrator_builds_against_tempdir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let id = harness_mesh::identity::init_or_load(tmp.path()).expect("identity");
+        let node_id = id.node_id();
+        let identity = Arc::new(id);
+        let trust = TrustStore::open(tmp.path(), node_id).expect("trust open");
+
+        let cfg = DaemonRuntimeConfig {
+            mesh_name: "test-mesh".into(),
+            api_bind: SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 0),
+            mesh_bind: SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 0),
+            mdns_enabled: false,
+            static_peers: vec![],
+        };
+
+        let orch = DaemonOrchestrator::build(identity, trust, cfg)
+            .await
+            .expect("build orchestrator");
+        let api_addr = orch.api_addr();
+        assert!(api_addr.port() != 0, "api should bind to a real port");
     }
 }

@@ -59,18 +59,30 @@ async fn daemon_main(args: DaemonArgs) -> Result<()> {
         ..DaemonRuntimeConfig::default()
     };
     if let Ok(peers) = std::env::var("HARNESS_STATIC_PEERS") {
+        // Strict parsing — a typo in operator config means the node
+        // boots in degraded mode. Refuse to start.
         config.static_peers = peers
             .split(',')
-            .filter_map(|s| s.trim().parse().ok())
-            .collect();
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.parse::<std::net::SocketAddr>().with_context(|| {
+                    format!("HARNESS_STATIC_PEERS entry {s:?} is not a valid SocketAddr")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
     }
-    if std::env::var("HARNESS_MDNS_DISABLED").is_ok() {
-        config.mdns_enabled = false;
+    if let Ok(v) = std::env::var("HARNESS_MDNS_DISABLED") {
+        // Treat empty / "0" / "false" as not-disabled.
+        let on = !matches!(v.as_str(), "" | "0" | "false");
+        if on {
+            config.mdns_enabled = false;
+        }
     }
     if let Ok(bind) = std::env::var("HARNESS_MESH_BIND") {
-        if let Ok(addr) = bind.parse() {
-            config.mesh_bind = addr;
-        }
+        config.mesh_bind = bind
+            .parse()
+            .with_context(|| format!("HARNESS_MESH_BIND={bind:?} is not a valid SocketAddr"))?;
     }
 
     let orchestrator = DaemonOrchestrator::build(identity.clone(), trust, config)
