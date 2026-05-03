@@ -11,9 +11,10 @@ description  = "Built-in capability implementations."
 workspace = true
 
 [features]
-default = ["echo", "shell"]
+default = ["echo", "shell", "llm"]
 echo = []
 shell = []
+llm = ["dep:reqwest", "dep:url"]
 
 [dependencies]
 harness-core   = { workspace = true }
@@ -26,6 +27,11 @@ tokio          = { workspace = true }
 tracing        = { workspace = true }
 blake3         = { workspace = true }
 parking_lot    = { workspace = true }
+reqwest        = { workspace = true, optional = true }
+url            = { workspace = true, optional = true }
+
+[dev-dependencies]
+wiremock       = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 nix = { version = "0.29", default-features = false, features = ["signal"] }
