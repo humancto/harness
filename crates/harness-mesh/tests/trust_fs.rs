@@ -278,6 +278,49 @@ async fn events_stream_delivers_removed() {
     }
 }
 
+/// Regression test for the persist-then-commit invariant.
+///
+/// If `write_atomic` fails (here we force it by precreating a stale tmp
+/// file with `create_new(true)` semantics), the in-memory cache must be
+/// unchanged — otherwise a remove that failed to hit disk would silently
+/// downgrade a previously-trusted peer until daemon restart.
+#[cfg(unix)]
+#[test]
+fn persist_failure_does_not_mutate_cache() {
+    let tmp = TempDir::new().expect("tempdir");
+    let root = tmp.path();
+    let store = TrustStore::open(root, random_self_id()).expect("open");
+    let alice = sample_peer(0xA1, TrustTier::Trusted);
+    store.add(alice.clone()).expect("add alice");
+    assert_eq!(store.tier(&alice.node_id), TrustTier::Trusted);
+
+    // Block the next persist by precreating the exact tmp filename
+    // `write_atomic` uses (`<root>/peers.toml.tmp.<pid>`). `create_new(true)`
+    // will fail with `AlreadyExists` and the persist-then-commit guard must
+    // leave the cache unchanged.
+    let tmp_path = root.join(format!("peers.toml.tmp.{}", std::process::id()));
+    fs::write(&tmp_path, b"sentinel").expect("seed stale tmp");
+
+    let err = store
+        .remove(&alice.node_id)
+        .expect_err("remove must fail when tmp exists");
+    assert!(matches!(err, TrustError::Io { .. }), "got {err:?}");
+
+    // Cache must reflect the pre-failure state — alice still Trusted, not
+    // silently downgraded to Default.
+    assert_eq!(
+        store.tier(&alice.node_id),
+        TrustTier::Trusted,
+        "persist failure must not mutate the cache"
+    );
+    assert!(store.contains(&alice.node_id));
+
+    // Clean up the sentinel; subsequent calls work again.
+    fs::remove_file(&tmp_path).expect("cleanup");
+    assert!(store.remove(&alice.node_id).expect("remove after cleanup"));
+    assert!(!store.contains(&alice.node_id));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_adds_4_distinct_peers_all_persist() {
     let tmp = TempDir::new().expect("tempdir");

@@ -128,6 +128,10 @@ impl TrustStore {
     /// `TierChanged` if only the tier changed; otherwise `Added`. Refuses to
     /// add a peer whose `node_id` matches the local node's
     /// (`TrustError::SelfPeer`). Atomically rewrites the file.
+    ///
+    /// Persist-then-commit semantics: if the file rewrite fails (EROFS, disk
+    /// full, fsync error), the in-memory cache is **not** mutated. Either
+    /// both succeed or both stay at the old state.
     pub fn add(&self, peer: Peer) -> Result<(), TrustError> {
         let event = {
             let mut inner = self.inner.lock();
@@ -135,8 +139,14 @@ impl TrustStore {
                 return Err(TrustError::SelfPeer(peer.node_id));
             }
             let prior = inner.cache.get(&peer.node_id).cloned();
-            inner.cache.insert(peer.node_id, peer.clone());
-            Self::persist(&inner)?;
+
+            // Build the new cache without mutating the live one. If persist
+            // fails, we drop the new cache and `inner.cache` is unchanged.
+            let mut next = inner.cache.clone();
+            next.insert(peer.node_id, peer.clone());
+            Self::persist_cache(&inner.root, &next)?;
+            inner.cache = next;
+
             match prior {
                 Some(prev) if prev.tier != peer.tier => TrustEvent::TierChanged {
                     node_id: peer.node_id,
@@ -155,13 +165,21 @@ impl TrustStore {
 
     /// Remove by `node_id`. Returns `true` if a peer was removed. Emits
     /// `Removed` if so. Atomically rewrites the file.
+    ///
+    /// Persist-then-commit semantics: if the file rewrite fails, the
+    /// in-memory cache is **not** mutated. This matters for trust:
+    /// a remove that "appeared to succeed" in memory but didn't reach disk
+    /// would silently downgrade a peer until daemon restart.
     pub fn remove(&self, node_id: &NodeId) -> Result<bool, TrustError> {
         let removed = {
             let mut inner = self.inner.lock();
-            if inner.cache.remove(node_id).is_none() {
+            if !inner.cache.contains_key(node_id) {
                 return Ok(false);
             }
-            Self::persist(&inner)?;
+            let mut next = inner.cache.clone();
+            next.remove(node_id);
+            Self::persist_cache(&inner.root, &next)?;
+            inner.cache = next;
             true
         };
         if removed {
@@ -213,13 +231,17 @@ impl TrustStore {
         self.tx.subscribe()
     }
 
-    fn persist(inner: &Inner) -> Result<(), TrustError> {
-        let peers: Vec<Peer> = inner.cache.values().cloned().collect();
+    /// Serialize `cache` and atomically write it to `<root>/peers.toml`.
+    /// On any error the file is left untouched (the atomic-rename + tmp
+    /// scrub in `write_atomic` makes that unconditional).
+    fn persist_cache(
+        root: &std::path::Path,
+        cache: &HashMap<NodeId, Peer>,
+    ) -> Result<(), TrustError> {
+        let peers: Vec<Peer> = cache.values().cloned().collect();
         let body = PeersFile::serialize(&peers)?;
-        let final_path = inner.root.join(PEERS_FILENAME);
-        let tmp = inner
-            .root
-            .join(format!("{PEERS_FILENAME}.tmp.{}", std::process::id()));
+        let final_path = root.join(PEERS_FILENAME);
+        let tmp = root.join(format!("{PEERS_FILENAME}.tmp.{}", std::process::id()));
         write_atomic(&tmp, &final_path, body.as_bytes())?;
         Ok(())
     }
