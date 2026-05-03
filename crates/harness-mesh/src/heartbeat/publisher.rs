@@ -98,14 +98,22 @@ impl HeartbeatPublisher {
     /// Build + sign the next heartbeat. Increments `seq` atomically so
     /// concurrent calls each get a distinct seq (broadcast loops typically
     /// run one publisher per node, but we don't enforce single-caller).
+    ///
+    /// The returned heartbeat is signed and ready to broadcast — but it
+    /// is also pre-counted, so dropping it without sending wastes a
+    /// `seq` slot. `#[must_use]` to catch the obvious mistake.
+    #[must_use = "the heartbeat is signed and pre-counted; send it or you waste a seq"]
     pub fn next(
         &self,
         snapshot: &HeartbeatPublisherConfig,
         leader_belief: NodeId,
         brain_score: i32,
     ) -> Heartbeat {
-        // Pre-increment so seq=1 is the first emitted (seq=0 is reserved
-        // for "never seen" in ReplayTable).
+        // Pre-increment so seq=1 is the first emitted. (ReplayTable
+        // does accept seq=0 exactly once via its Option<u64> sentinel,
+        // but we keep `0` as a useful "no heartbeat yet" marker for
+        // PeerEntry-less callers and to match the wire conventions of
+        // ed25519-dalek / TCP / RFC 8032.)
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let timestamp = unix_ms();
         let mut hb = Heartbeat {
@@ -140,6 +148,13 @@ impl HeartbeatPublisher {
     #[must_use]
     pub fn current_seq(&self) -> u64 {
         self.seq.load(Ordering::SeqCst)
+    }
+
+    /// Cheap clone of the underlying `Arc<Identity>`. Used by
+    /// `HeartbeatService::spawn_broadcaster` to construct a sibling
+    /// publisher in the spawned task.
+    pub(super) fn identity_arc(&self) -> Arc<Identity> {
+        self.identity.clone()
     }
 
     /// Sanity check that the publisher's interval matches the PRD value.

@@ -15,9 +15,11 @@
 //! `brain_score` aggregates.
 
 mod publisher;
+mod service;
 mod table;
 
 pub use publisher::{HeartbeatPublisher, HeartbeatPublisherConfig};
+pub use service::{BroadcasterHandle, HeartbeatService, ListenerHandle, SnapshotFn};
 pub use table::{PeerEntry, PeerTable};
 
 use std::time::Duration;
