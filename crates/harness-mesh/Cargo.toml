@@ -11,3 +11,10 @@ description  = "Discovery, transport, gossip, and weighted brain election."
 workspace = true
 
 [dependencies]
+harness-core = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+dirs         = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
