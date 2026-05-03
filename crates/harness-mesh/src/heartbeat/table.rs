@@ -37,9 +37,10 @@ impl PeerTable {
     /// (1.4's transport does this on `recv_sequenced`).
     ///
     /// Returns `true` if this was the first heartbeat for this peer
-    /// (i.e. a *new* peer joined). Callers (1.5's listener task) use
-    /// the return value to decide whether to publish a `peer_added`
-    /// vs `peer_updated` event on the API channel.
+    /// (i.e. a *new* peer joined). Most callers (election state machine,
+    /// tests) ignore this; only `HeartbeatService`'s listener task in
+    /// 1.5/1.10 inspects it to decide between `peer_added` /
+    /// `peer_updated` events on the API channel.
     pub fn record(&self, hb: Heartbeat) -> bool {
         let id = hb.node_id;
         let prior = self.inner.write().insert(

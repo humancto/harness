@@ -32,33 +32,30 @@ pub enum MeshEvent {
 }
 
 impl MeshEvent {
+    /// Returns `None` for the race window where a `Recorded` event
+    /// was published but the peer was already evicted by the time we
+    /// looked it up — emitting a `peer_added` for a peer that no
+    /// longer exists would race ahead of the inevitable `peer_evicted`
+    /// and confuse the UI's reducer.
     #[must_use]
-    pub fn from_table_event(event: &TableEvent, mesh_name: &str, peers: &PeerTable) -> Self {
+    pub fn from_table_event(
+        event: &TableEvent,
+        mesh_name: &str,
+        peers: &PeerTable,
+    ) -> Option<Self> {
         match event {
             TableEvent::Recorded { node_id, was_new } => {
-                let peer = peers.get(node_id).map_or_else(
-                    || PeerDto {
-                        node_id: format!("{node_id}"),
-                        pubkey_fp: format!("{node_id}")[..16].to_owned(),
-                        mesh_name: mesh_name.to_owned(),
-                        brain_score: 0,
-                        leader_belief: None,
-                        seq: 0,
-                        last_seen_ms_ago: 0,
-                        resources: None,
-                        capabilities_summary: vec![],
-                    },
-                    |entry| PeerDto::from_entry(&entry, mesh_name),
-                );
-                if *was_new {
+                let entry = peers.get(node_id)?;
+                let peer = PeerDto::from_entry(&entry, mesh_name);
+                Some(if *was_new {
                     MeshEvent::PeerAdded { peer }
                 } else {
                     MeshEvent::PeerUpdated { peer }
-                }
+                })
             }
-            TableEvent::Evicted { node_id } => MeshEvent::PeerEvicted {
+            TableEvent::Evicted { node_id } => Some(MeshEvent::PeerEvicted {
                 node_id: format!("{node_id}"),
-            },
+            }),
         }
     }
 }
@@ -89,8 +86,11 @@ impl TableEventBridge {
             loop {
                 match source.recv().await {
                     Ok(table_event) => {
-                        let event = MeshEvent::from_table_event(&table_event, &mesh_name, &peers);
-                        let _ = sink.send(event);
+                        if let Some(event) =
+                            MeshEvent::from_table_event(&table_event, &mesh_name, &peers)
+                        {
+                            let _ = sink.send(event);
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(
@@ -166,7 +166,8 @@ mod tests {
             node_id: NodeId::from_bytes([0x33; 16]),
             was_new: true,
         };
-        let mesh_event = MeshEvent::from_table_event(&event, "lan", &peers);
+        let mesh_event =
+            MeshEvent::from_table_event(&event, "lan", &peers).expect("recorded peer present");
         assert!(matches!(mesh_event, MeshEvent::PeerAdded { .. }));
     }
 
@@ -178,7 +179,8 @@ mod tests {
             node_id: NodeId::from_bytes([0x33; 16]),
             was_new: false,
         };
-        let mesh_event = MeshEvent::from_table_event(&event, "lan", &peers);
+        let mesh_event =
+            MeshEvent::from_table_event(&event, "lan", &peers).expect("recorded peer present");
         assert!(matches!(mesh_event, MeshEvent::PeerUpdated { .. }));
     }
 
@@ -188,13 +190,28 @@ mod tests {
         let event = TableEvent::Evicted {
             node_id: NodeId::from_bytes([0xAB; 16]),
         };
-        let mesh_event = MeshEvent::from_table_event(&event, "lan", &peers);
+        let mesh_event =
+            MeshEvent::from_table_event(&event, "lan", &peers).expect("evicted always emits");
         match mesh_event {
             MeshEvent::PeerEvicted { node_id } => {
                 assert_eq!(node_id, "abababababababababababababababab");
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn recorded_for_evicted_peer_returns_none() {
+        // Race window: a Recorded event was published, then the peer
+        // got evicted before this lookup ran. Returning None instead
+        // of fabricating a stale dto avoids racing ahead of the
+        // forthcoming Evicted event.
+        let peers = PeerTable::new();
+        let event = TableEvent::Recorded {
+            node_id: NodeId::from_bytes([0x77; 16]),
+            was_new: true,
+        };
+        assert!(MeshEvent::from_table_event(&event, "lan", &peers).is_none());
     }
 
     #[test]

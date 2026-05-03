@@ -67,15 +67,12 @@ async fn handle_socket(socket: WebSocket, state: ApiState) {
 
     loop {
         tokio::select! {
-            biased;
-            // Drain client → server: we don't take input on this WS,
-            // but we must read so close frames + pings are processed.
-            client = receiver.next() => {
-                match client {
-                    None | Some(Err(_) | Ok(Message::Close(_))) => break,
-                    _ => {}
-                }
-            }
+            // Server-push priority: a chatty / malicious client should
+            // not starve event delivery. We use the default (random)
+            // fairness — `biased` would prefer the read branch and let
+            // a flooded text-frame stream delay events. Listing the
+            // events branch first is style; tokio::select! poll order
+            // is randomized without `biased`.
             event = events.recv() => {
                 match event {
                     Ok(event) => {
@@ -111,6 +108,15 @@ async fn handle_socket(socket: WebSocket, state: ApiState) {
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
+            // Drain client → server: we don't take input on this WS,
+            // but we must observe close frames and Err so we know
+            // when the client has gone away.
+            client = receiver.next() => {
+                match client {
+                    None | Some(Err(_) | Ok(Message::Close(_))) => break,
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -142,6 +148,12 @@ mod tests {
             "ws://localhost",
             "garbage",
             "",
+            // Lookalike subdomains — these are the realistic
+            // bypass attempts and must NOT match.
+            "http://localhost.evil.com",
+            "http://127.0.0.1.evil.com",
+            "http://evil.com/127.0.0.1",
+            "http://localhost@evil.com",
         ] {
             assert!(!is_same_origin_loopback(bad), "should reject {bad}");
         }
