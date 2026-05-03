@@ -1,0 +1,13 @@
+[package]
+name         = "harness-core"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+description  = "Protocol types, traits, and shared glue for Harness."
+
+[lints]
+workspace = true
+
+[dependencies]

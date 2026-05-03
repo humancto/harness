@@ -1,0 +1,13 @@
+[package]
+name         = "harness-ui"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+description  = "Embedded web UI assets."
+
+[lints]
+workspace = true
+
+[dependencies]
