@@ -49,6 +49,12 @@ pub enum Command {
     /// Run the long-lived daemon: HTTP/WS API on 127.0.0.1:19198, mesh
     /// peers, embedded UI. Blocks until SIGINT/SIGTERM.
     Daemon(DaemonArgs),
+    /// Admin commands (set-password, etc.).
+    Admin(AdminArgs),
+    /// Submit a task to the local daemon.
+    Submit(SubmitArgs),
+    /// List submitted tasks.
+    Tasks(TasksArgs),
     /// Placeholder — clean teardown of `~/.harness/` is a Phase 6 concern.
     Leave(LeaveArgs),
 }
@@ -96,6 +102,52 @@ pub struct LeaveArgs {
 }
 
 #[derive(Debug, clap::Args)]
+pub struct AdminArgs {
+    #[command(subcommand)]
+    pub command: AdminCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AdminCommand {
+    /// Set (or replace) the admin password. Prompts via stdin (no echo).
+    SetPassword(AdminSetPasswordArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct AdminSetPasswordArgs {
+    #[arg(long)]
+    pub root: Option<PathBuf>,
+    /// Read the password from stdin instead of prompting (for scripts).
+    /// Reads exactly one line, trims trailing newline.
+    #[arg(long)]
+    pub from_stdin: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct SubmitArgs {
+    #[arg(long)]
+    pub root: Option<PathBuf>,
+    /// Capability id, e.g. `echo`, `shell.exec`, `mesh.search`.
+    pub capability: String,
+    /// Inline JSON input, or `@<path>` to read from a file, or `@-` for
+    /// stdin. Defaults to `{}`.
+    #[arg(long, default_value = "{}")]
+    pub input: String,
+    /// API base URL. Defaults to `http://127.0.0.1:19198`.
+    #[arg(long, default_value = "http://127.0.0.1:19198")]
+    pub api: String,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct TasksArgs {
+    #[arg(long)]
+    pub root: Option<PathBuf>,
+    /// API base URL.
+    #[arg(long, default_value = "http://127.0.0.1:19198")]
+    pub api: String,
+}
+
+#[derive(Debug, clap::Args)]
 pub struct DaemonArgs {
     #[arg(long)]
     pub root: Option<PathBuf>,
@@ -126,6 +178,9 @@ pub fn run(cli: Cli) -> Result<SyncOutcome> {
         Command::Peers(args) => cmd_peers(args).map(SyncOutcome::Print),
         Command::Status(args) => cmd_status(args).map(SyncOutcome::Print),
         Command::Leave(args) => cmd_leave(args).map(SyncOutcome::Print),
+        Command::Admin(args) => cmd_admin(args).map(SyncOutcome::Print),
+        Command::Submit(args) => Ok(SyncOutcome::SubmitRequested(args)),
+        Command::Tasks(args) => Ok(SyncOutcome::TasksRequested(args)),
         Command::Daemon(args) => Ok(SyncOutcome::DaemonRequested(args)),
     }
 }
@@ -137,6 +192,8 @@ pub fn run(cli: Cli) -> Result<SyncOutcome> {
 pub enum SyncOutcome {
     Print(String),
     DaemonRequested(DaemonArgs),
+    SubmitRequested(SubmitArgs),
+    TasksRequested(TasksArgs),
 }
 
 fn cmd_init(args: InitArgs) -> Result<String> {
@@ -229,6 +286,173 @@ fn cmd_leave(args: LeaveArgs) -> Result<String> {
            rm -rf {}",
         root.display()
     ))
+}
+
+fn cmd_admin(args: AdminArgs) -> Result<String> {
+    match args.command {
+        AdminCommand::SetPassword(a) => cmd_admin_set_password(a),
+    }
+}
+
+fn cmd_admin_set_password(args: AdminSetPasswordArgs) -> Result<String> {
+    let root = resolve_root(args.root)?;
+    let password = if args.from_stdin {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+            .context("read password from stdin")?;
+        buf.trim_end_matches(['\r', '\n']).to_string()
+    } else {
+        rpassword::prompt_password("New admin password: ").context("read password")?
+    };
+    if password.is_empty() {
+        anyhow::bail!("password cannot be empty");
+    }
+    if !args.from_stdin {
+        let confirm = rpassword::prompt_password("Confirm: ").context("read confirm password")?;
+        if confirm != password {
+            anyhow::bail!("passwords did not match");
+        }
+    }
+    harness_mesh::admin::set_password(&root, &password).context("save admin.toml")?;
+    Ok(format!(
+        "Admin password set. ({}/admin.toml)\nLog in with: harness submit ... (interactive)",
+        root.display(),
+    ))
+}
+
+/// Read or prompt for a password (CLI-side). Used by `submit` / `tasks`
+/// to acquire a session before calling the API.
+pub(crate) fn read_password_for_login() -> Result<String> {
+    rpassword::prompt_password("Admin password: ").context("read password")
+}
+
+/// Path to the cached session file (`<root>/.session`).
+pub(crate) fn session_path(root: &std::path::Path) -> std::path::PathBuf {
+    root.join(".session")
+}
+
+/// Read the cached session token, if present + non-stale. Stale (file
+/// mtime older than ~30d) is treated as absent so we re-login.
+pub(crate) fn read_cached_session(root: &std::path::Path) -> Option<String> {
+    let path = session_path(root);
+    let bytes = std::fs::read(&path).ok()?;
+    let token = String::from_utf8(bytes).ok()?.trim().to_string();
+    if token.is_empty() {
+        return None;
+    }
+    Some(token)
+}
+
+/// Persist a freshly-issued session token. Mode 0600 on Unix.
+pub(crate) fn write_cached_session(root: &std::path::Path, token: &str) -> Result<()> {
+    let path = session_path(root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        std::io::Write::write_all(&mut f, token.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, token)?;
+    }
+    Ok(())
+}
+
+/// Run the `submit` command async — needs an HTTP client.
+pub async fn run_submit(args: SubmitArgs) -> Result<String> {
+    let root = resolve_root(args.root)?;
+    let token = obtain_session_token(&root, &args.api).await?;
+
+    // Resolve --input: inline JSON | @path | @-
+    let input_str = match args.input.as_str() {
+        "@-" => {
+            let mut buf = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+                .context("read input from stdin")?;
+            buf
+        }
+        s if s.starts_with('@') => std::fs::read_to_string(&s[1..])
+            .with_context(|| format!("read input file {}", &s[1..]))?,
+        s => s.to_string(),
+    };
+    let input: serde_json::Value =
+        serde_json::from_str(input_str.trim()).context("input must be valid JSON")?;
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/tasks", args.api.trim_end_matches('/'));
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "capability": args.capability,
+            "input": input,
+        }))
+        .send()
+        .await
+        .context("submit POST failed")?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("submit failed: {status} — {body}");
+    }
+    Ok(body)
+}
+
+/// Run the `tasks` command async — needs an HTTP client.
+pub async fn run_tasks(args: TasksArgs) -> Result<String> {
+    let root = resolve_root(args.root)?;
+    let token = obtain_session_token(&root, &args.api).await?;
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/tasks", args.api.trim_end_matches('/'));
+    let resp = client
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .context("tasks GET failed")?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("tasks list failed: {status} — {body}");
+    }
+    Ok(body)
+}
+
+async fn obtain_session_token(root: &std::path::Path, api: &str) -> Result<String> {
+    if let Some(cached) = read_cached_session(root) {
+        return Ok(cached);
+    }
+    let password = read_password_for_login()?;
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/auth/login", api.trim_end_matches('/'));
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({ "password": password }))
+        .send()
+        .await
+        .context("login POST failed")?;
+    if !resp.status().is_success() {
+        anyhow::bail!("login failed: HTTP {}", resp.status());
+    }
+    let body: serde_json::Value = resp.json().await.context("parse login response")?;
+    let token = body["token"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("login response missing token field"))?
+        .to_string();
+    if let Err(e) = write_cached_session(root, &token) {
+        tracing::warn!(target: "harness.cli", ?e, "could not cache session");
+    }
+    Ok(token)
 }
 
 #[cfg(test)]
