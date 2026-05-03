@@ -26,7 +26,7 @@ When an item lands, flip its checkbox **in the same PR** as `STATE.md` is update
 - [x] **1.6** Weighted brain election (PRD §12.2): planner-aware, battery-aware, anti-flap. Property tests on convergence + no split-brain on connected LAN — shipped in #8 (`5e520f2`).
 - [x] **1.7** Pairing flow: `harness init` (creates mesh, prints pairing code, sets admin password) and `harness join` (scans LAN, pairing-code-approved exchange of pubkeys) — protocol layer shipped in #9 (`1cdb225`); CLI wiring in 1.9.
 - [x] **1.8** Trust file `~/.harness/peers.toml` (read/write/gossip on join) — shipped in #4 (`6bb2474`).
-- [ ] **1.9** CLI: `harness peers`, `harness status`.
+- [x] **1.9** CLI: `harness peers`, `harness status` — and `init` / `join` / `leave` — shipped in #10 (`305c00b`).
 - [ ] **1.10** Web UI Mesh page (read-only, live topology over WebSocket relay).
 
 ## Phase 2 — Tasks flow
