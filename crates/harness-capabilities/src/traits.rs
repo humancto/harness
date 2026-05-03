@@ -1,6 +1,8 @@
 //! The `Capability` trait — the contract every built-in (and future
 //! WASM-sandboxed) capability implements.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use harness_core::{Capability as ManifestEntry, NodeId};
 use serde_json::Value as JsonValue;
@@ -14,8 +16,15 @@ pub struct ExecutionContext {
     /// Local node id — capabilities embed this in any `Cost` / per-task
     /// `provenance` entries they emit.
     pub local_node: NodeId,
+    /// Mesh hostname for the local node. `Arc<str>` so cloning a context
+    /// is one ref-bump rather than a fresh allocation. `"unknown"` if
+    /// not yet assigned (early daemon-startup window).
+    pub local_node_name: Arc<str>,
     /// Issuer of the task — for audit + provenance.
     pub issued_by: NodeId,
+    /// Best-known mesh hostname for the issuer; `"unknown"` if the task
+    /// arrived without a resolvable name.
+    pub issued_by_name: Arc<str>,
     /// `task.id` from the envelope.
     pub task_id: harness_core::TaskId,
 }
