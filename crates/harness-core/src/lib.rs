@@ -17,6 +17,9 @@ pub use identity::{
     verify, Identity, KeyError, NodeId, ParseNodeIdError, PublicKey, Signature, VerifyError,
 };
 pub use protocol::{
-    Capability, Cardinality, Heartbeat, MergeStrategy, NodeManifest, PartialPolicy, ResourceHints,
-    Resources, Scope, Signable,
+    Budget, BudgetAction, Capability, Cardinality, CheckpointConfig, CheckpointStorage,
+    Constraints, Cost, ExecutionPolicy, FinalResult, HashFn, Heartbeat, LogLevel, LogLine,
+    MergeStrategy, NodeContribution, NodeManifest, NodeStatus, PartialPolicy, PartialResult, Plan,
+    PlanNode, ResourceHints, Resources, RetryPolicy, Scope, Signable, Status, Task, TaskResult,
+    TraceContext,
 };

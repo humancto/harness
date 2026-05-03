@@ -7,16 +7,31 @@ use serde::{Deserialize, Serialize};
 
 /// Task identifier — a Uuid v7 (sortable by creation time).
 ///
-/// Generation helpers (e.g. `TaskId::new_v7`) are item 2.1's job. For 1.2
-/// the wire shape lands so `Heartbeat::in_flight: Vec<TaskId>` compiles.
+/// Task identifier — a Uuid v7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TaskId(pub uuid::Uuid);
+
+impl TaskId {
+    /// Generate a fresh Uuid v7 (sortable by creation time).
+    #[must_use]
+    pub fn new_v7() -> Self {
+        Self(uuid::Uuid::now_v7())
+    }
+}
 
 /// Plan identifier — a Uuid v7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PlanId(pub uuid::Uuid);
+
+impl PlanId {
+    /// Generate a fresh Uuid v7.
+    #[must_use]
+    pub fn new_v7() -> Self {
+        Self(uuid::Uuid::now_v7())
+    }
+}
 
 /// Semantic version triple. Wire-stable: three `u16` fields, encoded in
 /// declaration order by `ciborium`.
