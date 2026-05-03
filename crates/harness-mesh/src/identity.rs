@@ -20,11 +20,13 @@
 //! FORMAT v0: 32 raw bytes. If we ever switch to a wrapped on-disk format,
 //! sniff a leading magic byte (length-32-vs-not is a free discriminator).
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 use harness_core::Identity;
+
+use crate::fs_util::{create_root_dir, enforce_mode_0600, write_atomic, FsError, Mode0600Error};
 
 /// Default seed length, equal to `Identity`'s expected secret-bytes length.
 const SEED_LEN: usize = 32;
@@ -55,6 +57,23 @@ impl IdentityError {
         Self::Io {
             path: path.into(),
             source,
+        }
+    }
+}
+
+impl From<FsError> for IdentityError {
+    fn from(e: FsError) -> Self {
+        match e {
+            FsError::Io { path, source } => Self::Io { path, source },
+        }
+    }
+}
+
+impl From<Mode0600Error> for IdentityError {
+    fn from(e: Mode0600Error) -> Self {
+        match e {
+            Mode0600Error::Io { path, source } => Self::Io { path, source },
+            Mode0600Error::UnsafePermissions { actual } => Self::UnsafePermissions { actual },
         }
     }
 }
@@ -94,7 +113,7 @@ pub fn init_or_load(root: &Path) -> Result<Identity, IdentityError> {
 /// exist (use [`init_or_load`] for the create-if-absent variant).
 pub fn load(root: &Path) -> Result<Identity, IdentityError> {
     let key = key_path(root);
-    enforce_key_permissions(&key)?;
+    enforce_mode_0600(&key)?;
 
     let mut file = fs::File::open(&key).map_err(|e| IdentityError::io(&key, e))?;
     let mut buf = Vec::with_capacity(SEED_LEN);
@@ -127,72 +146,7 @@ pub fn save(root: &Path, id: &Identity) -> Result<(), IdentityError> {
     }
     let tmp = root.join(format!("{KEY_FILENAME}.tmp.{}", std::process::id()));
     let bytes = id.to_secret_bytes();
-    write_atomic(&tmp, &final_path, bytes.as_slice())
-}
-
-/// Create `<root>` mode `0700` if missing. Idempotent.
-fn create_root_dir(root: &Path) -> Result<(), IdentityError> {
-    if !root.exists() {
-        fs::create_dir_all(root).map_err(|e| IdentityError::io(root, e))?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o700);
-        fs::set_permissions(root, perms).map_err(|e| IdentityError::io(root, e))?;
-    }
-    Ok(())
-}
-
-/// Hard-error if the key file's permissions are not exactly `0600` on Unix.
-/// On Windows, log a warning and proceed (no portable mode-bit equivalent).
-#[cfg_attr(not(unix), allow(unused_variables))]
-fn enforce_key_permissions(path: &Path) -> Result<(), IdentityError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let meta = fs::metadata(path).map_err(|e| IdentityError::io(path, e))?;
-        let mode = meta.permissions().mode() & 0o777;
-        if mode != 0o600 {
-            return Err(IdentityError::UnsafePermissions { actual: mode });
-        }
-    }
-    #[cfg(windows)]
-    {
-        tracing::warn!(
-            target: "harness.identity",
-            ?path,
-            "windows: skipping mode-0600 check on identity.key — Windows ACLs not yet enforced"
-        );
-    }
-    Ok(())
-}
-
-/// Write `data` to `tmp` (born `0600` on Unix), `fsync`, then rename to
-/// `final_path`. Removes a stale `tmp` if the rename fails so we don't
-/// pollute `root`.
-fn write_atomic(tmp: &Path, final_path: &Path, data: &[u8]) -> Result<(), IdentityError> {
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts.open(tmp).map_err(|e| IdentityError::io(tmp, e))?;
-
-    let write_then_rename = || -> Result<(), IdentityError> {
-        file.write_all(data)
-            .map_err(|e| IdentityError::io(tmp, e))?;
-        file.sync_all().map_err(|e| IdentityError::io(tmp, e))?;
-        drop(file);
-        fs::rename(tmp, final_path).map_err(|e| IdentityError::io(final_path, e))
-    };
-
-    if let Err(e) = write_then_rename() {
-        let _ = fs::remove_file(tmp);
-        return Err(e);
-    }
+    write_atomic(&tmp, &final_path, bytes.as_slice())?;
     Ok(())
 }
 
@@ -203,9 +157,6 @@ mod tests {
 
     #[test]
     fn corrupt_key_file_error_carries_lengths() {
-        // Just construct the error and round-trip its Display to make sure
-        // the variant is wired up. The full filesystem flow is covered in
-        // tests/identity_fs.rs.
         let e = IdentityError::CorruptKeyFile {
             expected: 32,
             got: 16,
