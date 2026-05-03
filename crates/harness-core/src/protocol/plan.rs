@@ -171,6 +171,44 @@ mod tests {
         assert_eq!(p, round_trip(&p));
     }
 
+    /// Locks the edge orientation — `(from, to)` means "from depends on to,"
+    /// i.e. `to` must complete before `from` starts. ADR-0002 carries the
+    /// rationale; this test catches a silent flip if a future refactor
+    /// reverses the convention without updating the doc-comment + ADR.
+    ///
+    /// Concrete contract: in a chain `a → b → c` (where `c` depends on `b`,
+    /// and `b` depends on `a`), the predecessors of `c` according to
+    /// `Plan::edges` are `{b}`, and `a`'s predecessors are `{}` (a is a
+    /// root: nothing must complete before it starts).
+    #[test]
+    fn plan_edges_express_from_depends_on_to() {
+        let a = TaskId::new_v7();
+        let b = TaskId::new_v7();
+        let c = TaskId::new_v7();
+        let mut tasks = HashMap::new();
+        tasks.insert(a, sample_node(a));
+        tasks.insert(b, sample_node(b));
+        tasks.insert(c, sample_node(c));
+        let p = Plan {
+            tasks,
+            edges: vec![(b, a), (c, b)],
+            ..sample_plan()
+        };
+
+        // For each task, find its dependencies — the right-hand side of
+        // any `(from, to)` pair where `from == task`.
+        let predecessors_of = |task: TaskId| -> Vec<TaskId> {
+            p.edges
+                .iter()
+                .filter_map(|(from, to)| if *from == task { Some(*to) } else { None })
+                .collect()
+        };
+
+        assert_eq!(predecessors_of(a), Vec::<TaskId>::new(), "a is a root");
+        assert_eq!(predecessors_of(b), vec![a], "b depends on a");
+        assert_eq!(predecessors_of(c), vec![b], "c depends on b");
+    }
+
     #[test]
     fn plan_node_round_trip() {
         let n = sample_node(TaskId::new_v7());

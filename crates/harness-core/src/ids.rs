@@ -6,14 +6,19 @@
 use serde::{Deserialize, Serialize};
 
 /// Task identifier — a Uuid v7 (sortable by creation time).
-///
-/// Task identifier — a Uuid v7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TaskId(pub uuid::Uuid);
 
 impl TaskId {
     /// Generate a fresh Uuid v7 (sortable by creation time).
+    ///
+    /// # Panics
+    ///
+    /// Inherits `uuid::Uuid::now_v7`'s panic semantics: if the underlying
+    /// `getrandom` source fails (only realistic on no-std / embedded
+    /// targets without OS randomness), this will panic. Phase 7 will
+    /// document handling for those targets if/when they become a goal.
     #[must_use]
     pub fn new_v7() -> Self {
         Self(uuid::Uuid::now_v7())
@@ -27,6 +32,10 @@ pub struct PlanId(pub uuid::Uuid);
 
 impl PlanId {
     /// Generate a fresh Uuid v7.
+    ///
+    /// # Panics
+    ///
+    /// See [`TaskId::new_v7`] — same semantics.
     #[must_use]
     pub fn new_v7() -> Self {
         Self(uuid::Uuid::now_v7())
