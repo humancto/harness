@@ -201,6 +201,35 @@ impl Store {
         })
     }
 
+    /// Compare-and-set state transition. Returns `Ok(true)` if the row
+    /// was at `from` and is now at `to`; `Ok(false)` if it was at some
+    /// other state or absent (caller lost the race).
+    ///
+    /// # Errors
+    /// `StoreError::InvalidTransition` if `from → to` is not a legal
+    /// hop per PRD §14.1 (programmer error — caught up-front before
+    /// the SQL fires).
+    pub fn try_transition_task(
+        &self,
+        id: TaskId,
+        from: TaskState,
+        to: TaskState,
+    ) -> Result<bool, StoreError> {
+        if !from.can_transition_to(to) {
+            return Err(StoreError::InvalidTransition {
+                from: from.as_str().into(),
+                to: to.as_str().into(),
+            });
+        }
+        self.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE tasks SET state = ?1 WHERE id = ?2 AND state = ?3",
+                params![to.as_str(), id.0.as_bytes(), from.as_str()],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
     /// List tasks in a given state, newest first by `issued_at` (Uuid v7
     /// is also sortable but we explicitly order by the indexed column).
     pub fn list_tasks_by_state(&self, state: TaskState) -> Result<Vec<TaskRow>, StoreError> {

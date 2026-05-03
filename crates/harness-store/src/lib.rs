@@ -14,6 +14,7 @@ pub mod manifests;
 mod migrations;
 pub mod open;
 pub mod replica;
+pub mod results;
 pub mod scopes;
 pub mod tasks;
 
@@ -22,4 +23,5 @@ pub use crate::error::StoreError;
 pub use crate::leases::{Lease, LeaseId, LeaseState};
 pub use crate::open::{Store, StoreConfig};
 pub use crate::replica::StoreReplicaApplier;
+pub use crate::results::TaskResult;
 pub use crate::tasks::{TaskRow, TaskState};
