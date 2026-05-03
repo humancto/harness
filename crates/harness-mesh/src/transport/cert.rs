@@ -11,7 +11,7 @@
 //! Cert validity is set to a 100-year window (2025-01-01 → 2125-01-01).
 //! Cert rotation is out of scope for 1.4 (see plan §14 footgun #5).
 
-use harness_core::Identity;
+use harness_core::{Identity, KeyError, PublicKey};
 use pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
@@ -42,6 +42,50 @@ const PKCS8_V1_ED25519_PREFIX: [u8; 16] = [
 pub(crate) enum CertError {
     #[error("rcgen: {0}")]
     Rcgen(#[from] rcgen::Error),
+}
+
+/// Errors extracting the SPKI from a peer's cert.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+#[allow(dead_code)]
+pub(crate) enum SpkiError {
+    #[error("could not parse certificate DER: {0}")]
+    ParseDer(String),
+    #[error("certificate algorithm is not Ed25519")]
+    NotEd25519,
+    #[error("invalid Ed25519 public key in certificate: {0}")]
+    InvalidKey(#[from] KeyError),
+}
+
+/// Extract the Ed25519 [`PublicKey`] from the SPKI of a parsed cert.
+#[allow(dead_code)]
+///
+/// Returns an error if the cert is malformed, the algorithm OID is not
+/// `1.3.101.112` (Ed25519), or the SPKI bytes don't decode to a valid
+/// curve point.
+pub(crate) fn extract_ed25519_spki(cert: &CertificateDer<'_>) -> Result<PublicKey, SpkiError> {
+    // Ed25519 algorithm OID: 1.3.101.112
+    const ED25519_OID: oid_registry::Oid<'static> = oid_registry::asn1_rs::oid!(1.3.101 .112);
+
+    use x509_parser::prelude::*;
+
+    let (_, parsed) =
+        X509Certificate::from_der(cert.as_ref()).map_err(|e| SpkiError::ParseDer(e.to_string()))?;
+
+    if parsed.tbs_certificate.subject_pki.algorithm.algorithm != ED25519_OID {
+        return Err(SpkiError::NotEd25519);
+    }
+
+    let bytes = parsed
+        .tbs_certificate
+        .subject_pki
+        .subject_public_key
+        .data
+        .as_ref();
+    let arr: &[u8; PublicKey::LEN] = bytes
+        .try_into()
+        .map_err(|_| SpkiError::ParseDer(format!("SPKI length {} != 32", bytes.len())))?;
+    Ok(PublicKey::from_bytes(arr)?)
 }
 
 /// Build the `PKCS#8` v1 envelope for an Ed25519 secret seed.
