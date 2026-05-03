@@ -751,6 +751,14 @@ version = "0.0.0"
 [[package]]
 name = "harness-cli"
 version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "harness-core",
+ "harness-mesh",
+ "tempfile",
+ "tracing",
+]
 
 [[package]]
 name = "harness-core"
@@ -778,8 +786,10 @@ version = "0.0.0"
 name = "harness-daemon"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "assert_cmd",
  "clap",
+ "harness-cli",
  "predicates",
 ]
 
