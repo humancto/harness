@@ -56,7 +56,7 @@ When an item lands, flip its checkbox **in the same PR** as `STATE.md` is update
   - [x] **3.3a** Local executor loop + `harness run --on self` + `GET /tasks/<id>` + `node_name` plumbing (PR #25). ADR-0009.
   - [ ] **3.3-fanout** Cross-node dispatch over QUIC (`--all`, `--where`, dispatcher async runtime).
   - [ ] **3.3-ui** UI Remote Shell mode with `[node-name]` interleaving.
-- [ ] **3.4** `llm.local.<model>` auto-registration from `ollama list`.
+- [x] **3.4** `llm.local.<model>` auto-registration from `ollama list` (PR #26). HTTP discovery + execution; ADR-0010 covers default-allow + DoS bounds + `Action::Llm` extensibility.
 - [ ] **3.5** Local-LLM micro-batcher (configurable `batch_window_ms`, default 50).
 - [ ] **3.6** `llm.cloud.{claude,openai,gemini}` capabilities + secrets-by-tag reference.
 - [ ] **3.7** `mcp.proxy` via `rmcp`: subprocess MCP servers, expose tools as `mcp.<server>.<tool>`.
