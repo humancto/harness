@@ -254,6 +254,7 @@ mod tests {
             trace_ctx: TraceContext::default(),
             issued_by: NodeId::from_bytes([0xFF; 16]),
             issued_at: 0,
+            tags: Vec::new(),
             sig: Signature::from_bytes([0; 64]),
         }
     }

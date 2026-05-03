@@ -175,6 +175,7 @@ mod tests {
             issued_by: NodeId::from_bytes([2; 16]),
             issued_by_name: Arc::from("issuer"),
             task_id: TaskId::new_v7(),
+            tags: std::sync::Arc::from(Vec::<String>::new()),
         };
         let out = cap
             .execute(&ctx, serde_json::json!({"hi": "there"}))

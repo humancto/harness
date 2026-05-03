@@ -27,6 +27,10 @@ pub struct ExecutionContext {
     pub issued_by_name: Arc<str>,
     /// `task.id` from the envelope.
     pub task_id: harness_core::TaskId,
+    /// Caller hints from the `Task` envelope. Honored variably by
+    /// capabilities — `llm.local.*` reads `"interactive"` to bypass
+    /// the micro-batcher (3.5). `Arc<[String]>` for cheap clone.
+    pub tags: Arc<[String]>,
 }
 
 /// Errors a capability can return from `execute`.

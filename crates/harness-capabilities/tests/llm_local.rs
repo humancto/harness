@@ -31,6 +31,7 @@ fn ctx() -> ExecutionContext {
         issued_by: NodeId::from_bytes([2; 16]),
         issued_by_name: Arc::from("issuer"),
         task_id: TaskId::new_v7(),
+        tags: std::sync::Arc::from(Vec::<String>::new()),
     }
 }
 
@@ -52,11 +53,15 @@ deny  = []
 }
 
 fn make_cap(model: &str, host: &Url, policy: Arc<PolicyEngine>) -> LlmLocalCapability {
+    use harness_capabilities::LlmBatcher;
+    use std::time::Duration;
+    let batcher = Arc::new(LlmBatcher::with_window(Duration::ZERO));
     LlmLocalCapability::new(
         policy,
         model.to_string(),
         host.clone(),
         reqwest::Client::new(),
+        batcher,
     )
 }
 
@@ -264,15 +269,19 @@ fn t19_one_reqwest_client_shared_across_caps() {
     // shape (both caps construct successfully with a shared client).
     // The real guarantee — connection pool sharing — is documented in
     // reqwest's docs: `Client::clone()` shares the underlying pool.
+    use harness_capabilities::LlmBatcher;
+    use std::time::Duration;
     let host = Url::parse("http://127.0.0.1:11434").expect("parse");
     let policy = engine_allow_all();
     let shared = reqwest::Client::new();
+    let batcher = Arc::new(LlmBatcher::with_window(Duration::from_millis(50)));
     let _cap_a = LlmLocalCapability::new(
         policy.clone(),
         "model-a".to_string(),
         host.clone(),
         shared.clone(),
+        batcher.clone(),
     );
-    let _cap_b = LlmLocalCapability::new(policy, "model-b".to_string(), host, shared);
+    let _cap_b = LlmLocalCapability::new(policy, "model-b".to_string(), host, shared, batcher);
     // No assertion — successful construction is the test.
 }

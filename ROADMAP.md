@@ -57,7 +57,7 @@ When an item lands, flip its checkbox **in the same PR** as `STATE.md` is update
   - [ ] **3.3-fanout** Cross-node dispatch over QUIC (`--all`, `--where`, dispatcher async runtime).
   - [ ] **3.3-ui** UI Remote Shell mode with `[node-name]` interleaving.
 - [x] **3.4** `llm.local.<model>` auto-registration from `ollama list` (PR #26). HTTP discovery + execution; ADR-0010 covers default-allow + DoS bounds + `Action::Llm` extensibility.
-- [ ] **3.5** Local-LLM micro-batcher (configurable `batch_window_ms`, default 50).
+- [x] **3.5** Local-LLM micro-batcher (PR #27). Dedup-within-window + interactive-tag bypass + forward-compat hook. ADR-0011 — true multi-prompt batching deferred until a vLLM/TGI backend lands (Ollama doesn't support it).
 - [ ] **3.6** `llm.cloud.{claude,openai,gemini}` capabilities + secrets-by-tag reference.
 - [ ] **3.7** `mcp.proxy` via `rmcp`: subprocess MCP servers, expose tools as `mcp.<server>.<tool>`.
 - [ ] **3.8** `brain.plan` Template backend (hardcoded plan templates from PRD §15.6).

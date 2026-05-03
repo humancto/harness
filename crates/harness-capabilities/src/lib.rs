@@ -21,6 +21,9 @@ pub mod echo;
 pub mod shell;
 
 #[cfg(feature = "llm")]
+pub mod llm_batcher;
+
+#[cfg(feature = "llm")]
 pub mod llm_local;
 
 pub use registry::{CapabilityRegistry, RegistryError};
@@ -31,6 +34,9 @@ pub use echo::EchoCapability;
 
 #[cfg(all(feature = "shell", unix))]
 pub use shell::ShellExecCapability;
+
+#[cfg(feature = "llm")]
+pub use llm_batcher::{Fingerprint, LlmBatcher};
 
 #[cfg(feature = "llm")]
 pub use llm_local::LlmLocalCapability;
@@ -120,12 +126,18 @@ pub async fn enrich_with_llm_local(
     // `.timeout(...)` on the request builder; we don't want a global
     // 2s cap here.
     let exec_client = reqwest::Client::new();
+    // One batcher per daemon, shared across all `llm.local.<model>` caps.
+    // The batcher key includes the model so cross-model isolation is
+    // preserved. Window from `HARNESS_LLM_BATCH_WINDOW_MS` (default 50ms;
+    // 0 disables).
+    let batcher = std::sync::Arc::new(llm_batcher::LlmBatcher::from_env());
     for model in models {
         let cap = LlmLocalCapability::new(
             policy.clone(),
             model.clone(),
             host.clone(),
             exec_client.clone(),
+            batcher.clone(),
         );
         // BUG-on-duplicate is intentional: enrich_with_llm_local is a
         // startup-once function; the model list was deduped above. A

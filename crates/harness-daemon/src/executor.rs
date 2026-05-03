@@ -182,12 +182,17 @@ impl LocalExecutor {
                 );
             }
 
+            // task.tags is already an owned Vec; clone-into-Arc<[String]>
+            // is one allocation. Read from the loaded task envelope so
+            // capabilities see the caller's hints.
+            let tags: std::sync::Arc<[String]> = std::sync::Arc::from(task.tags.clone());
             let ctx = ExecutionContext {
                 local_node,
                 local_node_name: local_node_name.clone(),
                 issued_by: task.issued_by,
                 issued_by_name: local_node_name.clone(),
                 task_id: id,
+                tags,
             };
 
             // S2: panic boundary. A panicking capability cannot wedge
@@ -445,6 +450,7 @@ mod tests {
             trace_ctx: TraceContext::default(),
             issued_by: issuer,
             issued_at: 1_700_000_000_000,
+            tags: Vec::new(),
             sig: Signature::from_bytes([0u8; 64]),
         };
         t.sign(&Identity::generate()).expect("sign");

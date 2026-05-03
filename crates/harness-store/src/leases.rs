@@ -394,6 +394,7 @@ mod tests {
             trace_ctx: TraceContext::default(),
             issued_by: id.public_key().node_id(),
             issued_at: 1_700_000_000_000,
+            tags: Vec::new(),
             sig: Signature::from_bytes([0; 64]),
         };
         t.sign(id).expect("sign");
