@@ -988,6 +988,17 @@ version = "0.0.0"
 [[package]]
 name = "harness-capabilities"
 version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "harness-core",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "harness-cli"
@@ -1034,6 +1045,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "harness-api",
+ "harness-capabilities",
  "harness-cli",
  "harness-core",
  "harness-mesh",

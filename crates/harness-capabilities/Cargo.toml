@@ -10,4 +10,17 @@ description  = "Built-in capability implementations."
 [lints]
 workspace = true
 
+[features]
+default = ["echo"]
+echo = []
+
 [dependencies]
+harness-core = { workspace = true }
+async-trait  = "0.1"
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
+tokio        = { workspace = true }
+tracing      = { workspace = true }
+blake3       = { workspace = true }
+parking_lot  = { workspace = true }
