@@ -1,18 +1,30 @@
-//! QUIC transport for harness mesh nodes (item 1.4 — in progress).
+//! QUIC transport for harness mesh nodes (item 1.4).
 //!
-//! Phase 1.4 commit ordering:
-//! 1. **`cert`** (shipped) — deterministic self-signed cert from `Identity`.
-//! 2. **`verifier`** (this commit) — pinned-pubkey rustls
-//!    `ServerCertVerifier` / `ClientCertVerifier`.
-//! 3. `envelope` — length-prefixed framer + `Sequenced` trait + replay
-//!    table.
-//! 4. `quic` + `connection` — `Transport`, `Connection`, `IncomingConnection`.
-//! 5. cancel-safety + property tests + tracing.
+//! Public surface:
 //!
-//! See `phase-1.4-quic.plan.md` for the full design.
+//! - [`Transport`] — one per node, binds a UDP socket and serves both
+//!   inbound and outbound connections.
+//! - [`TrustStore`] — in-memory snapshot of trusted pubkeys (1.8 has the
+//!   persistent version; this is for transport-layer dedupe).
+//! - [`Connection`] — one peer-to-peer link with `send` / `recv` /
+//!   `recv_sequenced` (cancel-safe recv via the [`envelope::RecvFramer`]
+//!   state machine).
+//! - [`IncomingConnection`] — pending inbound; caller decides whether to
+//!   accept based on the peer pubkey.
+//! - [`Sequenced`] — opt-in trait for replay-protected message types.
+//!   `Heartbeat` implements it; `NodeManifest` does not.
+//! - [`channels`] — `&'static str` constants for the PRD §13.6 logical
+//!   channel names.
+//! - [`TransportError`] — single enum for every fallible path.
 
 mod cert;
+mod connection;
 mod envelope;
+mod error;
+mod quic;
 mod verifier;
 
+pub use connection::{Connection, IncomingConnection};
 pub use envelope::{channels, Sequenced, MAX_FRAME_BYTES};
+pub use error::TransportError;
+pub use quic::{Transport, TrustStore};

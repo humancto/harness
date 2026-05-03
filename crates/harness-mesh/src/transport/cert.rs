@@ -34,12 +34,10 @@ const PKCS8_V1_ED25519_PREFIX: [u8; 16] = [
     0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
 ];
 
-/// Errors deriving a cert from an `Identity`. Lifted to `pub` once
-/// `transport::TransportError` (commit 4) needs to carry it.
+/// Errors deriving a cert from an `Identity`.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-#[allow(dead_code)]
-pub(crate) enum CertError {
+pub enum CertError {
     #[error("rcgen: {0}")]
     Rcgen(#[from] rcgen::Error),
 }
