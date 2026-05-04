@@ -24,6 +24,9 @@ pub mod shell;
 pub mod llm_batcher;
 
 #[cfg(feature = "llm")]
+pub mod llm_cloud_claude;
+
+#[cfg(feature = "llm")]
 pub mod llm_local;
 
 pub use registry::{CapabilityRegistry, RegistryError};
@@ -37,6 +40,9 @@ pub use shell::ShellExecCapability;
 
 #[cfg(feature = "llm")]
 pub use llm_batcher::{Fingerprint, LlmBatcher};
+
+#[cfg(feature = "llm")]
+pub use llm_cloud_claude::{enrich_with_llm_cloud_claude, LlmCloudClaudeCapability};
 
 #[cfg(feature = "llm")]
 pub use llm_local::LlmLocalCapability;
