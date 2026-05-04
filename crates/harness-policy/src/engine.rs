@@ -40,6 +40,14 @@ pub enum Action<'a> {
     /// `llm.local.<model>` (3.4) or `llm.cloud.<provider>` (3.6)
     /// invokes the underlying inference engine.
     Llm { model: &'a str },
+
+    /// Per-tag secret-access gate. Reserved for Phase 3.6-encrypted,
+    /// where the policy will gate which capabilities can read which
+    /// `secret/...` tags. In Phase 3.6a the evaluator returns
+    /// `Decision::Allow` unconditionally (see ADR-0012); the variant
+    /// exists now so the source-compat hook is in place when the
+    /// encrypted store lands.
+    Secret { tag: &'a str },
 }
 
 /// Per-call evaluation context. Cheap to build; borrows everything.
@@ -143,6 +151,10 @@ fn evaluate_against(policy: &Policy, ctx: &EvalContext<'_>) -> Decision {
     match ctx.action {
         Action::Shell { cmd, args } => evaluate_shell(policy, ctx.from_node, cmd, args),
         Action::Llm { model } => evaluate_llm(policy, ctx.from_node, model),
+        // Phase 3.6a: tag access is unconditionally allowed. The
+        // evaluator hook is here so 3.6-encrypted can gate without a
+        // source-compat break. See ADR-0012.
+        Action::Secret { tag: _ } => Decision::Allow,
     }
 }
 

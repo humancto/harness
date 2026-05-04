@@ -126,6 +126,7 @@ mod tests {
                     disk_io_class: harness_core::protocol::DiskIoClass::None,
                     estimated_duration_ms: None,
                 },
+                requires_secrets: vec![],
             }
         }
 

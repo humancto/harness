@@ -201,6 +201,7 @@ mod tests {
             tags: vec![],
             rate_limit: None,
             resource_hints: empty_hints(),
+            requires_secrets: vec![],
         }
     }
 

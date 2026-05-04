@@ -7,6 +7,7 @@ use std::time::SystemTime;
 use harness_core::{Identity, NodeId, PublicKey};
 use harness_mesh::heartbeat::PeerTable;
 use harness_policy::PolicyEngine;
+use harness_vault::SecretsStore;
 use parking_lot::RwLock;
 use tokio::sync::{broadcast, watch};
 
@@ -56,6 +57,12 @@ pub struct ApiState {
     /// Local policy engine — consulted by the executor before running
     /// privileged actions (Phase 3.1, used by `shell.exec` in 3.2).
     pub policy: Arc<PolicyEngine>,
+    /// Tagged credential store. Phase 3.6a: plaintext file-backed; the
+    /// 3.6-encrypted form will swap the impl behind the same trait.
+    /// Surfaced on `ApiState` so future admin endpoints (e.g. "which
+    /// secrets are configured?") and capability-execute paths share
+    /// the same handle.
+    pub secrets: Arc<dyn SecretsStore>,
 }
 
 impl std::fmt::Debug for ApiState {
@@ -105,6 +112,7 @@ pub struct ApiStateBuilder {
     auth: Option<Arc<crate::auth::AuthProvider>>,
     store: Option<harness_store::Store>,
     policy: Option<Arc<PolicyEngine>>,
+    secrets: Option<Arc<dyn SecretsStore>>,
 }
 
 impl ApiStateBuilder {
@@ -119,6 +127,7 @@ impl ApiStateBuilder {
             auth: None,
             store: None,
             policy: None,
+            secrets: None,
         }
     }
 
@@ -159,6 +168,12 @@ impl ApiStateBuilder {
     }
 
     #[must_use]
+    pub fn with_secrets(mut self, secrets: Arc<dyn SecretsStore>) -> Self {
+        self.secrets = Some(secrets);
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> ApiState {
         let local_node_id = self.identity.public_key().node_id();
         let mut status = LocalStatus::new(self.mesh_name);
@@ -174,6 +189,12 @@ impl ApiStateBuilder {
         let policy = self
             .policy
             .unwrap_or_else(|| Arc::new(PolicyEngine::new(harness_policy::Policy::deny_all())));
+        // Default to an empty secrets store. Production daemons supply
+        // a `PlaintextStore::load_default()`. Tests get an empty store
+        // unless they explicitly wire one.
+        let secrets = self
+            .secrets
+            .unwrap_or_else(|| Arc::new(harness_vault::PlaintextStore::empty()));
         ApiState {
             identity: self.identity,
             local_node_id,
@@ -183,6 +204,7 @@ impl ApiStateBuilder {
             auth,
             store: self.store,
             policy,
+            secrets,
         }
     }
 }

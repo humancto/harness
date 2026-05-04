@@ -68,6 +68,18 @@ pub struct Capability {
     pub tags: Vec<String>,
     pub rate_limit: Option<RateLimit>,
     pub resource_hints: ResourceHints,
+    /// Secret tags this capability needs from the local credential store
+    /// (PRD §10.5). Phase 3.6a: surfaces in the manifest only — the
+    /// dispatcher's `requires_secrets`-aware routing (skip nodes missing
+    /// the tag) lands with 3.6-encrypted.
+    ///
+    /// Wire-level back-compat: `serde(default)` lets old daemons that
+    /// pre-date this field decode a manifest as `vec![]`;
+    /// `skip_serializing_if = "Vec::is_empty"` keeps the CBOR diff
+    /// clean for capabilities that don't read secrets (no extra bytes
+    /// on the wire vs. the prior shape).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires_secrets: Vec<String>,
 }
 
 /// A node's signed declaration of identity, capabilities, scopes, and
@@ -146,6 +158,7 @@ mod tests {
                 burst: 20,
             }),
             resource_hints: sample_resource_hints(),
+            requires_secrets: vec![],
         }
     }
 
@@ -199,6 +212,46 @@ mod tests {
     fn capability_round_trip() {
         let c = sample_capability();
         assert_eq!(c, round_trip(&c));
+    }
+
+    /// Wire-level back-compat for `Capability::requires_secrets`:
+    ///
+    /// 1. A new daemon with `requires_secrets: vec![]` produces CBOR
+    ///    that does NOT carry the `requires_secrets` key (size parity
+    ///    with pre-3.6a manifests).
+    /// 2. CBOR produced WITHOUT the field decodes to `vec![]`.
+    /// 3. CBOR with a non-empty `requires_secrets` round-trips
+    ///    losslessly.
+    #[test]
+    fn capability_requires_secrets_round_trip() {
+        // 1: empty vec is not serialized.
+        let mut empty = sample_capability();
+        empty.requires_secrets.clear();
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&empty, &mut buf).expect("ser");
+        // CBOR map keys are encoded as text strings; search the encoded
+        // bytes for the literal field name. If `skip_serializing_if`
+        // works the bytes do not contain it.
+        let needle = b"requires_secrets";
+        assert!(
+            !buf.windows(needle.len()).any(|w| w == needle),
+            "empty requires_secrets must not appear in the CBOR bytes"
+        );
+
+        // 2: that same CBOR decodes back to `vec![]`.
+        let decoded: Capability =
+            ciborium::de::from_reader(buf.as_slice()).expect("de empty-shape");
+        assert_eq!(decoded.requires_secrets, Vec::<String>::new());
+
+        // 3: non-empty round-trip.
+        let mut with = sample_capability();
+        with.requires_secrets = vec!["secret/claude-api-key".to_string()];
+        let rt = round_trip(&with);
+        assert_eq!(
+            rt.requires_secrets,
+            vec!["secret/claude-api-key".to_string()]
+        );
+        assert_eq!(rt, with);
     }
 
     #[test]

@@ -1,0 +1,23 @@
+[package]
+name         = "harness-vault"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+description  = "Tagged credential store for harness capabilities (PRD §10.5)."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde      = { workspace = true }
+toml       = { workspace = true }
+thiserror  = { workspace = true }
+dirs       = { workspace = true }
+tracing    = { workspace = true }
+zeroize    = { workspace = true }
+
+[dev-dependencies]
+tempfile     = { workspace = true }
+serial_test  = { workspace = true }

@@ -14,11 +14,12 @@ workspace = true
 default = ["echo", "shell", "llm"]
 echo = []
 shell = []
-llm = ["dep:reqwest", "dep:url"]
+llm = ["dep:reqwest", "dep:url", "dep:harness-vault"]
 
 [dependencies]
 harness-core   = { workspace = true }
 harness-policy = { workspace = true }
+harness-vault  = { workspace = true, optional = true }
 async-trait    = "0.1"
 serde          = { workspace = true }
 serde_json     = { workspace = true }
@@ -32,6 +33,8 @@ url            = { workspace = true, optional = true }
 
 [dev-dependencies]
 wiremock       = { workspace = true }
+tracing-test   = { workspace = true }
+serial_test    = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 nix = { version = "0.29", default-features = false, features = ["signal"] }
