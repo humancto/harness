@@ -103,6 +103,7 @@ impl Default for DaemonRuntimeConfig {
 impl DaemonOrchestrator {
     /// Build all subsystems and bind sockets. Does NOT spawn loops yet —
     /// call [`Self::run_until_signal`].
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn build(
         identity: Arc<Identity>,
         persistent_trust: TrustStore,
@@ -179,6 +180,33 @@ impl DaemonOrchestrator {
         };
         let policy_engine = std::sync::Arc::new(policy_engine);
 
+        // Phase 3.6a: load `~/.harness/secrets.toml` if present. Missing
+        // file → empty store (capabilities that need a secret will
+        // surface a clear `not configured` error at execute time).
+        // Permission / parse errors abort startup — silently bypassing
+        // a credential file is worse than refusing to start.
+        let secrets_path = config.harness_root.join("secrets.toml");
+        let plaintext_store = match harness_vault::PlaintextStore::load_from_path(&secrets_path) {
+            Ok(s) => s,
+            Err(harness_vault::SecretsError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                tracing::info!(
+                    path = %secrets_path.display(),
+                    "no secrets.toml found; capabilities requiring secrets will fail until configured"
+                );
+                harness_vault::PlaintextStore::empty()
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "secrets load failed at {}: {e}",
+                    secrets_path.display()
+                ));
+            }
+        };
+        let secrets: std::sync::Arc<dyn harness_vault::SecretsStore> =
+            std::sync::Arc::new(plaintext_store);
+
         // Build the capability registry (echo + future Phase 3
         // additions feature-gated). The daemon advertises every
         // registered capability via NodeManifest.
@@ -188,6 +216,25 @@ impl DaemonOrchestrator {
         // failures log + return; daemon continues without LLM caps.
         #[cfg(feature = "llm")]
         harness_capabilities::enrich_with_llm_local(&capabilities, policy_engine.clone()).await;
+        // Phase 3.6a: register the single `llm.cloud.claude` cap. The
+        // capability surfaces in the manifest unconditionally — at
+        // execute time it errors with `not configured` if the secret
+        // tag is missing. This is intentional: peers can see the cap
+        // exists and route to it, and the operator gets a clear
+        // diagnostic instead of silent absence.
+        #[cfg(feature = "llm")]
+        {
+            let cloud_client = reqwest::Client::new();
+            let cloud_batcher =
+                std::sync::Arc::new(harness_capabilities::llm_batcher::LlmBatcher::from_env());
+            harness_capabilities::enrich_with_llm_cloud_claude(
+                &capabilities,
+                secrets.clone(),
+                policy_engine.clone(),
+                cloud_batcher,
+                cloud_client,
+            );
+        }
         let cap_ids = capabilities.ids();
 
         // Phase 3.3a: local executor loop. Picks Submitted tasks off
@@ -208,6 +255,7 @@ impl DaemonOrchestrator {
                 .with_auth(auth)
                 .with_store(store)
                 .with_policy(policy_engine)
+                .with_secrets(secrets.clone())
                 .build();
         let api_handle = harness_api::serve(config.api_bind, api_state.clone())
             .await
