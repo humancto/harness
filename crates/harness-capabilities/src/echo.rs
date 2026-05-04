@@ -74,6 +74,7 @@ impl Capability for EchoCapability {
                 disk_io_class: harness_core::protocol::DiskIoClass::None,
                 estimated_duration_ms: Some(1),
             },
+            requires_secrets: vec![],
         }
     }
 

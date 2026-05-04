@@ -168,6 +168,7 @@ impl Capability for LlmLocalCapability {
                 disk_io_class: DiskIoClass::Light,
                 estimated_duration_ms: None,
             },
+            requires_secrets: vec![],
         }
     }
 
