@@ -235,6 +235,12 @@ impl DaemonOrchestrator {
                 cloud_client,
             );
         }
+        // Phase 3.8: register `brain.plan` with the Template backend.
+        // Lives last in the enricher list so it observes every other
+        // registered capability via `WeakCapabilityRegistry::refs`.
+        // 3.9 will prepend `LocalFast` to the brain's backend lineup.
+        #[cfg(feature = "brain")]
+        harness_capabilities::enrich_with_brain_plan(&capabilities, identity.node_id()).await;
         let cap_ids = capabilities.ids();
 
         // Phase 3.3a: local executor loop. Picks Submitted tasks off

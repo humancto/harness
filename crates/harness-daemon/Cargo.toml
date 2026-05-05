@@ -15,8 +15,9 @@ name = "harness"
 path = "src/main.rs"
 
 [features]
-default = ["llm"]
+default = ["llm", "brain"]
 llm = []
+brain = []
 
 [dependencies]
 clap                = { workspace = true }
