@@ -42,7 +42,7 @@ Tests: 410 passing. ADRs 0001-0007 in place. Each PR atomic, expert-reviewed, CI
 | TBD | 3.8  | `brain.plan` Template tier — `harness-brain` crate, `WeakCapabilityRegistry`, `Unsigned<Plan>` + `CapabilityRef` in core. ADR-0013                                                                                                      |
 | TBD | 3.9  | `brain.plan` LocalFast tier — `LocalFastBackend` (Ollama, feature-gated), `CapabilitySchemaIndex`, `validate_plan` (schema + cost), `PlanningPolicy` gets `confidence_threshold`/`prefer_local_models`/`default_max_cost_usd`. ADR-0014 |
 
-Tests as of 3.9 merge: **620 passing** (+41 vs. 3.8) — workspace defaults now enable `harness-brain/localfast` so the LocalFast wiremock + JSON-extractor tests are part of the default suite.
+Tests as of 3.9 merge: **632 passing** (+53 vs. 3.8) — workspace defaults now enable `harness-brain/localfast` so the LocalFast wiremock + JSON-extractor tests are part of the default suite. Round-2 review surfaced a brace-counter desync in `extract_json_object` and a missing `tests/validate.rs` file (silently dropped during initial scaffold); both fixed in the same PR.
 
 ## Phase 3 carryovers (deferred from Phase 2)
 

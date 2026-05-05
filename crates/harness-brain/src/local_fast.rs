@@ -336,10 +336,17 @@ pub fn extract_json_object(s: &str) -> Option<&str> {
                 depth += 1;
             }
             b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    if let Some(s_idx) = start {
-                        return Some(&s[s_idx..=i]);
+                // Clamp at zero: a stray `}` in prose before the
+                // first `{` (LLM saying "the closing `}` belongs to
+                // the previous block, here's the plan: {...}") must
+                // NOT desync the counter and consume the real
+                // object's closer.
+                if depth > 0 {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some(s_idx) = start {
+                            return Some(&s[s_idx..=i]);
+                        }
                     }
                 }
             }
@@ -523,5 +530,19 @@ mod unit_tests {
     #[test]
     fn extract_no_object_returns_none() {
         assert!(extract_json_object("hello world").is_none());
+    }
+
+    #[test]
+    fn extract_handles_stray_close_in_prose() {
+        // Stray `}` in prose before the real object — must not
+        // desync the brace counter.
+        let s = "} prose {\"a\":1}";
+        assert_eq!(extract_json_object(s).unwrap(), "{\"a\":1}");
+    }
+
+    #[test]
+    fn extract_handles_multiple_stray_closes() {
+        let s = "}}} eventually {\"x\":42} more";
+        assert_eq!(extract_json_object(s).unwrap(), "{\"x\":42}");
     }
 }

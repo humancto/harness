@@ -504,6 +504,57 @@ async fn t23b_localfast_nomatch_falls_through_to_template() {
     assert_eq!(tpl_calls.load(Ordering::SeqCst), 0);
 }
 
+/// Backend that emits a confident plan whose `PlanNode.input` violates
+/// the registered cap's schema (cmd = integer instead of string). The
+/// executor must call `validate_plan`, get back `SchemaViolation`, and
+/// surface a diagnostic — not silently rubber-stamp the bad plan.
+#[derive(Debug)]
+struct SchemaViolatingBackend;
+
+#[async_trait]
+impl PlannerBackend for SchemaViolatingBackend {
+    fn id(&self) -> &str {
+        "violator"
+    }
+
+    async fn plan(&self, _req: &PlanRequest) -> Result<PlanOutcome, PlannerError> {
+        // shell.exec schema requires `cmd: string` — emit `cmd: 42` so
+        // schema validation rejects.
+        let plan = plan_one_node("shell.exec", json!({"cmd": 42}));
+        Ok(PlanOutcome::Confident(Box::new(PlanResponse {
+            plan: Unsigned(plan),
+            confidence: 0.95,
+            rationale: "violator".into(),
+            estimated_cost_usd: 0.0,
+            estimated_duration_ms: 0,
+            fallback_plan: None,
+        })))
+    }
+}
+
+#[tokio::test]
+async fn t24b_schema_violation_propagates_through_executor() {
+    let provider: Arc<dyn Fn() -> CapabilitySnapshot + Send + Sync> = Arc::new(snapshot_with_shell);
+    let cap = BrainPlanCapability::new(
+        vec![Arc::new(SchemaViolatingBackend)],
+        provider,
+        PlanConstraints::default(),
+    );
+    let err = cap
+        .execute(&ctx(), json!({"goal": "anything"}))
+        .await
+        .expect_err("must fail");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("SchemaViolation") || msg.contains("schema"),
+        "diagnostic must name SchemaViolation; got {msg}"
+    );
+    assert!(
+        msg.contains("shell.exec"),
+        "diagnostic must name the failing capability; got {msg}"
+    );
+}
+
 #[tokio::test]
 async fn t24_brain_plan_validation_failure_propagates_to_diagnostic() {
     // EmitsUnknownCap returns a Confident plan referencing a cap not in
