@@ -1060,6 +1060,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "blake3",
+ "harness-brain",
  "harness-core",
  "harness-policy",
  "harness-vault",

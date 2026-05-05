@@ -11,15 +11,17 @@ description  = "Built-in capability implementations."
 workspace = true
 
 [features]
-default = ["echo", "shell", "llm"]
+default = ["echo", "shell", "llm", "brain"]
 echo = []
 shell = []
 llm = ["dep:reqwest", "dep:url", "dep:harness-vault"]
+brain = ["dep:harness-brain"]
 
 [dependencies]
 harness-core   = { workspace = true }
 harness-policy = { workspace = true }
 harness-vault  = { workspace = true, optional = true }
+harness-brain  = { workspace = true, optional = true }
 async-trait    = "0.1"
 serde          = { workspace = true }
 serde_json     = { workspace = true }
