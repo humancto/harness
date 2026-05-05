@@ -15,9 +15,10 @@ name = "harness"
 path = "src/main.rs"
 
 [features]
-default = ["llm", "brain"]
+default = ["llm", "brain", "fs"]
 llm = []
 brain = []
+fs   = []
 
 [dependencies]
 clap                = { workspace = true }
@@ -34,7 +35,7 @@ harness-cli         = { workspace = true }
 harness-mesh        = { workspace = true }
 harness-api         = { workspace = true }
 harness-store        = { workspace = true }
-harness-capabilities = { workspace = true }
+harness-capabilities = { workspace = true, features = ["fs"] }
 harness-policy       = { workspace = true }
 harness-vault        = { workspace = true }
 harness-brain        = { workspace = true, features = ["localfast"] }

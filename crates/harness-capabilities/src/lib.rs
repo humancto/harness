@@ -26,6 +26,9 @@ pub mod llm_batcher;
 #[cfg(feature = "brain")]
 pub mod brain_plan;
 
+#[cfg(feature = "fs")]
+pub mod fs;
+
 #[cfg(feature = "llm")]
 pub mod llm_cloud_claude;
 
@@ -39,6 +42,9 @@ pub use registry::CapabilitySnapshot;
 
 #[cfg(feature = "brain")]
 pub use brain_plan::{enrich_with_brain_plan, BrainPlanCapability};
+
+#[cfg(feature = "fs")]
+pub use fs::{FsListCapability, FsReadCapability, ScopeConfig, ScopeError, ScopeRegistry};
 pub use traits::{Capability, CapabilityError, ExecutionContext};
 
 #[cfg(feature = "echo")]
