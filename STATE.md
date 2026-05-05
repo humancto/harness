@@ -31,17 +31,18 @@ Tests: 410 passing. ADRs 0001-0007 in place. Each PR atomic, expert-reviewed, CI
 
 ### Phase 3 progress (sub-items merged so far)
 
-| PR  | Item | Title                                                                                                                              |
-| --- | ---- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| #22 | 3.1  | Policy engine — `~/.harness/policy.toml`, ArcSwap-backed reload, deny-all default                                                  |
-| #24 | 3.2a | `shell.exec` synchronous form (Unix-only) + policy gate. ADR-0008 (streaming deferred)                                             |
-| #25 | 3.3a | Local executor loop + `harness run --on self` + `GET /tasks/<id>` + node_name plumbing                                             |
-| #26 | 3.4  | `llm.local.<model>` auto-registration via Ollama `/api/tags`. ADR-0010                                                             |
-| #27 | 3.5  | LLM micro-batcher (dedup-within-window). ADR-0011                                                                                  |
-| TBD | 3.6a | `llm.cloud.claude` + `harness-vault` plaintext store + `Action::Secret` hook. ADR-0012                                             |
-| TBD | 3.8  | `brain.plan` Template tier — `harness-brain` crate, `WeakCapabilityRegistry`, `Unsigned<Plan>` + `CapabilityRef` in core. ADR-0013 |
+| PR  | Item | Title                                                                                                                                                                                                                                   |
+| --- | ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| #22 | 3.1  | Policy engine — `~/.harness/policy.toml`, ArcSwap-backed reload, deny-all default                                                                                                                                                       |
+| #24 | 3.2a | `shell.exec` synchronous form (Unix-only) + policy gate. ADR-0008 (streaming deferred)                                                                                                                                                  |
+| #25 | 3.3a | Local executor loop + `harness run --on self` + `GET /tasks/<id>` + node_name plumbing                                                                                                                                                  |
+| #26 | 3.4  | `llm.local.<model>` auto-registration via Ollama `/api/tags`. ADR-0010                                                                                                                                                                  |
+| #27 | 3.5  | LLM micro-batcher (dedup-within-window). ADR-0011                                                                                                                                                                                       |
+| TBD | 3.6a | `llm.cloud.claude` + `harness-vault` plaintext store + `Action::Secret` hook. ADR-0012                                                                                                                                                  |
+| TBD | 3.8  | `brain.plan` Template tier — `harness-brain` crate, `WeakCapabilityRegistry`, `Unsigned<Plan>` + `CapabilityRef` in core. ADR-0013                                                                                                      |
+| TBD | 3.9  | `brain.plan` LocalFast tier — `LocalFastBackend` (Ollama, feature-gated), `CapabilitySchemaIndex`, `validate_plan` (schema + cost), `PlanningPolicy` gets `confidence_threshold`/`prefer_local_models`/`default_max_cost_usd`. ADR-0014 |
 
-Tests as of 3.8 merge: **579 passing** (+32 vs. 3.6a).
+Tests as of 3.9 merge: **620 passing** (+41 vs. 3.8) — workspace defaults now enable `harness-brain/localfast` so the LocalFast wiremock + JSON-extractor tests are part of the default suite.
 
 ## Phase 3 carryovers (deferred from Phase 2)
 
