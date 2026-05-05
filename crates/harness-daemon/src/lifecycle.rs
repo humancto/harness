@@ -235,12 +235,73 @@ impl DaemonOrchestrator {
                 cloud_client,
             );
         }
-        // Phase 3.8: register `brain.plan` with the Template backend.
+        // Phase 3.8/3.9: register `brain.plan` with a backend lineup.
         // Lives last in the enricher list so it observes every other
-        // registered capability via `WeakCapabilityRegistry::refs`.
-        // 3.9 will prepend `LocalFast` to the brain's backend lineup.
+        // registered capability via `WeakCapabilityRegistry::snapshot`.
+        //
+        // Backend lineup resolution:
+        //   1. Read `policy.planning.prefer_local_models` (PRD §15.2).
+        //   2. Walk the registry's `llm.local.*` ids; pick the first
+        //      preferred model that's locally registered.
+        //   3. Build `[LocalFastBackend, TemplateBackend]` if a model
+        //      resolved; otherwise just `[TemplateBackend]`.
+        //
+        // Default constraints flow from `policy.planning.confidence_threshold`
+        // + `default_max_cost_usd` per ADR-0014 §9.
         #[cfg(feature = "brain")]
-        harness_capabilities::enrich_with_brain_plan(&capabilities, identity.node_id()).await;
+        {
+            let policy_snapshot = policy_engine.snapshot();
+            let planning = &policy_snapshot.planning;
+
+            let mut backends: Vec<std::sync::Arc<dyn harness_brain::PlannerBackend>> = Vec::new();
+
+            #[cfg(feature = "llm")]
+            if let Some(model) =
+                resolve_local_fast_model(&capabilities, &planning.prefer_local_models)
+            {
+                let host_str = std::env::var("OLLAMA_HOST")
+                    .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+                let host = harness_capabilities::llm_local::parse_ollama_host(&host_str)
+                    .unwrap_or_else(|()| {
+                        #[allow(clippy::expect_used)]
+                        url::Url::parse("http://127.0.0.1:11434").expect("default host parses")
+                    });
+                match harness_brain::LocalFastBackend::new(host, model.clone(), identity.node_id())
+                {
+                    Ok(b) => {
+                        tracing::info!(
+                            target: "harness.brain",
+                            local_fast_model = %model,
+                            "registered LocalFast planner backend"
+                        );
+                        backends.push(std::sync::Arc::new(b));
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "harness.brain",
+                            ?err,
+                            "failed to construct LocalFastBackend; brain.plan will run Template-only"
+                        );
+                    }
+                }
+            }
+
+            backends.push(std::sync::Arc::new(harness_brain::TemplateBackend::new(
+                identity.node_id(),
+            )));
+
+            let brain_config = harness_capabilities::brain_plan::BrainPlanConfig {
+                default_constraints: harness_brain::PlanConstraints {
+                    max_cost_usd: planning.default_max_cost_usd,
+                    allow_cloud: planning.allow_cloud_escalation,
+                    must_be_local: false,
+                    plan_max_nodes: None,
+                    confidence_threshold: Some(planning.confidence_threshold),
+                },
+            };
+            harness_capabilities::enrich_with_brain_plan(&capabilities, backends, brain_config)
+                .await;
+        }
         let cap_ids = capabilities.ids();
 
         // Phase 3.3a: local executor loop. Picks Submitted tasks off
@@ -407,6 +468,27 @@ impl DaemonOrchestrator {
 
 fn map_discovery(err: &DiscoveryError) -> anyhow::Error {
     anyhow::anyhow!("discovery: {err}")
+}
+
+/// Resolve which local Ollama model the `LocalFast` planner should bind
+/// to. Walks `prefer_local_models` in declared order and returns the
+/// first that has a corresponding `llm.local.<model>` capability
+/// registered. Returns `None` when no preference matches — the daemon
+/// then registers brain.plan with a Template-only lineup.
+#[cfg(all(feature = "brain", feature = "llm"))]
+fn resolve_local_fast_model(
+    registry: &harness_capabilities::CapabilityRegistry,
+    prefer_models: &[String],
+) -> Option<String> {
+    let registered_ids: std::collections::HashSet<String> = registry
+        .ids()
+        .into_iter()
+        .filter_map(|id| id.strip_prefix("llm.local.").map(str::to_string))
+        .collect();
+    prefer_models
+        .iter()
+        .find(|m| registered_ids.contains(m.as_str()))
+        .cloned()
 }
 
 fn spawn_election_pump(

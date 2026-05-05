@@ -14,6 +14,7 @@ use serde_json::Value as JsonValue;
 pub use harness_core::{CapabilityRef, Unsigned};
 
 use crate::error::PlannerError;
+use crate::schema::CapabilitySchemaIndex;
 
 /// One planner tier. Implementations MUST be cheap to clone behind an
 /// `Arc` and MUST be `Send + Sync` so they can be invoked concurrently
@@ -70,6 +71,14 @@ pub enum PlanOutcome {
 pub struct PlanRequest {
     pub goal: String,
     pub available_capabilities: Vec<CapabilityRef>,
+    /// Phase 3.9 — compiled per-cap input-schema index, snapshotted
+    /// alongside `available_capabilities`. Template ignores it;
+    /// `LocalFast` projects the schemas into the system prompt
+    /// (id + required fields) so the LLM can match shapes.
+    /// `Default` is empty — request constructors that don't have
+    /// schemas (e.g. tests that don't exercise the `LocalFast` path)
+    /// can leave it default.
+    pub schemas: CapabilitySchemaIndex,
     pub constraints: PlanConstraints,
     pub context: Option<JsonValue>,
     /// Issuer of the `brain.plan` task — surfaced for templates and
@@ -101,6 +110,13 @@ pub struct PlanConstraints {
     pub allow_cloud: bool,
     pub must_be_local: bool,
     pub plan_max_nodes: Option<u32>,
+    /// Phase 3.9 — when `Some(t)`, the brain.plan executor treats a
+    /// `Confident(_)` outcome whose `confidence < t` as escalation
+    /// (advance to next backend with diagnostic). When `None`, every
+    /// `Confident(_)` is accepted (3.8 behavior). The default value
+    /// flows from `harness-policy::PlanningPolicy.confidence_threshold`
+    /// (PRD §15.2 default 0.7) via `BrainPlanConfig.default_constraints`.
+    pub confidence_threshold: Option<f64>,
 }
 
 // Compile-time guarantees that the planner surface is shareable across

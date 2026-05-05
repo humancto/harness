@@ -35,6 +35,9 @@ pub mod llm_local;
 pub use registry::{CapabilityRegistry, RegistryError, WeakCapabilityRegistry};
 
 #[cfg(feature = "brain")]
+pub use registry::CapabilitySnapshot;
+
+#[cfg(feature = "brain")]
 pub use brain_plan::{enrich_with_brain_plan, BrainPlanCapability};
 pub use traits::{Capability, CapabilityError, ExecutionContext};
 

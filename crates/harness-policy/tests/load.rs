@@ -44,6 +44,47 @@ fn t01_prd_example_round_trips() {
     assert!(p.capability.require_2fa_for.contains("shell.exec"));
     assert!(p.planning.allow_cloud_escalation);
     assert!(p.planning.local_only_for_tags.contains("medical"));
+    // 3.9 fields are absent from PRD example → defaults apply.
+    assert!((p.planning.confidence_threshold - 0.7).abs() < f64::EPSILON);
+    assert_eq!(p.planning.default_max_cost_usd, Some(1.0));
+    assert!(p.planning.prefer_local_models.is_empty());
+}
+
+#[test]
+fn t01b_planning_3_9_fields_round_trip() {
+    let toml = r#"
+[planning]
+confidence_threshold = 0.85
+prefer_local_models = ["llama3.1:8b", "qwen2.5:7b"]
+default_max_cost_usd = 5.0
+"#;
+    let p = load_from_str(toml).expect("3.9 planning fields parse");
+    assert!((p.planning.confidence_threshold - 0.85).abs() < f64::EPSILON);
+    assert_eq!(
+        p.planning.prefer_local_models,
+        vec!["llama3.1:8b".to_string(), "qwen2.5:7b".to_string()]
+    );
+    assert_eq!(p.planning.default_max_cost_usd, Some(5.0));
+}
+
+#[test]
+fn t01c_planning_default_max_cost_usd_can_be_disabled() {
+    let toml = r"
+[planning]
+default_max_cost_usd = false
+";
+    // `false` is not a valid Option<f64>; this should fail to parse,
+    // not silently coerce. Operators must write `default_max_cost_usd = 0.0`
+    // for "no plan can spend money" or omit the key for the default cap.
+    assert!(load_from_str(toml).is_err());
+}
+
+#[test]
+fn t01d_planning_default_constructor_uses_3_9_defaults() {
+    let p = harness_policy::PlanningPolicy::default();
+    assert!((p.confidence_threshold - 0.7).abs() < f64::EPSILON);
+    assert_eq!(p.default_max_cost_usd, Some(1.0));
+    assert!(p.prefer_local_models.is_empty());
 }
 
 #[test]

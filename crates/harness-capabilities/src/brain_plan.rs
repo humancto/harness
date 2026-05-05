@@ -1,22 +1,35 @@
 //! `brain.plan` — the `Anyone`-cardinality planner capability.
 //!
 //! Holds an ordered list of [`PlannerBackend`]s and walks them in tier
-//! order until one returns a confident, well-formed plan. The Phase 3.8
-//! lineup is `[TemplateBackend]`; 3.9 prepends `LocalFastBackend`,
-//! 3.6-cloud-escalation prepends a cloud tier.
+//! order until one returns a confident, well-formed, schema-valid plan
+//! whose cost fits the cap. Phase 3.8 lineup was `[TemplateBackend]`;
+//! 3.9 may prepend `LocalFastBackend` (via [`BrainPlanConfig`]).
 //!
 //! The capability is *policy-blind* by design (PRD §10.4): the planner
 //! does not consult `PolicyEngine`. Plans are emitted; the executing
 //! node enforces policy at execute time. The executing node may be a
 //! different node with a different policy than the brain.
+//!
+//! Validation:
+//! - 3.8 well-formedness (acyclic, caps-exist, non-empty, dangling-edge)
+//! - 3.9 schema match (every `PlanNode.input` against the cap's
+//!   `input_schema`) and cost cap (`estimated_cost_usd <= max_cost_usd`)
+//!
+//! Confidence threshold:
+//! - When `constraints.confidence_threshold = Some(t)` and the backend
+//!   returns `Confident(_)` with `confidence < t`, the executor treats
+//!   the outcome as escalation (advance to next backend with a
+//!   diagnostic). 3.8 had no threshold check; 3.9's default flows from
+//!   `harness-policy::PlanningPolicy.confidence_threshold` (PRD §15.2
+//!   default 0.7) via [`BrainPlanConfig::default_constraints`].
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use harness_brain::{
     backend::{PlanOutcome, PlanRequest, PlannerBackend, Unsigned},
-    validate::validate_plan_well_formed,
-    PlanConstraints,
+    validate::validate_plan,
+    CapabilitySchemaIndex, PlanConstraints,
 };
 use harness_core::protocol::{
     CostHint, CpuClass, DiskIoClass, NetworkClass, RateLimit, ResourceHints,
@@ -25,20 +38,35 @@ use harness_core::{Capability as ManifestEntry, CapabilityRef, Cardinality, SemV
 use serde::Deserialize;
 use serde_json::{json, Value as JsonValue};
 
-use crate::registry::CapabilityRegistry;
+use crate::registry::{CapabilityRegistry, CapabilitySnapshot};
 use crate::traits::{Capability, CapabilityError, ExecutionContext};
 
 /// Stable id for the capability surface.
 pub const ID: &str = "brain.plan";
 
+/// Daemon-supplied configuration for [`enrich_with_brain_plan`].
+#[derive(Debug, Clone, Default)]
+pub struct BrainPlanConfig {
+    /// Default constraints applied to every `PlanRequest` whose input
+    /// `constraints` field is absent or omits a sub-field. Daemon
+    /// builds this from `harness-policy::PlanningPolicy`
+    /// (`confidence_threshold`, `default_max_cost_usd`).
+    pub default_constraints: PlanConstraints,
+}
+
 /// `brain.plan` capability — wraps an ordered list of backends.
 pub struct BrainPlanCapability {
     backends: Vec<Arc<dyn PlannerBackend>>,
-    /// Snapshot provider for `available_capabilities`. Set by
-    /// [`enrich_with_brain_plan`] to a closure that downgrades the
-    /// host registry to a `WeakCapabilityRegistry` and reads through
-    /// it on every call. Tests can supply a static-Vec closure.
-    available_provider: Arc<dyn Fn() -> Vec<CapabilityRef> + Send + Sync>,
+    /// Snapshot provider — closure that returns
+    /// `(refs, CapabilitySchemaIndex)` atomically. Set by
+    /// [`enrich_with_brain_plan`] to a closure that downgrades the host
+    /// registry to a `WeakCapabilityRegistry`. Tests can supply a
+    /// static snapshot.
+    snapshot_provider: Arc<dyn Fn() -> CapabilitySnapshot + Send + Sync>,
+    /// Defaults applied when input.constraints is absent or omits a
+    /// sub-field. Set by [`enrich_with_brain_plan`] from
+    /// [`BrainPlanConfig::default_constraints`].
+    default_constraints: PlanConstraints,
 }
 
 impl std::fmt::Debug for BrainPlanCapability {
@@ -48,6 +76,7 @@ impl std::fmt::Debug for BrainPlanCapability {
                 "backends",
                 &self.backends.iter().map(|b| b.id()).collect::<Vec<_>>(),
             )
+            .field("default_constraints", &self.default_constraints)
             .finish_non_exhaustive()
     }
 }
@@ -56,11 +85,42 @@ impl BrainPlanCapability {
     #[must_use]
     pub fn new(
         backends: Vec<Arc<dyn PlannerBackend>>,
-        available_provider: Arc<dyn Fn() -> Vec<CapabilityRef> + Send + Sync>,
+        snapshot_provider: Arc<dyn Fn() -> CapabilitySnapshot + Send + Sync>,
+        default_constraints: PlanConstraints,
     ) -> Self {
         Self {
             backends,
-            available_provider,
+            snapshot_provider,
+            default_constraints,
+        }
+    }
+}
+
+/// Per-call constraint overrides. Each field is `Option<T>` so an
+/// absent field means "use the default" (NOT "false" / "zero"). The
+/// distinction matters for `bool` fields: `must_be_local` defaults to
+/// `false` in the daemon's `default_constraints`, and an explicit
+/// `false` in input is indistinguishable from absence — but an
+/// explicit `true` overrides while absence preserves the (potentially
+/// `true`) default.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct PlanConstraintsInput {
+    max_cost_usd: Option<f64>,
+    allow_cloud: Option<bool>,
+    must_be_local: Option<bool>,
+    plan_max_nodes: Option<u32>,
+    confidence_threshold: Option<f64>,
+}
+
+impl PlanConstraintsInput {
+    fn merge_over(self, defaults: PlanConstraints) -> PlanConstraints {
+        PlanConstraints {
+            max_cost_usd: self.max_cost_usd.or(defaults.max_cost_usd),
+            allow_cloud: self.allow_cloud.unwrap_or(defaults.allow_cloud),
+            must_be_local: self.must_be_local.unwrap_or(defaults.must_be_local),
+            plan_max_nodes: self.plan_max_nodes.or(defaults.plan_max_nodes),
+            confidence_threshold: self.confidence_threshold.or(defaults.confidence_threshold),
         }
     }
 }
@@ -71,13 +131,13 @@ impl BrainPlanCapability {
 struct BrainPlanInput {
     goal: String,
     #[serde(default)]
-    constraints: Option<PlanConstraints>,
+    constraints: Option<PlanConstraintsInput>,
     #[serde(default)]
     context: Option<JsonValue>,
     /// Optional override for `available_capabilities`. Per PRD §15.5:
     /// a brain on `mac-mini` may dispatch `brain.plan` to a `gpu-box`
     /// peer with the brain's own capability list rather than the
-    /// peer's. Absent → snapshot the local registry via the closure.
+    /// peer's. Absent → snapshot the local registry.
     #[serde(default)]
     available_capabilities: Option<Vec<CapabilityRef>>,
 }
@@ -103,7 +163,17 @@ impl Capability for BrainPlanCapability {
                 "additionalProperties": false,
                 "properties": {
                     "goal": { "type": "string", "minLength": 1 },
-                    "constraints": { "type": "object" },
+                    "constraints": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "max_cost_usd":         { "type": ["number", "null"], "minimum": 0 },
+                            "allow_cloud":          { "type": ["boolean", "null"] },
+                            "must_be_local":        { "type": ["boolean", "null"] },
+                            "plan_max_nodes":       { "type": ["integer", "null"], "minimum": 1 },
+                            "confidence_threshold": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }
+                        }
+                    },
                     "context": {},
                     "available_capabilities": {
                         "type": "array",
@@ -163,17 +233,31 @@ impl Capability for BrainPlanCapability {
             return Err(CapabilityError::InvalidInput("goal is empty".to_string()));
         }
 
-        // Snapshot available_capabilities once. The same Vec is reused
-        // for every backend so a registration race mid-flight cannot
-        // give backend N+1 a different list than backend N.
+        // Snapshot once. The same `(refs, schemas)` is reused for every
+        // backend so a registration race mid-flight cannot give backend
+        // N+1 a different view than backend N.
+        let snapshot = (self.snapshot_provider)();
+
+        // Input-override path: caller supplies `available_capabilities`.
+        // We still pull `schemas` from the local registry — locally-
+        // registered caps validate, foreign caps surface UnknownSchema
+        // (the dispatcher's tag-aware routing in 3.6-encrypted picks up
+        // the validation slack on the executing node).
         let available = input
             .available_capabilities
-            .unwrap_or_else(|| (self.available_provider)());
+            .unwrap_or_else(|| snapshot.refs.clone());
+        let schemas: CapabilitySchemaIndex = snapshot.schemas;
+
+        let constraints = input
+            .constraints
+            .unwrap_or_default()
+            .merge_over(self.default_constraints);
 
         let req = PlanRequest {
             goal: input.goal,
             available_capabilities: available,
-            constraints: input.constraints.unwrap_or_default(),
+            schemas,
+            constraints,
             context: input.context,
             issuing_node: ctx.issued_by,
         };
@@ -182,11 +266,27 @@ impl Capability for BrainPlanCapability {
         for backend in &self.backends {
             match backend.plan(&req).await {
                 Ok(PlanOutcome::Confident(resp)) => {
-                    // 3.8 has no confidence-threshold check. Validate
-                    // well-formedness; 3.9 layers on schema/cost.
-                    if let Err(e) =
-                        validate_plan_well_formed(resp.plan.as_inner(), &req.available_capabilities)
-                    {
+                    // 3.9 confidence-threshold gate.
+                    if let Some(threshold) = req.constraints.confidence_threshold {
+                        if resp.confidence < threshold {
+                            diagnostics.push(format!(
+                                "{}: confidence {:.2} < threshold {:.2}",
+                                backend.id(),
+                                resp.confidence,
+                                threshold,
+                            ));
+                            continue;
+                        }
+                    }
+                    // Full validation: structural + schema + cost.
+                    let validation = validate_plan(
+                        resp.plan.as_inner(),
+                        resp.estimated_cost_usd,
+                        &req.constraints,
+                        &req.schemas,
+                        &req.available_capabilities,
+                    );
+                    if let Err(e) = validation {
                         diagnostics.push(format!("{}: validation failed: {e}", backend.id()));
                         continue;
                     }
@@ -241,24 +341,24 @@ impl Capability for BrainPlanCapability {
     }
 }
 
-/// Register a `brain.plan` capability into `registry`. The backend
-/// lineup is just `[TemplateBackend]` for Phase 3.8; 3.9 will prepend
-/// the `LocalFast` tier.
+/// Register a `brain.plan` capability into `registry` with the given
+/// backend lineup. The daemon builds the lineup; for 3.8 it was
+/// `[TemplateBackend]`, for 3.9 it may be `[LocalFastBackend, TemplateBackend]`.
 ///
-/// `async` even though Template construction is sync — keeps the API
-/// stable for 3.9, which probes Ollama at enrich time.
+/// `async` even though Template construction is sync — `LocalFast` may
+/// probe Ollama at enrich time in future extensions.
 ///
-/// Idempotent only for fresh registries: a duplicate call panics with
-/// `BUG: enrich_with_brain_plan called twice`, matching
-/// `enrich_with_llm_local` / `enrich_with_llm_cloud_claude`.
+/// Idempotent-detected via `expect("BUG: enrich_with_brain_plan called twice")`,
+/// matching `enrich_with_llm_local` / `enrich_with_llm_cloud_claude`.
 pub async fn enrich_with_brain_plan(
     registry: &CapabilityRegistry,
-    local_node: harness_core::NodeId,
+    backends: Vec<Arc<dyn PlannerBackend>>,
+    config: BrainPlanConfig,
 ) {
     let weak = registry.downgrade();
-    let provider: Arc<dyn Fn() -> Vec<CapabilityRef> + Send + Sync> = Arc::new(move || weak.refs());
-    let template = Arc::new(harness_brain::TemplateBackend::new(local_node));
-    let cap = BrainPlanCapability::new(vec![template], provider);
+    let snapshot_provider: Arc<dyn Fn() -> CapabilitySnapshot + Send + Sync> =
+        Arc::new(move || weak.snapshot());
+    let cap = BrainPlanCapability::new(backends, snapshot_provider, config.default_constraints);
     #[allow(clippy::expect_used)]
     registry
         .register(Arc::new(cap))

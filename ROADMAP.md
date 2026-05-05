@@ -65,7 +65,7 @@ When an item lands, flip its checkbox **in the same PR** as `STATE.md` is update
   - [ ] **3.6-encrypted** Encrypted-at-rest + replicated credentials per PRD §10.5; tag-aware dispatcher routing on `requires_secrets`.
 - [ ] **3.7** `mcp.proxy` via `rmcp`: subprocess MCP servers, expose tools as `mcp.<server>.<tool>`.
 - [x] **3.8** `brain.plan` Template backend. `harness-brain` crate with `PlannerBackend` trait + four-state `PlanOutcome` + `TemplateBackend` (run:/shell:/...); `WeakCapabilityRegistry` for snapshot-without-leak; `Unsigned<Plan>` + `CapabilityRef` in core. ADR-0013.
-- [ ] **3.9** `brain.plan` LocalFast backend (tier 1) + plan validation (schema match + DAG acyclicity + cost cap).
+- [x] **3.9** `brain.plan` LocalFast backend (tier 1) + plan validation. `harness-brain::LocalFastBackend` (Ollama-backed, feature-gated); `CapabilitySchemaIndex` with eager `jsonschema` compile; `validate_plan` superset of well-formedness + schema-match + cost-cap; `WeakCapabilityRegistry::snapshot` for atomic (refs, schemas) view; PRD §15.2 confidence threshold at executor; `harness-policy::PlanningPolicy` gains `confidence_threshold`/`prefer_local_models`/`default_max_cost_usd`. ADR-0014.
 - [ ] **3.10** `fs.list` / `fs.read` / `fs.search` / `fs.grep` (Owner cardinality, Tantivy or sqlite-FTS index).
 - [ ] **3.11** `mesh.search` / `mesh.grep` federated wrappers (fan-out + Concat / Rerank merge).
 

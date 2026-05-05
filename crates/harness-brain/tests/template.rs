@@ -8,7 +8,8 @@
     clippy::unwrap_used,
     clippy::panic,
     clippy::float_cmp,
-    clippy::many_single_char_names
+    clippy::many_single_char_names,
+    deprecated
 )]
 
 use harness_brain::{
@@ -33,6 +34,7 @@ fn req(goal: &str, available: Vec<CapabilityRef>) -> PlanRequest {
     PlanRequest {
         goal: goal.to_string(),
         available_capabilities: available,
+        schemas: harness_brain::CapabilitySchemaIndex::default(),
         constraints: PlanConstraints::default(),
         context: None,
         issuing_node: NodeId::from_bytes([7; 16]),
