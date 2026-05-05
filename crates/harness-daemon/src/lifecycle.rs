@@ -207,10 +207,58 @@ impl DaemonOrchestrator {
         let secrets: std::sync::Arc<dyn harness_vault::SecretsStore> =
             std::sync::Arc::new(plaintext_store);
 
+        // Phase 3.10a: load `~/.harness/scopes.toml` if present. Missing
+        // file → empty registry (`fs.*` advertise no scopes; calls fail
+        // with `InvalidInput("unknown scope")`). Permission / parse
+        // errors abort startup — silently skipping a misconfigured
+        // scope is worse than a clear error.
+        #[cfg(feature = "fs")]
+        let scope_registry = {
+            let scopes_path = config.harness_root.join("scopes.toml");
+            let r = match harness_capabilities::ScopeRegistry::load_from_path(&scopes_path) {
+                Ok(r) => r,
+                Err(harness_capabilities::ScopeError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    tracing::info!(
+                        path = %scopes_path.display(),
+                        "no scopes.toml found; fs.* advertise no scopes"
+                    );
+                    harness_capabilities::ScopeRegistry::default()
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "scopes.toml load failed at {}: {e}",
+                        scopes_path.display()
+                    ));
+                }
+            };
+            std::sync::Arc::new(r)
+        };
+
         // Build the capability registry (echo + future Phase 3
         // additions feature-gated). The daemon advertises every
         // registered capability via NodeManifest.
         let capabilities = harness_capabilities::default_registry(policy_engine.clone());
+
+        // Phase 3.10a: register fs.list + fs.read after the default
+        // registry. The scope registry's `manifest_scopes()` populates
+        // `NodeManifest::scopes` further below.
+        #[cfg(feature = "fs")]
+        {
+            #[allow(clippy::expect_used)]
+            capabilities
+                .register(std::sync::Arc::new(
+                    harness_capabilities::FsListCapability::new(scope_registry.clone()),
+                ))
+                .expect("BUG: fs.list registered twice");
+            #[allow(clippy::expect_used)]
+            capabilities
+                .register(std::sync::Arc::new(
+                    harness_capabilities::FsReadCapability::new(scope_registry.clone()),
+                ))
+                .expect("BUG: fs.read registered twice");
+        }
         // Phase 3.4: discover locally-installed Ollama models and
         // register one `llm.local.<model>` cap per. Best-effort —
         // failures log + return; daemon continues without LLM caps.
