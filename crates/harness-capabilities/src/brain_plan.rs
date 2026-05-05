@@ -175,9 +175,15 @@ impl Capability for BrainPlanCapability {
             .available_capabilities
             .unwrap_or_else(|| (self.available_provider)());
 
+        // Schemas migrate in via CapabilitySnapshot in the next commit
+        // (CapabilitySnapshot + brain_plan migration). For now, the
+        // request carries an empty index; Template ignores it,
+        // LocalFast surfaces UnknownSchema for every cap (correct
+        // behavior — LocalFast is not registered yet).
         let req = PlanRequest {
             goal: input.goal,
             available_capabilities: available,
+            schemas: harness_brain::CapabilitySchemaIndex::default(),
             constraints: input.constraints.unwrap_or_default(),
             context: input.context,
             issuing_node: ctx.issued_by,
