@@ -23,13 +23,19 @@ pub mod shell;
 #[cfg(feature = "llm")]
 pub mod llm_batcher;
 
+#[cfg(feature = "brain")]
+pub mod brain_plan;
+
 #[cfg(feature = "llm")]
 pub mod llm_cloud_claude;
 
 #[cfg(feature = "llm")]
 pub mod llm_local;
 
-pub use registry::{CapabilityRegistry, RegistryError};
+pub use registry::{CapabilityRegistry, RegistryError, WeakCapabilityRegistry};
+
+#[cfg(feature = "brain")]
+pub use brain_plan::{enrich_with_brain_plan, BrainPlanCapability};
 pub use traits::{Capability, CapabilityError, ExecutionContext};
 
 #[cfg(feature = "echo")]

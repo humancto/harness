@@ -1043,6 +1043,16 @@ dependencies = [
 [[package]]
 name = "harness-brain"
 version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "harness-core",
+ "serde",
+ "serde_json",
+ "shlex",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "harness-capabilities"
@@ -1050,6 +1060,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "blake3",
+ "harness-brain",
  "harness-core",
  "harness-policy",
  "harness-vault",

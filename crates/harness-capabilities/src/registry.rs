@@ -6,13 +6,15 @@
 //!   handler for an incoming Task
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
-use harness_core::Capability as ManifestEntry;
+use harness_core::{Capability as ManifestEntry, CapabilityRef};
 use parking_lot::RwLock;
 use thiserror::Error;
 
 use crate::traits::Capability;
+
+type Inner = RwLock<HashMap<String, Arc<dyn Capability>>>;
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -24,7 +26,45 @@ pub enum RegistryError {
 /// Concurrent registry. Cheaply cloneable (Arc internal).
 #[derive(Clone, Default)]
 pub struct CapabilityRegistry {
-    inner: Arc<RwLock<HashMap<String, Arc<dyn Capability>>>>,
+    inner: Arc<Inner>,
+}
+
+/// `Weak` companion to [`CapabilityRegistry`] used by capabilities that
+/// need to *observe* the registry's contents without extending its
+/// lifetime (e.g. `brain.plan`, which snapshots the available-capability
+/// list per `PlanRequest`).
+///
+/// Holding a strong `Arc<CapabilityRegistry>` in a capability that lives
+/// inside the registry would create a refcount cycle and leak the
+/// registry on daemon shutdown. `WeakCapabilityRegistry` breaks that
+/// cycle: when the daemon drops the last `CapabilityRegistry` clone,
+/// `upgrade()` returns `None` and `refs()` yields `Vec::new()`, which
+/// surfaces as a clean `Failed("no backend ...")` from the executor.
+#[derive(Clone, Debug, Default)]
+pub struct WeakCapabilityRegistry {
+    inner: Weak<Inner>,
+}
+
+impl WeakCapabilityRegistry {
+    /// Snapshot the currently-registered capabilities into
+    /// [`CapabilityRef`]s. Returns `Vec::new()` if the registry has
+    /// been dropped.
+    #[must_use]
+    pub fn refs(&self) -> Vec<CapabilityRef> {
+        let Some(strong) = self.inner.upgrade() else {
+            return Vec::new();
+        };
+        let g = strong.read();
+        g.values()
+            .map(|c| {
+                let m = c.manifest();
+                CapabilityRef {
+                    id: m.id,
+                    version_major: m.version.major,
+                }
+            })
+            .collect()
+    }
 }
 
 impl std::fmt::Debug for CapabilityRegistry {
@@ -84,6 +124,16 @@ impl CapabilityRegistry {
         let mut ids: Vec<String> = g.keys().cloned().collect();
         ids.sort();
         ids
+    }
+
+    /// Build a [`WeakCapabilityRegistry`] handle that observes this
+    /// registry without extending its lifetime. See the
+    /// `WeakCapabilityRegistry` doc-comment for the rationale.
+    #[must_use]
+    pub fn downgrade(&self) -> WeakCapabilityRegistry {
+        WeakCapabilityRegistry {
+            inner: Arc::downgrade(&self.inner),
+        }
     }
 }
 

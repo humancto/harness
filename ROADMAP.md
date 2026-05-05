@@ -64,7 +64,7 @@ When an item lands, flip its checkbox **in the same PR** as `STATE.md` is update
   - [ ] **3.6-gemini** Gemini provider (mechanical, mirrors 3.6a).
   - [ ] **3.6-encrypted** Encrypted-at-rest + replicated credentials per PRD §10.5; tag-aware dispatcher routing on `requires_secrets`.
 - [ ] **3.7** `mcp.proxy` via `rmcp`: subprocess MCP servers, expose tools as `mcp.<server>.<tool>`.
-- [ ] **3.8** `brain.plan` Template backend (hardcoded plan templates from PRD §15.6).
+- [x] **3.8** `brain.plan` Template backend. `harness-brain` crate with `PlannerBackend` trait + four-state `PlanOutcome` + `TemplateBackend` (run:/shell:/...); `WeakCapabilityRegistry` for snapshot-without-leak; `Unsigned<Plan>` + `CapabilityRef` in core. ADR-0013.
 - [ ] **3.9** `brain.plan` LocalFast backend (tier 1) + plan validation (schema match + DAG acyclicity + cost cap).
 - [ ] **3.10** `fs.list` / `fs.read` / `fs.search` / `fs.grep` (Owner cardinality, Tantivy or sqlite-FTS index).
 - [ ] **3.11** `mesh.search` / `mesh.grep` federated wrappers (fan-out + Concat / Rerank merge).

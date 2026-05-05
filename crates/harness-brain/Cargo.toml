@@ -11,3 +11,13 @@ description  = "Planner runtime and backend tiers."
 workspace = true
 
 [dependencies]
+harness-core = { workspace = true }
+async-trait  = "0.1"
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+shlex        = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
