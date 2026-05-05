@@ -1,4 +1,4 @@
-//! Plan well-formedness checks (Phase 3.8 scope).
+//! Plan validation (Phase 3.8 well-formedness + 3.9 schema/cost).
 //!
 //! 3.8 ships:
 //! - non-empty `tasks`
@@ -6,27 +6,96 @@
 //! - DAG is acyclic (Kahn's algorithm)
 //! - every node's `capability` exists in `available_capabilities` by id
 //!
-//! 3.9 layers on:
-//! - JSON-Schema validation of `PlanNode.input` against
-//!   `Capability::input_schema`
-//! - `must_be_local` / `cloud_ok` consistency
-//! - estimated cost ≤ `constraints.max_cost_usd`
+//! 3.9 adds:
+//! - JSON-Schema validation of `PlanNode.input` against the registered
+//!   capability's `input_schema` (via [`crate::CapabilitySchemaIndex`])
+//! - estimated cost ≤ `constraints.max_cost_usd` (when set)
 //!
-//! `version_major` is intentionally NOT checked in 3.8 because
-//! `PlanNode` has no `capability_version_major` field today (ADR-0013 §10).
+//! Still NOT enforced in 3.9 (deferred to dispatcher / 3.6-encrypted):
+//! - `must_be_local` / `cloud_ok` consistency
+//! - `version_major` of capabilities (`PlanNode` has no version field today;
+//!   ADR-0013 §10 documents the gap, ADR-0014 §11 carries it forward).
 
 use std::collections::{HashMap, HashSet};
 
 use harness_core::{CapabilityRef, Plan, TaskId};
 
+use crate::backend::PlanConstraints;
 use crate::error::PlanValidationError;
+use crate::schema::CapabilitySchemaIndex;
 
-/// Run the well-formedness checks against `plan`. Returns `Ok(())` if
-/// every check passes; the first failure short-circuits.
+/// 3.8 well-formedness checks only. Retained so callers that don't yet
+/// have a `CapabilitySchemaIndex` and a cost number can still validate
+/// the structural sanity of a plan. New code should use
+/// [`validate_plan`].
+#[deprecated(
+    since = "0.1.0",
+    note = "Phase 3.9 adds schema + cost-cap validation; use `validate_plan` instead. \
+            `validate_plan_well_formed` will be removed in a future release."
+)]
 pub fn validate_plan_well_formed(
     plan: &Plan,
     available: &[CapabilityRef],
 ) -> Result<(), PlanValidationError> {
+    well_formed(plan, available)
+}
+
+/// 3.9 full validation. Strict superset of 3.8 well-formedness:
+/// 1. (3.8) `tasks` non-empty.
+/// 2. (3.8) edges reference existing task ids.
+/// 3. (3.8) DAG acyclic (Kahn's).
+/// 4. (3.8) every node's capability id is in `available`.
+/// 5. (3.9) every node's `input` validates against `schemas.get(cap_id)`.
+///    Missing schema → `UnknownSchema`.
+/// 6. (3.9) `constraints.max_cost_usd` is respected when set:
+///    `response_cost_usd <= cap`. Equality allowed.
+///
+/// `confidence_threshold` is NOT checked here — that lives at the
+/// brain.plan executor so a low-confidence `Confident(_)` becomes an
+/// escalation diagnostic, not a hard validation failure.
+pub fn validate_plan(
+    plan: &Plan,
+    response_cost_usd: f64,
+    constraints: &PlanConstraints,
+    schemas: &CapabilitySchemaIndex,
+    available: &[CapabilityRef],
+) -> Result<(), PlanValidationError> {
+    well_formed(plan, available)?;
+
+    // 5. Per-node schema validation.
+    for (task_id, node) in &plan.tasks {
+        match schemas.validate(&node.capability, &node.input) {
+            Ok(()) => {}
+            Err(errors) if errors == ["unknown capability schema"] => {
+                return Err(PlanValidationError::UnknownSchema {
+                    task: *task_id,
+                    cap: node.capability.clone(),
+                });
+            }
+            Err(errors) => {
+                return Err(PlanValidationError::SchemaViolation {
+                    task: *task_id,
+                    cap: node.capability.clone(),
+                    errors,
+                });
+            }
+        }
+    }
+
+    // 6. Cost cap.
+    if let Some(cap) = constraints.max_cost_usd {
+        if response_cost_usd > cap {
+            return Err(PlanValidationError::CostExceeded {
+                estimated_usd: response_cost_usd,
+                max_usd: cap,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn well_formed(plan: &Plan, available: &[CapabilityRef]) -> Result<(), PlanValidationError> {
     if plan.tasks.is_empty() {
         return Err(PlanValidationError::Empty);
     }

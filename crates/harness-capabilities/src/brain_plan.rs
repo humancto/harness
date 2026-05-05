@@ -13,6 +13,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+// Phase 3.9 migration to `validate_plan` lands in the next commit
+// (CapabilitySnapshot + brain_plan migration). Until then, suppress
+// the deprecation warning at the use site so the workspace builds
+// clean against `-D warnings`.
+#[allow(deprecated)]
 use harness_brain::{
     backend::{PlanOutcome, PlanRequest, PlannerBackend, Unsigned},
     validate::validate_plan_well_formed,
@@ -184,9 +189,12 @@ impl Capability for BrainPlanCapability {
                 Ok(PlanOutcome::Confident(resp)) => {
                     // 3.8 has no confidence-threshold check. Validate
                     // well-formedness; 3.9 layers on schema/cost.
-                    if let Err(e) =
-                        validate_plan_well_formed(resp.plan.as_inner(), &req.available_capabilities)
-                    {
+                    #[allow(deprecated)]
+                    let validation = validate_plan_well_formed(
+                        resp.plan.as_inner(),
+                        &req.available_capabilities,
+                    );
+                    if let Err(e) = validation {
                         diagnostics.push(format!("{}: validation failed: {e}", backend.id()));
                         continue;
                     }

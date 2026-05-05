@@ -101,6 +101,13 @@ pub struct PlanConstraints {
     pub allow_cloud: bool,
     pub must_be_local: bool,
     pub plan_max_nodes: Option<u32>,
+    /// Phase 3.9 — when `Some(t)`, the brain.plan executor treats a
+    /// `Confident(_)` outcome whose `confidence < t` as escalation
+    /// (advance to next backend with diagnostic). When `None`, every
+    /// `Confident(_)` is accepted (3.8 behavior). The default value
+    /// flows from `harness-policy::PlanningPolicy.confidence_threshold`
+    /// (PRD §15.2 default 0.7) via `BrainPlanConfig.default_constraints`.
+    pub confidence_threshold: Option<f64>,
 }
 
 // Compile-time guarantees that the planner surface is shareable across

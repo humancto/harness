@@ -1,17 +1,23 @@
 //! Planner runtime and backend tiers (PRD §15).
 //!
 //! Phase 3.8 ships the [`Template`](template::TemplateBackend) tier —
-//! pure pattern-matching, deterministic, no LLM. Phase 3.9 layers on
-//! `LocalFast` (Ollama-backed) at tier 1 of the same trait.
+//! pure pattern-matching, deterministic, no LLM. Phase 3.9 adds
+//! `LocalFast` (Ollama-backed) at tier 1 of the same trait, plus
+//! schema-aware plan validation via [`schema::CapabilitySchemaIndex`]
+//! and [`validate::validate_plan`].
 //!
 //! Operators consume this crate via the `brain.plan` capability in
-//! `harness-capabilities`; this crate itself is policy-blind and has no
-//! HTTP / I/O surface.
+//! `harness-capabilities`. The crate is policy-blind; the `LocalFast`
+//! backend (HTTP to Ollama) is feature-gated behind `localfast` so a
+//! Template-only build does not pull in `reqwest`.
 
 #![forbid(unsafe_code)]
 
 pub mod backend;
 pub mod error;
+#[cfg(feature = "localfast")]
+pub mod local_fast;
+pub mod schema;
 pub mod template;
 pub mod validate;
 
@@ -20,5 +26,10 @@ pub use backend::{
     Unsigned,
 };
 pub use error::{PlanValidationError, PlannerError};
+pub use schema::CapabilitySchemaIndex;
 pub use template::{TemplateBackend, BACKEND_ID as TEMPLATE_BACKEND_ID, TEMPLATE_CONFIDENCE};
-pub use validate::validate_plan_well_formed;
+#[allow(deprecated)]
+pub use validate::{validate_plan, validate_plan_well_formed};
+
+#[cfg(feature = "localfast")]
+pub use local_fast::LocalFastBackend;

@@ -8,7 +8,8 @@
     clippy::unwrap_used,
     clippy::panic,
     clippy::float_cmp,
-    clippy::many_single_char_names
+    clippy::many_single_char_names,
+    deprecated
 )]
 
 use harness_brain::{
