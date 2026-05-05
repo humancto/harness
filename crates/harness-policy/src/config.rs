@@ -107,7 +107,7 @@ pub struct CapabilityPolicy {
     pub require_2fa_for: HashSet<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanningPolicy {
     #[serde(default)]
@@ -115,6 +115,47 @@ pub struct PlanningPolicy {
 
     #[serde(default)]
     pub local_only_for_tags: HashSet<String>,
+
+    /// Phase 3.9 — minimum confidence a `Confident(_)` planner outcome
+    /// must meet before the `brain.plan` executor accepts it. Below
+    /// this threshold the executor escalates to the next backend tier.
+    /// PRD §15.2 default is 0.7; Template returns 0.6 (so 3.9
+    /// `LocalFast` returning 0.85+ wins automatically).
+    #[serde(default = "default_confidence_threshold")]
+    pub confidence_threshold: f64,
+
+    /// Phase 3.9 — preferred local LLM models in priority order. The
+    /// daemon picks the first one that's locally registered (via
+    /// `llm.local.*`); the rest are advisory. Empty → Template-only
+    /// brain.plan lineup.
+    #[serde(default)]
+    pub prefer_local_models: Vec<String>,
+
+    /// Phase 3.9 — default `max_cost_usd` cap applied to plans whose
+    /// input omits the field. `None` = no cap. Defaults to `Some(1.0)`
+    /// — a conservative starting point; operators raise per their tier.
+    #[serde(default = "default_max_cost_usd")]
+    pub default_max_cost_usd: Option<f64>,
+}
+
+fn default_confidence_threshold() -> f64 {
+    0.7
+}
+#[allow(clippy::unnecessary_wraps)]
+fn default_max_cost_usd() -> Option<f64> {
+    Some(1.0)
+}
+
+impl Default for PlanningPolicy {
+    fn default() -> Self {
+        Self {
+            allow_cloud_escalation: false,
+            local_only_for_tags: HashSet::new(),
+            confidence_threshold: default_confidence_threshold(),
+            prefer_local_models: Vec::new(),
+            default_max_cost_usd: default_max_cost_usd(),
+        }
+    }
 }
 
 /// `[llm]` policy section — Phase 3.4. Optional. When absent on the

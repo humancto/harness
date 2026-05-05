@@ -131,6 +131,11 @@ tracing-test      = { version = "0.2" }
 # the post-CVE-2024-fix release.
 shlex             = "1.3"
 
+# JSON-Schema validator for Phase 3.9 plan validation. 0.26 line is
+# stable enough for compile + validate; we don't use remote refs or
+# the `cli` feature, hence default-features = false.
+jsonschema        = { version = "0.26", default-features = false }
+
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn        = "deny"
 missing_debug_implementations = "warn"
