@@ -22,12 +22,12 @@ pub mod task;
 
 pub use cardinality::{AggregateOp, Cardinality, MergeStrategy, PartialPolicy};
 pub use heartbeat::Heartbeat;
-pub use manifest::{Capability, NodeManifest, ResourceHints, Resources, Scope};
+pub use manifest::{Capability, CapabilityRef, NodeManifest, ResourceHints, Resources, Scope};
 pub use plan::{Budget, BudgetAction, CheckpointConfig, CheckpointStorage, HashFn, Plan, PlanNode};
 pub use result::{
     Cost, FinalResult, LogLevel, LogLine, NodeContribution, NodeStatus, PartialResult, Status,
     TaskResult,
 };
-pub use signable::Signable;
+pub use signable::{Signable, Unsigned};
 pub use support::{CostHint, CpuClass, DiskIoClass, GpuInfo, NetworkClass, RateLimit};
 pub use task::{Constraints, ExecutionPolicy, RetryPolicy, Task, TraceContext};

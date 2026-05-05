@@ -82,6 +82,22 @@ pub struct Capability {
     pub requires_secrets: Vec<String>,
 }
 
+/// Reference to a capability *available on a node* — the projection of
+/// a [`Capability`] manifest entry that planners and routers care about
+/// (id + major-version compatibility, nothing schema-shaped).
+///
+/// Used by `harness-brain::PlannerBackend::plan` (PRD §15.3
+/// `available_capabilities`) and by
+/// [`harness_capabilities::WeakCapabilityRegistry::refs`]. Lives in
+/// `harness-core` rather than `harness-brain` because non-planning
+/// paths (a future `mesh.peers` introspection capability, for example)
+/// will want the same type without dragging the planner crate in.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CapabilityRef {
+    pub id: String,
+    pub version_major: u16,
+}
+
 /// A node's signed declaration of identity, capabilities, scopes, and
 /// resources. Gossiped to the mesh on change. PRD §13.2.
 ///
@@ -212,6 +228,15 @@ mod tests {
     fn capability_round_trip() {
         let c = sample_capability();
         assert_eq!(c, round_trip(&c));
+    }
+
+    #[test]
+    fn capability_ref_round_trip() {
+        let r = CapabilityRef {
+            id: "shell.exec".into(),
+            version_major: 0,
+        };
+        assert_eq!(r, round_trip(&r));
     }
 
     /// Wire-level back-compat for `Capability::requires_secrets`:
