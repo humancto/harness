@@ -48,7 +48,7 @@ pub struct WeakCapabilityRegistry {
 impl WeakCapabilityRegistry {
     /// Snapshot the currently-registered capabilities into
     /// [`CapabilityRef`]s. Returns `Vec::new()` if the registry has
-    /// been dropped.
+    /// been dropped. Always-on; brain-free.
     #[must_use]
     pub fn refs(&self) -> Vec<CapabilityRef> {
         let Some(strong) = self.inner.upgrade() else {
@@ -65,6 +65,59 @@ impl WeakCapabilityRegistry {
             })
             .collect()
     }
+
+    /// Atomic snapshot of `(refs, schemas)` under one `RwLock::read()`
+    /// so a concurrent registration cannot give callers inconsistent
+    /// views. Available only when the `brain` feature is on (because
+    /// `CapabilitySchemaIndex` lives in `harness-brain`).
+    ///
+    /// Schemas that fail to compile are silently dropped from the
+    /// index (with a `tracing::warn!` from the index builder); plans
+    /// referencing those caps surface
+    /// [`harness_brain::PlanValidationError::UnknownSchema`] at
+    /// validation time.
+    #[cfg(feature = "brain")]
+    #[must_use]
+    pub fn snapshot(&self) -> CapabilitySnapshot {
+        use harness_brain::CapabilitySchemaIndex;
+
+        let Some(strong) = self.inner.upgrade() else {
+            return CapabilitySnapshot {
+                refs: Vec::new(),
+                schemas: CapabilitySchemaIndex::default(),
+            };
+        };
+        let g = strong.read();
+        let mut refs = Vec::with_capacity(g.len());
+        let mut schema_pairs = Vec::with_capacity(g.len());
+        for cap in g.values() {
+            let m = cap.manifest();
+            refs.push(CapabilityRef {
+                id: m.id.clone(),
+                version_major: m.version.major,
+            });
+            schema_pairs.push((m.id, m.input_schema));
+        }
+        CapabilitySnapshot {
+            refs,
+            schemas: CapabilitySchemaIndex::from_pairs(schema_pairs),
+        }
+    }
+}
+
+/// Atomic snapshot of the registry surfaces a planner backend needs:
+/// the cap-ref list (id + `version_major`) for prompt construction and
+/// the compiled per-cap schema index for plan validation. Built once
+/// per `brain.plan` invocation and shared across the escalation chain
+/// so every backend sees the same view.
+///
+/// Phase 3.10+ may extend with `cost_hints` for cost-aware routing —
+/// the struct shape is the right place to add the field.
+#[cfg(feature = "brain")]
+#[derive(Clone, Debug, Default)]
+pub struct CapabilitySnapshot {
+    pub refs: Vec<CapabilityRef>,
+    pub schemas: harness_brain::CapabilitySchemaIndex,
 }
 
 impl std::fmt::Debug for CapabilityRegistry {

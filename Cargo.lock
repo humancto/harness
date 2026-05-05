@@ -1186,6 +1186,7 @@ dependencies = [
  "clap",
  "futures",
  "harness-api",
+ "harness-brain",
  "harness-capabilities",
  "harness-cli",
  "harness-core",

@@ -37,6 +37,7 @@ harness-store        = { workspace = true }
 harness-capabilities = { workspace = true }
 harness-policy       = { workspace = true }
 harness-vault        = { workspace = true }
+harness-brain        = { workspace = true }
 reqwest             = { workspace = true }
 
 [dev-dependencies]

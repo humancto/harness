@@ -235,12 +235,22 @@ impl DaemonOrchestrator {
                 cloud_client,
             );
         }
-        // Phase 3.8: register `brain.plan` with the Template backend.
+        // Phase 3.8/3.9: register `brain.plan` with a backend lineup.
         // Lives last in the enricher list so it observes every other
-        // registered capability via `WeakCapabilityRegistry::refs`.
-        // 3.9 will prepend `LocalFast` to the brain's backend lineup.
+        // registered capability via `WeakCapabilityRegistry::snapshot`.
+        // For now the lineup is just `[TemplateBackend]`; the next
+        // commit reads `[mesh.planning].prefer_local_models` and
+        // prepends `LocalFastBackend` when an Ollama model is
+        // registered locally.
         #[cfg(feature = "brain")]
-        harness_capabilities::enrich_with_brain_plan(&capabilities, identity.node_id()).await;
+        {
+            let template =
+                std::sync::Arc::new(harness_brain::TemplateBackend::new(identity.node_id()));
+            let backends: Vec<std::sync::Arc<dyn harness_brain::PlannerBackend>> = vec![template];
+            let brain_config = harness_capabilities::brain_plan::BrainPlanConfig::default();
+            harness_capabilities::enrich_with_brain_plan(&capabilities, backends, brain_config)
+                .await;
+        }
         let cap_ids = capabilities.ids();
 
         // Phase 3.3a: local executor loop. Picks Submitted tasks off
