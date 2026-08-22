@@ -10,13 +10,9 @@
 
 use std::collections::HashMap;
 
-use harness_brain::{
-    validate_plan, CapabilitySchemaIndex, PlanConstraints, PlanValidationError,
-};
+use harness_brain::{validate_plan, CapabilitySchemaIndex, PlanConstraints, PlanValidationError};
 use harness_core::protocol::{CpuClass, DiskIoClass, NetworkClass, ResourceHints};
-use harness_core::{
-    CapabilityRef, NodeId, Plan, PlanId, PlanNode, Signature, TaskId,
-};
+use harness_core::{CapabilityRef, NodeId, Plan, PlanId, PlanNode, Signature, TaskId};
 use serde_json::json;
 
 fn shell_only() -> Vec<CapabilityRef> {
@@ -106,7 +102,10 @@ fn t07_schema_match_fails_when_cmd_is_integer() {
         panic!("expected SchemaViolation; got {r:?}");
     };
     assert_eq!(cap, "shell.exec");
-    assert!(!errors.is_empty(), "errors must be populated via iter_errors");
+    assert!(
+        !errors.is_empty(),
+        "errors must be populated via iter_errors"
+    );
 }
 
 #[test]
@@ -117,7 +116,11 @@ fn t08_cost_exceeded_fails() {
         ..PlanConstraints::default()
     };
     let r = validate_plan(&p, 1.00, &constraints, &shell_index(), &shell_only());
-    let Err(PlanValidationError::CostExceeded { estimated_usd, max_usd }) = r else {
+    let Err(PlanValidationError::CostExceeded {
+        estimated_usd,
+        max_usd,
+    }) = r
+    else {
         panic!("expected CostExceeded; got {r:?}");
     };
     assert_eq!(estimated_usd, 1.00);
