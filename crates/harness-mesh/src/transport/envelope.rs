@@ -42,7 +42,13 @@ use harness_core::{Heartbeat, Signable};
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 
 /// Wire-protocol logical channels (PRD §13.6). `&'static str` so a peer
-/// can never inject a forged channel name from the wire.
+/// can never inject a forged channel name from the wire — inbound header
+/// names are mapped onto these constants via [`channels::known`] and
+/// anything else is rejected.
+///
+/// PRD §13.6 names per-task suffixes (`harness.task.result.<task_id>`);
+/// on the wire those are multiplexed onto one aggregate stream per peer
+/// pair per direction with `task_id` inside the payload (ADR-0017).
 pub mod channels {
     /// Heartbeats from a node. Replay-protected via `Heartbeat::seq`.
     pub const HEARTBEAT: &str = "harness.heartbeat";
@@ -50,6 +56,50 @@ pub mod channels {
     /// New-node manifest announcements. Not replay-protected (manifest is
     /// gossiped on change, idempotent).
     pub const ANNOUNCE: &str = "harness.announce";
+
+    /// Issuer → worker task assignments (`TaskAssign`).
+    pub const TASK_ASSIGN: &str = "harness.task.assign";
+
+    /// Worker → issuer assignment acks (`TaskClaim`).
+    pub const TASK_CLAIM: &str = "harness.task.claim";
+
+    /// Worker → issuer terminal results (`TaskResultMsg`).
+    pub const TASK_RESULT: &str = "harness.task.result";
+
+    /// LWW replica sync envelopes (PR-B / 3.3-gossip).
+    pub const GOSSIP_STATE: &str = "harness.gossip.state";
+
+    /// Map a wire-sourced name onto its static constant. `None` for
+    /// anything we don't recognize — the stream gets reset.
+    #[must_use]
+    pub fn known(name: &str) -> Option<&'static str> {
+        match name {
+            HEARTBEAT => Some(HEARTBEAT),
+            ANNOUNCE => Some(ANNOUNCE),
+            TASK_ASSIGN => Some(TASK_ASSIGN),
+            TASK_CLAIM => Some(TASK_CLAIM),
+            TASK_RESULT => Some(TASK_RESULT),
+            GOSSIP_STATE => Some(GOSSIP_STATE),
+            _ => None,
+        }
+    }
+
+    /// Per-channel maximum frame size (payload bytes).
+    ///
+    /// - assign: a `Task` carries arbitrary JSON input — 1 MiB.
+    /// - result: `shell.exec` caps stdout+stderr at 1 MiB each and JSON
+    ///   escaping can ~4× that — 8 MiB.
+    /// - announce: manifests scale with capability count — 256 KiB.
+    /// - everything else: the legacy 64 KiB default.
+    #[must_use]
+    pub fn frame_cap(channel: &'static str) -> usize {
+        match channel {
+            TASK_ASSIGN => 1024 * 1024,
+            TASK_RESULT => 8 * 1024 * 1024,
+            ANNOUNCE | GOSSIP_STATE => 256 * 1024,
+            _ => super::MAX_FRAME_BYTES,
+        }
+    }
 }
 
 /// Wire-protocol-layer errors that the framer / replay table surface.
@@ -84,6 +134,24 @@ impl Sequenced for Heartbeat {
     }
 }
 
+impl Sequenced for harness_core::TaskAssign {
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+}
+
+impl Sequenced for harness_core::TaskClaim {
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+}
+
+impl Sequenced for harness_core::TaskResultMsg {
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+}
+
 // -----------------------------------------------------------------------------
 // RecvFramer
 // -----------------------------------------------------------------------------
@@ -99,6 +167,10 @@ impl Sequenced for Heartbeat {
 pub(crate) struct RecvFramer {
     state: FramerState,
     leftover: Bytes,
+    /// Maximum accepted payload length. [`MAX_FRAME_BYTES`] by default;
+    /// channel streams install their per-channel cap
+    /// ([`channels::frame_cap`]).
+    cap: usize,
 }
 
 #[derive(Debug)]
@@ -117,12 +189,17 @@ enum FramerState {
 #[allow(dead_code)]
 impl RecvFramer {
     pub(crate) fn new() -> Self {
+        Self::with_cap(MAX_FRAME_BYTES)
+    }
+
+    pub(crate) fn with_cap(cap: usize) -> Self {
         Self {
             state: FramerState::NeedHeader {
                 buf: [0u8; 4],
                 filled: 0,
             },
             leftover: Bytes::new(),
+            cap,
         }
     }
 
@@ -160,11 +237,8 @@ impl RecvFramer {
                     *input = input.slice(take..);
                     if *filled == 4 {
                         let len = u32::from_be_bytes(*buf) as usize;
-                        if len > MAX_FRAME_BYTES {
-                            return Err(WireError::FrameTooLarge {
-                                len,
-                                max: MAX_FRAME_BYTES,
-                            });
+                        if len > self.cap {
+                            return Err(WireError::FrameTooLarge { len, max: self.cap });
                         }
                         self.state = FramerState::NeedPayload {
                             len,
@@ -226,13 +300,20 @@ impl Default for RecvFramer {
 /// Errors only if `payload.len() > MAX_FRAME_BYTES`.
 #[allow(dead_code)]
 pub(crate) fn encode_frame(payload: &[u8]) -> Result<Vec<u8>, WireError> {
-    if payload.len() > MAX_FRAME_BYTES {
+    encode_frame_capped(payload, MAX_FRAME_BYTES)
+}
+
+/// [`encode_frame`] with a caller-supplied cap — channel streams pass
+/// their per-channel [`channels::frame_cap`].
+#[allow(dead_code)]
+pub(crate) fn encode_frame_capped(payload: &[u8], cap: usize) -> Result<Vec<u8>, WireError> {
+    if payload.len() > cap {
         return Err(WireError::FrameTooLarge {
             len: payload.len(),
-            max: MAX_FRAME_BYTES,
+            max: cap,
         });
     }
-    // Length fits in u32 because we just checked it's <= MAX_FRAME_BYTES = 64 KiB.
+    // Length fits in u32: every per-channel cap is <= 8 MiB.
     #[allow(clippy::cast_possible_truncation)]
     let len = payload.len() as u32;
     let mut out = Vec::with_capacity(4 + payload.len());

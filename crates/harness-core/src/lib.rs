@@ -22,8 +22,8 @@ pub use identity::{
 };
 pub use protocol::{
     Budget, BudgetAction, Capability, CapabilityRef, Cardinality, CheckpointConfig,
-    CheckpointStorage, Constraints, Cost, ExecutionPolicy, FinalResult, HashFn, Heartbeat,
+    CheckpointStorage, Constraints, Cost, ExecutionPolicy, FinalResult, HashFn, Heartbeat, LeaseId,
     LogLevel, LogLine, MergeStrategy, NodeContribution, NodeManifest, NodeStatus, PartialPolicy,
     PartialResult, Plan, PlanNode, ResourceHints, Resources, RetryPolicy, Scope, Signable, Status,
-    Task, TaskResult, TraceContext, Unsigned,
+    Task, TaskAssign, TaskClaim, TaskResult, TaskResultMsg, TraceContext, Unsigned,
 };

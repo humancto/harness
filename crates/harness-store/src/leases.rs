@@ -9,16 +9,10 @@ use std::str::FromStr;
 use crate::error::StoreError;
 use crate::open::Store;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct LeaseId(pub uuid::Uuid);
-
-impl LeaseId {
-    #[must_use]
-    pub fn new_v7() -> Self {
-        Self(uuid::Uuid::now_v7())
-    }
-}
+// Since 3.3-fanout the id type lives in `harness-core` (it rides the
+// `TaskAssign`/`TaskClaim`/`TaskResultMsg` wire envelopes); re-exported
+// here so existing `harness_store::LeaseId` callers are unaffected.
+pub use harness_core::LeaseId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -222,7 +216,7 @@ impl Store {
                 params![lease_id.0.as_bytes()],
             )?;
             tx.execute(
-                "UPDATE tasks SET state = 'submitted'
+                "UPDATE tasks SET state = 'submitted', assigned_node = NULL
                   WHERE id = ? AND state IN ('dispatched', 'claimed', 'running')",
                 params![task_blob],
             )?;

@@ -30,11 +30,13 @@ use harness_mesh::election::{Election, ElectionConfig};
 use harness_mesh::heartbeat::{
     BroadcasterHandle, HeartbeatPublisherConfig, HeartbeatService, ListenerHandle, PEER_TIMEOUT,
 };
-use harness_mesh::transport::{self as transport, Connection, Transport, TransportError};
+use harness_mesh::transport::{self as transport, Transport, TransportError};
 use harness_mesh::{TrustEvent, TrustStore};
 use parking_lot::Mutex as ParkingMutex;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
+
+use crate::peer_net::{MeshIndexes, NoopHandlers, PeerNet};
 
 /// One-shot factory + run-loop for the daemon. Holds owned references
 /// to every long-lived subsystem.
@@ -48,6 +50,8 @@ pub(crate) struct DaemonOrchestrator {
     persistent_trust: TrustStore,
     /// Local executor for running tasks the daemon picks up. Phase 3.3a.
     executor: crate::executor::LocalExecutor,
+    /// Per-peer connection registry + channel router. Phase 3.3-fanout.
+    peer_net: Arc<PeerNet>,
     /// Coordinated shutdown — flipped to `true` on ctrl-c. The executor
     /// loop watches this; future loops can subscribe too.
     shutdown_tx: watch::Sender<bool>,
@@ -398,6 +402,34 @@ impl DaemonOrchestrator {
             local_node_name.clone(),
         );
 
+        // Phase 3.3-fanout (PR-A1): the per-peer connection registry +
+        // channel router. Announces our signed manifest on every adopted
+        // connection and feeds peer manifests into the capability/scope
+        // indexes the dispatcher routes against.
+        #[cfg(feature = "fs")]
+        let manifest_scopes = scope_registry.manifest_scopes();
+        #[cfg(not(feature = "fs"))]
+        let manifest_scopes = Vec::new();
+        let self_manifest = crate::peer_net::build_self_manifest(
+            &identity,
+            config.node_name.clone(),
+            capabilities.manifests(),
+            manifest_scopes,
+        )
+        .map_err(|e| anyhow::anyhow!("sign self manifest: {e}"))?;
+        let mesh_indexes = Arc::new(MeshIndexes {
+            caps: harness_orchestrator::CapabilityIndex::new(),
+            scopes: harness_orchestrator::ScopeIndex::new(),
+            store: Some(store.clone()),
+        });
+        let peer_net = PeerNet::new(
+            identity.clone(),
+            heartbeat.clone(),
+            mesh_indexes,
+            Arc::new(NoopHandlers),
+            self_manifest,
+        );
+
         let api_state =
             harness_api::ApiStateBuilder::new(identity.clone(), config.mesh_name.clone())
                 .with_peers(heartbeat.peers())
@@ -422,6 +454,7 @@ impl DaemonOrchestrator {
             election,
             persistent_trust,
             executor,
+            peer_net,
             shutdown_tx,
             tasks: ParkingMutex::new(Vec::new()),
             listeners: Arc::new(ParkingMutex::new(Vec::new())),
@@ -458,24 +491,11 @@ impl DaemonOrchestrator {
             (cfg, leader, s.brain_score)
         });
 
-        // Connections to broadcast to — read from a shared registry.
-        let conns: Arc<ParkingMutex<Vec<Arc<Connection>>>> =
-            Arc::new(ParkingMutex::new(Vec::new()));
-        // Each entry is held by both the conns Vec and its listener task.
-        // When the listener exits (peer dropped), only conns retains the Arc;
-        // the broadcaster's targets_fn sweeps these dead entries every tick.
-        // Without this sweep the Vec grows monotonically and the broadcaster
-        // wastes time + log spam re-trying dead peers indefinitely.
-        let conns_for_broadcaster = conns.clone();
-        let targets_fn: Arc<dyn Fn() -> Vec<Arc<Connection>> + Send + Sync + 'static> =
-            Arc::new(move || {
-                let mut g = conns_for_broadcaster.lock();
-                g.retain(|c| Arc::strong_count(c) > 1);
-                g.clone()
-            });
-
-        let broadcaster = self.heartbeat.spawn_broadcaster(snapshot_fn, targets_fn);
-        *self.broadcaster.lock() = Some(broadcaster);
+        // Phase 3.3-fanout: heartbeats ride their own named channel
+        // stream per peer, enqueued through the per-peer bounded
+        // outbound queues (PeerNet sweeps closed connections per tick).
+        let hb_broadcaster = self.peer_net.spawn_heartbeat_broadcaster(snapshot_fn);
+        self.tasks.lock().push(hb_broadcaster);
 
         let evictor = self.heartbeat.spawn_evictor(PEER_TIMEOUT / 2);
         *self.evictor.lock() = Some(evictor);
@@ -491,10 +511,8 @@ impl DaemonOrchestrator {
         // Accept loop — incoming QUIC connections from trusted peers.
         let accept_loop = spawn_accept_loop(
             self.transport.clone(),
-            self.heartbeat.clone(),
             self.persistent_trust.clone(),
-            self.listeners.clone(),
-            conns.clone(),
+            self.peer_net.clone(),
         );
         self.tasks.lock().push(accept_loop);
 
@@ -502,11 +520,9 @@ impl DaemonOrchestrator {
         // dials of known-trusted peers.
         let dial_loop = spawn_dial_loop(
             self.transport.clone(),
-            self.heartbeat.clone(),
             self.persistent_trust.clone(),
             self.discovery.clone(),
-            self.listeners.clone(),
-            conns,
+            self.peer_net.clone(),
         );
         self.tasks.lock().push(dial_loop);
 
@@ -532,6 +548,8 @@ impl DaemonOrchestrator {
         for task in tasks {
             task.abort();
         }
+        // Close per-peer connections + abort their router/sender tasks.
+        self.peer_net.shutdown();
         // Drop listener handles — each aborts its task on drop.
         self.listeners.lock().clear();
         let broadcaster = self.broadcaster.lock().take();
@@ -603,13 +621,7 @@ fn spawn_election_pump(
     })
 }
 
-fn spawn_accept_loop(
-    transport: Transport,
-    heartbeat: Arc<HeartbeatService>,
-    trust: TrustStore,
-    listeners: Arc<ParkingMutex<Vec<ListenerHandle>>>,
-    conns: Arc<ParkingMutex<Vec<Arc<Connection>>>>,
-) -> JoinHandle<()> {
+fn spawn_accept_loop(transport: Transport, trust: TrustStore, net: Arc<PeerNet>) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match transport.accept_one().await {
@@ -617,9 +629,7 @@ fn spawn_accept_loop(
                     let trust_clone = trust.clone();
                     match incoming.accept(|pk| trust_clone.lookup_by_pubkey(pk).is_some()) {
                         Ok(conn) => {
-                            let conn = Arc::new(conn);
-                            conns.lock().push(conn.clone());
-                            listeners.lock().push(heartbeat.register_peer(conn));
+                            net.adopt(Arc::new(conn));
                         }
                         Err(err) => {
                             tracing::warn!(target: "harness.daemon", ?err, "accept failed");
@@ -637,11 +647,9 @@ fn spawn_accept_loop(
 
 fn spawn_dial_loop(
     transport: Transport,
-    heartbeat: Arc<HeartbeatService>,
     trust: TrustStore,
     discovery: Arc<Discovery>,
-    listeners: Arc<ParkingMutex<Vec<ListenerHandle>>>,
-    conns: Arc<ParkingMutex<Vec<Arc<Connection>>>>,
+    net: Arc<PeerNet>,
 ) -> JoinHandle<()> {
     let mut discovery_events = discovery.subscribe();
     let mut trust_events = trust.subscribe();
@@ -653,13 +661,11 @@ fn spawn_dial_loop(
         for peer in discovery.peers() {
             try_dial_known(
                 &transport,
-                &heartbeat,
                 &trust,
                 &peer.addrs,
                 Some(peer.node_id),
                 &peer.pubkey_fp,
-                &listeners,
-                &conns,
+                &net,
                 &mut dialed,
             )
             .await;
@@ -668,16 +674,7 @@ fn spawn_dial_loop(
             // For static peers we don't know which node_id is at the
             // address — try every trusted pubkey. The transport's cert
             // pinning rejects all but the right one.
-            try_dial_static(
-                &transport,
-                &heartbeat,
-                &trust,
-                addr,
-                &listeners,
-                &conns,
-                &mut dialed,
-            )
-            .await;
+            try_dial_static(&transport, &trust, addr, &net, &mut dialed).await;
         }
 
         loop {
@@ -687,13 +684,11 @@ fn spawn_dial_loop(
                         Ok(DiscoveryEvent::Added(peer)) => {
                             try_dial_known(
                                 &transport,
-                                &heartbeat,
                                 &trust,
                                 &peer.addrs,
                                 Some(peer.node_id),
                                 &peer.pubkey_fp,
-                                &listeners,
-                                &conns,
+                                &net,
                                 &mut dialed,
                             )
                             .await;
@@ -723,29 +718,18 @@ fn spawn_dial_loop(
                             if known.pubkey_fp == pubkey_fp {
                                 try_dial_known(
                                     &transport,
-                                    &heartbeat,
                                     &trust,
                                     &known.addrs,
                                     Some(known.node_id),
                                     &known.pubkey_fp,
-                                    &listeners,
-                                    &conns,
+                                    &net,
                                     &mut dialed,
                                 )
                                 .await;
                             }
                         }
                         for addr in discovery.static_hints() {
-                            try_dial_static(
-                                &transport,
-                                &heartbeat,
-                                &trust,
-                                addr,
-                                &listeners,
-                                &conns,
-                                &mut dialed,
-                            )
-                            .await;
+                            try_dial_static(&transport, &trust, addr, &net, &mut dialed).await;
                         }
                     }
                 }
@@ -754,16 +738,13 @@ fn spawn_dial_loop(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn try_dial_known(
     transport: &Transport,
-    heartbeat: &Arc<HeartbeatService>,
     trust: &TrustStore,
     addrs: &[SocketAddr],
     node_id: Option<harness_core::NodeId>,
     pubkey_fp: &str,
-    listeners: &Arc<ParkingMutex<Vec<ListenerHandle>>>,
-    conns: &Arc<ParkingMutex<Vec<Arc<Connection>>>>,
+    net: &Arc<PeerNet>,
     dialed: &mut HashSet<harness_core::NodeId>,
 ) {
     let Some(peer) = trust
@@ -788,9 +769,7 @@ async fn try_dial_known(
                     %addr,
                     "dialed peer"
                 );
-                let conn = Arc::new(conn);
-                conns.lock().push(conn.clone());
-                listeners.lock().push(heartbeat.register_peer(conn));
+                net.adopt(Arc::new(conn));
                 if let Some(id) = node_id {
                     dialed.insert(id);
                 }
@@ -811,11 +790,9 @@ async fn try_dial_known(
 
 async fn try_dial_static(
     transport: &Transport,
-    heartbeat: &Arc<HeartbeatService>,
     trust: &TrustStore,
     addr: SocketAddr,
-    listeners: &Arc<ParkingMutex<Vec<ListenerHandle>>>,
-    conns: &Arc<ParkingMutex<Vec<Arc<Connection>>>>,
+    net: &Arc<PeerNet>,
     dialed: &mut HashSet<harness_core::NodeId>,
 ) {
     for peer in trust.all_peers() {
@@ -829,9 +806,7 @@ async fn try_dial_static(
                 %addr,
                 "dialed static peer"
             );
-            let conn = Arc::new(conn);
-            conns.lock().push(conn.clone());
-            listeners.lock().push(heartbeat.register_peer(conn));
+            net.adopt(Arc::new(conn));
             dialed.insert(peer.node_id);
             return;
         }

@@ -25,6 +25,11 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "task_results",
         include_str!("../migrations/V0004__task_results.sql"),
     ),
+    (
+        5,
+        "assigned_node",
+        include_str!("../migrations/V0005__assigned_node.sql"),
+    ),
 ];
 
 pub(crate) fn run(conn: &Connection) -> Result<(), StoreError> {
