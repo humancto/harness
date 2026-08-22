@@ -578,6 +578,12 @@ impl DaemonOrchestrator {
         self.heartbeat.peers()
     }
 
+    /// Partial-frame ring handle for test assertions (4.2 progress).
+    #[cfg(test)]
+    pub(crate) fn partial_buffers(&self) -> Arc<harness_api::PartialBuffers> {
+        self.api_state.partials.clone()
+    }
+
     /// Store handle for test assertions.
     #[cfg(test)]
     pub(crate) fn store(&self) -> harness_store::Store {

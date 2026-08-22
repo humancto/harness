@@ -23,6 +23,7 @@ pub(crate) struct TestDaemon {
     pub(crate) store: Store,
     pub(crate) peers: harness_mesh::heartbeat::PeerTable,
     pub(crate) mesh_addr: SocketAddr,
+    pub(crate) partials: Arc<harness_api::PartialBuffers>,
     pub(crate) stop_tx: watch::Sender<bool>,
     pub(crate) handle: tokio::task::JoinHandle<()>,
     pub(crate) root: tempfile::TempDir,
@@ -95,6 +96,7 @@ async fn boot_one(
     let mesh_addr = orch.mesh_addr();
     let store = orch.store();
     let peers = orch.peer_table();
+    let partials = orch.partial_buffers();
     let (stop_tx, stop_rx) = watch::channel(false);
     let handle = tokio::spawn(async move {
         let _ = orch.run_until(stop_rx).await;
@@ -104,6 +106,7 @@ async fn boot_one(
         store,
         peers,
         mesh_addr,
+        partials,
         stop_tx,
         handle,
         root,
@@ -387,6 +390,45 @@ async fn m04_mesh_grep_federates_across_both_nodes() {
     }
     assert_eq!(output["provenance"]["targets_ok"], 2);
     assert_eq!(output["failures"].as_array().expect("failures").len(), 0);
+
+    // 4.2 (ADR-0024): the coordinator streamed per-target progress into
+    // the issuer's partial ring — 2 per-target frames + 1 summary. If
+    // the wrapper ran on node-b, frames rode harness.task.partial; the
+    // final 50 ms flush can trail the result, so poll briefly.
+    let progress = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let frames: Vec<serde_json::Value> = a
+                .partials
+                .frames(id)
+                .iter()
+                .filter(|f| f.stream == "progress")
+                .map(|f| serde_json::from_str(&f.line).expect("progress line is JSON"))
+                .collect();
+            if frames.len() >= 3 || tokio::time::Instant::now() >= deadline {
+                break frames;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    assert_eq!(progress.len(), 3, "2 per-target + 1 summary: {progress:#?}");
+    let target_scopes: Vec<&str> = progress
+        .iter()
+        .filter_map(|c| c["target"]["scope"].as_str())
+        .collect();
+    assert!(target_scopes.contains(&"docs-a") && target_scopes.contains(&"docs-b"));
+    for c in progress.iter().filter(|c| !c["target"].is_null()) {
+        assert_eq!(c["outcome"], "ok");
+        assert_eq!(c["items"], 1, "one needle per scope: {c:#}");
+        assert_eq!(c["total"], 2);
+    }
+    let summary = progress
+        .iter()
+        .find(|c| !c["summary"].is_null())
+        .expect("summary frame");
+    assert_eq!(summary["summary"]["total"], 2);
+    assert_eq!(summary["summary"]["ok"], 2);
+    assert_eq!(summary["summary"]["failed"], 0);
 
     a.stop().await;
     b.stop().await;
