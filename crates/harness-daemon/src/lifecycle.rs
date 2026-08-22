@@ -384,7 +384,10 @@ impl DaemonOrchestrator {
                 // pipeline as shell line frames (ADR-0024).
                 Some(partial_streamer.sink()),
             );
-            harness_capabilities::enrich_with_mesh_meta(&capabilities, mesh_exec);
+            harness_capabilities::enrich_with_mesh_meta(&capabilities, mesh_exec.clone());
+            // 4.3: plan.execute — the DAG executor driver shares the
+            // same daemon services (ADR-0025).
+            harness_capabilities::enrich_with_plan_exec(&capabilities, mesh_exec);
         }
 
         // Phase 3.8/3.9: register `brain.plan` with a backend lineup.
