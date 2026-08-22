@@ -96,8 +96,31 @@ async fn run_mesh_query(
         .ok_or_else(|| anyhow::anyhow!("submit response missing task_id: {body}"))?;
 
     let deadline = Duration::from_millis(timeout_ms + 2 * CLI_SLACK_MS);
-    let envelope =
-        crate::run::poll_until_terminal(&client, &api_base, &token, &task_id, deadline).await?;
+    // 4.2: render per-target progress to stderr as frames arrive — only
+    // when stderr is a TTY, so piped/scripted invocations stay clean.
+    let progress_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let envelope = crate::run::poll_until_terminal_with(
+        &client,
+        &api_base,
+        &token,
+        &task_id,
+        deadline,
+        |frames| {
+            if !progress_tty {
+                return;
+            }
+            for frame in frames {
+                if let Some(line) = progress_line(frame) {
+                    // Progress is interactive telemetry: stderr, TTY-only.
+                    #[allow(clippy::print_stderr)]
+                    {
+                        eprintln!("{line}");
+                    }
+                }
+            }
+        },
+    )
+    .await?;
     let state = envelope.get("state").and_then(|s| s.as_str()).unwrap_or("");
     if state != "done" {
         let err = envelope
@@ -107,6 +130,35 @@ async fn run_mesh_query(
         bail!("{capability} {state}: {err}");
     }
     Ok(envelope.get("output").cloned().unwrap_or(JsonValue::Null))
+}
+
+/// Render one `partials` frame as a progress line, or `None` for
+/// frames that aren't per-target progress (stdout/stderr lines, the
+/// summary chunk — the final rendered output already covers those).
+fn progress_line(frame: &JsonValue) -> Option<String> {
+    if frame.get("stream").and_then(JsonValue::as_str) != Some("progress") {
+        return None;
+    }
+    let chunk: JsonValue = serde_json::from_str(frame.get("line")?.as_str()?).ok()?;
+    let target = chunk.get("target")?;
+    let node_name = target.get("node_name").and_then(JsonValue::as_str)?;
+    let scope = target.get("scope").and_then(JsonValue::as_str)?;
+    let completed = chunk.get("completed").and_then(JsonValue::as_u64)?;
+    let total = chunk.get("total").and_then(JsonValue::as_u64)?;
+    let outcome = chunk.get("outcome").and_then(JsonValue::as_str)?;
+    Some(match outcome {
+        "ok" => {
+            let items = chunk.get("items").and_then(JsonValue::as_u64).unwrap_or(0);
+            format!("[{completed}/{total}] {node_name}/{scope}: ok ({items} matches)")
+        }
+        other => {
+            let err = chunk
+                .get("error")
+                .and_then(JsonValue::as_str)
+                .unwrap_or(other);
+            format!("[{completed}/{total}] {node_name}/{scope}: {other} — {err}")
+        }
+    })
 }
 
 /// True when the fan-out found zero targets at all — distinct from a
@@ -225,6 +277,63 @@ fn render_search(output: &JsonValue) -> RunOutcome {
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_line_renders_ok_and_failure_variants() {
+        let ok = serde_json::json!({
+            "stream": "progress",
+            "seq": 0,
+            "line": serde_json::json!({
+                "target": {"node": "x", "node_name": "peer", "scope": "notes"},
+                "outcome": "ok", "items": 12,
+                "completed": 3, "total": 9
+            }).to_string(),
+        });
+        assert_eq!(
+            progress_line(&ok).expect("ok line"),
+            "[3/9] peer/notes: ok (12 matches)"
+        );
+        let failed = serde_json::json!({
+            "stream": "progress",
+            "seq": 1,
+            "line": serde_json::json!({
+                "target": {"node": "x", "node_name": "l2", "scope": "src"},
+                "outcome": "failed", "error": "deadline exceeded",
+                "completed": 4, "total": 9
+            }).to_string(),
+        });
+        assert_eq!(
+            progress_line(&failed).expect("failed line"),
+            "[4/9] l2/src: failed — deadline exceeded"
+        );
+        let timed = serde_json::json!({
+            "stream": "progress",
+            "seq": 2,
+            "line": serde_json::json!({
+                "target": {"node": "x", "node_name": "l3", "scope": "a"},
+                "outcome": "timed_out", "error": "timed out",
+                "completed": 5, "total": 9
+            }).to_string(),
+        });
+        assert_eq!(
+            progress_line(&timed).expect("timed line"),
+            "[5/9] l3/a: timed_out — timed out"
+        );
+    }
+
+    #[test]
+    fn progress_line_skips_non_progress_and_summary_frames() {
+        let stdout = serde_json::json!({ "stream": "stdout", "seq": 0, "line": "hi" });
+        assert!(progress_line(&stdout).is_none());
+        let summary = serde_json::json!({
+            "stream": "progress",
+            "seq": 1,
+            "line": r#"{"summary":{"total":2,"ok":2,"failed":0,"timed_out":0,"truncated_targets":0}}"#,
+        });
+        assert!(progress_line(&summary).is_none(), "summary is not a line");
+        let garbage = serde_json::json!({ "stream": "progress", "seq": 2, "line": "not json" });
+        assert!(progress_line(&garbage).is_none());
+    }
 
     #[test]
     fn grep_renders_matches_with_origin_prefix() {

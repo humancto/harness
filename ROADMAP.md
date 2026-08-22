@@ -77,7 +77,7 @@ When an item lands, flip its checkbox **in the same PR** as `STATE.md` is update
 **Demo:** "summarize 50 PDFs across 2 laptops" — wall-clock ~halves. Federated `mesh.search` shows per-node contribution in UI.
 
 - [x] **4.1** `FanoutController` with bounded streaming dispatch (PRD §14.7) — never materialize all sub-tasks. Pull-based Stream in `harness-orchestrator`, window = clamp(2×N_workers, 4, 64); mesh_meta rewired as first consumer (remote sub-task rows O(window)). ADR-0023.
-- [ ] **4.2** Result streams: `Stream<TaskResult>` for callers, WebSocket for UI.
+- [x] **4.2** Result streams: `Stream<TaskResult>` for callers, WebSocket for UI. `results::task_results` maps FanoutStream per §14.8; mesh_meta emits per-target progress frames over the 3.2-stream pipe; `WS /runs/:id` pushes seq-deduped `partials` frames with a pre-terminal sweep; CLI renders progress incrementally. ADR-0024.
 - [ ] **4.3** DAG executor (topological dispatch with dependency tracking).
 - [ ] **4.4** Resource-aware scheduler (multidimensional load — CPU/RAM/GPU/network/disk; `fit_score` per PRD §14.3).
 - [ ] **4.5** Federated execution lifecycle with `PartialResult` streaming + `provenance` per `NodeContribution`.

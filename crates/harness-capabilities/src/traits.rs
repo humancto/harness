@@ -34,13 +34,19 @@ pub struct ExecutionContext {
 }
 
 /// Which child stream a [`LogFrame`] came from. Serializes as
-/// `"stdout"` / `"stderr"` — the same strings the wire
+/// `"stdout"` / `"stderr"` / `"progress"` — the same strings the wire
 /// `PartialResult::output_chunk` and the API `partials` array carry.
+///
+/// `Progress` (4.2, ADR-0024) carries structured per-target fan-out
+/// telemetry: `line` is a small JSON object, not child output. Old
+/// nodes drop unknown kinds at the issuer-side allowlist — graceful
+/// mixed-version behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamKind {
     Stdout,
     Stderr,
+    Progress,
 }
 
 impl StreamKind {
@@ -49,6 +55,7 @@ impl StreamKind {
         match self {
             StreamKind::Stdout => "stdout",
             StreamKind::Stderr => "stderr",
+            StreamKind::Progress => "progress",
         }
     }
 }

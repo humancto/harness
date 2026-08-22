@@ -281,11 +281,16 @@ mod tests {
         streamer.on_frame(task, frame(StreamKind::Stdout, "hello"));
         streamer.on_frame(task, frame(StreamKind::Stderr, "oops"));
 
+        // 4.2: progress frames route identically.
+        streamer.on_frame(task, frame(StreamKind::Progress, r#"{"completed":1}"#));
+
         let frames = buffers.frames(task);
-        assert_eq!(frames.len(), 2);
+        assert_eq!(frames.len(), 3);
         assert_eq!(frames[0].stream, "stdout");
         assert_eq!(frames[0].line, "hello");
         assert_eq!(frames[1].stream, "stderr");
+        assert_eq!(frames[2].stream, "progress");
+        assert_eq!(frames[2].line, r#"{"completed":1}"#);
         // Nothing queued for the wire.
         assert!(streamer.flush_batches().is_empty());
     }

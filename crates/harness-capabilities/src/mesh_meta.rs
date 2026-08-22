@@ -30,11 +30,14 @@ use async_trait::async_trait;
 use futures::StreamExt as _;
 use harness_core::{Capability as ManifestEntry, Cardinality, NodeId, PartialPolicy, TaskId};
 use harness_orchestrator::{
-    EndReason, FanoutController, FanoutEvent, FanoutSpec, ItemOutcome, WindowPolicy,
+    task_results, EndReason, FanoutController, FanoutSpec, FanoutSummary, ItemOutcome, ResultCtx,
+    ResultMapper, WindowPolicy,
 };
 use serde_json::{json, Value as JsonValue};
 
-use crate::traits::{Capability, CapabilityError, ExecutionContext};
+use crate::traits::{
+    Capability, CapabilityError, ExecutionContext, FrameSink, LogFrame, StreamKind,
+};
 
 /// Ceiling on fan-out (node, scope) pairs per call.
 pub const MAX_FANOUT_TARGETS: usize = 64;
@@ -92,6 +95,13 @@ pub trait MeshExec: Send + Sync + 'static {
 
     /// Await the sub-task's terminal result, up to `deadline`.
     async fn await_terminal(&self, id: TaskId, deadline: Duration) -> SubTaskOutcome;
+
+    /// Sink for per-target progress frames (4.2, ADR-0024). `None`
+    /// (the default) disables emission — pure unit-test fakes stay
+    /// silent, and the daemon wires the partial-stream sink in.
+    fn progress_sink(&self) -> Option<crate::traits::FrameSink> {
+        None
+    }
 }
 
 fn clamp_timeout(input: &JsonValue) -> u64 {
@@ -123,99 +133,72 @@ async fn fan_out(
     let (local_pairs, remote_pairs): (Vec<_>, Vec<_>) =
         pairs.into_iter().partition(|(t, _)| t.is_self);
 
-    // Late-pulled remote pairs get the REMAINING wrapper budget, not the
-    // full timeout (diff review MAJOR-1): before 4.1 every row was
-    // submitted at T≈0, so row timeout_ms and lease TTL expired in
-    // wall-clock alignment with the wrapper deadline; windowed pull must
-    // recompute the budget at pull time to keep ADR-0022's "sub-task
-    // timeout ≤ wrapper deadline" orphan bound. Floor of 1 s so a pair
-    // pulled at the wire never gets a degenerate zero-timeout row.
-    let started = tokio::time::Instant::now();
-    let remaining_budget = move || {
-        timeout
-            .saturating_sub(started.elapsed())
-            .max(Duration::from_secs(1))
-    };
+    let local_spec = build_local_spec(
+        exec.clone(),
+        ctx.clone(),
+        sub_capability,
+        sub_input.clone(),
+        timeout,
+        local_pairs.clone(),
+    );
+    let remote_spec = build_remote_spec(
+        exec.clone(),
+        ctx.task_id,
+        sub_capability,
+        sub_input,
+        timeout,
+        remote_pairs.clone(),
+    );
 
-    let local_spec = {
-        let exec = exec.clone();
-        let ctx = ctx.clone();
-        let sub_input = sub_input.clone();
-        FanoutSpec {
-            source: futures::stream::iter(local_pairs.clone()).boxed(),
-            run: Box::new(move |_index, (_target, scope): (MeshTarget, String)| {
-                let exec = exec.clone();
-                let ctx = ctx.clone();
-                let input = sub_input(&scope);
-                Box::pin(async move {
-                    match tokio::time::timeout(timeout, exec.run_local(sub_capability, &ctx, input))
-                        .await
-                    {
-                        Ok(Ok(v)) => ItemOutcome::Ok(v),
-                        Ok(Err(e)) => ItemOutcome::Failed(e.to_string()),
-                        Err(_) => ItemOutcome::TimedOut,
-                    }
-                }) as futures::future::BoxFuture<'static, ItemOutcome<JsonValue>>
-            }),
-            window: WindowPolicy::Fixed(LOCAL_SCAN_CONCURRENCY),
-            live_workers: Box::new(|| 1),
-            deadline: Some(Box::pin(tokio::time::sleep(timeout))),
-            on_failure: PartialPolicy::ReturnPartial,
-        }
+    // 4.2 (ADR-0024): per-target progress frames. One shared counter
+    // set spans both controllers; the total is every pair either
+    // controller will attempt. `total` here is post-truncation.
+    let total = u64::try_from(local_pairs.len() + remote_pairs.len()).unwrap_or(u64::MAX);
+    let counters = Arc::new(ProgressCounters::new(total));
+    let sink = exec.progress_sink();
+    let items_key = if sub_capability == "fs.search" {
+        "hits"
+    } else {
+        "matches"
     };
-
-    let remote_spec = {
-        let exec = exec.clone();
-        let task_id = ctx.task_id;
-        // Distinct remote node count drives the 2×N window (constant
-        // snapshot — targets are already live-filtered; dynamic
-        // recompute belongs to the long-running consumers, 4.5).
-        let workers = {
-            let mut ids: Vec<NodeId> = remote_pairs.iter().map(|(t, _)| t.node_id).collect();
-            ids.sort_unstable();
-            ids.dedup();
-            ids.len()
-        };
-        FanoutSpec {
-            source: futures::stream::iter(remote_pairs.clone()).boxed(),
-            run: Box::new(move |_index, (target, scope): (MeshTarget, String)| {
-                let exec = exec.clone();
-                let input = sub_input(&scope);
-                let budget = remaining_budget();
-                #[allow(clippy::cast_possible_truncation)]
-                let budget_ms = budget.as_millis().min(u128::from(u32::MAX)) as u32;
-                Box::pin(async move {
-                    // Row insertion happens HERE, inside the pulled
-                    // future — an unpulled pair has no task row.
-                    match exec.submit_remote(
-                        sub_capability,
-                        input,
-                        target.node_id,
-                        task_id,
-                        budget_ms,
-                    ) {
-                        Ok(id) => match exec.await_terminal(id, budget).await {
-                            SubTaskOutcome::Done(v) => ItemOutcome::Ok(v),
-                            SubTaskOutcome::Failed(e) => ItemOutcome::Failed(e),
-                            SubTaskOutcome::TimedOut => ItemOutcome::TimedOut,
-                        },
-                        Err(e) => ItemOutcome::Failed(format!("submit failed: {e}")),
-                    }
-                }) as futures::future::BoxFuture<'static, ItemOutcome<JsonValue>>
-            }),
-            window: WindowPolicy::default_per_workers(),
-            live_workers: Box::new(move || workers),
-            deadline: Some(Box::pin(tokio::time::sleep(timeout))),
-            on_failure: PartialPolicy::ReturnPartial,
-        }
+    let dctx = |pairs_total: &[(MeshTarget, String)]| DriveCtx {
+        task_id: ctx.task_id,
+        node_id: ctx.local_node,
+        sink: sink.clone(),
+        counters: counters.clone(),
+        items_key,
+        expected: u64::try_from(pairs_total.len()).unwrap_or(u64::MAX),
     };
+    let local_ctx = dctx(&local_pairs);
+    let remote_ctx = dctx(&remote_pairs);
 
     let ((mut successes, mut failures), (remote_ok, remote_fail)) = tokio::join!(
-        drive_fanout(local_spec, local_pairs),
-        drive_fanout(remote_spec, remote_pairs),
+        drive_fanout(local_spec, local_pairs, local_ctx),
+        drive_fanout(remote_spec, remote_pairs, remote_ctx),
     );
     successes.extend(remote_ok);
     failures.extend(remote_fail);
+
+    // Exactly one summary frame per wrapper call, after both
+    // controllers settle — the two per-controller summaries are
+    // internals and never emitted.
+    if let Some(sink) = &sink {
+        use std::sync::atomic::Ordering;
+        let chunk = json!({ "summary": {
+            "total": total,
+            "ok": counters.ok.load(Ordering::SeqCst),
+            "failed": counters.failed.load(Ordering::SeqCst),
+            "timed_out": counters.timed_out.load(Ordering::SeqCst),
+            "truncated_targets": truncated_targets,
+        }});
+        sink(
+            ctx.task_id,
+            LogFrame {
+                stream: StreamKind::Progress,
+                line: chunk.to_string(),
+            },
+        );
+    }
     // Merged order is completion-ordered under the controller; sort both
     // lists by (node, scope) so wrapper output stays deterministic.
     successes.sort_by(|a, b| (a.0.node_id, &a.1).cmp(&(b.0.node_id, &b.1)));
@@ -233,6 +216,96 @@ async fn fan_out(
         successes,
         failures,
         truncated_targets,
+    }
+}
+
+/// Self-owned scopes: in-process execution under the ADR-0022
+/// `Fixed(LOCAL_SCAN_CONCURRENCY)` window.
+fn build_local_spec(
+    exec: Arc<dyn MeshExec>,
+    ctx: ExecutionContext,
+    sub_capability: &'static str,
+    sub_input: Arc<dyn Fn(&str) -> JsonValue + Send + Sync>,
+    timeout: Duration,
+    pairs: Vec<(MeshTarget, String)>,
+) -> FanoutSpec<(MeshTarget, String), JsonValue> {
+    FanoutSpec {
+        source: futures::stream::iter(pairs).boxed(),
+        run: Box::new(move |_index, (_target, scope): (MeshTarget, String)| {
+            let exec = exec.clone();
+            let ctx = ctx.clone();
+            let input = sub_input(&scope);
+            Box::pin(async move {
+                match tokio::time::timeout(timeout, exec.run_local(sub_capability, &ctx, input))
+                    .await
+                {
+                    Ok(Ok(v)) => ItemOutcome::Ok(v),
+                    Ok(Err(e)) => ItemOutcome::Failed(e.to_string()),
+                    Err(_) => ItemOutcome::TimedOut,
+                }
+            }) as futures::future::BoxFuture<'static, ItemOutcome<JsonValue>>
+        }),
+        window: WindowPolicy::Fixed(LOCAL_SCAN_CONCURRENCY),
+        live_workers: Box::new(|| 1),
+        deadline: Some(Box::pin(tokio::time::sleep(timeout))),
+        on_failure: PartialPolicy::ReturnPartial,
+    }
+}
+
+/// Remote pairs: pinned sub-task rows under the §14.7 `2 × N_workers`
+/// window. Late-pulled pairs get the REMAINING wrapper budget, not the
+/// full timeout (4.1 diff review MAJOR-1): before 4.1 every row was
+/// submitted at T≈0, so row `timeout_ms` and lease TTL expired in
+/// wall-clock alignment with the wrapper deadline; windowed pull must
+/// recompute the budget at pull time to keep ADR-0022's "sub-task
+/// timeout ≤ wrapper deadline" orphan bound. Floor of 1 s so a pair
+/// pulled at the wire never gets a degenerate zero-timeout row.
+fn build_remote_spec(
+    exec: Arc<dyn MeshExec>,
+    task_id: TaskId,
+    sub_capability: &'static str,
+    sub_input: Arc<dyn Fn(&str) -> JsonValue + Send + Sync>,
+    timeout: Duration,
+    pairs: Vec<(MeshTarget, String)>,
+) -> FanoutSpec<(MeshTarget, String), JsonValue> {
+    let started = tokio::time::Instant::now();
+    // Distinct remote node count drives the 2×N window (constant
+    // snapshot — targets are already live-filtered; dynamic recompute
+    // belongs to the long-running consumers, 4.5).
+    let workers = {
+        let mut ids: Vec<NodeId> = pairs.iter().map(|(t, _)| t.node_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.len()
+    };
+    FanoutSpec {
+        source: futures::stream::iter(pairs).boxed(),
+        run: Box::new(move |_index, (target, scope): (MeshTarget, String)| {
+            let exec = exec.clone();
+            let input = sub_input(&scope);
+            let budget = timeout
+                .saturating_sub(started.elapsed())
+                .max(Duration::from_secs(1));
+            #[allow(clippy::cast_possible_truncation)]
+            let budget_ms = budget.as_millis().min(u128::from(u32::MAX)) as u32;
+            Box::pin(async move {
+                // Row insertion happens HERE, inside the pulled
+                // future — an unpulled pair has no task row.
+                match exec.submit_remote(sub_capability, input, target.node_id, task_id, budget_ms)
+                {
+                    Ok(id) => match exec.await_terminal(id, budget).await {
+                        SubTaskOutcome::Done(v) => ItemOutcome::Ok(v),
+                        SubTaskOutcome::Failed(e) => ItemOutcome::Failed(e),
+                        SubTaskOutcome::TimedOut => ItemOutcome::TimedOut,
+                    },
+                    Err(e) => ItemOutcome::Failed(format!("submit failed: {e}")),
+                }
+            }) as futures::future::BoxFuture<'static, ItemOutcome<JsonValue>>
+        }),
+        window: WindowPolicy::default_per_workers(),
+        live_workers: Box::new(move || workers),
+        deadline: Some(Box::pin(tokio::time::sleep(timeout))),
+        on_failure: PartialPolicy::ReturnPartial,
     }
 }
 
@@ -256,55 +329,185 @@ fn collect_pairs(
     (pairs, truncated_targets)
 }
 
-/// Drive one controller stream to its `End`, resolving each event's
-/// `index` against `pairs` for provenance. Pairs never completed when
-/// the fan-out ends early (deadline or fail-fast; in-flight-dropped or
-/// never pulled) get explicit failure entries — nothing disappears
-/// silently, whatever `PartialPolicy` a future caller passes.
+/// Shared per-wrapper progress accounting (4.2, ADR-0024). Atomics for
+/// `Send` bounds only: both `drive_fanout` futures are polled by one
+/// `tokio::join!` on the wrapper's task, so updates never race and
+/// every emitted frame is self-consistent — do not "fix" this into a
+/// lock.
+struct ProgressCounters {
+    completed: std::sync::atomic::AtomicU64,
+    ok: std::sync::atomic::AtomicU64,
+    /// Excludes timeouts — those are counted in `timed_out`.
+    failed: std::sync::atomic::AtomicU64,
+    timed_out: std::sync::atomic::AtomicU64,
+    total: u64,
+}
+
+impl ProgressCounters {
+    fn new(total: u64) -> Self {
+        Self {
+            completed: std::sync::atomic::AtomicU64::new(0),
+            ok: std::sync::atomic::AtomicU64::new(0),
+            failed: std::sync::atomic::AtomicU64::new(0),
+            timed_out: std::sync::atomic::AtomicU64::new(0),
+            total,
+        }
+    }
+}
+
+/// Per-controller context for [`drive_fanout`].
+struct DriveCtx {
+    task_id: TaskId,
+    node_id: NodeId,
+    sink: Option<FrameSink>,
+    counters: Arc<ProgressCounters>,
+    /// JSON key holding the per-target result array (`"matches"` for
+    /// grep, `"hits"` for search) — for the frame's `items` count.
+    items_key: &'static str,
+    /// This controller's pair count — the `task_results` `progress`
+    /// denominator, deliberately PER-CONTROLLER while the frame chunks'
+    /// `completed`/`total` are cross-controller (shared counters). The
+    /// `TaskResult`s are discarded by `drive_fanout` today; an external
+    /// consumer of the §14.8 stream must not "fix" either side to match
+    /// the other (diff review MINOR-4).
+    expected: u64,
+}
+
+/// [`ResultMapper`] over one controller's (node, scope) pairs: resolves
+/// `index` provenance, accumulates successes/failures, updates the
+/// shared counters, and emits one progress frame per completed target.
+/// Pairs never completed when the fan-out ends early (deadline or
+/// fail-fast; in-flight-dropped or never pulled) get explicit failure
+/// entries — nothing disappears silently, whatever `PartialPolicy` a
+/// future caller passes.
+struct PairMapper {
+    pairs: Vec<(MeshTarget, String)>,
+    seen: Vec<bool>,
+    successes: Vec<(MeshTarget, String, JsonValue)>,
+    failures: Vec<JsonValue>,
+    ctx: DriveCtx,
+}
+
+impl PairMapper {
+    fn emit(&self, chunk: &JsonValue) {
+        if let Some(sink) = &self.ctx.sink {
+            sink(
+                self.ctx.task_id,
+                LogFrame {
+                    stream: StreamKind::Progress,
+                    line: chunk.to_string(),
+                },
+            );
+        }
+    }
+}
+
+impl ResultMapper<JsonValue> for PairMapper {
+    fn on_item(&mut self, index: u64, outcome: &ItemOutcome<JsonValue>) -> JsonValue {
+        use std::sync::atomic::Ordering;
+        let idx = usize::try_from(index).unwrap_or(usize::MAX);
+        let Some((target, scope)) = self.pairs.get(idx) else {
+            return JsonValue::Null;
+        };
+        self.seen[idx] = true;
+        let c = &self.ctx.counters;
+        c.completed.fetch_add(1, Ordering::SeqCst);
+        let (kind, items, error) = match outcome {
+            ItemOutcome::Ok(v) => {
+                c.ok.fetch_add(1, Ordering::SeqCst);
+                let items = v
+                    .get(self.ctx.items_key)
+                    .and_then(JsonValue::as_array)
+                    .map(Vec::len);
+                self.successes
+                    .push((target.clone(), scope.clone(), v.clone()));
+                ("ok", items, None)
+            }
+            ItemOutcome::Failed(e) => {
+                c.failed.fetch_add(1, Ordering::SeqCst);
+                self.failures.push(failure_entry(target, scope, e));
+                ("failed", None, Some(e.clone()))
+            }
+            ItemOutcome::TimedOut => {
+                c.timed_out.fetch_add(1, Ordering::SeqCst);
+                self.failures
+                    .push(failure_entry(target, scope, "timed out"));
+                ("timed_out", None, Some("timed out".into()))
+            }
+        };
+        let mut chunk = json!({
+            "target": {
+                "node": target.node_id.to_string(),
+                "node_name": target.node_name,
+                "scope": scope,
+            },
+            "outcome": kind,
+            "completed": c.completed.load(Ordering::SeqCst),
+            "total": c.total,
+            "ok": c.ok.load(Ordering::SeqCst),
+            "failed": c.failed.load(Ordering::SeqCst),
+            "timed_out": c.timed_out.load(Ordering::SeqCst),
+        });
+        if let Some(n) = items {
+            chunk["items"] = json!(n);
+        }
+        if let Some(e) = error {
+            chunk["error"] = json!(e);
+        }
+        self.emit(&chunk);
+        chunk
+    }
+
+    fn on_end(&mut self, summary: &FanoutSummary) -> JsonValue {
+        let early_end_error = match summary.reason {
+            EndReason::SourceDrained => None,
+            EndReason::DeadlineExceeded => Some("deadline exceeded before completion"),
+            // Unreachable today (both specs pass ReturnPartial) but a
+            // 4.5 caller with FailFast must not lose pairs silently.
+            EndReason::FailedFast => Some("aborted by fail-fast before completion"),
+        };
+        if let Some(error) = early_end_error {
+            for idx in 0..self.pairs.len() {
+                if !self.seen[idx] {
+                    let (target, scope) = &self.pairs[idx];
+                    self.failures.push(failure_entry(target, scope, error));
+                }
+            }
+        }
+        // Per-controller summary chunk — consumed by the stream but
+        // never emitted to the sink; fan_out sends the single merged
+        // summary frame after both controllers settle.
+        JsonValue::Null
+    }
+}
+
+/// Drive one controller through [`task_results`] to termination and
+/// recover the accumulated (successes, failures).
 async fn drive_fanout(
     spec: FanoutSpec<(MeshTarget, String), JsonValue>,
     pairs: Vec<(MeshTarget, String)>,
+    dctx: DriveCtx,
 ) -> (Vec<(MeshTarget, String, JsonValue)>, Vec<JsonValue>) {
-    let mut successes = Vec::new();
-    let mut failures = Vec::new();
-    let mut seen = vec![false; pairs.len()];
-    let mut reason = EndReason::SourceDrained;
-    let mut stream = FanoutController::stream(spec);
-    while let Some(ev) = stream.next().await {
-        match ev {
-            FanoutEvent::Item { index, outcome } => {
-                let idx = usize::try_from(index).unwrap_or(usize::MAX);
-                let Some((target, scope)) = pairs.get(idx) else {
-                    continue;
-                };
-                seen[idx] = true;
-                match outcome {
-                    ItemOutcome::Ok(v) => successes.push((target.clone(), scope.clone(), v)),
-                    ItemOutcome::Failed(e) => failures.push(failure_entry(target, scope, &e)),
-                    ItemOutcome::TimedOut => {
-                        failures.push(failure_entry(target, scope, "timed out"));
-                    }
-                }
-            }
-            FanoutEvent::End(summary) => reason = summary.reason,
-        }
-    }
-    let early_end_error = match reason {
-        EndReason::SourceDrained => None,
-        EndReason::DeadlineExceeded => Some("deadline exceeded before completion"),
-        // Unreachable today (both specs pass ReturnPartial) but a 4.5
-        // caller with FailFast must not lose pairs silently.
-        EndReason::FailedFast => Some("aborted by fail-fast before completion"),
+    let result_ctx = ResultCtx {
+        task_id: dctx.task_id,
+        node_id: dctx.node_id,
+        expected: Some(dctx.expected),
     };
-    if let Some(error) = early_end_error {
-        for (idx, done) in seen.iter().enumerate() {
-            if !done {
-                let (target, scope) = &pairs[idx];
-                failures.push(failure_entry(target, scope, error));
-            }
-        }
-    }
-    (successes, failures)
+    let seen = vec![false; pairs.len()];
+    let mapper = PairMapper {
+        seen,
+        successes: Vec::new(),
+        failures: Vec::new(),
+        pairs,
+        ctx: dctx,
+    };
+    let mut stream = task_results(FanoutController::stream(spec), result_ctx, mapper);
+    // The §14.8 Stream<TaskResult> is the engine here; the wrapper's
+    // deliverable is the merged terminal output, so the per-item
+    // TaskResults are consumed (their side effects live in the mapper).
+    while stream.next().await.is_some() {}
+    let mapper = stream.into_mapper();
+    (mapper.successes, mapper.failures)
 }
 
 struct FanOutOutcome {
@@ -586,6 +789,8 @@ mod tests {
         }
     }
 
+    type CapturedFrames = Arc<Mutex<Vec<(TaskId, LogFrame)>>>;
+
     struct FakeExec {
         targets: Vec<MeshTarget>,
         /// (capability, scope-json) log of local runs.
@@ -593,6 +798,8 @@ mod tests {
         remote_calls: Mutex<Vec<(String, NodeId, JsonValue)>>,
         remote_outcome: SubTaskOutcome,
         local_fails: bool,
+        /// 4.2: captured progress frames when a sink is installed.
+        frames: Option<CapturedFrames>,
     }
 
     impl FakeExec {
@@ -603,7 +810,24 @@ mod tests {
                 remote_calls: Mutex::new(vec![]),
                 remote_outcome,
                 local_fails: false,
+                frames: None,
             })
+        }
+
+        fn with_sink(
+            targets: Vec<MeshTarget>,
+            remote_outcome: SubTaskOutcome,
+        ) -> (Arc<Self>, CapturedFrames) {
+            let frames = Arc::new(Mutex::new(vec![]));
+            let exec = Arc::new(Self {
+                targets,
+                local_calls: Mutex::new(vec![]),
+                remote_calls: Mutex::new(vec![]),
+                remote_outcome,
+                local_fails: false,
+                frames: Some(frames.clone()),
+            });
+            (exec, frames)
         }
     }
 
@@ -645,6 +869,14 @@ mod tests {
         }
         async fn await_terminal(&self, _id: TaskId, _deadline: Duration) -> SubTaskOutcome {
             self.remote_outcome.clone()
+        }
+        fn progress_sink(&self) -> Option<crate::traits::FrameSink> {
+            self.frames.as_ref().map(|frames| {
+                let frames = frames.clone();
+                Arc::new(move |task_id: TaskId, frame: LogFrame| {
+                    frames.lock().push((task_id, frame));
+                }) as crate::traits::FrameSink
+            })
         }
     }
 
@@ -972,6 +1204,110 @@ mod tests {
             .iter()
             .all(|f| f["error"].as_str().unwrap().contains("deadline exceeded")));
         assert_eq!(out["provenance"]["targets_failed"], 30);
+    }
+
+    #[tokio::test]
+    async fn t12_progress_frames_per_target_plus_one_summary() {
+        let (exec, frames) = FakeExec::with_sink(
+            vec![
+                target(1, "self", true, &["docs"], &["fs.grep"]),
+                target(2, "peer", false, &["notes"], &["fs.grep"]),
+            ],
+            SubTaskOutcome::Done(json!({ "matches": [{ "path": "r.md", "line": 7 }] })),
+        );
+        let cap = MeshGrepCapability::new(exec);
+        let c = ctx();
+        let task_id = c.task_id;
+        cap.execute(&c, json!({ "pattern": "x" }))
+            .await
+            .expect("execute");
+        let captured = frames.lock();
+        assert_eq!(captured.len(), 3, "2 per-target + 1 summary");
+        assert!(captured
+            .iter()
+            .all(|(id, f)| *id == task_id && f.stream == StreamKind::Progress));
+        let chunks: Vec<JsonValue> = captured
+            .iter()
+            .map(|(_, f)| serde_json::from_str(&f.line).expect("json line"))
+            .collect();
+        let targets: Vec<&JsonValue> = chunks.iter().filter(|c| !c["target"].is_null()).collect();
+        assert_eq!(targets.len(), 2);
+        // Counts are monotone and self-consistent per frame.
+        for t in &targets {
+            assert_eq!(t["outcome"], "ok");
+            assert_eq!(t["total"], 2);
+            assert_eq!(t["items"], 1);
+            let completed = t["completed"].as_u64().unwrap();
+            assert!((1..=2).contains(&completed));
+            assert_eq!(t["ok"].as_u64().unwrap(), completed);
+        }
+        let scopes: Vec<&str> = targets
+            .iter()
+            .map(|t| t["target"]["scope"].as_str().unwrap())
+            .collect();
+        assert!(scopes.contains(&"docs") && scopes.contains(&"notes"));
+        let summary = chunks
+            .iter()
+            .find(|c| !c["summary"].is_null())
+            .expect("summary frame");
+        assert_eq!(summary["summary"]["total"], 2);
+        assert_eq!(summary["summary"]["ok"], 2);
+        assert_eq!(summary["summary"]["failed"], 0);
+        assert_eq!(summary["summary"]["timed_out"], 0);
+        assert_eq!(summary["summary"]["truncated_targets"], 0);
+    }
+
+    #[tokio::test]
+    async fn t13_progress_failure_frame_carries_error_and_summary_counts() {
+        let (exec, frames) = FakeExec::with_sink(
+            vec![
+                target(1, "self", true, &["docs"], &["fs.grep"]),
+                target(2, "peer", false, &["notes"], &["fs.grep"]),
+            ],
+            SubTaskOutcome::Failed("worker exploded".into()),
+        );
+        let cap = MeshGrepCapability::new(exec);
+        cap.execute(&ctx(), json!({ "pattern": "x" }))
+            .await
+            .expect("execute");
+        let chunks: Vec<JsonValue> = frames
+            .lock()
+            .iter()
+            .map(|(_, f)| serde_json::from_str(&f.line).expect("json line"))
+            .collect();
+        let failed = chunks
+            .iter()
+            .find(|c| c["outcome"] == "failed")
+            .expect("failed frame");
+        assert_eq!(failed["target"]["node_name"], "peer");
+        assert!(failed["error"]
+            .as_str()
+            .unwrap()
+            .contains("worker exploded"));
+        let summary = chunks
+            .iter()
+            .find(|c| !c["summary"].is_null())
+            .expect("summary");
+        assert_eq!(summary["summary"]["ok"], 1);
+        assert_eq!(summary["summary"]["failed"], 1);
+        assert_eq!(summary["summary"]["timed_out"], 0);
+    }
+
+    #[tokio::test]
+    async fn t14_sinkless_exec_emits_nothing_and_output_is_unchanged() {
+        // The default progress_sink (None) keeps every existing test
+        // green; this pins that the sink is genuinely optional.
+        let exec = FakeExec::new(
+            vec![target(1, "self", true, &["docs"], &["fs.grep"])],
+            SubTaskOutcome::Done(json!({ "matches": [] })),
+        );
+        assert!(exec.frames.is_none());
+        let cap = MeshGrepCapability::new(exec);
+        let out = cap
+            .execute(&ctx(), json!({ "pattern": "x" }))
+            .await
+            .expect("execute");
+        assert_eq!(out["results"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test(start_paused = true)]

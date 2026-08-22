@@ -380,6 +380,9 @@ impl DaemonOrchestrator {
                 identity.clone(),
                 capabilities.downgrade(),
                 heartbeat.peers(),
+                // 4.2: per-target progress frames ride the same partial
+                // pipeline as shell line frames (ADR-0024).
+                Some(partial_streamer.sink()),
             );
             harness_capabilities::enrich_with_mesh_meta(&capabilities, mesh_exec);
         }
@@ -573,6 +576,12 @@ impl DaemonOrchestrator {
     #[cfg(test)]
     pub(crate) fn peer_table(&self) -> harness_mesh::heartbeat::PeerTable {
         self.heartbeat.peers()
+    }
+
+    /// Partial-frame ring handle for test assertions (4.2 progress).
+    #[cfg(test)]
+    pub(crate) fn partial_buffers(&self) -> Arc<harness_api::PartialBuffers> {
+        self.api_state.partials.clone()
     }
 
     /// Store handle for test assertions.
