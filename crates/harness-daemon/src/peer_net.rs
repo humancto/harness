@@ -594,11 +594,17 @@ fn sign_or_protocol_err<T: Signable>(
 }
 
 /// Build + sign this node's manifest from the live registry state.
+///
+/// `secret_tags` advertises the *names* of secret tags the local vault
+/// can resolve (never values — ADR-0021); the dispatcher on every node
+/// uses it to route `requires_secrets`-declaring capabilities only to
+/// nodes holding the tags.
 pub(crate) fn build_self_manifest(
     identity: &Identity,
     hostname: String,
     capabilities: Vec<harness_core::Capability>,
     scopes: Vec<harness_core::Scope>,
+    secret_tags: Vec<String>,
 ) -> Result<NodeManifest, harness_core::ProtocolError> {
     let cpu_cores = std::thread::available_parallelism()
         .map(|n| u8::try_from(n.get()).unwrap_or(u8::MAX))
@@ -613,6 +619,7 @@ pub(crate) fn build_self_manifest(
         pubkey: *identity.public_key(),
         capabilities,
         scopes,
+        secret_tags,
         resources: harness_core::Resources {
             cpu_cores,
             // Resource sampling is a Phase 6 hardening item; 0 = unknown.
@@ -690,9 +697,14 @@ mod tests {
             scopes: Arc::new(ScopeIndex::new()),
             store: None,
         });
-        let manifest =
-            build_self_manifest(&identity, name.to_string(), vec![echo_capability()], vec![])
-                .expect("manifest");
+        let manifest = build_self_manifest(
+            &identity,
+            name.to_string(),
+            vec![echo_capability()],
+            vec![],
+            vec![],
+        )
+        .expect("manifest");
         let net = PeerNet::new(
             identity.clone(),
             heartbeat.clone(),

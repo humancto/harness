@@ -1,6 +1,14 @@
-//! Tagged credential store. Phase 3.6a — Plaintext-on-disk reference
-//! implementation; encrypted-replicated form is Phase 3.6-encrypted
-//! (PRD §10.5). Both forms implement the same [`SecretsStore`] trait.
+//! Tagged credential store (PRD §10.5). Two backends behind one
+//! [`SecretsStore`] trait:
+//!
+//! - [`EncryptedStore`] (Phase 3.6-encrypted, ADR-0021) — the daemon's
+//!   runtime store: `~/.harness/secrets.enc`, ChaCha20-Poly1305 under a
+//!   key derived from the node identity secret. Transparently migrates
+//!   a legacy plaintext file on first load. Mesh replication of
+//!   credentials is deferred to Phase 6.5.
+//! - [`PlaintextStore`] (Phase 3.6a, ADR-0012) — the plaintext-on-disk
+//!   reference implementation, retained as the migration source and
+//!   for tests.
 //!
 //! Capabilities reference credentials by **tag** (`secret/<name>`),
 //! never by raw bytes. The tag is the only identifier that ever appears
@@ -38,11 +46,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod encrypted;
 pub mod error;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+pub use encrypted::{derive_vault_key, EncryptedStore, VaultOrigin};
 pub use error::SecretsError;
 
 /// Default config path: `~/.harness/secrets.toml`.
@@ -140,6 +150,36 @@ pub trait SecretsStore: Send + Sync + std::fmt::Debug {
     /// Look up a secret by tag. Returns `None` if the tag is unknown.
     /// Implementations MUST NOT log the returned bytes.
     fn get(&self, tag: &str) -> Option<SecretValue>;
+
+    /// Tag *names* this store can currently resolve — file entries plus
+    /// env-var overrides, sorted and deduplicated. Names only, never
+    /// values: this list is advertised in the node's `NodeManifest`
+    /// (`secret_tags`) so the dispatcher can route
+    /// `requires_secrets`-declaring capabilities to nodes that hold the
+    /// tags (3.6-encrypted, ADR-0021).
+    ///
+    /// Defaults to empty so trait objects used purely for lookup (test
+    /// doubles) keep compiling; real stores override it.
+    fn tags(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// Tags resolvable via `HARNESS_SECRET_*` env-var overrides right now.
+/// The inverse of [`tag_to_env_var`]: `HARNESS_SECRET_FOO_BAR` →
+/// `secret/foo-bar`. Env names that don't round-trip through the tag
+/// grammar are ignored.
+#[must_use]
+pub(crate) fn env_override_tags() -> Vec<String> {
+    std::env::vars_os()
+        .filter_map(|(k, _)| k.into_string().ok())
+        .filter_map(|name| {
+            let suffix = name.strip_prefix("HARNESS_SECRET_")?;
+            let tag = format!("secret/{}", suffix.replace('_', "-").to_lowercase());
+            // Round-trip check: only well-formed names advertise.
+            (tag_to_env_var(&tag).as_deref() == Some(name.as_str())).then_some(tag)
+        })
+        .collect()
 }
 
 /// In-process plaintext credential store. Backed by a TOML file (default
@@ -200,6 +240,14 @@ impl SecretsStore for PlaintextStore {
             }
         }
         self.map.get(tag).cloned()
+    }
+
+    fn tags(&self) -> Vec<String> {
+        let mut tags: Vec<String> = self.map.keys().cloned().collect();
+        tags.extend(env_override_tags());
+        tags.sort();
+        tags.dedup();
+        tags
     }
 }
 

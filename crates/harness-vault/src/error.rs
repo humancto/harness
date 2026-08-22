@@ -30,4 +30,28 @@ pub enum SecretsError {
 
     #[error("permissions on {path} are too loose ({mode:o}); expected mode 0600 or stricter")]
     PermissionsTooLoose { path: PathBuf, mode: u32 },
+
+    #[error("serialize error for {path}: {source}")]
+    Serialize {
+        path: PathBuf,
+        #[source]
+        source: toml::ser::Error,
+    },
+
+    /// Envelope is structurally wrong: unsupported `format_version`,
+    /// non-hex fields, wrong nonce length, non-UTF-8 payload.
+    #[error("malformed encrypted credential file {path}: {reason}")]
+    BadFormat { path: PathBuf, reason: String },
+
+    /// AEAD open failed. Deliberately does not distinguish wrong key
+    /// from tampered ciphertext — the cipher can't, and the error
+    /// message must not help an attacker tell the difference.
+    #[error(
+        "failed to decrypt {path}: wrong key or tampered file \
+         (was the node identity key replaced?)"
+    )]
+    Decrypt { path: PathBuf },
+
+    #[error("failed to encrypt credential file {path}")]
+    Encrypt { path: PathBuf },
 }

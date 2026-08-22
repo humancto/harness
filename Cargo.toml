@@ -71,6 +71,9 @@ blake3        = { version = "1.5" }
 rand          = { version = "0.8" }
 zeroize       = { version = "1.8" }
 hex           = { version = "0.4" }
+# AEAD for the encrypted credential store (3.6-encrypted, ADR-0021).
+# Pure-Rust RustCrypto implementation; aligns with the dalek stack.
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 
 # Storage
 rusqlite      = { version = "0.32", features = ["bundled"] }

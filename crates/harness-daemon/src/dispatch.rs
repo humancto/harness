@@ -76,6 +76,29 @@ impl LiveSet for MeshLiveSet {
     }
 }
 
+/// [`MeshLiveSet`] narrowed to nodes that can satisfy the capability's
+/// `requires_secrets` (3.6-encrypted, ADR-0021). Filtering *inside* the
+/// live-set — rather than post-filtering the computed `DispatchPlan` —
+/// keeps routing deterministic (the round-robin cursor never elects a
+/// node that would then be discarded) and lets the empty case flow
+/// through the existing `NoEligibleNodes` → undispatchable path with no
+/// new error plumbing. The filter stays in the daemon: the orchestrator
+/// remains pure/store-free.
+struct SecretAwareLiveSet<'a> {
+    inner: MeshLiveSet,
+    runtime: &'a DispatchRuntime,
+    capability: &'a str,
+}
+
+impl LiveSet for SecretAwareLiveSet<'_> {
+    fn is_live(&self, node: &NodeId) -> bool {
+        self.inner.is_live(node)
+            && self
+                .runtime
+                .node_has_required_secrets(*node, self.capability)
+    }
+}
+
 struct ReplyObligation {
     issuer: NodeId,
     lease_id: LeaseId,
@@ -92,6 +115,10 @@ pub(crate) struct DispatchRuntime {
     rr_seeded: ParkingMutex<std::collections::HashSet<String>>,
     trust: TrustStore,
     peers: PeerTable,
+    /// Local vault, consulted for *tag names only* when routing
+    /// `requires_secrets`-declaring capabilities (ADR-0021). Values are
+    /// never read on the dispatch path.
+    secrets: Arc<dyn harness_vault::SecretsStore>,
     /// Set once after `PeerNet::new` (the net holds us as its handlers —
     /// a `Weak` back-reference avoids the cycle).
     net: OnceLock<Weak<PeerNet>>,
@@ -109,6 +136,7 @@ impl DispatchRuntime {
         dispatcher: Dispatcher,
         trust: TrustStore,
         peers: PeerTable,
+        secrets: Arc<dyn harness_vault::SecretsStore>,
     ) -> Arc<Self> {
         let local_id = identity.node_id();
         Arc::new(Self {
@@ -121,6 +149,7 @@ impl DispatchRuntime {
             rr_seeded: ParkingMutex::new(std::collections::HashSet::new()),
             trust,
             peers,
+            secrets,
             net: OnceLock::new(),
             reply: ParkingMutex::new(HashMap::new()),
             elig_failures: ParkingMutex::new(HashMap::new()),
@@ -222,7 +251,15 @@ impl DispatchRuntime {
             };
             let cardinality = self.cardinality_for(&task.capability);
             self.seed_rr_cursor(&task.capability);
-            let live = self.live_set();
+            // Liveness ∩ secret capability (ADR-0021): nodes missing a
+            // tag the capability requires are not candidates. When that
+            // empties the set the existing eligibility-failure window →
+            // terminal `undispatchable` path applies unchanged.
+            let live = SecretAwareLiveSet {
+                inner: self.live_set(),
+                runtime: self,
+                capability: &task.capability,
+            };
             match self
                 .dispatcher
                 .eligible_with_rr(&task, &cardinality, &live, &self.rr)
@@ -247,6 +284,50 @@ impl DispatchRuntime {
                     tracing::error!(target: "harness.dispatch", task = %task.id.0, "unknown dispatch plan");
                 }
                 Err(err) => self.eligibility_failure(&task, &err),
+            }
+        }
+    }
+
+    /// Can `node` satisfy `capability`'s `requires_secrets`? (ADR-0021)
+    ///
+    /// - **Self:** the local registry's manifest entry names the
+    ///   required tags; the live local vault (`SecretsStore::tags`)
+    ///   answers what we hold. Tag *names* only — no values move.
+    /// - **Peer:** the peer's stored manifest carries both its
+    ///   capability entry (with `requires_secrets`) and its advertised
+    ///   `secret_tags`.
+    /// - **Unknown:** a peer whose manifest we don't hold (index
+    ///   warm-up race) is NOT filtered — this is a routing
+    ///   optimization, not a security boundary (policy is enforced on
+    ///   the executing node, PRD §10.4), and pre-3.6 behavior (route,
+    ///   let the worker answer `not configured`) is the conservative
+    ///   fallback.
+    fn node_has_required_secrets(&self, node: NodeId, capability: &str) -> bool {
+        if node == self.local_id {
+            let required = self
+                .registry
+                .get(capability)
+                .map(|c| c.manifest().requires_secrets)
+                .unwrap_or_default();
+            if required.is_empty() {
+                return true;
+            }
+            let have = self.secrets.tags();
+            return required.iter().all(|t| have.contains(t));
+        }
+        match self.store.load_manifest(node) {
+            Ok(Some(m)) => {
+                let Some(cap) = m.capabilities.iter().find(|c| c.id == capability) else {
+                    return true;
+                };
+                cap.requires_secrets
+                    .iter()
+                    .all(|t| m.secret_tags.contains(t))
+            }
+            Ok(None) => true,
+            Err(e) => {
+                tracing::warn!(target: "harness.dispatch", ?e, %node, "load_manifest for secret routing");
+                true
             }
         }
     }
@@ -820,11 +901,15 @@ mod tests {
     }
 
     fn signed_task(issuer: &Identity) -> Task {
+        signed_task_for(issuer, "echo")
+    }
+
+    fn signed_task_for(issuer: &Identity, capability: &str) -> Task {
         let mut t = Task {
             id: TaskId::new_v7(),
             parent: None,
             plan_id: None,
-            capability: "echo".into(),
+            capability: capability.into(),
             input: serde_json::json!({"msg": "hi"}),
             constraints: Constraints::default(),
             retry: RetryPolicy::default(),
@@ -873,6 +958,9 @@ mod tests {
         store: Store,
         local: Arc<Identity>,
         remote: Arc<Identity>,
+        /// Clone of the runtime's peer table (shared `Arc` inner) so
+        /// tests can mark peers live by recording heartbeats.
+        peers: PeerTable,
         _tmp: tempfile::TempDir,
     }
 
@@ -894,19 +982,22 @@ mod tests {
             })
             .expect("trust add");
         let store = Store::open_memory().expect("store");
+        let peers = PeerTable::new();
         let runtime = DispatchRuntime::new(
             store.clone(),
             local.clone(),
             harness_capabilities::CapabilityRegistry::new(),
             Dispatcher::new(),
             trust,
-            PeerTable::new(),
+            peers.clone(),
+            Arc::new(harness_vault::PlaintextStore::empty()),
         );
         Fixture {
             runtime,
             store,
             local,
             remote,
+            peers,
             _tmp: tmp,
         }
     }
@@ -1285,5 +1376,182 @@ mod tests {
             .expect("load")
             .expect("row");
         assert_eq!(row.error.as_deref(), Some("boom"));
+    }
+
+    // ------------------------------------------------------------------
+    // 3.6-encrypted: requires_secrets-aware routing (ADR-0021)
+    // ------------------------------------------------------------------
+
+    const SECRET_CAP: &str = "llm.cloud.test";
+    const SECRET_TAG: &str = "secret/test-api-key";
+
+    fn secret_capability() -> harness_core::Capability {
+        harness_core::Capability {
+            id: SECRET_CAP.into(),
+            version: harness_core::SemVer::new(0, 1, 0),
+            cardinality: Cardinality::Anyone,
+            input_schema: serde_json::json!({}),
+            output_schema: serde_json::json!({}),
+            cost_hint: harness_core::protocol::CostHint::CloudPaid,
+            tags: vec![],
+            rate_limit: None,
+            resource_hints: empty_hints(),
+            requires_secrets: vec![SECRET_TAG.to_string()],
+        }
+    }
+
+    fn signed_peer_manifest(id: &Identity, secret_tags: Vec<String>) -> harness_core::NodeManifest {
+        let mut m = harness_core::NodeManifest {
+            node_id: id.node_id(),
+            hostname: "peer".into(),
+            pubkey: *id.public_key(),
+            capabilities: vec![secret_capability()],
+            scopes: vec![],
+            secret_tags,
+            resources: harness_core::Resources {
+                cpu_cores: 1,
+                ram_total_mb: 1,
+                gpu: None,
+                os: "linux".into(),
+                arch: "x86_64".into(),
+            },
+            online_since: 0,
+            version: harness_core::SemVer::new(0, 1, 0),
+            sig: Signature::from_bytes([0u8; 64]),
+        };
+        m.sign(id).expect("sign manifest");
+        m
+    }
+
+    fn live_heartbeat(node: NodeId) -> harness_core::Heartbeat {
+        harness_core::Heartbeat {
+            node_id: node,
+            seq: 1,
+            timestamp: 1_700_000_000_000,
+            queue_depth: 0,
+            cpu_busy_pct: 0,
+            cpu_pinned_count: 0,
+            ram_used_mb: 0,
+            ram_total_mb: 0,
+            gpu_used_mb: 0,
+            gpu_total_mb: 0,
+            capabilities_hash: [0u8; 16],
+            in_flight: vec![],
+            leader_belief: node,
+            brain_score: 0,
+            on_battery: false,
+            paused: false,
+            version: harness_core::SemVer::new(0, 1, 0),
+            sig: Signature::from_bytes([0u8; 64]),
+        }
+    }
+
+    /// Register `peer` as a live routing candidate: manifest into the
+    /// dispatcher's capability index + the store mirror, heartbeat into
+    /// the peer table.
+    fn add_live_candidate(f: &Fixture, peer: &Identity, secret_tags: Vec<String>) {
+        let m = signed_peer_manifest(peer, secret_tags);
+        f.runtime.dispatcher.capability_index().upsert_node(&m);
+        f.store.upsert_manifest(&m).expect("upsert manifest");
+        f.peers.record(live_heartbeat(peer.node_id()));
+    }
+
+    #[tokio::test]
+    async fn t11_requires_secrets_routes_only_to_tag_holder() {
+        let f = fixture();
+        let with_tag = Identity::generate();
+        let without_tag = Identity::generate();
+        add_live_candidate(&f, &with_tag, vec![SECRET_TAG.to_string()]);
+        add_live_candidate(&f, &without_tag, vec![]);
+
+        // Three polls: the tag-holder must be chosen every time, never
+        // the other node (round-robin must not rotate onto it). The
+        // assign send fails (no PeerNet attached) so the task resets to
+        // Submitted after each poll — which is exactly what lets us
+        // re-poll; `last_dispatched` records each routing choice.
+        for _ in 0..3 {
+            let task = {
+                let t = signed_task_for(&f.local, SECRET_CAP);
+                f.store.insert_task(&t).expect("insert");
+                t
+            };
+            f.runtime.poll_submitted_once();
+            assert_eq!(
+                f.store.last_dispatched(SECRET_CAP).expect("cursor"),
+                Some(with_tag.node_id()),
+                "must route to the node advertising the required tag"
+            );
+            // The lease proves the dispatch targeted the tag-holder.
+            let leases = f.store.list_leases_for_task(task.id).expect("leases");
+            assert_eq!(leases.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn t12_requires_secrets_no_holder_is_undispatchable() {
+        let f = fixture();
+        let without_tag = Identity::generate();
+        add_live_candidate(&f, &without_tag, vec![]);
+
+        // Deadline already elapsed → the first eligibility failure is
+        // terminal (no need to wait out the retry window).
+        let mut task = signed_task_for(&f.local, SECRET_CAP);
+        task.constraints.deadline = Some(1);
+        f.store.insert_task(&task).expect("insert");
+
+        f.runtime.poll_submitted_once();
+
+        assert_eq!(
+            f.store.task_state(task.id).expect("state"),
+            Some(TaskState::Failed),
+            "no node holds the tag → terminal undispatchable failure"
+        );
+        let row = f
+            .store
+            .load_task_result(task.id)
+            .expect("load")
+            .expect("row");
+        let err = row.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("undispatchable"),
+            "error must flow through the existing undispatchable path: {err:?}"
+        );
+        assert!(
+            f.store
+                .list_leases_for_task(task.id)
+                .expect("leases")
+                .is_empty(),
+            "no lease may be minted for a filtered-out node"
+        );
+    }
+
+    #[tokio::test]
+    async fn t13_node_has_required_secrets_cases() {
+        let f = fixture();
+        let with_tag = Identity::generate();
+        let without_tag = Identity::generate();
+        add_live_candidate(&f, &with_tag, vec![SECRET_TAG.to_string()]);
+        add_live_candidate(&f, &without_tag, vec![]);
+        let unknown = Identity::generate(); // no manifest stored
+
+        assert!(f
+            .runtime
+            .node_has_required_secrets(with_tag.node_id(), SECRET_CAP));
+        assert!(!f
+            .runtime
+            .node_has_required_secrets(without_tag.node_id(), SECRET_CAP));
+        // No manifest on file → cannot judge → not filtered (routing
+        // optimization, not a security boundary; ADR-0021).
+        assert!(f
+            .runtime
+            .node_has_required_secrets(unknown.node_id(), SECRET_CAP));
+        // A capability the manifest doesn't list → not filtered.
+        assert!(f
+            .runtime
+            .node_has_required_secrets(without_tag.node_id(), "echo"));
+        // Self: empty local registry declares no requirements → true.
+        assert!(f
+            .runtime
+            .node_has_required_secrets(f.local.node_id(), SECRET_CAP));
     }
 }

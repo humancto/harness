@@ -114,6 +114,7 @@ mod tests {
             pubkey: *id.public_key(),
             capabilities: caps.to_vec(),
             scopes: vec![],
+            secret_tags: vec![],
             resources: empty_resources(),
             online_since: 0,
             version: SemVer {

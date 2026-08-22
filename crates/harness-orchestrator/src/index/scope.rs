@@ -76,6 +76,7 @@ mod tests {
                     last_indexed: None,
                 })
                 .collect(),
+            secret_tags: vec![],
             resources: Resources {
                 cpu_cores: 0,
                 ram_total_mb: 0,

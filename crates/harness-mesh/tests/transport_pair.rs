@@ -247,6 +247,7 @@ async fn node_manifest_round_trip_via_transport() {
         pubkey: *client_id.public_key(),
         capabilities: vec![],
         scopes: vec![],
+        secret_tags: vec![],
         resources: Resources {
             cpu_cores: 1,
             ram_total_mb: 1,

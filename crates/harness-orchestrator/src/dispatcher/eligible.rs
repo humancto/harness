@@ -236,6 +236,7 @@ mod tests {
                     last_indexed: None,
                 })
                 .collect(),
+            secret_tags: vec![],
             resources: empty_resources(),
             online_since: 0,
             version: SemVer {
