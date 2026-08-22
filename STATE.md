@@ -109,9 +109,20 @@ These will land alongside their natural Phase 3 home, not as a "phase 2.10":
 
 - (nothing)
 
+## Phase 4 progress
+
+| PR  | Item | What shipped                                                                                                                                                                                          |
+| --- | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| #44 | 4.1  | `FanoutController` (harness-orchestrator): pure pull-based Stream, window = clamp(2×N_workers, 4, 64) recomputed per refill, Drop-as-cancel, deadline + FailFast with drop accounting. mesh_meta rewired: remote sub-task rows now O(window) via two concurrently-polled controllers (locals keep the ADR-0022 Fixed(4) bound). ADR-0023. +17 tests (907 total) |
+
+4.1 review round 1 (plan): 2 majors fixed pre-implementation — index-resolved failure
+provenance; two controller instances so local scans stay ≤4 and remote submission isn't
+starved behind local work. `PartialPolicy::Wait` aliased to `ReturnPartial` at the
+controller until 4.5 (ADR-0023).
+
 ## Phase 4 — next up
 
-Spine is sequential: **4.1 FanoutController** → 4.2 result streams → 4.3 DAG executor →
+Spine is sequential: ~~4.1 FanoutController~~ → **4.2 result streams** → 4.3 DAG executor →
 4.4 resource-aware scheduler → 4.5 federated lifecycle (owes the ADR-0022 permit-release
 fix) → 4.6 lease extension/retry backoff (owes carried risks 9/10) → 4.7 backpressure
 tests → 4.8 UI DAG viz. Phase-4-owned obligations from below: risks 2 (drop-guard), 9

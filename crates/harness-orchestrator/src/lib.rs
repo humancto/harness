@@ -12,9 +12,14 @@
 pub mod dispatcher;
 pub mod error;
 pub mod executor;
+pub mod fanout;
 pub mod index;
 
 pub use dispatcher::{DispatchPlan, Dispatcher, LiveSet, RoundRobin, StaticLiveSet};
 pub use error::DispatchError;
 pub use executor::{policy_check, ExecutorError};
+pub use fanout::{
+    EndReason, FanoutController, FanoutEvent, FanoutSpec, FanoutStream, FanoutSummary, ItemOutcome,
+    WindowPolicy,
+};
 pub use index::{CapabilityIndex, ScopeIndex};

@@ -28,8 +28,9 @@ fs   = ["dep:cap-std", "dep:base64", "dep:toml", "dep:dirs", "dep:rusqlite", "de
 mcp  = ["dep:rmcp", "dep:toml"]
 
 [dependencies]
-harness-core   = { workspace = true }
-harness-policy = { workspace = true }
+harness-core         = { workspace = true }
+harness-policy       = { workspace = true }
+harness-orchestrator = { workspace = true }
 harness-vault  = { workspace = true, optional = true }
 harness-brain  = { workspace = true, optional = true }
 async-trait    = "0.1"
@@ -52,6 +53,8 @@ regex          = { workspace = true, optional = true }
 rmcp           = { workspace = true, optional = true }
 
 [dev-dependencies]
+# test-util enables tokio::test(start_paused) for the 4.1 deadline test.
+tokio          = { workspace = true, features = ["test-util"] }
 wiremock       = { workspace = true }
 jsonschema     = { workspace = true }
 tracing-test   = { workspace = true }

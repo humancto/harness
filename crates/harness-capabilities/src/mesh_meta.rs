@@ -28,7 +28,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt as _;
-use harness_core::{Capability as ManifestEntry, Cardinality, NodeId, TaskId};
+use harness_core::{Capability as ManifestEntry, Cardinality, NodeId, PartialPolicy, TaskId};
+use harness_orchestrator::{
+    EndReason, FanoutController, FanoutEvent, FanoutSpec, ItemOutcome, WindowPolicy,
+};
 use serde_json::{json, Value as JsonValue};
 
 use crate::traits::{Capability, CapabilityError, ExecutionContext};
@@ -99,15 +102,146 @@ fn clamp_timeout(input: &JsonValue) -> u64 {
         .clamp(1_000, MAX_TIMEOUT_MS)
 }
 
-/// Shared fan-out driver for both wrappers. `sub_input(scope)` builds
-/// the per-scope `fs.*` input.
+/// Shared fan-out driver for both wrappers (rewired through
+/// `FanoutController` in 4.1 — ADR-0023). `sub_input(scope)` builds the
+/// per-scope `fs.*` input.
+///
+/// Two controller instances run concurrently: self-owned scopes through
+/// a `Fixed(LOCAL_SCAN_CONCURRENCY)` window (ADR-0022's "at most 4
+/// concurrent scans" bound stands), remote pairs through the §14.7
+/// `2 × N_workers` window — so remote sub-task **rows are inserted
+/// O(window) at a time**, never all up front, while local and remote
+/// work still overlap.
 async fn fan_out(
     exec: &Arc<dyn MeshExec>,
     ctx: &ExecutionContext,
-    sub_capability: &str,
-    sub_input: &(dyn Fn(&str) -> JsonValue + Send + Sync),
+    sub_capability: &'static str,
+    sub_input: Arc<dyn Fn(&str) -> JsonValue + Send + Sync>,
     timeout: Duration,
 ) -> FanOutOutcome {
+    let (pairs, truncated_targets) = collect_pairs(exec, sub_capability);
+    let (local_pairs, remote_pairs): (Vec<_>, Vec<_>) =
+        pairs.into_iter().partition(|(t, _)| t.is_self);
+
+    // Late-pulled remote pairs get the REMAINING wrapper budget, not the
+    // full timeout (diff review MAJOR-1): before 4.1 every row was
+    // submitted at T≈0, so row timeout_ms and lease TTL expired in
+    // wall-clock alignment with the wrapper deadline; windowed pull must
+    // recompute the budget at pull time to keep ADR-0022's "sub-task
+    // timeout ≤ wrapper deadline" orphan bound. Floor of 1 s so a pair
+    // pulled at the wire never gets a degenerate zero-timeout row.
+    let started = tokio::time::Instant::now();
+    let remaining_budget = move || {
+        timeout
+            .saturating_sub(started.elapsed())
+            .max(Duration::from_secs(1))
+    };
+
+    let local_spec = {
+        let exec = exec.clone();
+        let ctx = ctx.clone();
+        let sub_input = sub_input.clone();
+        FanoutSpec {
+            source: futures::stream::iter(local_pairs.clone()).boxed(),
+            run: Box::new(move |_index, (_target, scope): (MeshTarget, String)| {
+                let exec = exec.clone();
+                let ctx = ctx.clone();
+                let input = sub_input(&scope);
+                Box::pin(async move {
+                    match tokio::time::timeout(timeout, exec.run_local(sub_capability, &ctx, input))
+                        .await
+                    {
+                        Ok(Ok(v)) => ItemOutcome::Ok(v),
+                        Ok(Err(e)) => ItemOutcome::Failed(e.to_string()),
+                        Err(_) => ItemOutcome::TimedOut,
+                    }
+                }) as futures::future::BoxFuture<'static, ItemOutcome<JsonValue>>
+            }),
+            window: WindowPolicy::Fixed(LOCAL_SCAN_CONCURRENCY),
+            live_workers: Box::new(|| 1),
+            deadline: Some(Box::pin(tokio::time::sleep(timeout))),
+            on_failure: PartialPolicy::ReturnPartial,
+        }
+    };
+
+    let remote_spec = {
+        let exec = exec.clone();
+        let task_id = ctx.task_id;
+        // Distinct remote node count drives the 2×N window (constant
+        // snapshot — targets are already live-filtered; dynamic
+        // recompute belongs to the long-running consumers, 4.5).
+        let workers = {
+            let mut ids: Vec<NodeId> = remote_pairs.iter().map(|(t, _)| t.node_id).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids.len()
+        };
+        FanoutSpec {
+            source: futures::stream::iter(remote_pairs.clone()).boxed(),
+            run: Box::new(move |_index, (target, scope): (MeshTarget, String)| {
+                let exec = exec.clone();
+                let input = sub_input(&scope);
+                let budget = remaining_budget();
+                #[allow(clippy::cast_possible_truncation)]
+                let budget_ms = budget.as_millis().min(u128::from(u32::MAX)) as u32;
+                Box::pin(async move {
+                    // Row insertion happens HERE, inside the pulled
+                    // future — an unpulled pair has no task row.
+                    match exec.submit_remote(
+                        sub_capability,
+                        input,
+                        target.node_id,
+                        task_id,
+                        budget_ms,
+                    ) {
+                        Ok(id) => match exec.await_terminal(id, budget).await {
+                            SubTaskOutcome::Done(v) => ItemOutcome::Ok(v),
+                            SubTaskOutcome::Failed(e) => ItemOutcome::Failed(e),
+                            SubTaskOutcome::TimedOut => ItemOutcome::TimedOut,
+                        },
+                        Err(e) => ItemOutcome::Failed(format!("submit failed: {e}")),
+                    }
+                }) as futures::future::BoxFuture<'static, ItemOutcome<JsonValue>>
+            }),
+            window: WindowPolicy::default_per_workers(),
+            live_workers: Box::new(move || workers),
+            deadline: Some(Box::pin(tokio::time::sleep(timeout))),
+            on_failure: PartialPolicy::ReturnPartial,
+        }
+    };
+
+    let ((mut successes, mut failures), (remote_ok, remote_fail)) = tokio::join!(
+        drive_fanout(local_spec, local_pairs),
+        drive_fanout(remote_spec, remote_pairs),
+    );
+    successes.extend(remote_ok);
+    failures.extend(remote_fail);
+    // Merged order is completion-ordered under the controller; sort both
+    // lists by (node, scope) so wrapper output stays deterministic.
+    successes.sort_by(|a, b| (a.0.node_id, &a.1).cmp(&(b.0.node_id, &b.1)));
+    failures.sort_by(|a, b| {
+        let key = |v: &JsonValue| {
+            (
+                v["node"].as_str().unwrap_or("").to_string(),
+                v["scope"].as_str().unwrap_or("").to_string(),
+            )
+        };
+        key(a).cmp(&key(b))
+    });
+
+    FanOutOutcome {
+        successes,
+        failures,
+        truncated_targets,
+    }
+}
+
+/// Enumerate (target, scope) fan-out pairs for `sub_capability`,
+/// bounded at [`MAX_FANOUT_TARGETS`] with the excess reported.
+fn collect_pairs(
+    exec: &Arc<dyn MeshExec>,
+    sub_capability: &str,
+) -> (Vec<(MeshTarget, String)>, usize) {
     let mut pairs: Vec<(MeshTarget, String)> = Vec::new();
     for target in exec.targets() {
         if !target.capabilities.iter().any(|c| c == sub_capability) {
@@ -119,86 +253,58 @@ async fn fan_out(
     }
     let truncated_targets = pairs.len().saturating_sub(MAX_FANOUT_TARGETS);
     pairs.truncate(MAX_FANOUT_TARGETS);
+    (pairs, truncated_targets)
+}
 
-    let mut successes: Vec<(MeshTarget, String, JsonValue)> = Vec::new();
-    let mut failures: Vec<JsonValue> = Vec::new();
-
-    // Self-owned scopes run in-process, concurrently with the remote
-    // waits below; remotes are submitted first so their dispatch
-    // overlaps our local work.
-    let mut remote_handles: Vec<(MeshTarget, String, Result<TaskId, CapabilityError>)> = Vec::new();
-    let mut local_pairs: Vec<(MeshTarget, String)> = Vec::new();
-    #[allow(clippy::cast_possible_truncation)]
-    let sub_timeout_ms = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
-    for (target, scope) in pairs {
-        if target.is_self {
-            local_pairs.push((target, scope));
-        } else {
-            let submitted = exec.submit_remote(
-                sub_capability,
-                sub_input(&scope),
-                target.node_id,
-                ctx.task_id,
-                sub_timeout_ms,
-            );
-            remote_handles.push((target, scope, submitted));
-        }
-    }
-
-    let local_futs = local_pairs.into_iter().map(|(target, scope)| {
-        let exec = exec.clone();
-        let input = sub_input(&scope);
-        async move {
-            let res =
-                tokio::time::timeout(timeout, exec.run_local(sub_capability, ctx, input)).await;
-            (target, scope, res)
-        }
-    });
-    let remote_futs = remote_handles
-        .into_iter()
-        .map(|(target, scope, submitted)| {
-            let exec = exec.clone();
-            async move {
-                let outcome = match submitted {
-                    Ok(id) => exec.await_terminal(id, timeout).await,
-                    Err(e) => SubTaskOutcome::Failed(format!("submit failed: {e}")),
+/// Drive one controller stream to its `End`, resolving each event's
+/// `index` against `pairs` for provenance. Pairs never completed when
+/// the fan-out ends early (deadline or fail-fast; in-flight-dropped or
+/// never pulled) get explicit failure entries — nothing disappears
+/// silently, whatever `PartialPolicy` a future caller passes.
+async fn drive_fanout(
+    spec: FanoutSpec<(MeshTarget, String), JsonValue>,
+    pairs: Vec<(MeshTarget, String)>,
+) -> (Vec<(MeshTarget, String, JsonValue)>, Vec<JsonValue>) {
+    let mut successes = Vec::new();
+    let mut failures = Vec::new();
+    let mut seen = vec![false; pairs.len()];
+    let mut reason = EndReason::SourceDrained;
+    let mut stream = FanoutController::stream(spec);
+    while let Some(ev) = stream.next().await {
+        match ev {
+            FanoutEvent::Item { index, outcome } => {
+                let idx = usize::try_from(index).unwrap_or(usize::MAX);
+                let Some((target, scope)) = pairs.get(idx) else {
+                    continue;
                 };
-                (target, scope, outcome)
+                seen[idx] = true;
+                match outcome {
+                    ItemOutcome::Ok(v) => successes.push((target.clone(), scope.clone(), v)),
+                    ItemOutcome::Failed(e) => failures.push(failure_entry(target, scope, &e)),
+                    ItemOutcome::TimedOut => {
+                        failures.push(failure_entry(target, scope, "timed out"));
+                    }
+                }
             }
-        });
-
-    // Local scans are bounded (review MAJOR-2 — "bounded channels
-    // everywhere"): at most LOCAL_SCAN_CONCURRENCY fs.* walks run at
-    // once on this node; remotes are bounded by the remote executor.
-    let (local_results, remote_results) = tokio::join!(
-        futures::stream::iter(local_futs)
-            .buffer_unordered(LOCAL_SCAN_CONCURRENCY)
-            .collect::<Vec<_>>(),
-        futures::future::join_all(remote_futs),
-    );
-
-    for (target, scope, res) in local_results {
-        match res {
-            Ok(Ok(output)) => successes.push((target, scope, output)),
-            Ok(Err(e)) => failures.push(failure_entry(&target, &scope, &e.to_string())),
-            Err(_) => failures.push(failure_entry(&target, &scope, "timed out")),
+            FanoutEvent::End(summary) => reason = summary.reason,
         }
     }
-    for (target, scope, outcome) in remote_results {
-        match outcome {
-            SubTaskOutcome::Done(output) => successes.push((target, scope, output)),
-            SubTaskOutcome::Failed(e) => failures.push(failure_entry(&target, &scope, &e)),
-            SubTaskOutcome::TimedOut => {
-                failures.push(failure_entry(&target, &scope, "timed out"));
+    let early_end_error = match reason {
+        EndReason::SourceDrained => None,
+        EndReason::DeadlineExceeded => Some("deadline exceeded before completion"),
+        // Unreachable today (both specs pass ReturnPartial) but a 4.5
+        // caller with FailFast must not lose pairs silently.
+        EndReason::FailedFast => Some("aborted by fail-fast before completion"),
+    };
+    if let Some(error) = early_end_error {
+        for (idx, done) in seen.iter().enumerate() {
+            if !done {
+                let (target, scope) = &pairs[idx];
+                failures.push(failure_entry(target, scope, error));
             }
         }
     }
-
-    FanOutOutcome {
-        successes,
-        failures,
-        truncated_targets,
-    }
+    (successes, failures)
 }
 
 struct FanOutOutcome {
@@ -329,7 +435,7 @@ impl Capability for MeshGrepCapability {
             .and_then(JsonValue::as_u64)
             .unwrap_or(100)
             .clamp(1, 1000);
-        let sub_input = move |scope: &str| {
+        let sub_input: Arc<dyn Fn(&str) -> JsonValue + Send + Sync> = Arc::new(move |scope| {
             let mut v = json!({ "scope": scope, "pattern": pattern, "max_results": limit });
             if let Some(l) = &literal {
                 v["literal"] = l.clone();
@@ -341,8 +447,8 @@ impl Capability for MeshGrepCapability {
                 v["file_glob"] = g.clone();
             }
             v
-        };
-        let outcome = fan_out(&self.exec, ctx, "fs.grep", &sub_input, timeout).await;
+        });
+        let outcome = fan_out(&self.exec, ctx, "fs.grep", sub_input, timeout).await;
 
         // Concat merge: every per-scope result block keeps its origin.
         let results: Vec<JsonValue> = outcome
@@ -429,9 +535,9 @@ impl Capability for MeshSearchCapability {
             .clamp(1, 1000) as usize;
         let query = query.to_string();
         let sub_limit = limit;
-        let sub_input =
-            move |scope: &str| json!({ "scope": scope, "query": query, "limit": sub_limit });
-        let outcome = fan_out(&self.exec, ctx, "fs.search", &sub_input, timeout).await;
+        let sub_input: Arc<dyn Fn(&str) -> JsonValue + Send + Sync> =
+            Arc::new(move |scope| json!({ "scope": scope, "query": query, "limit": sub_limit }));
+        let outcome = fan_out(&self.exec, ctx, "fs.search", sub_input, timeout).await;
 
         // Flatten hits, annotate origin, sort by score descending.
         let mut hits: Vec<JsonValue> = Vec::new();
@@ -668,6 +774,231 @@ mod tests {
         assert_eq!(
             out["provenance"]["truncated_targets"],
             100 - MAX_FANOUT_TARGETS
+        );
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Gauged fake for the 4.1 O(window) proofs: counts non-terminal
+    /// remote rows (+1 on submit, −1 when its await resolves) and live
+    /// local scans; both resolve only when the test releases permits.
+    struct GaugedExec {
+        targets: Vec<MeshTarget>,
+        /// `timeout_ms` of every `submit_remote` call, in call order.
+        budgets: Mutex<Vec<u32>>,
+        submits: AtomicUsize,
+        non_terminal: AtomicUsize,
+        non_terminal_peak: AtomicUsize,
+        local_live: AtomicUsize,
+        local_peak: AtomicUsize,
+        remote_gate: tokio::sync::Semaphore,
+        local_gate: tokio::sync::Semaphore,
+    }
+
+    impl GaugedExec {
+        fn new(targets: Vec<MeshTarget>) -> Arc<Self> {
+            Arc::new(Self {
+                targets,
+                budgets: Mutex::new(vec![]),
+                submits: AtomicUsize::new(0),
+                non_terminal: AtomicUsize::new(0),
+                non_terminal_peak: AtomicUsize::new(0),
+                local_live: AtomicUsize::new(0),
+                local_peak: AtomicUsize::new(0),
+                remote_gate: tokio::sync::Semaphore::new(0),
+                local_gate: tokio::sync::Semaphore::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl MeshExec for GaugedExec {
+        fn targets(&self) -> Vec<MeshTarget> {
+            self.targets.clone()
+        }
+        async fn run_local(
+            &self,
+            _capability: &str,
+            _ctx: &ExecutionContext,
+            _input: JsonValue,
+        ) -> Result<JsonValue, CapabilityError> {
+            let n = self.local_live.fetch_add(1, Ordering::SeqCst) + 1;
+            self.local_peak.fetch_max(n, Ordering::SeqCst);
+            let permit = self.local_gate.acquire().await;
+            self.local_live.fetch_sub(1, Ordering::SeqCst);
+            permit
+                .map_err(|_| CapabilityError::Failed("gate closed".into()))?
+                .forget();
+            Ok(json!({ "matches": [], "truncated": false }))
+        }
+        fn submit_remote(
+            &self,
+            _capability: &str,
+            _input: JsonValue,
+            _pin_to: NodeId,
+            _parent: TaskId,
+            timeout_ms: u32,
+        ) -> Result<TaskId, CapabilityError> {
+            self.budgets.lock().push(timeout_ms);
+            self.submits.fetch_add(1, Ordering::SeqCst);
+            let n = self.non_terminal.fetch_add(1, Ordering::SeqCst) + 1;
+            self.non_terminal_peak.fetch_max(n, Ordering::SeqCst);
+            Ok(TaskId::new_v7())
+        }
+        async fn await_terminal(&self, _id: TaskId, _deadline: Duration) -> SubTaskOutcome {
+            let permit = self.remote_gate.acquire().await;
+            self.non_terminal.fetch_sub(1, Ordering::SeqCst);
+            match permit {
+                Ok(p) => p.forget(),
+                Err(_) => return SubTaskOutcome::Failed("gate closed".into()),
+            }
+            SubTaskOutcome::Done(json!({ "matches": [], "truncated": false }))
+        }
+    }
+
+    fn wide_target(byte: u8, scope_count: usize) -> MeshTarget {
+        let scopes = (0..scope_count).map(|i| format!("s{byte}-{i}")).collect();
+        MeshTarget {
+            node_id: NodeId::from_bytes([byte; 16]),
+            node_name: format!("n{byte}"),
+            is_self: false,
+            scopes,
+            capabilities: vec!["fs.grep".into()],
+        }
+    }
+
+    async fn yield_until(cond: impl Fn() -> bool) {
+        for _ in 0..10_000 {
+            if cond() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("condition never reached");
+    }
+
+    #[tokio::test]
+    async fn t07_remote_rows_bounded_by_window_2_nodes() {
+        // 2 remote nodes × 20 scopes = 40 pairs; window = clamp(2×2,4,64) = 4.
+        let exec = GaugedExec::new(vec![wide_target(2, 20), wide_target(3, 20)]);
+        let cap = MeshGrepCapability::new(exec.clone());
+        let c = ctx();
+        let handle = tokio::spawn(async move { cap.execute(&c, json!({ "pattern": "x" })).await });
+        let e = exec.clone();
+        yield_until(move || e.non_terminal.load(Ordering::SeqCst) == 4).await;
+        // Window full: no further rows exist yet.
+        assert_eq!(exec.submits.load(Ordering::SeqCst), 4);
+        exec.remote_gate.add_permits(40);
+        let out = handle.await.expect("join").expect("execute");
+        assert_eq!(out["results"].as_array().unwrap().len(), 40);
+        assert_eq!(exec.submits.load(Ordering::SeqCst), 40, "all pairs ran");
+        assert_eq!(
+            exec.non_terminal_peak.load(Ordering::SeqCst),
+            4,
+            "never more than window non-terminal rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn t08_window_scales_with_worker_count_3_nodes() {
+        // 3 nodes → window = clamp(2×3,4,64) = 6 — above the min-clamp
+        // floor, proving 2×N drives refill (review MINOR-6).
+        let exec = GaugedExec::new(vec![
+            wide_target(2, 10),
+            wide_target(3, 10),
+            wide_target(4, 10),
+        ]);
+        let cap = MeshGrepCapability::new(exec.clone());
+        let c = ctx();
+        let handle = tokio::spawn(async move { cap.execute(&c, json!({ "pattern": "x" })).await });
+        let e = exec.clone();
+        yield_until(move || e.non_terminal.load(Ordering::SeqCst) == 6).await;
+        exec.remote_gate.add_permits(30);
+        let out = handle.await.expect("join").expect("execute");
+        assert_eq!(out["results"].as_array().unwrap().len(), 30);
+        assert_eq!(exec.non_terminal_peak.load(Ordering::SeqCst), 6);
+    }
+
+    #[tokio::test]
+    async fn t09_local_scans_stay_bounded_at_4_on_wide_mesh() {
+        // Self with 12 scopes + 3 remote nodes: the remote window is 6,
+        // but local scans keep ADR-0022's dedicated bound of 4.
+        let mut self_target = wide_target(1, 12);
+        self_target.is_self = true;
+        self_target.node_name = "self".into();
+        let exec = GaugedExec::new(vec![
+            self_target,
+            wide_target(2, 2),
+            wide_target(3, 2),
+            wide_target(4, 2),
+        ]);
+        exec.remote_gate.add_permits(6); // remotes finish freely
+        let cap = MeshGrepCapability::new(exec.clone());
+        let c = ctx();
+        let handle = tokio::spawn(async move { cap.execute(&c, json!({ "pattern": "x" })).await });
+        let e = exec.clone();
+        yield_until(move || e.local_live.load(Ordering::SeqCst) == 4).await;
+        exec.local_gate.add_permits(12);
+        let out = handle.await.expect("join").expect("execute");
+        assert_eq!(out["results"].as_array().unwrap().len(), 18);
+        assert_eq!(
+            exec.local_peak.load(Ordering::SeqCst),
+            4,
+            "local scan concurrency stays at LOCAL_SCAN_CONCURRENCY"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn t10_deadline_never_pulls_remaining_pairs() {
+        // 1 node × 30 scopes, window 4, nothing ever completes: the
+        // 1 s (min-clamped) deadline fires with 26 pairs unpulled —
+        // those never became task rows, and every pair is accounted for
+        // in failures[].
+        let exec = GaugedExec::new(vec![wide_target(2, 30)]);
+        let cap = MeshGrepCapability::new(exec.clone());
+        let out = cap
+            .execute(&ctx(), json!({ "pattern": "x", "timeout_ms": 1000 }))
+            .await
+            .expect("execute");
+        assert_eq!(
+            exec.submits.load(Ordering::SeqCst),
+            4,
+            "unpulled pairs never submitted"
+        );
+        assert_eq!(out["results"].as_array().unwrap().len(), 0);
+        let failures = out["failures"].as_array().unwrap();
+        assert_eq!(failures.len(), 30, "every pair accounted for");
+        assert!(failures
+            .iter()
+            .all(|f| f["error"].as_str().unwrap().contains("deadline exceeded")));
+        assert_eq!(out["provenance"]["targets_failed"], 30);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn t11_late_pulled_pairs_get_remaining_budget() {
+        // Diff review MAJOR-1: a pair pulled after time has passed must
+        // carry the REMAINING wrapper budget as its row timeout, so the
+        // ADR-0022 "sub-task timeout ≤ wrapper deadline" bound holds
+        // under windowed pull.
+        let exec = GaugedExec::new(vec![wide_target(2, 8)]);
+        let cap = MeshGrepCapability::new(exec.clone());
+        let c = ctx();
+        let handle = tokio::spawn(async move {
+            cap.execute(&c, json!({ "pattern": "x", "timeout_ms": 2000 }))
+                .await
+        });
+        let e = exec.clone();
+        yield_until(move || e.non_terminal.load(Ordering::SeqCst) == 4).await;
+        assert!(exec.budgets.lock().iter().take(4).all(|&b| b == 2000));
+        tokio::time::advance(Duration::from_millis(500)).await;
+        exec.remote_gate.add_permits(8);
+        let out = handle.await.expect("join").expect("execute");
+        assert_eq!(out["results"].as_array().unwrap().len(), 8);
+        let budgets = exec.budgets.lock().clone();
+        assert_eq!(budgets.len(), 8);
+        assert!(
+            budgets[4..].iter().all(|&b| b <= 1500),
+            "late pulls carry remaining budget, got {budgets:?}"
         );
     }
 
