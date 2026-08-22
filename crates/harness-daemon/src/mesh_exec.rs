@@ -240,6 +240,12 @@ impl harness_capabilities::PlanExec for StoreMeshExec {
         match self.store.list_manifests() {
             Ok(manifests) => {
                 for m in manifests {
+                    // 4.4 (4.3 carry): same liveness predicate as
+                    // targets() — a departed peer's capability must not
+                    // validate a plan step that then dies at dispatch.
+                    if m.node_id != self.local_id && !self.peers.is_live(&m.node_id, PEER_TIMEOUT) {
+                        continue;
+                    }
                     for cap in m.capabilities {
                         if seen.insert(cap.id.clone()) {
                             out.push(cap);
@@ -290,5 +296,119 @@ impl StoreMeshExec {
             }
             tokio::time::sleep(Duration::from_millis(AWAIT_POLL_MS)).await;
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use harness_capabilities::PlanExec as _;
+    use harness_core::{NodeManifest, Resources, SemVer};
+
+    fn manifest_with_cap(id: &Identity, cap_id: &str) -> NodeManifest {
+        let mut m = NodeManifest {
+            node_id: id.node_id(),
+            hostname: "h".into(),
+            pubkey: *id.public_key(),
+            capabilities: vec![harness_core::Capability {
+                id: cap_id.into(),
+                version: SemVer::new(0, 1, 0),
+                cardinality: harness_core::Cardinality::Anyone,
+                input_schema: serde_json::json!({ "type": "object" }),
+                output_schema: serde_json::json!({ "type": "object" }),
+                cost_hint: harness_core::protocol::CostHint::LocalFast,
+                tags: vec![],
+                rate_limit: None,
+                resource_hints: harness_core::ResourceHints {
+                    cpu_class: harness_core::protocol::CpuClass::Light,
+                    memory_mb: None,
+                    gpu_required: false,
+                    gpu_memory_mb: None,
+                    network_class: harness_core::protocol::NetworkClass::None,
+                    disk_io_class: harness_core::protocol::DiskIoClass::None,
+                    estimated_duration_ms: None,
+                },
+                requires_secrets: vec![],
+            }],
+            scopes: vec![],
+            secret_tags: vec![],
+            resources: Resources {
+                cpu_cores: 0,
+                ram_total_mb: 0,
+                gpu: None,
+                os: "test".into(),
+                arch: "test".into(),
+            },
+            online_since: 0,
+            version: SemVer::new(0, 1, 0),
+            sig: Signature::from_bytes([0; 64]),
+        };
+        m.sign(id).expect("sign");
+        m
+    }
+
+    fn live_heartbeat(node: NodeId) -> harness_core::Heartbeat {
+        harness_core::Heartbeat {
+            node_id: node,
+            seq: 1,
+            timestamp: 1_700_000_000_000,
+            queue_depth: 0,
+            cpu_busy_pct: 0,
+            cpu_pinned_count: 0,
+            ram_used_mb: 0,
+            ram_total_mb: 0,
+            gpu_used_mb: 0,
+            gpu_total_mb: 0,
+            capabilities_hash: [0u8; 16],
+            replica_head: [0u8; 32],
+            in_flight: vec![],
+            leader_belief: node,
+            brain_score: 0,
+            on_battery: false,
+            paused: false,
+            version: SemVer::new(0, 1, 0),
+            sig: Signature::from_bytes([0u8; 64]),
+        }
+    }
+
+    #[test]
+    fn known_capabilities_filters_dead_peers_keeps_self() {
+        // 4.4 (4.3 carry): a departed peer's manifest must not validate
+        // plans; self and live peers must.
+        let store = Store::open_memory().expect("store");
+        let me = Arc::new(Identity::generate());
+        let live_peer = Identity::generate();
+        let dead_peer = Identity::generate();
+        store
+            .upsert_manifest(&manifest_with_cap(&me, "self.cap"))
+            .expect("self");
+        store
+            .upsert_manifest(&manifest_with_cap(&live_peer, "live.cap"))
+            .expect("live");
+        store
+            .upsert_manifest(&manifest_with_cap(&dead_peer, "dead.cap"))
+            .expect("dead");
+        let peers = PeerTable::new();
+        peers.record(live_heartbeat(live_peer.node_id()));
+        // dead_peer: manifest stored, no heartbeat.
+        let exec = StoreMeshExec::new(
+            store,
+            me,
+            harness_capabilities::CapabilityRegistry::new().downgrade(),
+            peers,
+            None,
+        );
+        let ids: Vec<String> = exec
+            .known_capabilities()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert!(ids.contains(&"self.cap".to_string()), "self always in");
+        assert!(ids.contains(&"live.cap".to_string()), "live peer in");
+        assert!(
+            !ids.contains(&"dead.cap".to_string()),
+            "departed peer filtered: {ids:?}"
+        );
     }
 }

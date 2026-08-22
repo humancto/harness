@@ -374,3 +374,86 @@ async fn logout_invalidates_session() {
         .expect("submit");
     assert_eq!(submit_resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn submit_clamps_execution_and_carries_resource_hints() {
+    // 4.4 (carried risk 12 / ADR-0026): a u32::MAX timeout/lease must be
+    // clamped BEFORE signing; declared resource hints must persist.
+    let state = build_state(true);
+    let app = router(state.clone());
+    let login_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"password":"hunter2"}"#))
+                .expect("req"),
+        )
+        .await
+        .expect("resp");
+    let token = body_json(login_resp).await["token"]
+        .as_str()
+        .expect("token")
+        .to_string();
+
+    let body = serde_json::json!({
+        "capability": "echo",
+        "input": {"msg": "hi"},
+        "execution": {
+            "redundancy": 9,
+            "timeout_ms": u32::MAX,
+            "on_partial": "fail_fast",
+            "lease_ms": u32::MAX,
+        },
+        "resource_hints": {
+            "cpu_class": "heavy",
+            "memory_mb": 2048,
+            "gpu_required": false,
+            "gpu_memory_mb": null,
+            "network_class": "none",
+            "disk_io_class": "none",
+            "estimated_duration_ms": null,
+        },
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/tasks")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(body.to_string()))
+                .expect("req"),
+        )
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let id_str = body_json(resp).await["task_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let id = harness_core::TaskId(id_str.parse().expect("uuid"));
+    let store = state.store.clone().expect("store");
+    let task = store.load_task(id).expect("load").expect("present");
+    assert_eq!(
+        task.execution.timeout_ms,
+        harness_core::ExecutionPolicy::MAX_TIMEOUT_MS,
+        "timeout clamped"
+    );
+    assert_eq!(
+        task.execution.lease_ms,
+        harness_core::ExecutionPolicy::MAX_LEASE_MS,
+        "lease clamped"
+    );
+    assert_eq!(task.execution.redundancy, 1, "redundancy normalized");
+    assert_eq!(
+        task.resource_hints.cpu_class,
+        harness_core::protocol::CpuClass::Heavy,
+        "hints carried"
+    );
+    assert_eq!(task.resource_hints.memory_mb, Some(2048));
+    // The clamped envelope still verifies (clamped BEFORE signing).
+    assert!(harness_core::Signable::verify_signature(&task, state.identity.public_key()).is_ok());
+}

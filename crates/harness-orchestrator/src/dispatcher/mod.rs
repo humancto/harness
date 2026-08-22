@@ -6,12 +6,17 @@ mod eligible;
 mod filter;
 mod live_set;
 mod round_robin;
+pub mod score;
 
 use harness_core::NodeId;
 
 pub use eligible::Dispatcher;
 pub use live_set::{LiveSet, StaticLiveSet};
 pub use round_robin::RoundRobin;
+pub use score::{
+    effective_hints, fit_score, LoadView, NodeSnapshot, StaticLoadView, SuccessTracker,
+    BATTERY_COST_WEIGHT, MIN_SUCCESS_RATE, PRESSURE_FLOOR,
+};
 
 /// What the dispatcher decided for a single submission. The caller (2.4)
 /// turns this into actual sends.

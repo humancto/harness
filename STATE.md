@@ -119,6 +119,13 @@ These will land alongside their natural Phase 3 home, not as a "phase 2.10":
 
 | #46 | 4.3  | DAG executor (ADR-0025): pure `DagScheduler` (Kahn ready-sets, exact skip-cascade, output retention) + `plan.execute` driver (channel-fed 4.1 controller, unpinned signed step rows with `parent`/`plan_id`, `$task_output` threading + resolved-input schema recheck, driver-owned FailFast/continue, try-acquire one-plan-per-node) + `StorePlanExec` wiring + `list_tasks_by_plan` + `Signature` JSON seq-visitor + CLI `harness plan`/`exec`. m05 E2E on a real daemon. +34 tests |
 
+| #47 | 4.4  | Resource-aware scheduler (ADR-0026): pure `fit_score` (hard gates for impossibilities only; soft floored pressure — saturation never fails a task), `eligible_scored` argmax + RR tie-band (equal fleets keep the exact RR sequence), `StoreLoadView` (heartbeat ∪ store counts ∪ same-poll reservations, max-composed), `SuccessTracker` EWMA fed remote + local + expiry + send-fail, truthful heartbeat `queue_depth`, ResourceGated-waits-not-fails, fresh-first batches (risk 10), `ExecutionPolicy::clamped` + submit `resource_hints` (risk 12), `known_capabilities` liveness (4.3 carry). +23 tests |
+
+4.4 review round 1 (plan): BLOCKER fixed pre-implementation — pressure is soft-floored and
+ResourceGated is exempt from the eligibility terminal window (saturation = queueing, never
+failure); local terminals feed the success EWMA (self-bias fix); heterogeneous-capacity
+placement is a deliberate, test-locked behavior change.
+
 4.3 reviews: plan round 1 REVISE (2 blockers fixed pre-implementation: try-acquire
 one-plan permit instead of queuing; entry schema index from the manifest union). Diff
 round REVISE → fixed in-PR: fail_fast now honors feed-time (resolution/schema-recheck)

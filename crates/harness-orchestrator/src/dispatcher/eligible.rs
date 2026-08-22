@@ -142,6 +142,83 @@ impl Dispatcher {
             other => self.eligible(task, other, live),
         }
     }
+
+    /// Resource-aware `Anyone` selection (roadmap 4.4, ADR-0026):
+    /// candidates are filtered exactly as [`Self::eligible_with_rr`],
+    /// then ranked by [`crate::dispatcher::score::fit_score`]. Hard-gated
+    /// (score-0) nodes are dropped; among survivors, every node within
+    /// [`Self::TIE_EPSILON`] of the best score forms a tie band resolved
+    /// by the round-robin cursor — determinism for equal inputs,
+    /// starvation avoidance, and exact round-robin behavior when scores
+    /// are uniform (equal-capacity fleets with today's unpopulated
+    /// heartbeats).
+    ///
+    /// `Owner` / `Federated` are unchanged (ownership dominates; 4.5
+    /// owns federated scoring).
+    ///
+    /// # Errors
+    /// [`DispatchError::ResourceGated`] when candidates exist but every
+    /// one is hard-gated — a transient condition the caller must treat
+    /// as "wait", never as terminal (plan review BLOCKER-1). Otherwise
+    /// the same set as [`Self::eligible`].
+    pub fn eligible_scored<L: LiveSet, V: crate::dispatcher::score::LoadView>(
+        &self,
+        task: &Task,
+        hints: &harness_core::ResourceHints,
+        cardinality: &Cardinality,
+        live: &L,
+        loads: &V,
+        rr: &RoundRobin,
+    ) -> Result<DispatchPlan, DispatchError> {
+        if !matches!(cardinality, Cardinality::Anyone) {
+            return self.eligible(task, cardinality, live);
+        }
+        let mut candidates = self.capabilities.nodes_for(&task.capability);
+        candidates = live.live_subset(&candidates);
+        candidates = filter::apply_constraints(candidates, &task.constraints, &self.scopes, live)?;
+        if candidates.is_empty() {
+            return Err(DispatchError::NoEligibleNodes {
+                capability: task.capability.clone(),
+            });
+        }
+        candidates.sort();
+        let scored: Vec<(NodeId, f64)> = candidates
+            .iter()
+            .map(|n| {
+                (
+                    *n,
+                    crate::dispatcher::score::fit_score(
+                        hints,
+                        &loads.snapshot(n),
+                        loads.success_rate(n),
+                    ),
+                )
+            })
+            .filter(|(_, s)| *s > 0.0)
+            .collect();
+        if scored.is_empty() {
+            return Err(DispatchError::ResourceGated {
+                capability: task.capability.clone(),
+            });
+        }
+        let best = scored
+            .iter()
+            .map(|(_, s)| *s)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let tied: Vec<NodeId> = scored
+            .iter()
+            .filter(|(_, s)| *s >= best * (1.0 - Self::TIE_EPSILON))
+            .map(|(n, _)| *n)
+            .collect();
+        // `tied` inherits the sorted candidate order; uniform scores →
+        // tied == candidates → identical RR sequence to eligible_with_rr.
+        let chosen = rr.next(&task.capability, &tied)?;
+        Ok(DispatchPlan::Single { node: chosen })
+    }
+
+    /// Scores within this relative band of the best are ties, resolved
+    /// round-robin (determinism + starvation avoidance).
+    pub const TIE_EPSILON: f64 = 0.01;
 }
 
 fn read_scope_field(task: &Task, field: &str) -> Result<String, DispatchError> {
@@ -517,5 +594,338 @@ mod tests {
             DispatchPlan::Single { node } => assert_eq!(node, NodeId::from_bytes([2; 16])),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, dead_code)]
+mod tests_support {
+    use super::*;
+    use crate::dispatcher::live_set::StaticLiveSet;
+    use harness_core::{
+        Capability, Cardinality, Constraints, ExecutionPolicy, Identity, NodeManifest, Resources,
+        RetryPolicy, SemVer, Signature, TaskId, TraceContext,
+    };
+
+    pub(super) fn empty_hints_pub() -> harness_core::ResourceHints {
+        harness_core::ResourceHints {
+            cpu_class: harness_core::protocol::CpuClass::Light,
+            memory_mb: None,
+            gpu_required: false,
+            gpu_memory_mb: None,
+            network_class: harness_core::protocol::NetworkClass::None,
+            disk_io_class: harness_core::protocol::DiskIoClass::None,
+            estimated_duration_ms: None,
+        }
+    }
+
+    fn echo_cap() -> Capability {
+        Capability {
+            id: "echo".into(),
+            version: SemVer {
+                major: 0,
+                minor: 1,
+                patch: 0,
+            },
+            cardinality: Cardinality::Anyone,
+            input_schema: serde_json::json!({}),
+            output_schema: serde_json::json!({}),
+            cost_hint: harness_core::protocol::CostHint::LocalFast,
+            tags: vec![],
+            rate_limit: None,
+            resource_hints: empty_hints_pub(),
+            requires_secrets: vec![],
+        }
+    }
+
+    /// Three live nodes (ids 1..3) all advertising `echo`.
+    pub(super) fn build3() -> (Dispatcher, StaticLiveSet) {
+        let d = Dispatcher::new();
+        for n in [1u8, 2, 3] {
+            let id = Identity::generate();
+            let m = NodeManifest {
+                node_id: NodeId::from_bytes([n; 16]),
+                hostname: "h".into(),
+                pubkey: *id.public_key(),
+                capabilities: vec![echo_cap()],
+                scopes: vec![],
+                secret_tags: vec![],
+                resources: Resources {
+                    cpu_cores: 0,
+                    ram_total_mb: 0,
+                    gpu: None,
+                    os: "test".into(),
+                    arch: "test".into(),
+                },
+                online_since: 0,
+                version: SemVer {
+                    major: 0,
+                    minor: 1,
+                    patch: 0,
+                },
+                sig: Signature::from_bytes([0; 64]),
+            };
+            d.capability_index().upsert_node(&m);
+            d.scope_index().upsert_node(&m);
+        }
+        let live = StaticLiveSet::from_node_ids([1u8, 2, 3].map(|n| NodeId::from_bytes([n; 16])));
+        (d, live)
+    }
+
+    pub(super) fn task_for(capability: &str) -> Task {
+        Task {
+            id: TaskId::new_v7(),
+            parent: None,
+            plan_id: None,
+            capability: capability.into(),
+            input: serde_json::json!({}),
+            constraints: Constraints::default(),
+            retry: RetryPolicy::default(),
+            execution: ExecutionPolicy::default(),
+            resource_hints: empty_hints_pub(),
+            trace_ctx: TraceContext::default(),
+            issued_by: NodeId::from_bytes([9; 16]),
+            issued_at: 0,
+            tags: vec![],
+            sig: Signature::from_bytes([0; 64]),
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod scored_tests {
+    use super::tests_support::*;
+    use super::*;
+    use crate::dispatcher::score::{NodeSnapshot, StaticLoadView};
+    use crate::dispatcher::RoundRobin;
+    use harness_core::Cardinality;
+
+    fn node(n: u8) -> NodeId {
+        NodeId::from_bytes([n; 16])
+    }
+
+    fn pick(plan: DispatchPlan) -> NodeId {
+        match plan {
+            DispatchPlan::Single { node } => node,
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn s01_uniform_loads_reproduce_rr_sequence_exactly() {
+        // Regression lock: equal-capacity candidates (all-default
+        // snapshots) must round-robin identically to eligible_with_rr.
+        let (d, live) = build3();
+        let loads = StaticLoadView::default();
+        let rr_scored = RoundRobin::new();
+        let rr_plain = RoundRobin::new();
+        let t = task_for("echo");
+        for _ in 0..6 {
+            let a = pick(
+                d.eligible_scored(
+                    &t,
+                    &empty_hints_pub(),
+                    &Cardinality::Anyone,
+                    &live,
+                    &loads,
+                    &rr_scored,
+                )
+                .unwrap(),
+            );
+            let b = pick(
+                d.eligible_with_rr(&t, &Cardinality::Anyone, &live, &rr_plain)
+                    .unwrap(),
+            );
+            assert_eq!(a, b, "scored selection must match RR when uniform");
+        }
+    }
+
+    #[test]
+    fn s02_loaded_node_loses_argmax() {
+        let (d, live) = build3();
+        let mut loads = StaticLoadView::default();
+        for n in [1u8, 2, 3] {
+            loads.snapshots.insert(
+                node(n),
+                NodeSnapshot {
+                    cpu_cores: 4,
+                    ..NodeSnapshot::default()
+                },
+            );
+        }
+        // Node 1 is heavily loaded.
+        loads.snapshots.get_mut(&node(1)).unwrap().assigned_inflight = 6;
+        let rr = RoundRobin::new();
+        let t = task_for("echo");
+        for _ in 0..4 {
+            let chosen = pick(
+                d.eligible_scored(
+                    &t,
+                    &empty_hints_pub(),
+                    &Cardinality::Anyone,
+                    &live,
+                    &loads,
+                    &rr,
+                )
+                .unwrap(),
+            );
+            assert_ne!(chosen, node(1), "loaded node must lose argmax");
+        }
+    }
+
+    #[test]
+    fn s03_all_gated_is_resource_gated_error() {
+        let (d, live) = build3();
+        let mut loads = StaticLoadView::default();
+        for n in [1u8, 2, 3] {
+            loads.snapshots.insert(
+                node(n),
+                NodeSnapshot {
+                    paused: true,
+                    ..NodeSnapshot::default()
+                },
+            );
+        }
+        let rr = RoundRobin::new();
+        let t = task_for("echo");
+        let err = d
+            .eligible_scored(
+                &t,
+                &empty_hints_pub(),
+                &Cardinality::Anyone,
+                &live,
+                &loads,
+                &rr,
+            )
+            .unwrap_err();
+        assert!(matches!(err, DispatchError::ResourceGated { .. }));
+    }
+
+    #[test]
+    fn s04_gated_node_excluded_from_rotation() {
+        let (d, live) = build3();
+        let mut loads = StaticLoadView::default();
+        loads.snapshots.insert(
+            node(2),
+            NodeSnapshot {
+                paused: true,
+                ..NodeSnapshot::default()
+            },
+        );
+        let rr = RoundRobin::new();
+        let t = task_for("echo");
+        for _ in 0..6 {
+            let chosen = pick(
+                d.eligible_scored(
+                    &t,
+                    &empty_hints_pub(),
+                    &Cardinality::Anyone,
+                    &live,
+                    &loads,
+                    &rr,
+                )
+                .unwrap(),
+            );
+            assert_ne!(chosen, node(2), "paused node never selected");
+        }
+    }
+
+    #[test]
+    fn s05_heterogeneous_cores_prefer_bigger_node() {
+        // Deliberate new behavior (review MAJOR-3): capacity-
+        // proportional placement on heterogeneous fleets.
+        let (d, live) = build3();
+        let mut loads = StaticLoadView::default();
+        loads.snapshots.insert(
+            node(1),
+            NodeSnapshot {
+                cpu_cores: 12,
+                ..NodeSnapshot::default()
+            },
+        );
+        for n in [2u8, 3] {
+            loads.snapshots.insert(
+                node(n),
+                NodeSnapshot {
+                    cpu_cores: 2,
+                    ..NodeSnapshot::default()
+                },
+            );
+        }
+        let rr = RoundRobin::new();
+        let t = task_for("echo");
+        let chosen = pick(
+            d.eligible_scored(
+                &t,
+                &empty_hints_pub(),
+                &Cardinality::Anyone,
+                &live,
+                &loads,
+                &rr,
+            )
+            .unwrap(),
+        );
+        assert_eq!(chosen, node(1), "idle big node wins first placement");
+        // Load it up: placement rebalances to the small nodes.
+        loads.snapshots.get_mut(&node(1)).unwrap().assigned_inflight = 20;
+        let chosen = pick(
+            d.eligible_scored(
+                &t,
+                &empty_hints_pub(),
+                &Cardinality::Anyone,
+                &live,
+                &loads,
+                &rr,
+            )
+            .unwrap(),
+        );
+        assert_ne!(chosen, node(1), "loaded big node loses");
+    }
+
+    #[test]
+    fn s06_tie_band_alternates_round_robin() {
+        let (d, live) = build3();
+        let mut loads = StaticLoadView::default();
+        // Nodes 1 and 2 identical; node 3 clearly worse (outside band).
+        for n in [1u8, 2] {
+            loads.snapshots.insert(
+                node(n),
+                NodeSnapshot {
+                    cpu_cores: 4,
+                    ..NodeSnapshot::default()
+                },
+            );
+        }
+        loads.snapshots.insert(
+            node(3),
+            NodeSnapshot {
+                cpu_cores: 4,
+                assigned_inflight: 7,
+                ..NodeSnapshot::default()
+            },
+        );
+        let rr = RoundRobin::new();
+        let t = task_for("echo");
+        let picks: Vec<NodeId> = (0..4)
+            .map(|_| {
+                pick(
+                    d.eligible_scored(
+                        &t,
+                        &empty_hints_pub(),
+                        &Cardinality::Anyone,
+                        &live,
+                        &loads,
+                        &rr,
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        assert!(picks.iter().all(|p| *p != node(3)), "worse node excluded");
+        assert!(
+            picks.windows(2).all(|w| w[0] != w[1]),
+            "tie band alternates: {picks:?}"
+        );
     }
 }

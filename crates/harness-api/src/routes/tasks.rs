@@ -31,6 +31,10 @@ pub struct SubmitRequest {
     /// e.g. `["interactive"]` opts out of the LLM micro-batcher.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// §14.9 resource hints (4.4). Optional; defaults to all-Light —
+    /// the scheduler also unions in the capability manifest's hints.
+    #[serde(default)]
+    pub resource_hints: Option<ResourceHints>,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,8 +83,23 @@ pub async fn submit_handler(
         input: req.input,
         constraints: req.constraints.unwrap_or_default(),
         retry: RetryPolicy::default(),
-        execution: req.execution.unwrap_or_default(),
-        resource_hints: ResourceHints {
+        // 4.4 (risk 12): clamp caller-supplied policy into sane bounds
+        // BEFORE signing — a u32::MAX timeout would otherwise mint a
+        // ~49-day lease (ADR-0026).
+        execution: {
+            let requested = req.execution.unwrap_or_default();
+            let clamped = requested.clamped();
+            if clamped != requested {
+                tracing::warn!(
+                    target: "harness.api.tasks",
+                    requested_timeout = requested.timeout_ms,
+                    requested_lease = requested.lease_ms,
+                    "execution policy clamped at submit"
+                );
+            }
+            clamped
+        },
+        resource_hints: req.resource_hints.unwrap_or(ResourceHints {
             cpu_class: harness_core::protocol::CpuClass::Light,
             memory_mb: None,
             gpu_required: false,
@@ -88,7 +107,7 @@ pub async fn submit_handler(
             network_class: harness_core::protocol::NetworkClass::None,
             disk_io_class: harness_core::protocol::DiskIoClass::None,
             estimated_duration_ms: None,
-        },
+        }),
         trace_ctx: TraceContext::default(),
         issued_by: state.local_node_id,
         issued_at: now_ms,

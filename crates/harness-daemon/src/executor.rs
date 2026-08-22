@@ -38,6 +38,11 @@ pub(crate) struct LocalExecutor {
     /// subscribes; the assign-time terminal-resend covers missed events
     /// (ADR-0017).
     terminal_tx: tokio::sync::broadcast::Sender<TaskId>,
+    /// 4.4 (ADR-0026): shared with the dispatch runtime so LOCAL
+    /// terminals feed the per-node success EWMA too — otherwise the
+    /// self node's rate stays pinned at the optimistic prior while
+    /// remote failures accrue (review MAJOR-2).
+    success: Option<Arc<harness_orchestrator::SuccessTracker>>,
 }
 
 impl std::fmt::Debug for LocalExecutor {
@@ -66,7 +71,17 @@ impl LocalExecutor {
             local_node_name,
             sem: Arc::new(tokio::sync::Semaphore::new(max)),
             terminal_tx,
+            success: None,
         }
+    }
+
+    /// Attach the shared success tracker (see `success` field docs).
+    pub(crate) fn with_success_tracker(
+        mut self,
+        tracker: Arc<harness_orchestrator::SuccessTracker>,
+    ) -> Self {
+        self.success = Some(tracker);
+        self
     }
 
     /// Subscribe to terminal-task notifications (see `terminal_tx`).
@@ -177,6 +192,7 @@ impl LocalExecutor {
 
         let store = self.store.clone();
         let local_node = self.local_node;
+        let success = self.success.clone();
         let local_node_name = self.local_node_name.clone();
         let terminal_tx = self.terminal_tx.clone();
 
@@ -215,6 +231,9 @@ impl LocalExecutor {
                 .await;
 
             let now = now_unix_ms();
+            if let Some(t) = &success {
+                t.record(local_node, matches!(&outcome, Ok(Ok(_))));
+            }
             match outcome {
                 Ok(Ok(output)) => {
                     let _ = store.try_transition_task(id, TaskState::Running, TaskState::Done);
