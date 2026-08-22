@@ -50,6 +50,76 @@ export interface StatusDto {
   ui_version: string;
 }
 
+// --- Tasks (crates/harness-api/src/routes/tasks.rs) ---
+
+// Mirrors harness_core::Constraints as serialized by `harness run`
+// (crates/harness-cli/src/run.rs submit_task).
+export interface ConstraintsDto {
+  deadline: number | null;
+  max_cost_usd: number | null;
+  must_be_local: boolean;
+  require_tags: string[];
+  exclude_tags: string[];
+  /** NodeId as raw bytes (16), e.g. from hexToBytes(node_id). */
+  pin_to_node: number[] | null;
+  pin_to_scope: string | null;
+}
+
+// Mirrors harness_core::ExecutionPolicy.
+export interface ExecutionPolicyDto {
+  redundancy: number;
+  timeout_ms: number;
+  on_partial: "fail_fast" | "best_effort";
+  lease_ms: number;
+}
+
+// Body for POST /api/v1/tasks (SubmitRequest in tasks.rs).
+export interface SubmitTaskRequest {
+  capability: string;
+  input: unknown;
+  constraints?: ConstraintsDto;
+  execution?: ExecutionPolicyDto;
+  tags?: string[];
+}
+
+// 201 response of POST /api/v1/tasks (SubmitResponse in tasks.rs).
+export interface SubmitTaskResponse {
+  task_id: string;
+  state: string;
+}
+
+export type TaskState =
+  | "submitted"
+  | "assigned"
+  | "running"
+  | "done"
+  | "failed"
+  | "expired"
+  | "cancelled";
+
+// GET /api/v1/tasks/{id} — output/error/completed_at_ms are omitted
+// (not null) until the task is terminal.
+export interface TaskDetailDto {
+  id: string;
+  capability: string;
+  state: TaskState | string;
+  input: unknown;
+  issued_at_ms: number;
+  completed_at_ms?: number;
+  output?: unknown;
+  error?: string;
+}
+
+// shell.exec `output` payload (harness-capabilities shell executor).
+export interface ShellExecOutput {
+  stdout: string;
+  stderr: string;
+  exit_code: number | null;
+  timed_out: boolean;
+  stdout_truncated_bytes?: number;
+  stderr_truncated_bytes?: number;
+}
+
 export type MeshEvent =
   | { type: "peer_added"; peer: PeerDto }
   | { type: "peer_updated"; peer: PeerDto }

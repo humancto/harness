@@ -56,7 +56,7 @@ When an item lands, flip its checkbox **in the same PR** as `STATE.md` is update
   - [x] **3.3a** Local executor loop + `harness run --on self` + `GET /tasks/<id>` + `node_name` plumbing (PR #25). ADR-0009.
   - [x] **3.3-fanout** Cross-node dispatch over QUIC (`--all`, `--where`, dispatcher async runtime) — PRs #35 (wire+index plumbing) + A2 (dispatch runtime + CLI). ADR-0017. Gossip replica sync + WS run stream split to **3.3-gossip** below; UI to 3.3-ui.
   - [ ] **3.3-gossip** `harness.gossip.state` channel + heartbeat `replica_head` anti-entropy + `WS /api/v1/runs/<task_id>` result stream (STATE.md Phase-2 carryovers 1/2/5).
-  - [ ] **3.3-ui** UI Remote Shell mode with `[node-name]` interleaving.
+  - [x] **3.3-ui** UI Remote Shell mode with `[node-name]` interleaving.
 - [x] **3.4** `llm.local.<model>` auto-registration from `ollama list` (PR #26). HTTP discovery + execution; ADR-0010 covers default-allow + DoS bounds + `Action::Llm` extensibility.
 - [x] **3.5** Local-LLM micro-batcher (PR #27). Dedup-within-window + interactive-tag bypass + forward-compat hook. ADR-0011 — true multi-prompt batching deferred until a vLLM/TGI backend lands (Ollama doesn't support it).
 - [ ] **3.6** `llm.cloud.{claude,openai,gemini}` capabilities + secrets-by-tag reference.
