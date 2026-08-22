@@ -144,14 +144,17 @@ pub fn fit_score(hints: &ResourceHints, snap: &NodeSnapshot, success_rate: f64) 
     let cpu_pressure = (used_cores + task_cores(hints)) / cores;
 
     let mem_pressure = if snap.ram_total_mb > 0 {
-        f64::from(snap.ram_used_mb + hints.memory_mb.unwrap_or(DEFAULT_TASK_MB))
+        // f64 BEFORE adding: u32 addition here overflows on a
+        // heartbeat-supplied ram_used_mb near u32::MAX (diff review
+        // MAJOR-1 — panic in debug, inverted ranking in release).
+        (f64::from(snap.ram_used_mb) + f64::from(hints.memory_mb.unwrap_or(DEFAULT_TASK_MB)))
             / f64::from(snap.ram_total_mb)
     } else {
         0.0 // unknown → neutral
     };
 
     let gpu_pressure = if hints.gpu_required && snap.gpu_total_mb > 0 {
-        f64::from(snap.gpu_used_mb + hints.gpu_memory_mb.unwrap_or(0))
+        (f64::from(snap.gpu_used_mb) + f64::from(hints.gpu_memory_mb.unwrap_or(0)))
             / f64::from(snap.gpu_total_mb)
     } else {
         0.0
@@ -454,6 +457,16 @@ mod tests {
                     let mut h = hints();
                     h.memory_mb = Some(ram / 4);
                     let s = fit_score(&h, &snap, 1.0);
+                    assert!(s.is_finite() && (0.0..=1.0).contains(&s), "{s}");
+                    // MAJOR-1 regression: hostile/buggy heartbeat with
+                    // ram_used at the ceiling and NO declared memory
+                    // hint must not overflow the u32 addition.
+                    let hostile = NodeSnapshot {
+                        ram_total_mb: ram.max(1),
+                        ram_used_mb: u32::MAX,
+                        ..snap
+                    };
+                    let s = fit_score(&hints(), &hostile, 1.0);
                     assert!(s.is_finite() && (0.0..=1.0).contains(&s), "{s}");
                 }
             }

@@ -117,6 +117,10 @@ struct StoreLoadView<'a> {
     runtime: &'a DispatchRuntime,
     inflight: HashMap<NodeId, u32>,
     reserved: ParkingMutex<HashMap<NodeId, u32>>,
+    /// Base snapshots memoized per pass — `load_manifest` decodes the
+    /// FULL manifest CBOR, so without this the hot path pays
+    /// tasks × candidates decodes per 100 ms poll (review MAJOR-2).
+    base: ParkingMutex<HashMap<NodeId, NodeSnapshot>>,
 }
 
 impl<'a> StoreLoadView<'a> {
@@ -129,6 +133,7 @@ impl<'a> StoreLoadView<'a> {
             runtime,
             inflight,
             reserved: ParkingMutex::new(HashMap::new()),
+            base: ParkingMutex::new(HashMap::new()),
         }
     }
 
@@ -139,6 +144,12 @@ impl<'a> StoreLoadView<'a> {
 
 impl LoadView for StoreLoadView<'_> {
     fn snapshot(&self, node: &NodeId) -> NodeSnapshot {
+        if let Some(cached) = self.base.lock().get(node) {
+            let mut snap = *cached;
+            let reserved = self.reserved.lock().get(node).copied().unwrap_or(0);
+            snap.assigned_inflight = snap.assigned_inflight.saturating_add(reserved);
+            return snap;
+        }
         let mut snap = NodeSnapshot::default();
         // Capacity from the stored manifest (self manifest indexed at boot).
         if let Ok(Some(m)) = self.runtime.store.load_manifest(*node) {
@@ -166,9 +177,10 @@ impl LoadView for StoreLoadView<'_> {
             snap.paused = hb.paused;
             snap.on_battery = hb.on_battery;
         }
-        let assigned = self.inflight.get(node).copied().unwrap_or(0);
+        snap.assigned_inflight = self.inflight.get(node).copied().unwrap_or(0);
+        self.base.lock().insert(*node, snap);
         let reserved = self.reserved.lock().get(node).copied().unwrap_or(0);
-        snap.assigned_inflight = assigned.saturating_add(reserved);
+        snap.assigned_inflight = snap.assigned_inflight.saturating_add(reserved);
         snap
     }
 
@@ -206,6 +218,11 @@ pub(crate) struct DispatchRuntime {
     /// 4.4 (ADR-0026): per-node dispatch-outcome EWMA. Shared with the
     /// local executor so local terminals feed it too (review MAJOR-2).
     success: Arc<SuccessTracker>,
+    /// Issuer side: tasks currently resource-gated (waiting, no
+    /// terminal window). Batched BEHIND never-seen tasks so deadline-
+    /// less gated work can't starve other capabilities (diff review
+    /// BLOCKER-1).
+    gated: ParkingMutex<std::collections::HashSet<TaskId>>,
 }
 
 impl DispatchRuntime {
@@ -235,6 +252,7 @@ impl DispatchRuntime {
             elig_failures: ParkingMutex::new(HashMap::new()),
             partials: OnceLock::new(),
             success: Arc::new(SuccessTracker::new()),
+            gated: ParkingMutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -341,12 +359,17 @@ impl DispatchRuntime {
                 return;
             }
         };
-        // 4.4: fresh-first batch (carried risk 10) — tasks not yet in
-        // the eligibility-failure map go first, so up to 16 known-
-        // undispatchable tasks can't starve a fresh one.
+        if rows.is_empty() {
+            return; // no store queries on idle polls (review MINOR-1)
+        }
+        // 4.4: priority batch (carried risk 10 + review BLOCKER-1) —
+        // never-seen tasks first, then resource-gated waiters, then
+        // known-undispatchable retries. Deadline-less gated work can
+        // therefore never starve other capabilities.
         let known_failing: std::collections::HashSet<TaskId> =
             self.elig_failures.lock().keys().copied().collect();
-        let batch = select_batch(rows, &known_failing, DISPATCH_BATCH);
+        let gated: std::collections::HashSet<TaskId> = self.gated.lock().clone();
+        let batch = select_batch(rows, &gated, &known_failing, DISPATCH_BATCH);
         // One load view per pass; same-poll assignments are reserved so
         // the batch spreads (ADR-0026).
         let loads = StoreLoadView::new(self);
@@ -386,6 +409,7 @@ impl DispatchRuntime {
                 &self.rr,
             ) {
                 Ok(DispatchPlan::Single { node }) => {
+                    self.gated.lock().remove(&task.id);
                     loads.note_assigned(node);
                     self.dispatch_to(&task, node);
                 }
@@ -564,6 +588,7 @@ impl DispatchRuntime {
         // deadline, exactly like work queued behind a busy executor.
         if matches!(err, DispatchError::ResourceGated { .. }) {
             self.elig_failures.lock().remove(&task.id);
+            self.gated.lock().insert(task.id);
             let deadline_expired = task
                 .constraints
                 .deadline
@@ -571,9 +596,11 @@ impl DispatchRuntime {
             if !deadline_expired {
                 return; // keep waiting; gates re-evaluate every poll
             }
+            self.gated.lock().remove(&task.id);
             self.fail_undispatchable(task, &format!("deadline exceeded while {err}"));
             return;
         }
+        self.gated.lock().remove(&task.id);
         let now = Instant::now();
         let first = *self.elig_failures.lock().entry(task.id).or_insert(now);
         let window_expired =
@@ -1082,13 +1109,28 @@ fn lease_ttl_ms(task: &Task) -> u32 {
 /// the window until the first non-full poll — harmless while waiting.
 fn select_batch(
     rows: Vec<harness_store::TaskRow>,
+    gated: &std::collections::HashSet<TaskId>,
     known_failing: &std::collections::HashSet<TaskId>,
     batch: usize,
 ) -> Vec<harness_store::TaskRow> {
-    let (fresh, failing): (Vec<_>, Vec<_>) = rows
+    let mut fresh = Vec::new();
+    let mut waiting = Vec::new();
+    let mut failing = Vec::new();
+    for r in rows {
+        if known_failing.contains(&r.id) {
+            failing.push(r);
+        } else if gated.contains(&r.id) {
+            waiting.push(r);
+        } else {
+            fresh.push(r);
+        }
+    }
+    fresh
         .into_iter()
-        .partition(|r| !known_failing.contains(&r.id));
-    fresh.into_iter().chain(failing).take(batch).collect()
+        .chain(waiting)
+        .chain(failing)
+        .take(batch)
+        .collect()
 }
 
 fn now_unix_ms() -> u64 {
@@ -1906,22 +1948,73 @@ mod tests {
             started_at: None,
             finished_at: None,
         };
-        let rows: Vec<_> = (0..5).map(mk).collect();
+        let rows: Vec<_> = (0..6).map(mk).collect();
         let failing: std::collections::HashSet<TaskId> =
             [rows[0].id, rows[1].id].into_iter().collect();
-        let batch = select_batch(rows.clone(), &failing, 3);
-        // Fresh (2,3,4) first, in submission order; failing fill the rest.
-        assert_eq!(batch[0].id, rows[2].id);
-        assert_eq!(batch[1].id, rows[3].id);
-        assert_eq!(batch[2].id, rows[4].id);
-        // Room left → failing tasks still retry.
-        let batch = select_batch(rows.clone(), &failing, 5);
-        assert_eq!(batch.len(), 5);
-        assert_eq!(batch[3].id, rows[0].id, "failing retained in order");
+        // Row 2 is resource-gated: batched AFTER fresh, BEFORE failing
+        // (review BLOCKER-1 — gated work can't starve other tasks).
+        let gated: std::collections::HashSet<TaskId> = [rows[2].id].into_iter().collect();
+        let batch = select_batch(rows.clone(), &gated, &failing, 3);
+        assert_eq!(batch[0].id, rows[3].id, "never-seen first");
+        assert_eq!(batch[1].id, rows[4].id);
+        assert_eq!(batch[2].id, rows[5].id);
+        let batch = select_batch(rows.clone(), &gated, &failing, 6);
+        assert_eq!(batch[3].id, rows[2].id, "gated after fresh");
+        assert_eq!(batch[4].id, rows[0].id, "failing last, in order");
         // Empty and all-failing cases.
-        assert!(select_batch(vec![], &failing, 3).is_empty());
+        assert!(select_batch(vec![], &gated, &failing, 3).is_empty());
         let all: std::collections::HashSet<TaskId> = rows.iter().map(|r| r.id).collect();
-        assert_eq!(select_batch(rows, &all, 2).len(), 2);
+        let none = std::collections::HashSet::new();
+        assert_eq!(select_batch(rows, &none, &all, 2).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn t24_gated_backlog_cannot_starve_other_capabilities() {
+        // BLOCKER-1 regression: >BATCH resource-gated tasks for a
+        // paused capability must not block a fresh task for a healthy
+        // one.
+        let f = fixture();
+        let paused_node = Identity::generate();
+        add_live_candidate(&f, &paused_node, vec![SECRET_TAG.to_string()]);
+        let mut hb = live_heartbeat(paused_node.node_id());
+        hb.paused = true;
+        hb.seq = 2;
+        f.peers.record(hb);
+        // 20 gated tasks for the paused capability (all deadline-less).
+        for _ in 0..20 {
+            let t = signed_task_for(&f.local, SECRET_CAP);
+            f.store.insert_task(&t).expect("insert");
+        }
+        // Two polls: first marks them gated, second exercises priority.
+        f.runtime.poll_submitted_once();
+        // A fresh task for a DIFFERENT capability with a healthy node.
+        let healthy = Identity::generate();
+        let m = {
+            let mut m = signed_peer_manifest(&healthy, vec![]);
+            m.capabilities[0].id = "other.cap".into();
+            m.capabilities[0].requires_secrets = vec![];
+            m.sign(&healthy).expect("re-sign");
+            m
+        };
+        f.runtime.dispatcher.capability_index().upsert_node(&m);
+        f.store.upsert_manifest(&m).expect("upsert");
+        f.peers.record(live_heartbeat(healthy.node_id()));
+        let fresh = signed_task_for(&f.local, "other.cap");
+        f.store.insert_task(&fresh).expect("insert");
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.last_dispatched("other.cap").expect("cursor"),
+            Some(healthy.node_id()),
+            "fresh task must dispatch despite 20 older gated tasks"
+        );
+        // Gated tasks are still Submitted (waiting, not failed).
+        assert!(
+            f.store
+                .list_tasks_by_state_assigned(TaskState::Submitted, None)
+                .expect("list")
+                .len()
+                >= 20
+        );
     }
 
     #[tokio::test]

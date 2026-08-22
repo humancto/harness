@@ -100,3 +100,24 @@ capability failure with node failure (uniform inputs distort nothing;
 node-specific bad inputs bounded by the floor + decay) — 4.6's circuit
 breaker refines on this substrate. Federated/Owner scoring → 4.5.
 Real sampling (`sysinfo`) → Phase 6.
+
+## Diff-review addenda
+
+- **Gated batch priority (BLOCKER-1)**: ResourceGated tasks live in a
+  separate waiting set and batch AFTER never-seen tasks, BEFORE
+  known-failing retries — deadline-less gated work for a paused
+  capability can never starve other capabilities (regression-locked:
+  20 gated + 1 fresh other-capability task).
+- **Pressure math is f64 end-to-end** — a hostile/buggy heartbeat with
+  `ram_used_mb` at the u32 ceiling must not overflow (was a confirmed
+  debug-panic / release-ranking-inversion; regression in the sweep
+  test).
+- **Base snapshots are memoized per poll pass** — `load_manifest`
+  decodes the full manifest CBOR, so the hot path pays one decode per
+  node per pass, not per task × candidate.
+- A task alternating ResourceGated ↔ other eligibility errors has its
+  terminal window erased on each gated poll — consistent with
+  wait-semantics, accepted.
+- A locally-executed task whose lease expires records one `false` at
+  expiry and possibly another at its eventual terminal — a rare,
+  bounded double-penalty; accepted.
