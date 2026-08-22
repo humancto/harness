@@ -29,6 +29,16 @@ pub struct Heartbeat {
     /// First 16 bytes of `blake3` over the canonical CBOR encoding of the
     /// node's current manifest. Peers re-fetch on mismatch.
     pub capabilities_hash: [u8; 16],
+    /// `blake3` over the node's canonical replica snapshot
+    /// (`Store::replica_head`, 3.3-gossip / ADR-0019). Anti-entropy: a
+    /// peer whose head differs triggers a full replica sync. All-zero
+    /// means "no replica state advertised" (node predates the field or
+    /// runs without a store) and is ignored by the sync trigger.
+    /// `#[serde(default)]` keeps pre-3.3-gossip heartbeats decodable —
+    /// a wire-format ADDITION, not a break (the insta fixture was
+    /// regenerated; ADR-0019 records it).
+    #[serde(default)]
+    pub replica_head: [u8; 32],
     /// Tasks currently running on this node. Recommended cap of 16
     /// entries; enforcement lives in the broadcast loop (item 1.5).
     pub in_flight: Vec<TaskId>,
@@ -70,6 +80,7 @@ mod tests {
             gpu_used_mb: 0,
             gpu_total_mb: 0,
             capabilities_hash: [0xAB; 16],
+            replica_head: [0xEE; 32],
             in_flight: vec![
                 TaskId(uuid::Uuid::from_u128(0)),
                 TaskId(uuid::Uuid::from_u128(1)),
@@ -92,6 +103,63 @@ mod tests {
         ciborium::ser::into_writer(&hb, &mut buf).expect("serialize");
         let back: Heartbeat = ciborium::de::from_reader(buf.as_slice()).expect("deserialize");
         assert_eq!(hb, back);
+    }
+
+    /// Decode-compat: a heartbeat encoded by a pre-3.3-gossip node (no
+    /// `replica_head` on the wire) must still decode, with the field
+    /// defaulting to all-zero. The mirror struct below reproduces the
+    /// exact pre-3.3-gossip field set (same names, same order).
+    #[test]
+    fn heartbeat_without_replica_head_still_decodes() {
+        #[derive(serde::Serialize)]
+        struct LegacyHeartbeat {
+            node_id: NodeId,
+            seq: u64,
+            timestamp: u64,
+            queue_depth: u16,
+            cpu_busy_pct: u8,
+            cpu_pinned_count: u8,
+            ram_used_mb: u32,
+            ram_total_mb: u32,
+            gpu_used_mb: u32,
+            gpu_total_mb: u32,
+            capabilities_hash: [u8; 16],
+            in_flight: Vec<TaskId>,
+            leader_belief: NodeId,
+            brain_score: i32,
+            on_battery: bool,
+            paused: bool,
+            version: SemVer,
+            sig: Signature,
+        }
+        let new = sample_heartbeat(Signature::from_bytes([0x77; 64]));
+        let legacy = LegacyHeartbeat {
+            node_id: new.node_id,
+            seq: new.seq,
+            timestamp: new.timestamp,
+            queue_depth: new.queue_depth,
+            cpu_busy_pct: new.cpu_busy_pct,
+            cpu_pinned_count: new.cpu_pinned_count,
+            ram_used_mb: new.ram_used_mb,
+            ram_total_mb: new.ram_total_mb,
+            gpu_used_mb: new.gpu_used_mb,
+            gpu_total_mb: new.gpu_total_mb,
+            capabilities_hash: new.capabilities_hash,
+            in_flight: new.in_flight.clone(),
+            leader_belief: new.leader_belief,
+            brain_score: new.brain_score,
+            on_battery: new.on_battery,
+            paused: new.paused,
+            version: new.version,
+            sig: new.sig,
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&legacy, &mut buf).expect("serialize legacy");
+        let back: Heartbeat = ciborium::de::from_reader(buf.as_slice()).expect("decode legacy");
+        assert_eq!(back.replica_head, [0u8; 32], "missing field defaults");
+        assert_eq!(back.node_id, new.node_id);
+        assert_eq!(back.seq, new.seq);
+        assert_eq!(back.in_flight, new.in_flight);
     }
 
     #[test]

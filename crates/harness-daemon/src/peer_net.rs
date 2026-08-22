@@ -29,8 +29,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use harness_core::{
-    Heartbeat, Identity, LeaseId, NodeId, NodeManifest, Signable, TaskAssign, TaskClaim,
-    TaskResultMsg,
+    Heartbeat, Identity, LeaseId, NodeId, NodeManifest, ReplicaSyncEnvelope, Signable, TaskAssign,
+    TaskClaim, TaskResultMsg,
 };
 use harness_mesh::heartbeat::{HeartbeatService, PeerTable, HEARTBEAT_INTERVAL, PEER_TIMEOUT};
 use harness_mesh::transport::{channels, ChannelStream, Connection, TransportError};
@@ -99,21 +99,22 @@ impl MeshIndexes {
     }
 }
 
-/// One outbound message. `Heartbeat` and `Announce` arrive pre-signed
-/// (their seq/idempotency is channel-independent); the task envelopes
-/// arrive **unsigned with a placeholder seq** — the sender task stamps
-/// the per-stream seq and signs with the local identity right before
-/// the wire write, because the seq is a per-stream property.
+/// One outbound message. `Heartbeat`, `Announce`, and `Gossip` arrive
+/// pre-signed (their seq/idempotency is channel-independent — gossip is
+/// idempotent LWW, ADR-0019); the task envelopes arrive **unsigned with
+/// a placeholder seq** — the sender task stamps the per-stream seq and
+/// signs with the local identity right before the wire write, because
+/// the seq is a per-stream property.
 // Variant sizes differ (Assign carries a whole Task) but entries are
 // transient queue items with depth 64 — boxing would just add churn.
 #[allow(clippy::large_enum_variant)]
-#[allow(dead_code)] // Assign/Claim/Result senders land in PR-A2
 pub(crate) enum OutboundMsg {
     Heartbeat(Heartbeat),
     Announce(NodeManifest),
     Assign(TaskAssign),
     Claim(TaskClaim),
     Result(TaskResultMsg),
+    Gossip(ReplicaSyncEnvelope),
 }
 
 impl OutboundMsg {
@@ -124,6 +125,7 @@ impl OutboundMsg {
             OutboundMsg::Assign(_) => channels::TASK_ASSIGN,
             OutboundMsg::Claim(_) => channels::TASK_CLAIM,
             OutboundMsg::Result(_) => channels::TASK_RESULT,
+            OutboundMsg::Gossip(_) => channels::GOSSIP_STATE,
         }
     }
 }
@@ -171,6 +173,10 @@ pub(crate) struct PeerNet {
     handlers: Arc<dyn TaskChannelHandlers>,
     self_manifest: NodeManifest,
     peers: ParkingMutex<HashMap<NodeId, PeerEntry>>,
+    /// 3.3-gossip: set once after construction (the gossip service holds
+    /// an `Arc<PeerNet>`, so this back-reference is `Weak` to avoid the
+    /// cycle). Unset in unit tests that don't exercise gossip.
+    gossip: std::sync::OnceLock<std::sync::Weak<crate::gossip::GossipService>>,
 }
 
 impl PeerNet {
@@ -192,7 +198,17 @@ impl PeerNet {
             handlers,
             self_manifest,
             peers: ParkingMutex::new(HashMap::new()),
+            gossip: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Wire the gossip back-reference after `GossipService::new`.
+    pub(crate) fn attach_gossip(&self, gossip: &Arc<crate::gossip::GossipService>) {
+        let _ = self.gossip.set(Arc::downgrade(gossip));
+    }
+
+    fn gossip(&self) -> Option<Arc<crate::gossip::GossipService>> {
+        self.gossip.get().and_then(std::sync::Weak::upgrade)
     }
 
     #[cfg_attr(not(test), allow(dead_code))] // PR-A2 dispatch runtime reads these
@@ -430,6 +446,7 @@ impl PeerNet {
                 sign_or_protocol_err(&mut r, identity)?;
                 ch.send(&r).await
             }
+            OutboundMsg::Gossip(g) => ch.send(g).await,
         }
     }
 
@@ -477,7 +494,14 @@ impl PeerNet {
                 n if n == channels::HEARTBEAT => match ch.recv_sequenced::<Heartbeat>().await {
                     Ok(hb) => {
                         if hb.node_id == peer_id {
+                            let peer_head = hb.replica_head;
                             self.heartbeat.record_incoming(hb);
+                            // 3.3-gossip anti-entropy: a diverged replica
+                            // head triggers a rate-limited full sync
+                            // (ADR-0019). All-zero = not advertised.
+                            if let Some(gossip) = self.gossip() {
+                                gossip.on_peer_head(peer_id, peer_head);
+                            }
                         } else {
                             tracing::warn!(
                                 target: "harness.fanout",
@@ -554,9 +578,56 @@ impl PeerNet {
                         Err(e) => Err(e),
                     }
                 }
+                n if n == channels::GOSSIP_STATE => {
+                    match ch.recv::<ReplicaSyncEnvelope>().await {
+                        // `recv` verified the envelope signature against
+                        // the connection peer's pubkey; the `source`
+                        // cross-check below stops a trusted peer from
+                        // replaying another node's (validly self-signed)
+                        // envelope as its own channel traffic.
+                        Ok(env) => {
+                            if env.source != peer_id {
+                                tracing::warn!(
+                                    target: "harness.gossip",
+                                    peer = %peer_id,
+                                    claimed = %env.source,
+                                    "gossip source does not match connection peer; dropped"
+                                );
+                            } else if let Some(store) = &self.indexes.store {
+                                match store.replica_apply_envelope(&env) {
+                                    Ok(applied) => {
+                                        tracing::debug!(
+                                            target: "harness.gossip",
+                                            peer = %peer_id,
+                                            entries = env.entries.len(),
+                                            applied,
+                                            "replica sync applied"
+                                        );
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            target: "harness.gossip",
+                                            peer = %peer_id,
+                                            ?err,
+                                            "replica sync apply failed"
+                                        );
+                                    }
+                                }
+                            } else {
+                                tracing::debug!(
+                                    target: "harness.gossip",
+                                    peer = %peer_id,
+                                    "gossip received but no store configured; dropped"
+                                );
+                            }
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
                 other => {
-                    // `GOSSIP_STATE` lands in PR-B; anything else is
-                    // unreachable (accept_channel validates names).
+                    // Anything else is unreachable
+                    // (accept_channel validates names).
                     tracing::debug!(
                         target: "harness.fanout",
                         peer = %peer_id,

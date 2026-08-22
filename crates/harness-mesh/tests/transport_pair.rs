@@ -48,6 +48,7 @@ fn sample_heartbeat(node: NodeId, seq: u64) -> Heartbeat {
         gpu_used_mb: 0,
         gpu_total_mb: 0,
         capabilities_hash: [0u8; 16],
+        replica_head: [0u8; 32],
         in_flight: vec![TaskId(uuid::Uuid::nil())],
         leader_belief: node,
         brain_score: 0,

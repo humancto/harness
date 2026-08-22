@@ -6,6 +6,9 @@ mod dispatch;
 mod executor;
 #[cfg(test)]
 mod fanout_tests;
+mod gossip;
+#[cfg(test)]
+mod gossip_tests;
 mod lifecycle;
 mod mesh_exec;
 mod peer_net;

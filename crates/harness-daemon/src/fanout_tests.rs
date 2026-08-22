@@ -18,22 +18,22 @@ use tokio::sync::watch;
 
 use crate::lifecycle::{DaemonOrchestrator, DaemonRuntimeConfig};
 
-struct TestDaemon {
-    identity: Arc<Identity>,
-    store: Store,
-    peers: harness_mesh::heartbeat::PeerTable,
-    mesh_addr: SocketAddr,
-    stop_tx: watch::Sender<bool>,
-    handle: tokio::task::JoinHandle<()>,
-    root: tempfile::TempDir,
+pub(crate) struct TestDaemon {
+    pub(crate) identity: Arc<Identity>,
+    pub(crate) store: Store,
+    pub(crate) peers: harness_mesh::heartbeat::PeerTable,
+    pub(crate) mesh_addr: SocketAddr,
+    pub(crate) stop_tx: watch::Sender<bool>,
+    pub(crate) handle: tokio::task::JoinHandle<()>,
+    pub(crate) root: tempfile::TempDir,
 }
 
 impl TestDaemon {
-    fn node_id(&self) -> NodeId {
+    pub(crate) fn node_id(&self) -> NodeId {
         self.identity.node_id()
     }
 
-    async fn stop(self) {
+    pub(crate) async fn stop(self) {
         let _ = self.stop_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(5), self.handle).await;
     }
@@ -41,7 +41,7 @@ impl TestDaemon {
 
 /// Generate two identities + cross-trusted roots, then boot daemons.
 /// `b` dials `a` via a static peer hint.
-async fn boot_pair(policy_toml: Option<&str>) -> (TestDaemon, TestDaemon) {
+pub(crate) async fn boot_pair(policy_toml: Option<&str>) -> (TestDaemon, TestDaemon) {
     let root_a = tempfile::tempdir().expect("root a");
     let root_b = tempfile::tempdir().expect("root b");
     let id_a = Arc::new(harness_mesh::identity::init_or_load(root_a.path()).expect("id a"));
@@ -159,7 +159,7 @@ fn submit_task(
     task.id
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -189,7 +189,7 @@ async fn wait_for_state(
 
 /// Wait until both nodes hold each other's manifest AND at least one
 /// heartbeat (the `mesh_meta` target filter requires peer liveness).
-async fn wait_for_mesh(a: &TestDaemon, b: &TestDaemon) {
+pub(crate) async fn wait_for_mesh(a: &TestDaemon, b: &TestDaemon) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let seen = a.store.load_manifest(b.node_id()).ok().flatten().is_some()
