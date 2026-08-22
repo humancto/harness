@@ -50,7 +50,10 @@ pub use registry::CapabilitySnapshot;
 pub use brain_plan::{enrich_with_brain_plan, BrainPlanCapability};
 
 #[cfg(feature = "fs")]
-pub use fs::{FsListCapability, FsReadCapability, ScopeConfig, ScopeError, ScopeRegistry};
+pub use fs::{
+    FsGrepCapability, FsListCapability, FsReadCapability, FsSearchCapability, ScopeConfig,
+    ScopeError, ScopeRegistry,
+};
 pub use traits::{Capability, CapabilityError, ExecutionContext};
 
 #[cfg(feature = "echo")]
