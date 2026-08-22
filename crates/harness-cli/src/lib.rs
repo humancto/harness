@@ -27,6 +27,7 @@ use clap::{Parser, Subcommand};
 use harness_mesh::pairing::PairingCode;
 use harness_mesh::{identity, PendingPairings, TrustStore};
 
+pub mod plan;
 pub mod query;
 pub mod run;
 pub use run::{run_run, RunOutcome};
@@ -68,8 +69,31 @@ pub enum Command {
     Search(QueryArgs),
     /// Federated grep across every node's scopes (`mesh.grep`, 3.11).
     Grep(QueryArgs),
+    /// Plan a goal with the brain and print the DAG (dry run, 4.3).
+    Plan(PlanArgs),
+    /// Plan a goal, then execute the plan across the mesh (4.3).
+    Exec(PlanArgs),
     /// Placeholder — clean teardown of `~/.harness/` is a Phase 6 concern.
     Leave(LeaveArgs),
+}
+
+/// Args for `harness plan` / `harness exec` (4.3, PRD §19).
+#[derive(Debug, clap::Args)]
+pub struct PlanArgs {
+    /// Natural-language goal for the planner.
+    pub goal: String,
+    /// Whole-plan execution timeout in milliseconds (default 120000).
+    #[arg(long)]
+    pub timeout_ms: Option<u64>,
+    /// Keep executing independent branches past a step failure
+    /// (default aborts on the first failure).
+    #[arg(long)]
+    pub keep_going: bool,
+    #[arg(long)]
+    pub root: Option<std::path::PathBuf>,
+    /// Daemon API base URL.
+    #[arg(long, default_value = "http://127.0.0.1:19198")]
+    pub api: String,
 }
 
 /// Args shared by `harness search` and `harness grep`.
@@ -259,6 +283,8 @@ pub fn run(cli: Cli) -> Result<SyncOutcome> {
         Command::Run(args) => Ok(SyncOutcome::RunRequested(args)),
         Command::Search(args) => Ok(SyncOutcome::SearchRequested(args)),
         Command::Grep(args) => Ok(SyncOutcome::GrepRequested(args)),
+        Command::Plan(args) => Ok(SyncOutcome::PlanRequested(args)),
+        Command::Exec(args) => Ok(SyncOutcome::ExecRequested(args)),
         Command::Daemon(args) => Ok(SyncOutcome::DaemonRequested(args)),
     }
 }
@@ -275,6 +301,8 @@ pub enum SyncOutcome {
     RunRequested(RunArgs),
     SearchRequested(QueryArgs),
     GrepRequested(QueryArgs),
+    PlanRequested(PlanArgs),
+    ExecRequested(PlanArgs),
 }
 
 fn cmd_init(args: InitArgs) -> Result<String> {

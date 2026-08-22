@@ -117,6 +117,8 @@ These will land alongside their natural Phase 3 home, not as a "phase 2.10":
 
 | #45 | 4.2  | Result streams (ADR-0024): `results::task_results` — the §14.8 `Stream<TaskResult>` over FanoutStream (recoverable ResultMapper, never Final); `StreamKind::Progress` riding the 3.2-stream pipe (no new wire channels); mesh_meta emits per-target + one summary frame; `WS /runs/:id` pushes seq-deduped `partials` batches with a guaranteed pre-terminal sweep; CLI `grep`/`search` render TTY-gated incremental progress; types.ts mirrors the full contract for 4.8. +14 tests |
 
+| #46 | 4.3  | DAG executor (ADR-0025): pure `DagScheduler` (Kahn ready-sets, exact skip-cascade, output retention) + `plan.execute` driver (channel-fed 4.1 controller, unpinned signed step rows with `parent`/`plan_id`, `$task_output` threading + resolved-input schema recheck, driver-owned FailFast/continue, try-acquire one-plan-per-node) + `StorePlanExec` wiring + `list_tasks_by_plan` + `Signature` JSON seq-visitor + CLI `harness plan`/`exec`. m05 E2E on a real daemon. +34 tests |
+
 4.1 review round 1 (plan): 2 majors fixed pre-implementation — index-resolved failure
 provenance; two controller instances so local scans stay ≤4 and remote submission isn't
 starved behind local work. `PartialPolicy::Wait` aliased to `ReturnPartial` at the

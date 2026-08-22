@@ -373,7 +373,7 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
         &tx,
         &mut sent,
         &mut records,
-        &sink,
+        sink.as_ref(),
         ctx.task_id,
         &row_ids,
     );
@@ -399,12 +399,12 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
                         }
                     };
                     record_settled(&mut records, node_id, &step_outcome, &row_ids);
-                    emit_step_frame(&sink, ctx.task_id, node_id, &records, &row_ids);
+                    emit_step_frame(sink.as_ref(), ctx.task_id, node_id, &records, &row_ids);
                     for skipped in &progress.newly_skipped {
                         records
                             .entry(*skipped)
                             .and_modify(|r| r.state = StepState::Skipped);
-                        emit_step_frame(&sink, ctx.task_id, *skipped, &records, &row_ids);
+                        emit_step_frame(sink.as_ref(), ctx.task_id, *skipped, &records, &row_ids);
                     }
                     if fatal && fail_fast {
                         aborted = true;
@@ -418,7 +418,7 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
                         &tx,
                         &mut sent,
                         &mut records,
-                        &sink,
+                        sink.as_ref(),
                         ctx.task_id,
                         &row_ids,
                     );
@@ -446,7 +446,7 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
         records
             .entry(skipped)
             .and_modify(|r| r.state = StepState::Skipped);
-        emit_step_frame(&sink, ctx.task_id, skipped, &records, &row_ids);
+        emit_step_frame(sink.as_ref(), ctx.task_id, skipped, &records, &row_ids);
     }
 
     let summary = scheduler.summary();
@@ -528,7 +528,7 @@ fn feed_ready(
     tx: &tokio::sync::mpsc::Sender<ReadyStep>,
     sent: &mut Vec<TaskId>,
     records: &mut HashMap<TaskId, StepRecord>,
-    sink: &Option<FrameSink>,
+    sink: Option<&FrameSink>,
     plan_task: TaskId,
     row_ids: &Arc<parking_lot::Mutex<HashMap<TaskId, TaskId>>>,
 ) {
@@ -612,7 +612,7 @@ fn record_settled(
 }
 
 fn emit_step_frame(
-    sink: &Option<FrameSink>,
+    sink: Option<&FrameSink>,
     plan_task: TaskId,
     node_id: TaskId,
     records: &HashMap<TaskId, StepRecord>,
@@ -643,7 +643,12 @@ fn emit_step_frame(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::similar_names
+)]
 mod tests {
     use super::*;
     use harness_core::{NodeId, PlanNode, Signature};
@@ -651,6 +656,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     type Frames = Arc<Mutex<Vec<(TaskId, LogFrame)>>>;
+    /// `(row, capability, input, parent, plan_id)`.
+    type SubmitRecord = (TaskId, String, JsonValue, TaskId, PlanId);
 
     fn ctx() -> ExecutionContext {
         ExecutionContext {
@@ -691,9 +698,9 @@ mod tests {
     }
 
     struct FakePlanExec {
-        /// (row, capability, input, parent, plan_id) per submit.
-        submits: Mutex<Vec<(TaskId, String, JsonValue, TaskId, PlanId)>>,
-        /// Budgets (timeout_ms) per submit, in order.
+        /// `(row, capability, input, parent, plan_id)` per submit.
+        submits: Mutex<Vec<SubmitRecord>>,
+        /// Budgets (`timeout_ms`) per submit, in order.
         budgets: Mutex<Vec<u32>>,
         gate: tokio::sync::Semaphore,
         non_terminal: AtomicUsize,
@@ -755,8 +762,7 @@ mod tests {
                 .lock()
                 .iter()
                 .find(|(row, ..)| *row == id)
-                .map(|(_, _, input, ..)| input.clone())
-                .unwrap_or(JsonValue::Null);
+                .map_or(JsonValue::Null, |(_, _, input, ..)| input.clone());
             if input.get("fail").is_some() {
                 SubTaskOutcome::Failed("step exploded".into())
             } else {

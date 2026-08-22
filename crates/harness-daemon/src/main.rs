@@ -40,6 +40,8 @@ fn main() -> Result<()> {
             dispatch_outcome(harness_cli::query::run_search(args))
         }
         SyncOutcome::GrepRequested(args) => dispatch_outcome(harness_cli::query::run_grep(args)),
+        SyncOutcome::PlanRequested(args) => dispatch_outcome(harness_cli::plan::run_plan(args)),
+        SyncOutcome::ExecRequested(args) => dispatch_outcome(harness_cli::plan::run_exec(args)),
     }
 }
 

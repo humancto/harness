@@ -180,7 +180,7 @@ impl DagScheduler {
             let mut visited = 0usize;
             while let Some(id) = queue.pop() {
                 visited += 1;
-                for &d in dependents.get(&id).map(Vec::as_slice).unwrap_or(&[]) {
+                for &d in dependents.get(&id).map_or(&[][..], Vec::as_slice) {
                     if let Some(r) = indeg.get_mut(&d) {
                         *r -= 1;
                         if *r == 0 {
@@ -281,10 +281,9 @@ impl DagScheduler {
                 if self.states[&d] != StepState::Waiting {
                     continue;
                 }
-                let r = self
-                    .remaining
-                    .get_mut(&d)
-                    .expect("dependent tracked in remaining");
+                let Some(r) = self.remaining.get_mut(&d) else {
+                    continue; // unreachable: every step is tracked
+                };
                 *r -= 1;
                 if *r == 0 {
                     progress.newly_ready.push(d);
@@ -382,7 +381,7 @@ impl DagScheduler {
     /// dependencies).
     #[must_use]
     pub fn deps_of(&self, step: TaskId) -> &[TaskId] {
-        self.deps.get(&step).map(Vec::as_slice).unwrap_or(&[])
+        self.deps.get(&step).map_or(&[][..], Vec::as_slice)
     }
 
     fn mark_in_flight(&mut self, id: TaskId) {
@@ -407,7 +406,12 @@ impl DagScheduler {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::many_single_char_names
+)]
 mod tests {
     use super::*;
     use harness_core::{NodeId, PlanId, PlanNode, ResourceHints, Signature};

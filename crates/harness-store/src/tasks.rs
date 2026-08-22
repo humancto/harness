@@ -99,6 +99,9 @@ impl FromStr for TaskState {
     }
 }
 
+/// Step rows of one plan: `(row id, capability, state, parent id)`.
+pub type PlanStepRows = Vec<(TaskId, String, TaskState, Option<TaskId>)>;
+
 /// One row of the `tasks` table, suitable for read-back without
 /// reconstructing the full `Task` envelope (see [`Store::load_task`] for
 /// that). Surface for CLI / UI listings.
@@ -352,7 +355,7 @@ impl Store {
     pub fn list_tasks_by_plan(
         &self,
         plan_id: harness_core::PlanId,
-    ) -> Result<Vec<(TaskId, String, TaskState, Option<TaskId>)>, StoreError> {
+    ) -> Result<PlanStepRows, StoreError> {
         self.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT id, capability, state, parent_id
