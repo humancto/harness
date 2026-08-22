@@ -11,3 +11,6 @@ description  = "Federated result merge strategies."
 workspace = true
 
 [dependencies]
+harness-core = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }

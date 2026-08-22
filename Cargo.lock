@@ -1379,6 +1379,11 @@ dependencies = [
 [[package]]
 name = "harness-merge"
 version = "0.0.0"
+dependencies = [
+ "harness-core",
+ "serde_json",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "harness-mesh"
