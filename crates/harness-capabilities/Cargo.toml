@@ -43,6 +43,7 @@ dirs           = { workspace = true, optional = true }
 
 [dev-dependencies]
 wiremock       = { workspace = true }
+jsonschema     = { workspace = true }
 tracing-test   = { workspace = true }
 serial_test    = { workspace = true }
 tempfile       = { workspace = true }
