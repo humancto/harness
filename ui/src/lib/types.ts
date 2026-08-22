@@ -90,7 +90,10 @@ export interface SubmitTaskResponse {
 
 export type TaskState =
   | "submitted"
+  | "planned"
+  | "dispatched"
   | "assigned"
+  | "claimed"
   | "running"
   | "done"
   | "failed"
@@ -106,6 +109,16 @@ export interface TaskDetailDto {
   input: unknown;
   issued_at_ms: number;
   completed_at_ms?: number;
+  output?: unknown;
+  error?: string;
+}
+
+// One frame of `WS /api/v1/runs/<task_id>` — must match
+// crates/harness-api/src/routes/runs.rs `RunStreamEvent`. `output` /
+// `error` are omitted (not null) until the terminal frame; the server
+// closes the socket after sending it.
+export interface RunStreamEvent {
+  state: TaskState | string;
   output?: unknown;
   error?: string;
 }

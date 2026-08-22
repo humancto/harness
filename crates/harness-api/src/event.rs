@@ -144,6 +144,7 @@ mod tests {
             gpu_used_mb: 0,
             gpu_total_mb: 0,
             capabilities_hash: [0; 16],
+            replica_head: [0u8; 32],
             in_flight: vec![],
             leader_belief: NodeId::from_bytes([0x33; 16]),
             brain_score: 100,

@@ -148,6 +148,7 @@ async fn evict_stale_drops_silent_peers() {
         gpu_used_mb: 0,
         gpu_total_mb: 0,
         capabilities_hash: [0u8; 16],
+        replica_head: [0u8; 32],
         in_flight: vec![],
         leader_belief: other.node_id(),
         brain_score: 0,

@@ -68,6 +68,7 @@ struct HbResourceHalf {
 #[derive(Clone, Debug)]
 struct HbStateHalf {
     capabilities_hash: [u8; 16],
+    replica_head: [u8; 32],
     in_flight: Vec<TaskId>,
     leader_belief: NodeId,
     brain_score: i32,
@@ -99,6 +100,7 @@ prop_compose! {
 prop_compose! {
     fn arb_state_half()(
         capabilities_hash in any::<[u8; 16]>(),
+        replica_head in any::<[u8; 32]>(),
         in_flight in proptest::collection::vec(arb_task_id(), 0..16),
         leader_belief in arb_node_id(),
         brain_score in any::<i32>(),
@@ -107,8 +109,8 @@ prop_compose! {
         version in arb_semver(),
     ) -> HbStateHalf {
         HbStateHalf {
-            capabilities_hash, in_flight, leader_belief, brain_score,
-            on_battery, paused, version,
+            capabilities_hash, replica_head, in_flight, leader_belief,
+            brain_score, on_battery, paused, version,
         }
     }
 }
@@ -128,6 +130,7 @@ fn arb_heartbeat_with_sig(
         gpu_used_mb: r.gpu_used_mb,
         gpu_total_mb: r.gpu_total_mb,
         capabilities_hash: s.capabilities_hash,
+        replica_head: s.replica_head,
         in_flight: s.in_flight,
         leader_belief: s.leader_belief,
         brain_score: s.brain_score,
@@ -227,6 +230,7 @@ fn canonical_heartbeat_fixture() -> Heartbeat {
         gpu_used_mb: 0,
         gpu_total_mb: 0,
         capabilities_hash: [0xCDu8; 16],
+        replica_head: [0xEEu8; 32],
         in_flight: vec![
             TaskId(uuid::Uuid::from_u128(
                 0x0000_0000_0000_0000_0000_0000_0000_0001,
@@ -321,16 +325,184 @@ fn node_manifest_wire_format_is_stable() {
 /// embedding a manifest in a heartbeat (manifests are gossiped on change,
 /// PRD §13.2).
 #[test]
-fn heartbeat_typical_size_under_512_bytes() {
+fn heartbeat_typical_size_under_576_bytes() {
     let mut hb = canonical_heartbeat_fixture();
     hb.sign(&fixture_identity()).expect("sign");
     let mut buf = Vec::new();
     ciborium::ser::into_writer(&hb, &mut buf).expect("serialize");
     assert!(
-        buf.len() < 512,
+        buf.len() < 576,
         "heartbeat grew to {} bytes; PRD §13.1 estimated ~280 B \
-         (overlooks CBOR field-name overhead; real-world ~480 B). \
-         Threshold 512 leaves headroom but flags real bloat.",
+         (overlooks CBOR field-name overhead; real-world ~480 B before \
+         3.3-gossip). ADR-0019's `replica_head` addition costs ~47 B \
+         (32-byte array + field name), so the budget moved 512 → 576. \
+         Still far under any practical MTU concern; flags real bloat.",
         buf.len()
     );
+}
+
+// -----------------------------------------------------------------------------
+// 3.3 dispatch + gossip envelope fixtures (STATE.md carried risk 6 / ADR-0019)
+// -----------------------------------------------------------------------------
+
+use harness_core::{
+    Constraints, Cost, ExecutionPolicy, FinalResult, LeaseId, ReplicaSyncEnvelope, ReplicatedState,
+    ReplicatedTaskState, ResourceHints, RetryPolicy, Status, Task, TaskAssign, TaskClaim,
+    TaskResultMsg, TraceContext,
+};
+
+/// Second deterministic identity — the "worker" side of the dispatch
+/// envelopes (the fixture identity plays the issuer).
+fn fixture_worker_identity() -> Identity {
+    Identity::from_secret_bytes(&[0x43u8; 32])
+}
+
+fn fixture_task_id() -> TaskId {
+    TaskId(uuid::Uuid::from_u128(
+        0x0000_0000_0000_0000_0000_0000_0000_00AA,
+    ))
+}
+
+fn fixture_lease_id() -> LeaseId {
+    LeaseId(uuid::Uuid::from_u128(
+        0x0000_0000_0000_0000_0000_0000_0000_00BB,
+    ))
+}
+
+fn canonical_task_fixture() -> Task {
+    let issuer = fixture_identity();
+    let mut task = Task {
+        id: fixture_task_id(),
+        parent: None,
+        plan_id: None,
+        capability: "echo".into(),
+        input: serde_json::json!({"msg": "fixture"}),
+        constraints: Constraints::default(),
+        retry: RetryPolicy::default(),
+        execution: ExecutionPolicy::default(),
+        resource_hints: ResourceHints {
+            cpu_class: harness_core::protocol::CpuClass::Light,
+            memory_mb: None,
+            gpu_required: false,
+            gpu_memory_mb: None,
+            network_class: harness_core::protocol::NetworkClass::None,
+            disk_io_class: harness_core::protocol::DiskIoClass::None,
+            estimated_duration_ms: None,
+        },
+        trace_ctx: TraceContext::default(),
+        issued_by: issuer.node_id(),
+        issued_at: 1_700_000_000_000,
+        tags: Vec::new(),
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    task.sign(&issuer).expect("sign task");
+    task
+}
+
+#[test]
+fn task_assign_wire_format_is_stable() {
+    let issuer = fixture_identity();
+    let mut assign = TaskAssign {
+        seq: 3,
+        lease_id: fixture_lease_id(),
+        task: canonical_task_fixture(),
+        assigned_by: issuer.node_id(),
+        lease_expires_at: 1_700_000_060_000,
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    assign.sign(&issuer).expect("sign assign");
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&assign, &mut buf).expect("serialize");
+
+    // CHANGING THIS SNAPSHOT IS A WIRE-FORMAT BREAK.
+    // It requires an ADR documenting the migration story + a version bump.
+    insta::assert_snapshot!("task_assign_wire_v0", hex::encode(&buf));
+}
+
+#[test]
+fn task_claim_wire_format_is_stable() {
+    let worker = fixture_worker_identity();
+    let mut claim = TaskClaim {
+        seq: 4,
+        lease_id: fixture_lease_id(),
+        task_id: fixture_task_id(),
+        worker: worker.node_id(),
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    claim.sign(&worker).expect("sign claim");
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&claim, &mut buf).expect("serialize");
+
+    // CHANGING THIS SNAPSHOT IS A WIRE-FORMAT BREAK.
+    insta::assert_snapshot!("task_claim_wire_v0", hex::encode(&buf));
+}
+
+#[test]
+fn task_result_msg_wire_format_is_stable() {
+    let worker = fixture_worker_identity();
+    let mut result = FinalResult {
+        task_id: fixture_task_id(),
+        node_id: worker.node_id(),
+        started_at: 1_700_000_000_100,
+        finished_at: 1_700_000_000_500,
+        status: Status::Ok,
+        output: serde_json::json!({"echoed": {"msg": "fixture"}}),
+        cost: Cost {
+            tokens_in: 0,
+            tokens_out: 0,
+            usd: 0.0,
+            wall_ms: 400,
+            node_id: worker.node_id(),
+        },
+        logs: Vec::new(),
+        provenance: Vec::new(),
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    result.sign(&worker).expect("sign inner result");
+    let mut msg = TaskResultMsg {
+        seq: 5,
+        lease_id: fixture_lease_id(),
+        result,
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    msg.sign(&worker).expect("sign outer result msg");
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&msg, &mut buf).expect("serialize");
+
+    // CHANGING THIS SNAPSHOT IS A WIRE-FORMAT BREAK.
+    insta::assert_snapshot!("task_result_msg_wire_v0", hex::encode(&buf));
+}
+
+#[test]
+fn replica_sync_envelope_wire_format_is_stable() {
+    let source = fixture_identity();
+    let mut env = ReplicaSyncEnvelope {
+        source: source.node_id(),
+        assembled_at: 1_700_000_000_000,
+        entries: vec![
+            ReplicatedTaskState {
+                task_id: fixture_task_id(),
+                state: ReplicatedState::Done,
+                at_ms: 1_700_000_000_500,
+                source: source.node_id(),
+                output_preview: Some(b"{\"echoed\":{\"msg\":\"fixture\"}}".to_vec()),
+            },
+            ReplicatedTaskState {
+                task_id: TaskId(uuid::Uuid::from_u128(
+                    0x0000_0000_0000_0000_0000_0000_0000_00AB,
+                )),
+                state: ReplicatedState::Running,
+                at_ms: 1_700_000_000_400,
+                source: source.node_id(),
+                output_preview: None,
+            },
+        ],
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    env.sign(&source).expect("sign envelope");
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&env, &mut buf).expect("serialize");
+
+    // CHANGING THIS SNAPSHOT IS A WIRE-FORMAT BREAK.
+    insta::assert_snapshot!("replica_sync_envelope_wire_v0", hex::encode(&buf));
 }

@@ -41,7 +41,7 @@ pub async fn ws_events(
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-fn is_same_origin_loopback(origin: &str) -> bool {
+pub(crate) fn is_same_origin_loopback(origin: &str) -> bool {
     // Allow http(s)://localhost(:port), http(s)://127.0.0.1(:port),
     // and http(s)://[::1](:port).
     let lower = origin.trim().to_ascii_lowercase();

@@ -1428,6 +1428,7 @@ mod tests {
             node_id: node,
             seq: 1,
             timestamp: 1_700_000_000_000,
+            replica_head: [0u8; 32],
             queue_depth: 0,
             cpu_busy_pct: 0,
             cpu_pinned_count: 0,

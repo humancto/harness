@@ -26,6 +26,10 @@ pub struct HeartbeatPublisherConfig {
     pub gpu_used_mb: u32,
     pub gpu_total_mb: u32,
     pub capabilities_hash: [u8; 16],
+    /// `Store::replica_head()` snapshot for anti-entropy (3.3-gossip /
+    /// ADR-0019). All-zero = "no replica state advertised"; peers skip
+    /// the head comparison for such heartbeats.
+    pub replica_head: [u8; 32],
     pub on_battery: bool,
     pub paused: bool,
     pub version: SemVer,
@@ -42,6 +46,7 @@ impl Default for HeartbeatPublisherConfig {
             gpu_used_mb: 0,
             gpu_total_mb: 0,
             capabilities_hash: [0u8; 16],
+            replica_head: [0u8; 32],
             on_battery: false,
             paused: false,
             version: SemVer::new(0, 0, 0),
@@ -128,6 +133,7 @@ impl HeartbeatPublisher {
             gpu_used_mb: snapshot.gpu_used_mb,
             gpu_total_mb: snapshot.gpu_total_mb,
             capabilities_hash: snapshot.capabilities_hash,
+            replica_head: snapshot.replica_head,
             in_flight: Vec::new(), // populated by 2.x when tasks land
             leader_belief,
             brain_score,
@@ -188,6 +194,7 @@ mod tests {
             gpu_used_mb: 0,
             gpu_total_mb: 0,
             capabilities_hash: [0xCD; 16],
+            replica_head: [0xEE; 32],
             on_battery: false,
             paused: false,
             version: SemVer::new(0, 1, 0),
@@ -269,6 +276,7 @@ mod tests {
         assert_eq!(hb.queue_depth, 999);
         assert_eq!(hb.cpu_busy_pct, 88);
         assert_eq!(hb.capabilities_hash, [0xCD; 16]);
+        assert_eq!(hb.replica_head, [0xEE; 32]);
     }
 
     #[test]

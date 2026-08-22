@@ -55,6 +55,8 @@ pub(crate) struct DaemonOrchestrator {
     peer_net: Arc<PeerNet>,
     /// Issuer+worker dispatch runtime. Phase 3.3-fanout PR-A2.
     dispatch: Arc<DispatchRuntime>,
+    /// Replica gossip service. Phase 3.3-gossip (ADR-0019).
+    gossip: Arc<crate::gossip::GossipService>,
     /// Coordinated shutdown — flipped to `true` on ctrl-c. The executor
     /// loop watches this; future loops can subscribe too.
     shutdown_tx: watch::Sender<bool>,
@@ -490,6 +492,12 @@ impl DaemonOrchestrator {
         );
         dispatch_runtime.attach_net(&peer_net);
 
+        // Phase 3.3-gossip: LWW replica sync over `harness.gossip.state`
+        // + heartbeat replica_head anti-entropy (ADR-0019).
+        let gossip = crate::gossip::GossipService::new(store.clone(), identity.clone());
+        gossip.attach_net(&peer_net);
+        peer_net.attach_gossip(&gossip);
+
         let api_state =
             harness_api::ApiStateBuilder::new(identity.clone(), config.mesh_name.clone())
                 .with_node_name(config.node_name.clone())
@@ -517,6 +525,7 @@ impl DaemonOrchestrator {
             executor,
             peer_net,
             dispatch: dispatch_runtime,
+            gossip,
             shutdown_tx,
             tasks: ParkingMutex::new(Vec::new()),
             listeners: Arc::new(ParkingMutex::new(Vec::new())),
@@ -582,8 +591,17 @@ impl DaemonOrchestrator {
         // score is updated by the election pump and surfaced via the
         // API state, which the broadcaster reads each tick.
         let snapshot_state = self.api_state.clone();
+        let snapshot_store = self.api_state.store.clone();
         let local_id = self.transport.node_id();
         let snapshot_fn: harness_mesh::heartbeat::SnapshotFn = Box::new(move || {
+            // 3.3-gossip: advertise the replica head per tick so peers
+            // can detect divergence (ADR-0019). All-zero = "no replica
+            // state advertised" (also the value peers see on head
+            // errors — never advertise a bogus head).
+            let replica_head = snapshot_store
+                .as_ref()
+                .and_then(|s| s.replica_head().ok())
+                .unwrap_or_default();
             let s = snapshot_state.local_status.read();
             let cfg = HeartbeatPublisherConfig {
                 version: harness_core::SemVer {
@@ -591,6 +609,7 @@ impl DaemonOrchestrator {
                     minor: 1,
                     patch: 0,
                 },
+                replica_head,
                 ..HeartbeatPublisherConfig::default()
             };
             let leader = s.leader_belief.unwrap_or(local_id);
@@ -660,6 +679,15 @@ impl DaemonOrchestrator {
             self.shutdown_tx.subscribe(),
         ));
         self.tasks.lock().push(reply_handle);
+
+        // Phase 3.3-gossip: periodic replica delta push (head-triggered
+        // full syncs fire from the heartbeat recv path).
+        let gossip_handle = tokio::spawn(
+            self.gossip
+                .clone()
+                .run_gossip_loop(self.shutdown_tx.subscribe()),
+        );
+        self.tasks.lock().push(gossip_handle);
     }
 
     async fn shutdown(self) {
