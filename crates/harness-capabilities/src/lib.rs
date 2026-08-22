@@ -41,6 +41,9 @@ pub mod llm_cloud_openai;
 #[cfg(feature = "llm")]
 pub mod llm_local;
 
+#[cfg(feature = "mcp")]
+pub mod mcp;
+
 pub use registry::{CapabilityRegistry, RegistryError, WeakCapabilityRegistry};
 
 #[cfg(feature = "brain")]
@@ -76,6 +79,12 @@ pub use llm_cloud_openai::{enrich_with_llm_cloud_openai, LlmCloudOpenaiCapabilit
 
 #[cfg(feature = "llm")]
 pub use llm_local::LlmLocalCapability;
+
+#[cfg(feature = "mcp")]
+pub use mcp::{
+    enrich_with_mcp, enrich_with_mcp_from_path, McpConfig, McpConfigError, McpServerConfig,
+    McpServerHandle, McpSpawnError, McpToolCapability,
+};
 
 /// Build a registry preloaded with every built-in capability gated by
 /// the active feature set. Phase 3 expands this to include `shell.exec`

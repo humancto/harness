@@ -12,7 +12,7 @@ mod validate;
 
 pub use config::{
     CapabilityPolicy, DenyCmd, DenyPattern, DenyRule, LlmAllow, LlmAllowModel, LlmAllowPrefix,
-    LlmPolicy, PlanningPolicy, Policy, ShellAllow, ShellPolicy, TrustLevel,
+    LlmPolicy, McpPolicy, McpRule, PlanningPolicy, Policy, ShellAllow, ShellPolicy, TrustLevel,
 };
 pub use engine::{
     default_path, load_default_path, load_from_path, load_from_str, Action, Decision, EvalContext,

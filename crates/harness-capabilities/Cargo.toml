@@ -21,6 +21,11 @@ brain = ["dep:harness-brain"]
 # with FTS5) + regex add transitive deps that minimal consumers (CLI,
 # future embedded UIs) shouldn't pay for. Daemon enables explicitly.
 fs   = ["dep:cap-std", "dep:base64", "dep:toml", "dep:dirs", "dep:rusqlite", "dep:regex"]
+# 3.7 — mcp.<server>.<tool> proxy over subprocess MCP servers. Opt-in
+# (NOT in default) because rmcp adds transitive deps (process-wrap,
+# chrono, tokio-util codec) that minimal consumers shouldn't pay for.
+# Daemon enables explicitly, mirroring `fs`.
+mcp  = ["dep:rmcp", "dep:toml"]
 
 [dependencies]
 harness-core   = { workspace = true }
@@ -43,6 +48,7 @@ toml           = { workspace = true, optional = true }
 dirs           = { workspace = true, optional = true }
 rusqlite       = { workspace = true, optional = true }
 regex          = { workspace = true, optional = true }
+rmcp           = { workspace = true, optional = true }
 
 [dev-dependencies]
 wiremock       = { workspace = true }

@@ -34,6 +34,9 @@ pub(crate) fn validate(policy: &Policy) -> Result<(), PolicyError> {
         check_llm_rules("llm.deny", &llm.deny, &mut errors);
     }
 
+    check_mcp_rules("mcp.allow", &policy.mcp.allow, &mut errors);
+    check_mcp_rules("mcp.deny", &policy.mcp.deny, &mut errors);
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -54,6 +57,15 @@ fn check_llm_rules(prefix: &str, rules: &[crate::config::LlmAllow], errors: &mut
                     errors,
                 );
             }
+        }
+    }
+}
+
+fn check_mcp_rules(prefix: &str, rules: &[crate::config::McpRule], errors: &mut Vec<String>) {
+    for (i, rule) in rules.iter().enumerate() {
+        check_llm_field(&format!("{prefix}[{i}].server"), &rule.server, errors);
+        if let Some(tool) = rule.tool.as_deref() {
+            check_llm_field(&format!("{prefix}[{i}].tool"), tool, errors);
         }
     }
 }
