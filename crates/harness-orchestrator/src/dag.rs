@@ -240,10 +240,18 @@ impl DagScheduler {
         let failed = match outcome {
             StepOutcome::Done(output) => {
                 self.states.insert(step, StepState::Done);
-                let dependents = self.dependents[&step].len();
-                if dependents > 0 {
+                // Retain only for dependents that can still reference
+                // the output — one already settled (e.g. skipped via a
+                // different failed prereq while this step was in
+                // flight) will never call settle_prereqs_of again
+                // (diff review MINOR-4).
+                let unsettled = self.dependents[&step]
+                    .iter()
+                    .filter(|d| !self.states[d].is_terminal())
+                    .count();
+                if unsettled > 0 {
                     self.outputs.insert(step, output);
-                    self.pending_refs.insert(step, dependents);
+                    self.pending_refs.insert(step, unsettled);
                 }
                 false
             }

@@ -365,7 +365,7 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
     let mut aborted = false;
     let mut deadline_hit = false;
     let initial = scheduler.take_initial_ready();
-    feed_ready(
+    if feed_ready(
         initial,
         &plan,
         &mut scheduler,
@@ -376,8 +376,11 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
         sink.as_ref(),
         ctx.task_id,
         &row_ids,
-    );
-    if !scheduler.is_settled() {
+        fail_fast,
+    ) {
+        aborted = true;
+    }
+    if !aborted && !scheduler.is_settled() {
         loop {
             match stream.next().await {
                 Some(FanoutEvent::Item { index, outcome }) => {
@@ -410,7 +413,7 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
                         aborted = true;
                         break;
                     }
-                    feed_ready(
+                    if feed_ready(
                         progress.newly_ready,
                         &plan,
                         &mut scheduler,
@@ -421,7 +424,11 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
                         sink.as_ref(),
                         ctx.task_id,
                         &row_ids,
-                    );
+                        fail_fast,
+                    ) {
+                        aborted = true;
+                        break;
+                    }
                     if scheduler.is_settled() {
                         break;
                     }
@@ -518,7 +525,9 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
 /// Resolve + schema-recheck each ready step and feed it to the window;
 /// a resolution/validation failure settles the step as `Failed`
 /// synchronously (cascading), which may ready or skip further steps —
-/// processed iteratively.
+/// processed iteratively. Under `fail_fast`, the first such failure
+/// stops feeding and returns `true` so the caller aborts the plan
+/// (diff review MAJOR-1 — a feed-time failure is a step failure).
 #[allow(clippy::too_many_arguments)]
 fn feed_ready(
     ready: Vec<TaskId>,
@@ -531,7 +540,8 @@ fn feed_ready(
     sink: Option<&FrameSink>,
     plan_task: TaskId,
     row_ids: &Arc<parking_lot::Mutex<HashMap<TaskId, TaskId>>>,
-) {
+    fail_fast: bool,
+) -> bool {
     let mut queue = ready;
     while !queue.is_empty() {
         let node_id = queue.remove(0);
@@ -579,11 +589,15 @@ fn feed_ready(
                             .and_modify(|r| r.state = StepState::Skipped);
                         emit_step_frame(sink, plan_task, *skipped, records, row_ids);
                     }
+                    if fail_fast {
+                        return true;
+                    }
                     queue.extend(progress.newly_ready);
                 }
             }
         }
     }
+    false
 }
 
 fn record_settled(
@@ -1082,6 +1096,34 @@ mod tests {
             .expect("summary frame");
         assert_eq!(summary["plan_summary"]["ok"], 2);
         assert_eq!(summary["plan_summary"]["total"], 2);
+    }
+
+    #[tokio::test]
+    async fn t11_fail_fast_honors_feed_time_failures() {
+        // Diff review MAJOR-1: a pointer-miss at resolution time is a
+        // step failure — under fail_fast the plan must abort and
+        // terminal-ize Failed, not report Done with failed steps.
+        let ids = sorted_ids(3);
+        let (a, b, c_id) = (ids[0], ids[1], ids[2]);
+        let exec = FakePlanExec::new(1, 100);
+        let cap = PlanExecCapability::new(exec.clone());
+        let c = ctx();
+        let input = json!({ "plan": plan_json(
+            vec![
+                node_of(a, json!({"msg": "one"})),
+                node_of(b, json!({"x": {"$task_output": a.0.to_string(), "pointer": "/nope"}})),
+                node_of(c_id, json!({"independent": true})),
+            ],
+            // c depends on NOTHING but is sequenced after b's failure
+            // window via the chain a→b; keep c independent so the test
+            // proves the abort stops even unrelated branches.
+            vec![(b, a)],
+        )});
+        let err = cap
+            .execute(&c, input)
+            .await
+            .expect_err("fail_fast plan must fail on a feed-time failure");
+        assert!(err.to_string().contains("aborted"), "{err}");
     }
 
     #[tokio::test(start_paused = true)]

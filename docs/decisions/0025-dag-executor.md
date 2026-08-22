@@ -70,6 +70,15 @@ Recursion guard: step capabilities `plan.execute` and `brain.plan` are
 rejected — no nested plans in 4.3. `mesh.*` steps are allowed (their
 local scans run in-process per ADR-0022; no extra executor permit).
 
+Two accepted looseness notes (diff review MINOR-5/6): the manifest
+union has **no liveness filter** — a capability advertised only by a
+departed peer validates, and its step then fails at the dispatch
+eligibility window (carried risk 11; a liveness filter is the 4.4
+follow-up), with first-seen-wins on schema conflicts across manifests;
+and step rows **drop the parent task's tags** (matching `submit_remote`
+precedent) — an interactive plan's LLM steps lose the batcher-bypass
+tag until tag propagation is designed (fail-closed for policy tags).
+
 **`Plan.sig` is NOT verified in 4.3.** `brain.plan` emits the unsigned
 inner plan; trust rides the signed `plan.execute` **Task** envelope that
 carries the plan as input, exactly as every other capability input is
@@ -89,13 +98,22 @@ holding an executor permit.
 ## Failure policy — single-layered
 
 The controller always runs `ReturnPartial`; the **driver** owns policy,
-keyed by the plan-task's own `execution.on_partial` (no new plan field):
+keyed by the `plan.execute` **input field `on_failure`**
+(`"fail_fast"` default | `"continue"`). This deviates from the plan
+review's original "key off the envelope's `execution.on_partial`":
+capabilities never see the task envelope (`ExecutionContext`
+deliberately carries no execution policy — promoting it is 37-site
+churn owned by 4.5), so the knob rides the input, mirroring
+`timeout_ms`. The CLI maps `--keep-going` → `"continue"`.
 
-- `FailFast` (the envelope default): first `Failed`/`TimedOut` step →
-  stop feeding ready steps, drop the stream (cancelling in-flight runner
-  futures), `skip_remaining()`.
-- `ReturnPartial` / `Wait` (aliased per ADR-0023): independent branches
-  continue; only transitive dependents of a failed step are skipped.
+- `fail_fast` (default): the first `Failed`/`TimedOut` step — including
+  a **feed-time** failure (`$task_output` resolution or resolved-input
+  schema recheck) — stops feeding ready steps, drops the stream
+  (cancelling in-flight runner futures), and `skip_remaining()`s; the
+  plan task terminal-izes `Failed`.
+- `continue` (and any future `Wait`, aliased per ADR-0023): independent
+  branches continue; only transitive dependents of a failed step are
+  skipped.
 
 `DagSummary` is authoritative; the controller's `FanoutSummary` is
 discarded. In-flight rows dropped on abort keep executing to their own

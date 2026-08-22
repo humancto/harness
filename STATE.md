@@ -119,6 +119,15 @@ These will land alongside their natural Phase 3 home, not as a "phase 2.10":
 
 | #46 | 4.3  | DAG executor (ADR-0025): pure `DagScheduler` (Kahn ready-sets, exact skip-cascade, output retention) + `plan.execute` driver (channel-fed 4.1 controller, unpinned signed step rows with `parent`/`plan_id`, `$task_output` threading + resolved-input schema recheck, driver-owned FailFast/continue, try-acquire one-plan-per-node) + `StorePlanExec` wiring + `list_tasks_by_plan` + `Signature` JSON seq-visitor + CLI `harness plan`/`exec`. m05 E2E on a real daemon. +34 tests |
 
+4.3 reviews: plan round 1 REVISE (2 blockers fixed pre-implementation: try-acquire
+one-plan permit instead of queuing; entry schema index from the manifest union). Diff
+round REVISE → fixed in-PR: fail_fast now honors feed-time (resolution/schema-recheck)
+step failures; ADR-0025 corrected to the `on_failure` input-field mechanism; UTF-8-safe
+CLI preview truncation; DagScheduler retains outputs only for unsettled dependents.
+**Carried (ADR-0025 documented): manifest union lacks a liveness filter (capability from
+a departed peer validates then fails at the eligibility window — 4.4 follow-up), and step
+rows drop parent-task tags (interactive plans lose the LLM batcher-bypass tag).**
+
 4.1 review round 1 (plan): 2 majors fixed pre-implementation — index-resolved failure
 provenance; two controller instances so local scans stay ≤4 and remote submission isn't
 starved behind local work. `PartialPolicy::Wait` aliased to `ReturnPartial` at the

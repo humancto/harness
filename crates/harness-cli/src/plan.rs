@@ -265,14 +265,7 @@ fn render_plan(plan: &JsonValue) -> RunOutcome {
         let short = &id[..id.len().min(8)];
         let input_preview = node
             .get("input")
-            .map(|i| {
-                let s = i.to_string();
-                if s.len() > 60 {
-                    format!("{}…", &s[..60])
-                } else {
-                    s
-                }
-            })
+            .map(|i| truncate_chars(&i.to_string(), 60))
             .unwrap_or_default();
         if deps.is_empty() {
             out.push_str(&format!("  {short}  {cap}  {input_preview}\n"));
@@ -291,6 +284,20 @@ fn render_plan(plan: &JsonValue) -> RunOutcome {
         stderr: String::new(),
         code: 0,
     }
+}
+
+/// Truncate at a char boundary at or below `max_bytes` (JSON strings
+/// carry raw UTF-8 — a byte slice can split a multi-byte char and
+/// panic; diff review MAJOR-3).
+fn truncate_chars(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &s[..cut])
 }
 
 /// Render a plan.execute aggregate.
@@ -319,7 +326,20 @@ fn render_exec(output: &JsonValue) -> RunOutcome {
             .and_then(JsonValue::as_u64)
             .unwrap_or(0),
     );
-    let mut failed = 0u64;
+    // Exit code from the aggregate counts, not error-string presence
+    // (diff review MINOR-7).
+    let bad = output
+        .get("failed")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0)
+        + output
+            .get("timed_out")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0)
+        + output
+            .get("skipped")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0);
     if let Some(steps) = output.get("steps").and_then(JsonValue::as_object) {
         let mut ids: Vec<&String> = steps.keys().collect();
         ids.sort_unstable();
@@ -332,10 +352,7 @@ fn render_exec(output: &JsonValue) -> RunOutcome {
                 .unwrap_or("?");
             let state = s.get("state").and_then(JsonValue::as_str).unwrap_or("?");
             match s.get("error").and_then(JsonValue::as_str) {
-                Some(err) => {
-                    failed += 1;
-                    out.push_str(&format!("  {short}  {cap}  {state} — {err}\n"));
-                }
+                Some(err) => out.push_str(&format!("  {short}  {cap}  {state} — {err}\n")),
                 None => out.push_str(&format!("  {short}  {cap}  {state}\n")),
             }
         }
@@ -343,7 +360,7 @@ fn render_exec(output: &JsonValue) -> RunOutcome {
     RunOutcome {
         stdout: out,
         stderr: String::new(),
-        code: i32::from(failed > 0),
+        code: i32::from(bad > 0),
     }
 }
 
@@ -374,6 +391,22 @@ mod tests {
             out.stdout
         );
         assert!(out.stdout.contains("⇐ depends on [aaaaaaaa]"));
+    }
+
+    #[test]
+    fn plan_listing_truncates_non_ascii_previews_safely() {
+        // Diff review MAJOR-3: byte-slicing a UTF-8 JSON string panics
+        // on a char boundary; the preview must truncate char-safely.
+        let a = "aaaaaaaa-0000-7000-8000-000000000001";
+        let long_unicode = "é".repeat(80); // 2 bytes per char
+        let plan = json!({
+            "name": "unicode",
+            "tasks": { a: { "id": a, "capability": "echo", "input": {"msg": long_unicode} } },
+            "edges": [],
+        });
+        let out = render_plan(&plan); // must not panic
+        assert_eq!(out.code, 0);
+        assert!(out.stdout.contains('…'), "preview truncated");
     }
 
     #[test]
