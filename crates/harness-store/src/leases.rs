@@ -232,6 +232,24 @@ impl Store {
         })
     }
 
+    /// Atomically transition `pending|claimed → expired` WITHOUT
+    /// touching the task row. The dispatch runtime's terminal-expiry
+    /// branch must win this CAS before writing any terminal state, so
+    /// an in-flight result (`try_complete_pending_or_claimed`) and the
+    /// expiry path cannot both terminate the same task (3.3-fanout
+    /// PR-A2 review M1). Returns `Ok(false)` when the lease is already
+    /// terminal — the caller lost the race and must not write anything.
+    pub fn try_expire_lease(&self, lease_id: LeaseId) -> Result<bool, StoreError> {
+        self.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE leases SET state = 'expired'
+                  WHERE lease_id = ? AND state IN ('pending', 'claimed')",
+                params![lease_id.0.as_bytes()],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
     /// Atomically transition `pending|claimed → completed`. The result
     /// path uses this instead of [`Store::try_complete`]: a worker's
     /// `TaskClaim` travels on a different stream than its result, so a

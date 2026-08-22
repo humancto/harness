@@ -99,6 +99,14 @@ From the PR-A1 diff review (APPROVE, 5 minors) + ADR-0017:
 7. **Federated cardinality routes to a single node until Phase 4.5** (documented in ADR-0017); `redundancy=2` speculative execution untouched (6.2).
 8. **`FinalResult.started_at`/`wall_ms` not tracked** until Phase 5 cost tracking (mirror `finished_at`/0).
 
+From the PR-A2 diff review (M1/M2/m4 fixed in-PR; deferred minors below):
+
+9. **Send-failure resets bypass `max_attempts`** — a heartbeat-live but unsendable peer produces a ~10 Hz dispatch→lease→reset loop (bounded only by the peer going stale). Belongs to the 4.6 backoff work (R16).
+10. **Dispatch batch head-of-line** — 16 persistently-undispatchable FIFO tasks can stall dispatch for up to the eligibility window; skip-known-failing or rotate the batch in 4.x scheduler work.
+11. **Unknown-capability tasks** now fail after the 30 s eligibility window instead of instantly (pre-A2 the executor failed them immediately); consider a fast-fail when NO node advertises the capability.
+12. **`SubmitRequest.execution` unclamped** — authenticated callers can set ~49-day lease/timeout values; `redundancy != 1` accepted but ignored until 6.2. Add sanity clamps in the Phase 4 scheduler PR.
+13. `elig_failures`/`reply` map entries can strand if a future cancel API removes tasks out-of-band; sweep or key eviction when 5.x cancellation lands.
+
 ## Open decisions / carried risks
 
 - **Phase 0 review surfaced two Risks** to address before Phase 3 (not blocking now):

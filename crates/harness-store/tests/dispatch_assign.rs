@@ -248,3 +248,34 @@ fn t10_submitted_to_failed_supervisor_hop_is_legal() {
         .expect("supervisor hop"));
     assert_eq!(s.task_state(id).expect("state"), Some(TaskState::Failed));
 }
+
+#[test]
+fn t11_try_expire_lease_cas_semantics() {
+    let s = fresh_store();
+    let id = TaskId::new_v7();
+    s.insert_task(&dummy_task(id)).expect("insert");
+    let node = NodeId::from_bytes(NODE_A);
+    assert!(s.try_dispatch_task(id, node).expect("dispatch"));
+    let lease = s.create_lease(id, node, 60_000, 1).expect("lease");
+
+    // Wins from pending; task row untouched.
+    assert!(s.try_expire_lease(lease.lease_id).expect("expire"));
+    assert_eq!(
+        s.task_state(id).expect("state"),
+        Some(TaskState::Dispatched)
+    );
+    // Second attempt loses (already terminal).
+    assert!(!s.try_expire_lease(lease.lease_id).expect("re-expire"));
+
+    // Completed lease: expiry loses.
+    let id2 = TaskId::new_v7();
+    s.insert_task(&dummy_task(id2)).expect("insert2");
+    assert!(s.try_dispatch_task(id2, node).expect("dispatch2"));
+    let lease2 = s.create_lease(id2, node, 60_000, 1).expect("lease2");
+    assert!(s
+        .try_complete_pending_or_claimed(lease2.lease_id)
+        .expect("complete"));
+    assert!(!s
+        .try_expire_lease(lease2.lease_id)
+        .expect("expire completed"));
+}

@@ -242,19 +242,16 @@ fn resolve_targets(args: &RunArgs, mesh: &[NodeRef]) -> Result<Vec<NodeRef>> {
         }
         return Ok(matched);
     }
+    let self_target = || {
+        mesh.iter()
+            .find(|n| n.is_self)
+            .cloned()
+            .map(|n| vec![n])
+            .ok_or_else(|| anyhow::anyhow!("local node missing from the daemon's mesh view"))
+    };
     match args.on.as_deref() {
-        None => Ok(mesh
-            .iter()
-            .find(|n| n.is_self)
-            .cloned()
-            .map(|n| vec![n])
-            .unwrap_or_default()),
-        Some(sel) if sel.eq_ignore_ascii_case("self") => Ok(mesh
-            .iter()
-            .find(|n| n.is_self)
-            .cloned()
-            .map(|n| vec![n])
-            .unwrap_or_default()),
+        None => self_target(),
+        Some(sel) if sel.eq_ignore_ascii_case("self") => self_target(),
         Some(sel) => {
             let sel_lower = sel.to_ascii_lowercase();
             let by_name = mesh

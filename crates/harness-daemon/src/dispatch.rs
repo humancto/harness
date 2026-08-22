@@ -300,13 +300,31 @@ impl DispatchRuntime {
         let lease = match self.store.create_lease(task.id, node, ttl, attempt) {
             Ok(l) => l,
             Err(e) => {
+                // A store error minting the lease is fatal for this task:
+                // `Dispatched → Submitted` is not a legal hop without a
+                // lease to expire, so the task terminates as Cancelled
+                // WITH a visible reason (review M2 — no silent terminal).
                 tracing::warn!(target: "harness.dispatch", ?e, "create_lease");
-                // Roll the dispatch back so the task re-routes.
+                let msg = format!("dispatch aborted: lease creation failed: {e}");
                 let _ = self.store.try_transition_task(
                     task.id,
                     TaskState::Dispatched,
                     TaskState::Cancelled,
                 );
+                let now_ms = now_unix_ms();
+                if let Err(we) =
+                    self.store
+                        .write_task_result_failed(task.id, &msg, now_ms, self.local_id)
+                {
+                    tracing::warn!(target: "harness.dispatch", ?we, "write lease-failure result");
+                }
+                let _ = self.store.replica_apply_local(&ReplicatedTaskState {
+                    task_id: task.id,
+                    state: ReplicatedState::Cancelled,
+                    at_ms: now_ms,
+                    source: self.local_id,
+                    output_preview: Some(msg.into_bytes().into_iter().take(256).collect()),
+                });
                 return;
             }
         };
@@ -389,9 +407,26 @@ impl DispatchRuntime {
                 .flatten()
                 .map_or(3, |t| u32::from(t.retry.max_attempts));
             if lease.attempt >= max_attempts {
-                // Terminal: walk the issuer-side row to Expired, then
-                // retire the lease (the guarded reset no-ops on the
-                // already-Expired row).
+                // Terminal expiry joins the lease-CAS discipline (review
+                // M1): win `pending|claimed → expired` FIRST. Losing
+                // means a result completed the lease between
+                // `find_expired`'s snapshot and now — that result owns
+                // the terminal state; write nothing.
+                match self.store.try_expire_lease(lease.lease_id) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::debug!(
+                            target: "harness.dispatch",
+                            task = %lease.task_id.0,
+                            "expiry lost the lease CAS to an in-flight result; skipping"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "harness.dispatch", ?e, "try_expire_lease");
+                        continue;
+                    }
+                }
                 for from in [
                     TaskState::Dispatched,
                     TaskState::Claimed,
@@ -412,7 +447,6 @@ impl DispatchRuntime {
                 {
                     tracing::warn!(target: "harness.dispatch", ?e, "write expired result");
                 }
-                let _ = self.store.expire_and_reset_task(lease.lease_id);
                 let _ = self.store.replica_apply_local(&ReplicatedTaskState {
                     task_id: lease.task_id,
                     state: ReplicatedState::Expired,
@@ -1113,6 +1147,111 @@ mod tests {
             "terminal row untouched"
         );
         assert_eq!(f.runtime.reply_obligations_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn t09_result_wins_race_expiry_writes_nothing() {
+        // M1 ordering A: the result lands (lease completed) after
+        // find_expired snapshotted the lease. The terminal-expiry
+        // branch must lose the lease CAS and leave the Done row alone.
+        let f = fixture();
+        let task = signed_task(&f.local);
+        f.store.insert_task(&task).expect("insert");
+        assert!(f
+            .store
+            .try_dispatch_task(task.id, f.remote.node_id())
+            .expect("dispatch"));
+        // attempt >= max_attempts (3) and TTL already elapsed → the
+        // expire pass takes the terminal branch for this lease.
+        let lease = f
+            .store
+            .create_lease(task.id, f.remote.node_id(), 1, 3)
+            .expect("lease");
+        std::thread::sleep(Duration::from_millis(5));
+
+        // The result arrives first…
+        let result = signed_result(&f.remote, task.id, true);
+        f.runtime.on_result(
+            f.remote.node_id(),
+            TaskResultMsg {
+                seq: 0,
+                lease_id: lease.lease_id,
+                result,
+                sig: Signature::from_bytes([0u8; 64]),
+            },
+        );
+        assert_eq!(
+            f.store.task_state(task.id).expect("state"),
+            Some(TaskState::Done)
+        );
+
+        // …then the expiry pass runs over the same (now-completed) lease.
+        f.runtime.expire_pass();
+
+        assert_eq!(
+            f.store.task_state(task.id).expect("state"),
+            Some(TaskState::Done),
+            "expiry must not disturb the completed task"
+        );
+        let row = f
+            .store
+            .load_task_result(task.id)
+            .expect("load")
+            .expect("row");
+        assert!(
+            row.error.is_none(),
+            "Done row must not be overwritten: {row:?}"
+        );
+        assert_eq!(row.completed_by, f.remote.node_id());
+    }
+
+    #[tokio::test]
+    async fn t10_expiry_wins_race_late_result_dropped() {
+        // M1 ordering B: terminal expiry wins the lease CAS; the late
+        // result must be dropped without overwriting the Expired row.
+        let f = fixture();
+        let task = signed_task(&f.local);
+        f.store.insert_task(&task).expect("insert");
+        assert!(f
+            .store
+            .try_dispatch_task(task.id, f.remote.node_id())
+            .expect("dispatch"));
+        let lease = f
+            .store
+            .create_lease(task.id, f.remote.node_id(), 1, 3)
+            .expect("lease");
+        std::thread::sleep(Duration::from_millis(5));
+
+        f.runtime.expire_pass();
+        assert_eq!(
+            f.store.task_state(task.id).expect("state"),
+            Some(TaskState::Expired)
+        );
+
+        let result = signed_result(&f.remote, task.id, true);
+        f.runtime.on_result(
+            f.remote.node_id(),
+            TaskResultMsg {
+                seq: 0,
+                lease_id: lease.lease_id,
+                result,
+                sig: Signature::from_bytes([0u8; 64]),
+            },
+        );
+        assert_eq!(
+            f.store.task_state(task.id).expect("state"),
+            Some(TaskState::Expired),
+            "late result must not resurrect an expired task"
+        );
+        let row = f
+            .store
+            .load_task_result(task.id)
+            .expect("load")
+            .expect("row");
+        assert!(
+            row.error.as_deref().unwrap_or("").contains("lease expired"),
+            "expiry reason must survive the late result: {row:?}"
+        );
     }
 
     #[tokio::test]
