@@ -14,6 +14,7 @@ pub mod error;
 pub mod executor;
 pub mod fanout;
 pub mod index;
+pub mod results;
 
 pub use dispatcher::{DispatchPlan, Dispatcher, LiveSet, RoundRobin, StaticLiveSet};
 pub use error::DispatchError;
@@ -23,3 +24,4 @@ pub use fanout::{
     WindowPolicy,
 };
 pub use index::{CapabilityIndex, ScopeIndex};
+pub use results::{task_results, ResultCtx, ResultMapper, TaskResultStream};
