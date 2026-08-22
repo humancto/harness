@@ -1,7 +1,30 @@
 # Harness Implementation State
 
-**Current phase:** 3 (fleet exec live; 3.3-gossip / 3.3-ui / 3.2-stream / 3.6-encrypted / 3.11 remain)
-**Last updated:** 2026-08-22 (post-3.3-fanout PR-A2)
+**Current phase:** 4 — Distribution patterns (Phase 3 COMPLETE as of #42)
+**Last updated:** 2026-08-22 (post-3.2-stream, Phase 3 rollover)
+
+## Phase 3 summary (post-merge) — COMPLETE
+
+Every 3.x roadmap item is checked. Demo gate **satisfied**: `harness run --all -- uname -a`
+executes across QUIC-connected daemons with exactly-once semantics (money tests m01–m03),
+and `harness search` / `harness grep` federate across every live node's `fs.*` scopes with
+merged, origin-annotated results (m04). Tests: **890 passing** (410 at Phase 2 close).
+
+Phase 3 PRs after the A2 table below:
+
+| PR  | Item        | What shipped                                                                                                                                                     |
+| --- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| #36 | 3.3-A2      | Dispatch runtime + `harness run --all/--on/--where` (details in the A2 row below)                                                                                 |
+| #37 | 3.7         | `mcp.proxy` via rmcp — subprocess MCP servers exposed as `mcp.<server>.<tool>`                                                                                    |
+| #38 | 3.11        | `mesh.grep` / `mesh.search` federated wrappers + CLI `harness search`/`grep`. ADR-0022                                                                            |
+| #39 | 3.3-ui      | UI Remote Shell page with `[node-name]` interleaving                                                                                                              |
+| #40 | 3.6-encrypted | Encrypted-at-rest secrets (ChaCha20-Poly1305, blake3-derived key) + `secret_tags` manifest field + `SecretAwareLiveSet` routing. ADR-0021                        |
+| #41 | 3.3-gossip  | `harness.gossip.state` replica sync over QUIC + heartbeat `replica_head` anti-entropy + `WS /api/v1/runs/<id>` + axum `:id` route fix. ADR-0019                    |
+| #42 | 3.2-stream  | shell.exec line-frame streaming: frame sink → coalesced signed `PartialResult` batches (≤20/s/task) over `harness.task.partial` → 500-frame ring buffers → `partials` in `GET /tasks/:id`. ADR-0020 |
+
+Phase-2 carryovers 1/2/3/5 all closed (gossip channel, replica_head, dispatch runtime, WS run
+stream). Carryovers 4 (JSON-Schema input validation at submit), 6 (registry compile-time dup
+assert), 7 (full `input_schema` in `GET /capabilities`) remain open — none block Phase 4.
 
 ## Phase 2 summary (post-merge)
 
@@ -85,6 +108,15 @@ These will land alongside their natural Phase 3 home, not as a "phase 2.10":
 ## Blocked
 
 - (nothing)
+
+## Phase 4 — next up
+
+Spine is sequential: **4.1 FanoutController** → 4.2 result streams → 4.3 DAG executor →
+4.4 resource-aware scheduler → 4.5 federated lifecycle (owes the ADR-0022 permit-release
+fix) → 4.6 lease extension/retry backoff (owes carried risks 9/10) → 4.7 backpressure
+tests → 4.8 UI DAG viz. Phase-4-owned obligations from below: risks 2 (drop-guard), 9
+(send-failure backoff → 4.6), 10 (dispatch head-of-line → 4.4), 11 (unknown-capability
+fast-fail), 12 (`SubmitRequest.execution` clamps → 4.4).
 
 ## 3.3-fanout carried risks (review follow-ups; owners named)
 
