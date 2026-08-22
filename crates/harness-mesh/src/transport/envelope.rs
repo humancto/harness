@@ -66,6 +66,13 @@ pub mod channels {
     /// Worker → issuer terminal results (`TaskResultMsg`).
     pub const TASK_RESULT: &str = "harness.task.result";
 
+    /// Worker → issuer streaming progress (`PartialResult`) — line
+    /// frames from `shell.exec` streaming (3.2-stream, ADR-0020).
+    /// Fire-and-forget: partials are best-effort progress; the terminal
+    /// result on [`TASK_RESULT`] is authoritative. Replay-protected via
+    /// `PartialResult::seq` (stamped per-stream by the sender task).
+    pub const TASK_PARTIAL: &str = "harness.task.partial";
+
     /// LWW replica sync envelopes (PR-B / 3.3-gossip).
     pub const GOSSIP_STATE: &str = "harness.gossip.state";
 
@@ -79,6 +86,7 @@ pub mod channels {
             TASK_ASSIGN => Some(TASK_ASSIGN),
             TASK_CLAIM => Some(TASK_CLAIM),
             TASK_RESULT => Some(TASK_RESULT),
+            TASK_PARTIAL => Some(TASK_PARTIAL),
             GOSSIP_STATE => Some(GOSSIP_STATE),
             _ => None,
         }
@@ -90,6 +98,9 @@ pub mod channels {
     /// - result: `shell.exec` caps stdout+stderr at 1 MiB each and JSON
     ///   escaping can ~4× that — 8 MiB.
     /// - announce: manifests scale with capability count — 256 KiB.
+    /// - partial: coalesced line batches, bounded at the emitter (8 KiB
+    ///   lines, 4 KiB batch budget) so 64 KiB is generous headroom even
+    ///   after JSON escaping (ADR-0020).
     /// - everything else: the legacy 64 KiB default.
     #[must_use]
     pub fn frame_cap(channel: &'static str) -> usize {
@@ -97,6 +108,7 @@ pub mod channels {
             TASK_ASSIGN => 1024 * 1024,
             TASK_RESULT => 8 * 1024 * 1024,
             ANNOUNCE | GOSSIP_STATE => 256 * 1024,
+            TASK_PARTIAL => 64 * 1024,
             _ => super::MAX_FRAME_BYTES,
         }
     }
@@ -147,6 +159,12 @@ impl Sequenced for harness_core::TaskClaim {
 }
 
 impl Sequenced for harness_core::TaskResultMsg {
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+}
+
+impl Sequenced for harness_core::PartialResult {
     fn seq(&self) -> u64 {
         self.seq
     }
@@ -661,6 +679,28 @@ mod tests {
     }
 
     // --- Sequenced ---
+
+    #[test]
+    fn task_partial_channel_is_known_with_64k_cap() {
+        assert_eq!(
+            channels::known("harness.task.partial"),
+            Some(channels::TASK_PARTIAL)
+        );
+        assert_eq!(channels::frame_cap(channels::TASK_PARTIAL), 64 * 1024);
+    }
+
+    #[test]
+    fn sequenced_impl_for_partial_result_returns_seq_field() {
+        let p = harness_core::PartialResult {
+            task_id: TaskId::new_v7(),
+            node_id: NodeId::from_bytes([0x02; 16]),
+            seq: 17,
+            progress: 0.0,
+            output_chunk: serde_json::Value::Null,
+            sig: Signature::from_bytes([0u8; 64]),
+        };
+        assert_eq!(<harness_core::PartialResult as Sequenced>::seq(&p), 17);
+    }
 
     #[test]
     fn sequenced_impl_for_heartbeat_returns_seq_field() {

@@ -40,8 +40,9 @@ pub fn api_router(state: ApiState) -> Router {
         // axum 0.7 / matchit 0.7 path params use `:id` — the earlier
         // `{id}` spelling registered a LITERAL "{id}" segment (axum 0.8
         // syntax), so `GET /api/v1/tasks/<uuid>` always fell through to
-        // the 404 fallback. Fixed alongside 3.3-gossip's runs route;
-        // regression-tested in tests/runs_websocket.rs.
+        // the 404 fallback. Found independently by 3.3-gossip and
+        // 3.2-stream; regression-tested in runs_websocket.rs and the
+        // partials API test.
         .route("/tasks/:id", get(tasks::get_handler))
         .route("/runs/:id", get(runs::ws_run))
         .fallback(api_not_found)

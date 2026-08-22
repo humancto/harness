@@ -29,8 +29,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use harness_core::{
-    Heartbeat, Identity, LeaseId, NodeId, NodeManifest, ReplicaSyncEnvelope, Signable, TaskAssign,
-    TaskClaim, TaskResultMsg,
+    Heartbeat, Identity, LeaseId, NodeId, NodeManifest, PartialResult, ReplicaSyncEnvelope,
+    Signable, TaskAssign, TaskClaim, TaskResultMsg,
 };
 use harness_mesh::heartbeat::{HeartbeatService, PeerTable, HEARTBEAT_INTERVAL, PEER_TIMEOUT};
 use harness_mesh::transport::{channels, ChannelStream, Connection, TransportError};
@@ -53,6 +53,15 @@ pub(crate) trait TaskChannelHandlers: Send + Sync + 'static {
     fn on_assign(&self, from: NodeId, msg: TaskAssign);
     fn on_claim(&self, from: NodeId, msg: TaskClaim);
     fn on_result(&self, from: NodeId, msg: TaskResultMsg);
+    /// Streaming progress from a worker (3.2-stream, ADR-0020). The
+    /// transport verified the envelope signature + per-stream seq and
+    /// the recv loop checked `msg.node_id == from`. Fire-and-forget:
+    /// implementations buffer for observability; the terminal result
+    /// stays authoritative. Default no-op so handler impls that predate
+    /// streaming keep compiling.
+    fn on_partial(&self, from: NodeId, msg: PartialResult) {
+        let _ = (from, msg);
+    }
     /// An enqueued `TaskAssign` could not be delivered (queue full, send
     /// error after retry, or no live connection). The dispatcher resets
     /// the lease so the task re-routes.
@@ -115,6 +124,10 @@ pub(crate) enum OutboundMsg {
     Claim(TaskClaim),
     Result(TaskResultMsg),
     Gossip(ReplicaSyncEnvelope),
+    /// Streaming progress (3.2-stream). Fire-and-forget: a failed send
+    /// is dropped (no lease reset, no retry beyond the sender's single
+    /// evict-and-retry) — the terminal result is authoritative.
+    Partial(PartialResult),
 }
 
 impl OutboundMsg {
@@ -126,6 +139,7 @@ impl OutboundMsg {
             OutboundMsg::Claim(_) => channels::TASK_CLAIM,
             OutboundMsg::Result(_) => channels::TASK_RESULT,
             OutboundMsg::Gossip(_) => channels::GOSSIP_STATE,
+            OutboundMsg::Partial(_) => channels::TASK_PARTIAL,
         }
     }
 }
@@ -447,6 +461,12 @@ impl PeerNet {
                 ch.send(&r).await
             }
             OutboundMsg::Gossip(g) => ch.send(g).await,
+            OutboundMsg::Partial(p) => {
+                let mut p = p.clone();
+                p.seq = ch.next_seq();
+                sign_or_protocol_err(&mut p, identity)?;
+                ch.send(&p).await
+            }
         }
     }
 
@@ -618,6 +638,24 @@ impl PeerNet {
                                     target: "harness.gossip",
                                     peer = %peer_id,
                                     "gossip received but no store configured; dropped"
+                                );
+                            }
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                n if n == channels::TASK_PARTIAL => {
+                    match ch.recv_sequenced::<PartialResult>().await {
+                        Ok(p) => {
+                            if p.node_id == peer_id {
+                                self.handlers.on_partial(peer_id, p);
+                            } else {
+                                tracing::warn!(
+                                    target: "harness.fanout",
+                                    peer = %peer_id,
+                                    claimed = %p.node_id,
+                                    "partial node_id does not match connection peer; dropped"
                                 );
                             }
                             Ok(())
@@ -991,6 +1029,126 @@ mod tests {
         got.task
             .verify_signature(a.identity.public_key())
             .expect("inner sig");
+    }
+
+    struct RecordingPartialHandlers {
+        partials: ParkingMutex<Vec<(NodeId, harness_core::PartialResult)>>,
+    }
+
+    impl TaskChannelHandlers for RecordingPartialHandlers {
+        fn on_assign(&self, _: NodeId, _: TaskAssign) {}
+        fn on_claim(&self, _: NodeId, _: TaskClaim) {}
+        fn on_result(&self, _: NodeId, _: TaskResultMsg) {}
+        fn on_partial(&self, from: NodeId, msg: harness_core::PartialResult) {
+            self.partials.lock().push((from, msg));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn t06_partial_envelope_reaches_handlers_signed_and_stamped() {
+        // Worker (a) streams partials to issuer (b) over
+        // harness.task.partial; the sender task stamps the stream seq
+        // and signs with a's identity.
+        let recording = Arc::new(RecordingPartialHandlers {
+            partials: ParkingMutex::new(Vec::new()),
+        });
+        let a = build_node("node-a", Arc::new(NoopHandlers));
+        let b = build_node("node-b", recording.clone());
+        interconnect(&a, &b).await;
+
+        let task_id = TaskId::new_v7();
+        for i in 0..3 {
+            let partial = harness_core::PartialResult {
+                task_id,
+                node_id: a.identity.node_id(),
+                seq: 0, // placeholder; the sender task stamps the stream seq
+                progress: 0.0,
+                output_chunk: serde_json::json!({
+                    "frames": [{ "stream": "stdout", "line": format!("line-{i}") }],
+                }),
+                sig: Signature::from_bytes([0u8; 64]),
+            };
+            a.net
+                .send_to(b.identity.node_id(), OutboundMsg::Partial(partial))
+                .expect("enqueue");
+        }
+
+        wait_until(
+            || recording.partials.lock().len() == 3,
+            "partials delivered",
+        )
+        .await;
+        let got = recording.partials.lock();
+        for (i, (from, p)) in got.iter().enumerate() {
+            assert_eq!(*from, a.identity.node_id());
+            assert_eq!(p.task_id, task_id);
+            assert_eq!(p.node_id, a.identity.node_id());
+            // Stamped per-stream: 0,1,2 in send order.
+            assert_eq!(p.seq, i as u64);
+            assert_eq!(
+                p.output_chunk["frames"][0]["line"],
+                serde_json::json!(format!("line-{i}"))
+            );
+            // Signed by the sender task with a's identity.
+            p.verify_signature(a.identity.public_key()).expect("sig");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn t07_partial_replay_rejected_on_channel() {
+        // Raw transport pair (no PeerNet) so we control the seq: the
+        // same signed seq sent twice must be rejected by the receiving
+        // ChannelStream's replay slot.
+        let id_a = Arc::new(Identity::generate());
+        let id_b = Arc::new(Identity::generate());
+        let ta = Transport::bind(loopback(), id_a.clone(), TransportTrust::new()).expect("bind a");
+        let tb = Transport::bind(loopback(), id_b.clone(), TransportTrust::new()).expect("bind b");
+
+        let accept = tokio::spawn({
+            let t = tb.clone();
+            async move {
+                let inc = t.accept_one().await.expect("accept");
+                inc.accept(|_| true).expect("approve")
+            }
+        });
+        let conn_a = ta
+            .dial(tb.local_addr().expect("addr"), id_b.public_key())
+            .await
+            .expect("dial");
+        let conn_b = accept.await.expect("join");
+
+        let send_ch = conn_a
+            .channel(channels::TASK_PARTIAL)
+            .await
+            .expect("open channel");
+        let recv_task = tokio::spawn(async move {
+            let ch = conn_b.accept_channel().await.expect("accept channel");
+            assert_eq!(ch.name(), channels::TASK_PARTIAL);
+            let first = ch
+                .recv_sequenced::<harness_core::PartialResult>()
+                .await
+                .expect("first partial accepted");
+            assert_eq!(first.seq, 5);
+            let replay = ch
+                .recv_sequenced::<harness_core::PartialResult>()
+                .await
+                .expect_err("replayed seq must be rejected");
+            let msg = replay.to_string();
+            assert!(msg.contains("replay"), "unexpected error: {msg}");
+        });
+
+        let mut partial = harness_core::PartialResult {
+            task_id: TaskId::new_v7(),
+            node_id: id_a.node_id(),
+            seq: 5,
+            progress: 0.0,
+            output_chunk: serde_json::json!({"frames": []}),
+            sig: Signature::from_bytes([0u8; 64]),
+        };
+        partial.sign(&id_a).expect("sign");
+        send_ch.send(&partial).await.expect("send 1");
+        send_ch.send(&partial).await.expect("send 2 (wire accepts)");
+        recv_task.await.expect("recv task");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
