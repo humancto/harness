@@ -264,18 +264,35 @@ impl DaemonOrchestrator {
         // failures log + return; daemon continues without LLM caps.
         #[cfg(feature = "llm")]
         harness_capabilities::enrich_with_llm_local(&capabilities, policy_engine.clone()).await;
-        // Phase 3.6a: register the single `llm.cloud.claude` cap. The
-        // capability surfaces in the manifest unconditionally — at
-        // execute time it errors with `not configured` if the secret
-        // tag is missing. This is intentional: peers can see the cap
-        // exists and route to it, and the operator gets a clear
-        // diagnostic instead of silent absence.
+        // Phase 3.6a/3.6b: register the `llm.cloud.{claude,openai,gemini}`
+        // caps. Each capability surfaces in the manifest unconditionally
+        // — at execute time it errors with `not configured` if its
+        // secret tag is missing. This is intentional: peers can see the
+        // cap exists and route to it, and the operator gets a clear
+        // diagnostic instead of silent absence. The reqwest client and
+        // batcher are shared across providers (connection-pool reuse;
+        // the batcher fingerprint pins the provider so cross-provider
+        // coalescing is impossible).
         #[cfg(feature = "llm")]
         {
             let cloud_client = reqwest::Client::new();
             let cloud_batcher =
                 std::sync::Arc::new(harness_capabilities::llm_batcher::LlmBatcher::from_env());
             harness_capabilities::enrich_with_llm_cloud_claude(
+                &capabilities,
+                secrets.clone(),
+                policy_engine.clone(),
+                cloud_batcher.clone(),
+                cloud_client.clone(),
+            );
+            harness_capabilities::enrich_with_llm_cloud_openai(
+                &capabilities,
+                secrets.clone(),
+                policy_engine.clone(),
+                cloud_batcher.clone(),
+                cloud_client.clone(),
+            );
+            harness_capabilities::enrich_with_llm_cloud_gemini(
                 &capabilities,
                 secrets.clone(),
                 policy_engine.clone(),

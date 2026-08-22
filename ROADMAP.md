@@ -60,8 +60,8 @@ When an item lands, flip its checkbox **in the same PR** as `STATE.md` is update
 - [x] **3.5** Local-LLM micro-batcher (PR #27). Dedup-within-window + interactive-tag bypass + forward-compat hook. ADR-0011 — true multi-prompt batching deferred until a vLLM/TGI backend lands (Ollama doesn't support it).
 - [ ] **3.6** `llm.cloud.{claude,openai,gemini}` capabilities + secrets-by-tag reference.
   - [x] **3.6a** Claude provider + `harness-vault` plaintext credential store + `Action::Secret` policy hook + `Capability::requires_secrets` manifest field (PR #28). ADR-0012.
-  - [ ] **3.6-openai** OpenAI provider (mechanical, mirrors 3.6a).
-  - [ ] **3.6-gemini** Gemini provider (mechanical, mirrors 3.6a).
+  - [x] **3.6-openai** OpenAI provider (mechanical, mirrors 3.6a).
+  - [x] **3.6-gemini** Gemini provider (mechanical, mirrors 3.6a).
   - [ ] **3.6-encrypted** Encrypted-at-rest + replicated credentials per PRD §10.5; tag-aware dispatcher routing on `requires_secrets`.
 - [ ] **3.7** `mcp.proxy` via `rmcp`: subprocess MCP servers, expose tools as `mcp.<server>.<tool>`.
 - [x] **3.8** `brain.plan` Template backend. `harness-brain` crate with `PlannerBackend` trait + four-state `PlanOutcome` + `TemplateBackend` (run:/shell:/...); `WeakCapabilityRegistry` for snapshot-without-leak; `Unsigned<Plan>` + `CapabilityRef` in core. ADR-0013.

@@ -1174,6 +1174,7 @@ dependencies = [
  "harness-core",
  "harness-policy",
  "harness-vault",
+ "jsonschema",
  "nix",
  "parking_lot",
  "reqwest",
