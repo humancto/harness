@@ -454,6 +454,150 @@ allow = [{ cmd = "/bin/cat" }]
     assert_eq!(out["stdout"].as_str().unwrap(), "");
 }
 
+// ───────────────────────────────────────────── Streaming (3.2-stream)
+
+use harness_capabilities::{FrameSink, LogFrame, StreamKind};
+use std::time::Instant;
+
+type FrameLog = Arc<parking_lot::Mutex<Vec<(Instant, LogFrame)>>>;
+
+fn recording_sink() -> (FrameSink, FrameLog) {
+    let log: FrameLog = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let log2 = log.clone();
+    let sink: FrameSink = Arc::new(move |_task, frame| {
+        log2.lock().push((Instant::now(), frame));
+    });
+    (sink, log)
+}
+
+fn streaming_cap(toml: &str, sink: FrameSink) -> ShellExecCapability {
+    let p = load_from_str(toml).expect("policy must parse");
+    ShellExecCapability::with_frame_sink(Arc::new(PolicyEngine::new(p)), sink)
+}
+
+const SH_POLICY: &str = r#"
+[shell]
+allow = [{ cmd = "/bin/sh", any_args = true }]
+"#;
+
+#[tokio::test]
+async fn t18_streaming_frames_arrive_incrementally_before_exit() {
+    let (sink, log) = recording_sink();
+    let cap = streaming_cap(SH_POLICY, sink);
+    let out = cap
+        .execute(
+            &ctx(),
+            serde_json::json!({
+                "cmd":  "/bin/sh",
+                "args": ["-c", "echo one; sleep 0.3; echo two; sleep 0.3; echo three"],
+            }),
+        )
+        .await
+        .expect("execute");
+    let finished = Instant::now();
+
+    // Final output is still complete — streaming does not consume it.
+    assert_eq!(out["exit_code"], serde_json::json!(0));
+    assert_eq!(out["stdout"].as_str().unwrap(), "one\ntwo\nthree\n");
+
+    let frames = log.lock();
+    let lines: Vec<&str> = frames.iter().map(|(_, f)| f.line.as_str()).collect();
+    assert_eq!(lines, vec!["one", "two", "three"]);
+    assert!(frames.iter().all(|(_, f)| f.stream == StreamKind::Stdout));
+
+    // ≥2 separate frame batches BEFORE process exit: "one" must have
+    // been framed well before the child finished (≥ 400ms earlier given
+    // the two 300ms sleeps), and "two" strictly between the endpoints.
+    let t_one = frames[0].0;
+    let t_three = frames[2].0;
+    assert!(
+        finished.duration_since(t_one) >= std::time::Duration::from_millis(400),
+        "first frame must arrive while the child is still running"
+    );
+    assert!(
+        t_three.duration_since(t_one) >= std::time::Duration::from_millis(400),
+        "frames must be spread across the run, not flushed at exit"
+    );
+    let t_two = frames[1].0;
+    assert!(t_two > t_one && t_two < t_three);
+}
+
+#[tokio::test]
+async fn t19_streaming_stderr_frames_tagged() {
+    let (sink, log) = recording_sink();
+    let cap = streaming_cap(SH_POLICY, sink);
+    let out = cap
+        .execute(
+            &ctx(),
+            serde_json::json!({
+                "cmd":  "/bin/sh",
+                "args": ["-c", "echo out; echo err 1>&2"],
+            }),
+        )
+        .await
+        .expect("execute");
+    assert_eq!(out["stdout"].as_str().unwrap(), "out\n");
+    assert_eq!(out["stderr"].as_str().unwrap(), "err\n");
+
+    let frames = log.lock();
+    assert!(frames
+        .iter()
+        .any(|(_, f)| f.stream == StreamKind::Stdout && f.line == "out"));
+    assert!(frames
+        .iter()
+        .any(|(_, f)| f.stream == StreamKind::Stderr && f.line == "err"));
+}
+
+#[tokio::test]
+async fn t20_streaming_timeout_preserves_partial_output_and_frames() {
+    // t09c's property, streaming form: the pre-timeout line survives in
+    // BOTH the final buffer and the frame stream.
+    let (sink, log) = recording_sink();
+    let cap = streaming_cap(SH_POLICY, sink);
+    let out = cap
+        .execute(
+            &ctx(),
+            serde_json::json!({
+                "cmd":  "/bin/sh",
+                "args": ["-c", "echo line1; sleep 60"],
+                "timeout_ms": 300,
+            }),
+        )
+        .await
+        .expect("execute");
+    assert_eq!(out["timed_out"], serde_json::json!(true));
+    assert_eq!(out["stdout"].as_str().unwrap(), "line1\n");
+
+    let frames = log.lock();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].1.line, "line1");
+}
+
+#[tokio::test]
+async fn t21_streaming_cap_still_enforced_and_frames_mirror_kept_bytes() {
+    let (sink, log) = recording_sink();
+    let p = load_from_str(SH_POLICY).expect("policy");
+    let cap =
+        ShellExecCapability::with_frame_sink_and_max(Arc::new(PolicyEngine::new(p)), sink, 256);
+    let out = cap
+        .execute(
+            &ctx(),
+            serde_json::json!({
+                "cmd":  "/bin/sh",
+                "args": ["-c", "head -c 4096 /dev/zero | tr '\\0' a"],
+            }),
+        )
+        .await
+        .expect("execute");
+    assert_eq!(out["stdout"].as_str().unwrap().len(), 256);
+    assert_eq!(out["stdout_truncated_bytes"], serde_json::json!(3840));
+
+    // Frames carry exactly the kept 256 bytes — nothing past the cap.
+    let frames = log.lock();
+    let framed_bytes: usize = frames.iter().map(|(_, f)| f.line.len()).sum();
+    assert_eq!(framed_bytes, 256, "frames must mirror the capped buffer");
+}
+
 // ───────────────────────────────────────────── Manifest
 
 #[test]

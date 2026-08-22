@@ -49,9 +49,9 @@ When an item lands, flip its checkbox **in the same PR** as `STATE.md` is update
 **Demo:** `harness run --all -- uname -a`; `harness search "term sheet"` federates across nodes.
 
 - [x] **3.1** Policy engine: parse `~/.harness/policy.toml`, allow/deny matching, evaluated **on the executing node** (PRD §10.4).
-- [ ] **3.2** `shell.exec` capability with streaming output (line-frames over QUIC) + policy check.
+- [x] **3.2** `shell.exec` capability with streaming output (line-frames over QUIC) + policy check.
   - [x] **3.2a** synchronous form (PR #24) — capability + policy gate + bounded buffers + timeout. ADR-0008.
-  - [ ] **3.2-stream** line-frame streaming output over QUIC (`harness.task.partial.<task_id>`).
+  - [x] **3.2-stream** line-frame streaming output over QUIC (`harness.task.partial` aggregate channel per ADR-0017) — frame sink + coalesced `PartialResult` batches + per-task ring buffers + `partials` in `GET /tasks/{id}`. ADR-0020.
 - [x] **3.3** CLI: `harness run --all|--on <node>|--where <expr>`. UI Remote Shell mode with `[node-name]` interleaving. **Complete** (3.3a + 3.3-fanout + 3.3-gossip + 3.3-ui).
   - [x] **3.3a** Local executor loop + `harness run --on self` + `GET /tasks/<id>` + `node_name` plumbing (PR #25). ADR-0009.
   - [x] **3.3-fanout** Cross-node dispatch over QUIC (`--all`, `--where`, dispatcher async runtime) — PRs #35 (wire+index plumbing) + A2 (dispatch runtime + CLI). ADR-0017. Gossip replica sync + WS run stream split to **3.3-gossip** below; UI to 3.3-ui.

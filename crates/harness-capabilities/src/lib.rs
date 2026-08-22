@@ -63,7 +63,7 @@ pub use fs::{
     FsGrepCapability, FsListCapability, FsReadCapability, FsSearchCapability, ScopeConfig,
     ScopeError, ScopeRegistry,
 };
-pub use traits::{Capability, CapabilityError, ExecutionContext};
+pub use traits::{Capability, CapabilityError, ExecutionContext, FrameSink, LogFrame, StreamKind};
 
 #[cfg(feature = "echo")]
 pub use echo::EchoCapability;
@@ -98,8 +98,23 @@ pub use mcp::{
 /// `mcp.proxy`, `fs.*`, `mesh.*` as their feature flags activate.
 #[must_use]
 pub fn default_registry(
+    policy: std::sync::Arc<harness_policy::PolicyEngine>,
+) -> CapabilityRegistry {
+    default_registry_with_shell_sink(policy, None)
+}
+
+/// [`default_registry`] with an optional streaming frame sink for
+/// `shell.exec` (3.2-stream, ADR-0020). With `Some(sink)`, `shell.exec`
+/// emits line frames through it as child output arrives; the terminal
+/// JSON envelope is unchanged either way. The daemon passes its
+/// partial-result streamer here; `None` keeps the synchronous form.
+#[must_use]
+pub fn default_registry_with_shell_sink(
     #[cfg_attr(not(all(feature = "shell", unix)), allow(unused_variables))] policy: std::sync::Arc<
         harness_policy::PolicyEngine,
+    >,
+    #[cfg_attr(not(all(feature = "shell", unix)), allow(unused_variables))] shell_sink: Option<
+        traits::FrameSink,
     >,
 ) -> CapabilityRegistry {
     let registry = CapabilityRegistry::new();
@@ -109,7 +124,11 @@ pub fn default_registry(
     }
     #[cfg(all(feature = "shell", unix))]
     {
-        let _ = registry.register(std::sync::Arc::new(ShellExecCapability::new(policy)));
+        let cap = match shell_sink {
+            Some(sink) => ShellExecCapability::with_frame_sink(policy, sink),
+            None => ShellExecCapability::new(policy),
+        };
+        let _ = registry.register(std::sync::Arc::new(cap));
     }
     registry
 }

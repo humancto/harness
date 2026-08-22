@@ -1,10 +1,16 @@
 //! `shell.exec` — run a single command (no shell parsing) on the local
 //! node, gated by the policy engine. PRD §10.4 + roadmap item 3.2.
 //!
-//! This is the synchronous form. The streaming form (line-frames over
-//! QUIC) is the follow-up `3.2-stream` item — see ADR-0008. The
-//! `read_capped` reader here is forward-compatible: replacing the
-//! buffer with a frame emitter is a localized change.
+//! Two forms (ADR-0008 / ADR-0020):
+//!
+//! - **Synchronous** ([`ShellExecCapability::new`]) — output is captured
+//!   into bounded buffers and returned in one JSON envelope.
+//! - **Streaming** ([`ShellExecCapability::with_frame_sink`]) — same
+//!   envelope at the end, but additionally each completed output line is
+//!   emitted as a [`LogFrame`] through the sink *while the child runs*.
+//!   Frames mirror exactly the bytes kept in the final buffers: past the
+//!   per-stream cap nothing is framed, and the sink never receives data
+//!   the terminal output would not contain.
 //!
 //! Disclosure surface: the host's `PATH` (basenames findable via PATH)
 //! plus `HOME`, `USER`, `LANG`, `LC_*`, `TMPDIR`. Anything in
@@ -32,13 +38,22 @@ use serde_json::Value as JsonValue;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-use crate::traits::{Capability, CapabilityError, ExecutionContext};
+use crate::traits::{
+    Capability, CapabilityError, ExecutionContext, FrameSink, LogFrame, StreamKind,
+};
+use harness_core::TaskId;
 
 pub const SHELL_EXEC_ID: &str = "shell.exec";
 
 /// Per-stream cap. Enforced *during* read; a runaway child cannot OOM
 /// the daemon because we drain-and-count past the cap.
 pub const MAX_OUTPUT_BYTES: usize = 1 << 20; // 1 MiB
+
+/// A line frame's maximum payload. An unbroken byte run with no `\n`
+/// is flushed in `MAX_LINE_BYTES` chunks so a `yes`-style child cannot
+/// buffer unbounded pending-line state or produce frames the wire
+/// layer would refuse (ADR-0020).
+pub const MAX_LINE_BYTES: usize = 8 * 1024;
 
 const DEFAULT_TIMEOUT_MS: u64 = 60_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
@@ -56,10 +71,22 @@ const BASE_ENV_KEYS: &[&str] = &[
 /// holds an `Arc<PolicyEngine>` (cheap clone, lock-free reads) so each
 /// `execute` call is one atomic load + one linear-scan against the
 /// allow/deny lists.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ShellExecCapability {
     policy: Arc<PolicyEngine>,
     max_output_bytes: usize,
+    /// Streaming sink (3.2-stream, ADR-0020). `None` = synchronous form,
+    /// exactly the pre-streaming behavior.
+    sink: Option<FrameSink>,
+}
+
+impl std::fmt::Debug for ShellExecCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShellExecCapability")
+            .field("max_output_bytes", &self.max_output_bytes)
+            .field("streaming", &self.sink.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ShellExecCapability {
@@ -68,6 +95,21 @@ impl ShellExecCapability {
         Self {
             policy,
             max_output_bytes: MAX_OUTPUT_BYTES,
+            sink: None,
+        }
+    }
+
+    /// Streaming constructor (3.2-stream): identical caps / timeout /
+    /// env hygiene / kill-on-drop semantics as [`Self::new`], plus each
+    /// completed output line is emitted through `sink` as it arrives.
+    /// Frames also still accumulate into the final buffers, so the
+    /// terminal output shape is unchanged.
+    #[must_use]
+    pub fn with_frame_sink(policy: Arc<PolicyEngine>, sink: FrameSink) -> Self {
+        Self {
+            policy,
+            max_output_bytes: MAX_OUTPUT_BYTES,
+            sink: Some(sink),
         }
     }
 
@@ -80,6 +122,19 @@ impl ShellExecCapability {
         Self {
             policy,
             max_output_bytes: max,
+            sink: None,
+        }
+    }
+
+    /// Test-only: streaming + small cap, for exercising the cap/frame
+    /// interaction without megabytes of output.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_frame_sink_and_max(policy: Arc<PolicyEngine>, sink: FrameSink, max: usize) -> Self {
+        Self {
+            policy,
+            max_output_bytes: max,
+            sink: Some(sink),
         }
     }
 }
@@ -206,7 +261,7 @@ impl Capability for ShellExecCapability {
             }
         }
 
-        let output = self.execute_shell(input).await?;
+        let output = self.execute_shell(input, ctx.task_id).await?;
         serde_json::to_value(&output)
             .map_err(|e| CapabilityError::Failed(format!("encode output: {e}")))
     }
@@ -216,6 +271,7 @@ impl ShellExecCapability {
     async fn execute_shell(
         &self,
         input: ShellExecInput,
+        task_id: TaskId,
     ) -> Result<ShellExecOutput, CapabilityError> {
         let timeout_ms = input
             .timeout_ms
@@ -278,8 +334,16 @@ impl ShellExecCapability {
             CapabilityError::Failed("stderr pipe missing after spawn".to_string())
         })?;
         let cap = self.max_output_bytes;
-        let stdout_task = tokio::spawn(read_capped(stdout_pipe, cap));
-        let stderr_task = tokio::spawn(read_capped(stderr_pipe, cap));
+        let stdout_emitter = self
+            .sink
+            .clone()
+            .map(|sink| LineEmitter::new(sink, task_id, StreamKind::Stdout));
+        let stderr_emitter = self
+            .sink
+            .clone()
+            .map(|sink| LineEmitter::new(sink, task_id, StreamKind::Stderr));
+        let stdout_task = tokio::spawn(read_streaming(stdout_pipe, cap, stdout_emitter));
+        let stderr_task = tokio::spawn(read_streaming(stderr_pipe, cap, stderr_emitter));
 
         let mut timed_out = false;
         let status = tokio::select! {
@@ -327,11 +391,84 @@ impl ShellExecCapability {
     }
 }
 
+/// Per-stream line assembler for the streaming form (ADR-0020). Holds
+/// the trailing partial line between reads; each completed `\n` line —
+/// or each `MAX_LINE_BYTES` chunk of an unbroken run — becomes one
+/// [`LogFrame`] through the sink. `finish()` flushes a trailing partial
+/// line at EOF so `printf 'no newline'` still frames.
+struct LineEmitter {
+    sink: FrameSink,
+    task_id: TaskId,
+    kind: StreamKind,
+    pending: Vec<u8>,
+}
+
+impl LineEmitter {
+    fn new(sink: FrameSink, task_id: TaskId, kind: StreamKind) -> Self {
+        Self {
+            sink,
+            task_id,
+            kind,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Feed the bytes that were *kept* (within the cap). Bytes past the
+    /// cap are never framed — frames mirror the final buffers exactly.
+    fn feed(&mut self, mut bytes: &[u8]) {
+        while let Some(pos) = bytes.iter().position(|b| *b == b'\n') {
+            self.push_bounded(&bytes[..pos]);
+            self.emit_pending();
+            bytes = &bytes[pos + 1..];
+        }
+        self.push_bounded(bytes);
+    }
+
+    /// Append to `pending`, flushing full `MAX_LINE_BYTES` chunks so the
+    /// partial-line buffer (and thus every frame) stays bounded.
+    fn push_bounded(&mut self, bytes: &[u8]) {
+        self.pending.extend_from_slice(bytes);
+        while self.pending.len() >= MAX_LINE_BYTES {
+            let rest = self.pending.split_off(MAX_LINE_BYTES);
+            let chunk = std::mem::replace(&mut self.pending, rest);
+            self.emit(&chunk);
+        }
+    }
+
+    fn emit_pending(&mut self) {
+        // A bare "\n" is a real (empty) line — emit it.
+        let chunk = std::mem::take(&mut self.pending);
+        self.emit(&chunk);
+    }
+
+    fn emit(&mut self, chunk: &[u8]) {
+        let line = String::from_utf8_lossy(chunk).into_owned();
+        (self.sink)(
+            self.task_id,
+            LogFrame {
+                stream: self.kind,
+                line,
+            },
+        );
+    }
+
+    fn finish(&mut self) {
+        if !self.pending.is_empty() {
+            self.emit_pending();
+        }
+    }
+}
+
 /// Read up to `cap` bytes from `r`. Past `cap`, drain-and-count so the
 /// child doesn't block on a full pipe. Returns `(kept, extra_bytes)`.
-async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
+///
+/// With `emitter: Some(..)` (3.2-stream) each kept byte additionally
+/// flows through the [`LineEmitter`], producing line frames as they
+/// arrive. With `None` this is byte-for-byte the original `read_capped`.
+async fn read_streaming<R: tokio::io::AsyncRead + Unpin>(
     mut r: R,
     cap: usize,
+    mut emitter: Option<LineEmitter>,
 ) -> Result<(Vec<u8>, u64), CapabilityError> {
     let mut kept = Vec::with_capacity(std::cmp::min(cap, 8192));
     let mut buf = [0u8; 8192];
@@ -348,12 +485,18 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
             let space = cap - kept.len();
             let take = std::cmp::min(space, n);
             kept.extend_from_slice(&buf[..take]);
+            if let Some(em) = emitter.as_mut() {
+                em.feed(&buf[..take]);
+            }
             if take < n {
                 extra += (n - take) as u64;
             }
         } else {
             extra += n as u64;
         }
+    }
+    if let Some(em) = emitter.as_mut() {
+        em.finish();
     }
     Ok((kept, extra))
 }
@@ -411,5 +554,52 @@ mod unit_tests {
         assert_eq!(signal_name(9), Some("SIGKILL"));
         assert_eq!(signal_name(15), Some("SIGTERM"));
         assert_eq!(signal_name(99), None);
+    }
+
+    fn collecting_emitter() -> (LineEmitter, Arc<parking_lot::Mutex<Vec<LogFrame>>>) {
+        let frames = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink_frames = frames.clone();
+        let sink: FrameSink = Arc::new(move |_task, frame| sink_frames.lock().push(frame));
+        let em = LineEmitter::new(sink, TaskId::new_v7(), StreamKind::Stdout);
+        (em, frames)
+    }
+
+    #[test]
+    fn line_emitter_splits_on_newlines_across_feeds() {
+        let (mut em, frames) = collecting_emitter();
+        em.feed(b"hel");
+        em.feed(b"lo\nwor");
+        assert_eq!(frames.lock().len(), 1, "only the completed line framed");
+        em.feed(b"ld\n\n");
+        em.finish();
+        let got: Vec<String> = frames.lock().iter().map(|f| f.line.clone()).collect();
+        assert_eq!(got, vec!["hello", "world", ""]);
+    }
+
+    #[test]
+    fn line_emitter_flushes_trailing_partial_on_finish() {
+        let (mut em, frames) = collecting_emitter();
+        em.feed(b"no newline");
+        assert!(frames.lock().is_empty());
+        em.finish();
+        let got = frames.lock();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].line, "no newline");
+    }
+
+    #[test]
+    fn line_emitter_chunks_unbroken_runs_at_max_line_bytes() {
+        let (mut em, frames) = collecting_emitter();
+        // 2.5 * MAX_LINE_BYTES with no newline, fed in pipe-sized reads.
+        let total = MAX_LINE_BYTES * 5 / 2;
+        let data = vec![b'a'; total];
+        for chunk in data.chunks(8192) {
+            em.feed(chunk);
+        }
+        em.finish();
+        let got = frames.lock();
+        assert!(got.iter().all(|f| f.line.len() <= MAX_LINE_BYTES));
+        let reassembled: usize = got.iter().map(|f| f.line.len()).sum();
+        assert_eq!(reassembled, total, "no bytes lost to chunking");
     }
 }

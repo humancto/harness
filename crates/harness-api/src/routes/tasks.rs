@@ -264,6 +264,15 @@ pub async fn get_handler(
         "input":        task.input,
         "issued_at_ms": task.issued_at,
     });
+    // 3.2-stream (ADR-0020): buffered streaming line frames, oldest
+    // first, from the in-memory ring (last ~500 per task). OMITTED when
+    // the task streamed nothing — non-streaming capabilities keep their
+    // response shape unchanged. Best-effort progress only; `output` /
+    // `error` from the terminal result stay authoritative.
+    let frames = state.partials.frames(task_id);
+    if !frames.is_empty() {
+        body["partials"] = serde_json::json!(frames);
+    }
     if let Some(r) = result {
         body["completed_at_ms"] = serde_json::json!(r.completed_at_ms);
         if let Some(out) = r.output {

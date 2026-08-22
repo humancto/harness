@@ -67,6 +67,10 @@ pub struct ApiState {
     /// secrets are configured?") and capability-execute paths share
     /// the same handle.
     pub secrets: Arc<dyn SecretsStore>,
+    /// Streaming partial-output ring buffers (3.2-stream, ADR-0020).
+    /// The daemon shares one instance between its dispatch runtime /
+    /// local sink (writers) and `GET /tasks/{id}` (reader).
+    pub partials: Arc<crate::partials::PartialBuffers>,
 }
 
 impl std::fmt::Debug for ApiState {
@@ -118,6 +122,7 @@ pub struct ApiStateBuilder {
     store: Option<harness_store::Store>,
     policy: Option<Arc<PolicyEngine>>,
     secrets: Option<Arc<dyn SecretsStore>>,
+    partials: Option<Arc<crate::partials::PartialBuffers>>,
 }
 
 impl ApiStateBuilder {
@@ -134,6 +139,7 @@ impl ApiStateBuilder {
             store: None,
             policy: None,
             secrets: None,
+            partials: None,
         }
     }
 
@@ -185,6 +191,15 @@ impl ApiStateBuilder {
         self
     }
 
+    /// Share the daemon's partial-output ring buffers (3.2-stream).
+    /// When not set, a fresh (never-written) instance is created so
+    /// `partials` is always empty-but-present.
+    #[must_use]
+    pub fn with_partials(mut self, partials: Arc<crate::partials::PartialBuffers>) -> Self {
+        self.partials = Some(partials);
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> ApiState {
         let local_node_id = self.identity.public_key().node_id();
@@ -208,6 +223,9 @@ impl ApiStateBuilder {
         let secrets = self
             .secrets
             .unwrap_or_else(|| Arc::new(harness_vault::PlaintextStore::empty()));
+        let partials = self
+            .partials
+            .unwrap_or_else(|| Arc::new(crate::partials::PartialBuffers::new()));
         ApiState {
             identity: self.identity,
             local_node_id,
@@ -218,6 +236,7 @@ impl ApiStateBuilder {
             store: self.store,
             policy,
             secrets,
+            partials,
         }
     }
 }

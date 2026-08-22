@@ -29,10 +29,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
+use harness_api::PartialBuffers;
 use harness_capabilities::CapabilityRegistry;
 use harness_core::{
-    Cardinality, Cost, FinalResult, Identity, LeaseId, NodeId, PublicKey, ReplicatedState,
-    ReplicatedTaskState, Signable, Status, Task, TaskAssign, TaskClaim, TaskId, TaskResultMsg,
+    Cardinality, Cost, FinalResult, Identity, LeaseId, NodeId, PartialResult, PublicKey,
+    ReplicatedState, ReplicatedTaskState, Signable, Status, Task, TaskAssign, TaskClaim, TaskId,
+    TaskResultMsg,
 };
 use harness_mesh::heartbeat::{PeerTable, PEER_TIMEOUT};
 use harness_mesh::TrustStore;
@@ -126,6 +128,10 @@ pub(crate) struct DispatchRuntime {
     reply: ParkingMutex<HashMap<TaskId, ReplyObligation>>,
     /// Issuer side: first time each task failed eligibility.
     elig_failures: ParkingMutex<HashMap<TaskId, Instant>>,
+    /// Issuer side: streaming partial-output ring buffers shared with
+    /// the API (3.2-stream, ADR-0020). Set once from lifecycle; when
+    /// unset (bare unit-test fixtures), inbound partials are dropped.
+    partials: OnceLock<Arc<PartialBuffers>>,
 }
 
 impl DispatchRuntime {
@@ -153,6 +159,7 @@ impl DispatchRuntime {
             net: OnceLock::new(),
             reply: ParkingMutex::new(HashMap::new()),
             elig_failures: ParkingMutex::new(HashMap::new()),
+            partials: OnceLock::new(),
         })
     }
 
@@ -167,7 +174,20 @@ impl DispatchRuntime {
         let _ = self.net.set(Arc::downgrade(net));
     }
 
-    fn net(&self) -> Option<Arc<PeerNet>> {
+    /// Share the API's partial-output ring buffers (3.2-stream).
+    pub(crate) fn attach_partials(&self, buffers: Arc<PartialBuffers>) {
+        let _ = self.partials.set(buffers);
+    }
+
+    /// Worker side: the issuer of a task we ingested from the wire and
+    /// still owe a result for. `None` for locally-issued tasks (and for
+    /// remote tasks already replied to — by then the child has exited
+    /// and no more frames arrive).
+    pub(crate) fn remote_issuer(&self, task_id: TaskId) -> Option<NodeId> {
+        self.reply.lock().get(&task_id).map(|o| o.issuer)
+    }
+
+    pub(crate) fn net(&self) -> Option<Arc<PeerNet>> {
         self.net.get().and_then(Weak::upgrade)
     }
 
@@ -837,6 +857,51 @@ impl TaskChannelHandlers for DispatchRuntime {
         }
     }
 
+    /// Issuer side: streaming line frames from a worker (3.2-stream,
+    /// ADR-0020). The transport verified the envelope signature against
+    /// the connection peer and the per-stream seq; the recv loop checked
+    /// `msg.node_id == from`. Best-effort: frames land in the in-memory
+    /// ring for `GET /tasks/{id}`; any validation failure just drops the
+    /// partial — the terminal result is authoritative.
+    fn on_partial(&self, from: NodeId, msg: PartialResult) {
+        let Some(buffers) = self.partials.get() else {
+            return;
+        };
+        // Only the node the task is currently assigned to may stream
+        // partials for it.
+        match self.store.assigned_node(msg.task_id) {
+            Ok(Some(node)) if node == from => {}
+            Ok(_) => {
+                tracing::debug!(
+                    target: "harness.dispatch",
+                    %from,
+                    task = %msg.task_id.0,
+                    "partial from a node the task is not assigned to; dropped"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(target: "harness.dispatch", ?e, "assigned_node on partial");
+                return;
+            }
+        }
+        let Some(frames) = msg.output_chunk.get("frames").and_then(|f| f.as_array()) else {
+            tracing::debug!(
+                target: "harness.dispatch",
+                task = %msg.task_id.0,
+                "partial without a frames array; dropped"
+            );
+            return;
+        };
+        for frame in frames {
+            let stream = frame.get("stream").and_then(|s| s.as_str());
+            let line = frame.get("line").and_then(|l| l.as_str());
+            if let (Some(stream @ ("stdout" | "stderr")), Some(line)) = (stream, line) {
+                buffers.append(msg.task_id, stream, line.to_string());
+            }
+        }
+    }
+
     /// Issuer side: the assign never made it onto the wire.
     fn on_assign_send_failed(&self, node: NodeId, lease_id: LeaseId) {
         tracing::warn!(target: "harness.dispatch", %node, "assign send failed; resetting lease");
@@ -1343,6 +1408,115 @@ mod tests {
             row.error.as_deref().unwrap_or("").contains("lease expired"),
             "expiry reason must survive the late result: {row:?}"
         );
+    }
+
+    fn partial_msg(worker: &Identity, task_id: TaskId, lines: &[(&str, &str)]) -> PartialResult {
+        let frames: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|(stream, line)| serde_json::json!({"stream": stream, "line": line}))
+            .collect();
+        PartialResult {
+            task_id,
+            node_id: worker.node_id(),
+            seq: 0,
+            progress: 0.0,
+            output_chunk: serde_json::json!({ "frames": frames }),
+            sig: Signature::from_bytes([0u8; 64]),
+        }
+    }
+
+    #[tokio::test]
+    async fn t11_on_partial_appends_frames_to_ring() {
+        let f = fixture();
+        let buffers = Arc::new(harness_api::PartialBuffers::new());
+        f.runtime.attach_partials(buffers.clone());
+
+        let task = signed_task(&f.local);
+        f.store.insert_task(&task).expect("insert");
+        assert!(f
+            .store
+            .try_dispatch_task(task.id, f.remote.node_id())
+            .expect("dispatch"));
+
+        f.runtime.on_partial(
+            f.remote.node_id(),
+            partial_msg(&f.remote, task.id, &[("stdout", "one"), ("stderr", "two")]),
+        );
+        f.runtime.on_partial(
+            f.remote.node_id(),
+            partial_msg(&f.remote, task.id, &[("stdout", "three")]),
+        );
+
+        let frames = buffers.frames(task.id);
+        let got: Vec<(String, String)> = frames
+            .iter()
+            .map(|fr| (fr.stream.clone(), fr.line.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("stdout".into(), "one".into()),
+                ("stderr".into(), "two".into()),
+                ("stdout".into(), "three".into()),
+            ]
+        );
+        // Ring seqs are per-task append order.
+        assert_eq!(frames[0].seq, 0);
+        assert_eq!(frames[2].seq, 2);
+    }
+
+    #[tokio::test]
+    async fn t12_on_partial_from_unassigned_node_dropped() {
+        let f = fixture();
+        let buffers = Arc::new(harness_api::PartialBuffers::new());
+        f.runtime.attach_partials(buffers.clone());
+
+        let task = signed_task(&f.local);
+        f.store.insert_task(&task).expect("insert");
+        // Assigned to some OTHER node, not `remote`.
+        assert!(f
+            .store
+            .try_dispatch_task(task.id, Identity::generate().node_id())
+            .expect("dispatch"));
+
+        f.runtime.on_partial(
+            f.remote.node_id(),
+            partial_msg(&f.remote, task.id, &[("stdout", "spoofed")]),
+        );
+        assert!(
+            buffers.frames(task.id).is_empty(),
+            "partial from a non-assigned node must not land"
+        );
+    }
+
+    #[tokio::test]
+    async fn t13_on_partial_malformed_chunk_dropped() {
+        let f = fixture();
+        let buffers = Arc::new(harness_api::PartialBuffers::new());
+        f.runtime.attach_partials(buffers.clone());
+
+        let task = signed_task(&f.local);
+        f.store.insert_task(&task).expect("insert");
+        assert!(f
+            .store
+            .try_dispatch_task(task.id, f.remote.node_id())
+            .expect("dispatch"));
+
+        // No frames array — dropped, no panic.
+        let mut malformed = partial_msg(&f.remote, task.id, &[]);
+        malformed.output_chunk = serde_json::json!({"not_frames": 1});
+        f.runtime.on_partial(f.remote.node_id(), malformed);
+        // Unknown stream tag skipped, valid one kept.
+        let mixed = partial_msg(
+            &f.remote,
+            task.id,
+            &[("bogus", "skipped"), ("stdout", "kept")],
+        );
+        f.runtime.on_partial(f.remote.node_id(), mixed);
+
+        let frames = buffers.frames(task.id);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].line, "kept");
     }
 
     #[tokio::test]

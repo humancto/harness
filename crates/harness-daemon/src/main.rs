@@ -11,6 +11,7 @@ mod gossip;
 mod gossip_tests;
 mod lifecycle;
 mod mesh_exec;
+mod partial_stream;
 mod peer_net;
 
 use std::sync::Arc;

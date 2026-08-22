@@ -57,6 +57,9 @@ pub(crate) struct DaemonOrchestrator {
     dispatch: Arc<DispatchRuntime>,
     /// Replica gossip service. Phase 3.3-gossip (ADR-0019).
     gossip: Arc<crate::gossip::GossipService>,
+    /// Frame router + wire coalescer for streaming partial output.
+    /// Phase 3.2-stream (ADR-0020).
+    partial_streamer: Arc<crate::partial_stream::PartialStreamer>,
     /// Coordinated shutdown — flipped to `true` on ctrl-c. The executor
     /// loop watches this; future loops can subscribe too.
     shutdown_tx: watch::Sender<bool>,
@@ -250,10 +253,24 @@ impl DaemonOrchestrator {
             std::sync::Arc::new(r)
         };
 
+        // 3.2-stream (ADR-0020): one shared partial-output ring buffer
+        // set (API reader + dispatch/local writers) and the streamer
+        // that routes capability line frames — local tasks append
+        // directly, remote tasks coalesce onto `harness.task.partial`.
+        // Built before the registry so `shell.exec` can take the sink.
+        let partial_buffers = Arc::new(harness_api::PartialBuffers::new());
+        let partial_streamer = crate::partial_stream::PartialStreamer::new(
+            identity.node_id(),
+            partial_buffers.clone(),
+        );
+
         // Build the capability registry (echo + future Phase 3
         // additions feature-gated). The daemon advertises every
         // registered capability via NodeManifest.
-        let capabilities = harness_capabilities::default_registry(policy_engine.clone());
+        let capabilities = harness_capabilities::default_registry_with_shell_sink(
+            policy_engine.clone(),
+            Some(partial_streamer.sink()),
+        );
 
         // Phase 3.10a: register fs.list + fs.read after the default
         // registry. The scope registry's `manifest_scopes()` populates
@@ -491,6 +508,11 @@ impl DaemonOrchestrator {
             self_manifest,
         );
         dispatch_runtime.attach_net(&peer_net);
+        // 3.2-stream: issuer-side partials land in the shared ring; the
+        // worker-side streamer needs the runtime for issuer lookup +
+        // wire access.
+        dispatch_runtime.attach_partials(partial_buffers.clone());
+        partial_streamer.attach_dispatch(&dispatch_runtime);
 
         // Phase 3.3-gossip: LWW replica sync over `harness.gossip.state`
         // + heartbeat replica_head anti-entropy (ADR-0019).
@@ -507,6 +529,7 @@ impl DaemonOrchestrator {
                 .with_store(store)
                 .with_policy(policy_engine)
                 .with_secrets(secrets.clone())
+                .with_partials(partial_buffers)
                 .build();
         let api_handle = harness_api::serve(config.api_bind, api_state.clone())
             .await
@@ -526,6 +549,7 @@ impl DaemonOrchestrator {
             peer_net,
             dispatch: dispatch_runtime,
             gossip,
+            partial_streamer,
             shutdown_tx,
             tasks: ParkingMutex::new(Vec::new()),
             listeners: Arc::new(ParkingMutex::new(Vec::new())),
@@ -688,6 +712,14 @@ impl DaemonOrchestrator {
                 .run_gossip_loop(self.shutdown_tx.subscribe()),
         );
         self.tasks.lock().push(gossip_handle);
+        // Phase 3.2-stream: coalesced partial-output flusher (one
+        // `harness.task.partial` send per streaming task per 50ms tick).
+        let partial_handle = tokio::spawn(
+            self.partial_streamer
+                .clone()
+                .run_flush_loop(self.shutdown_tx.subscribe()),
+        );
+        self.tasks.lock().push(partial_handle);
     }
 
     async fn shutdown(self) {

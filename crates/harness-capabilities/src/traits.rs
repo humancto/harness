@@ -33,6 +33,44 @@ pub struct ExecutionContext {
     pub tags: Arc<[String]>,
 }
 
+/// Which child stream a [`LogFrame`] came from. Serializes as
+/// `"stdout"` / `"stderr"` — the same strings the wire
+/// `PartialResult::output_chunk` and the API `partials` array carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamKind {
+    Stdout,
+    Stderr,
+}
+
+impl StreamKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StreamKind::Stdout => "stdout",
+            StreamKind::Stderr => "stderr",
+        }
+    }
+}
+
+/// One line of child output, emitted by a streaming-capable capability
+/// (today: `shell.exec` built with `ShellExecCapability::with_frame_sink`)
+/// as it arrives — before the process exits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogFrame {
+    pub stream: StreamKind,
+    /// One line, newline stripped (lossy UTF-8). Bounded — an unbroken
+    /// run of bytes with no `\n` is chunked at 8 KiB (ADR-0020).
+    pub line: String,
+}
+
+/// Sink for streaming line frames. Called from the capability's reader
+/// tasks *while the child is still running* — implementations must be
+/// non-blocking (enqueue / append; never await, never do I/O inline).
+/// The `TaskId` is the executing task's id from [`ExecutionContext`],
+/// so one sink instance can serve every concurrent task.
+pub type FrameSink = Arc<dyn Fn(harness_core::TaskId, LogFrame) + Send + Sync>;
+
 /// Errors a capability can return from `execute`.
 #[derive(Debug, Error)]
 #[non_exhaustive]
