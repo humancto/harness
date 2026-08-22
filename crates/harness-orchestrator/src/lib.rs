@@ -19,7 +19,7 @@ pub use dispatcher::{DispatchPlan, Dispatcher, LiveSet, RoundRobin, StaticLiveSe
 pub use error::DispatchError;
 pub use executor::{policy_check, ExecutorError};
 pub use fanout::{
-    EndReason, FanoutController, FanoutEvent, FanoutSpec, FanoutStream, FanoutSummary,
-    ItemOutcome, WindowPolicy,
+    EndReason, FanoutController, FanoutEvent, FanoutSpec, FanoutStream, FanoutSummary, ItemOutcome,
+    WindowPolicy,
 };
 pub use index::{CapabilityIndex, ScopeIndex};

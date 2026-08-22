@@ -18,7 +18,6 @@
 //! stops polling stops refill (pre-work for 4.7) — and cancellation is
 //! `Drop`: dropping the stream drops the in-flight futures.
 
-use std::future::Future as _;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -33,7 +32,11 @@ pub enum WindowPolicy {
     /// progress).
     Fixed(usize),
     /// PRD §14.7's `factor × N_workers`, clamped to `[min, max]`.
-    PerWorkers { factor: usize, min: usize, max: usize },
+    PerWorkers {
+        factor: usize,
+        min: usize,
+        max: usize,
+    },
 }
 
 impl WindowPolicy {
@@ -325,6 +328,16 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    type TestRunner = Box<dyn FnMut(u64, u64) -> BoxFuture<'static, ItemOutcome<u64>> + Send>;
+
+    /// Counts re-poll requests from the stream (t12's lost-waker check).
+    struct CountWaker(Arc<AtomicUsize>);
+    impl futures::task::ArcWake for CountWaker {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     /// A controllable fake sub-task: resolves when the test fires its
     /// oneshot; counts live instances via a drop guard.
     struct Guard(Arc<AtomicUsize>);
@@ -334,9 +347,11 @@ mod tests {
         }
     }
 
+    type Gates = Arc<parking_lot::Mutex<Vec<(u64, oneshot::Sender<ItemOutcome<u64>>)>>>;
+
     struct Harness {
         /// Senders for not-yet-released items, keyed by index.
-        gates: Arc<parking_lot::Mutex<Vec<(u64, oneshot::Sender<ItemOutcome<u64>>)>>>,
+        gates: Gates,
         /// Live (spawned, not yet dropped) runner futures.
         live: Arc<AtomicUsize>,
         /// Peak of `live`.
@@ -354,8 +369,7 @@ mod tests {
             }
         }
 
-        fn runner(&self) -> Box<dyn FnMut(u64, u64) -> BoxFuture<'static, ItemOutcome<u64>> + Send>
-        {
+        fn runner(&self) -> TestRunner {
             let gates = self.gates.clone();
             let live = self.live.clone();
             let peak = self.peak.clone();
@@ -369,7 +383,8 @@ mod tests {
                 let guard = Guard(live.clone());
                 Box::pin(async move {
                     let _guard = guard;
-                    rx.await.unwrap_or(ItemOutcome::Failed("gate dropped".into()))
+                    rx.await
+                        .unwrap_or(ItemOutcome::Failed("gate dropped".into()))
                 })
             })
         }
@@ -377,7 +392,7 @@ mod tests {
         /// Release the oldest gated item with the given outcome.
         fn release_oldest(&self, outcome: ItemOutcome<u64>) -> u64 {
             let (index, tx) = self.gates.lock().remove(0);
-            tx.send(outcome).ok().expect("receiver alive");
+            assert!(tx.send(outcome).is_ok(), "receiver alive");
             index
         }
 
@@ -578,7 +593,11 @@ mod tests {
         // 5 pulled (4 + 1 refill), 2 completed → 3 dropped in flight.
         assert_eq!(sum.dropped_in_flight, 3);
         assert_eq!(h.live.load(Ordering::SeqCst), 0, "drop guards fired");
-        assert_eq!(h.pulled.load(Ordering::SeqCst), 5, "source not pulled further");
+        assert_eq!(
+            h.pulled.load(Ordering::SeqCst),
+            5,
+            "source not pulled further"
+        );
         assert!(matches!(poll(&mut s), Poll::Ready(None)));
     }
 
@@ -675,7 +694,11 @@ mod tests {
         assert_eq!(sum.reason, EndReason::DeadlineExceeded);
         assert_eq!(sum.dropped_in_flight, 3);
         assert_eq!(h.live.load(Ordering::SeqCst), 0);
-        assert_eq!(h.pulled.load(Ordering::SeqCst), 3, "no pulls after deadline");
+        assert_eq!(
+            h.pulled.load(Ordering::SeqCst),
+            3,
+            "no pulls after deadline"
+        );
         assert!(matches!(poll(&mut s), Poll::Ready(None)));
     }
 
@@ -733,10 +756,7 @@ mod tests {
     }
     impl Stream for StutterSource {
         type Item = u64;
-        fn poll_next(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Option<Self::Item>> {
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             if self.remaining == 0 {
                 return Poll::Ready(None);
             }
@@ -758,12 +778,6 @@ mod tests {
         // completion relies on the source's registered waker (counted).
         let h = Harness::new();
         let wake_count = Arc::new(AtomicUsize::new(0));
-        struct CountWaker(Arc<AtomicUsize>);
-        impl futures::task::ArcWake for CountWaker {
-            fn wake_by_ref(arc_self: &Arc<Self>) {
-                arc_self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
         let waker = futures::task::waker(Arc::new(CountWaker(wake_count.clone())));
         let spec = FanoutSpec {
             source: StutterSource {
@@ -782,7 +796,10 @@ mod tests {
         // First poll: source is Pending → 0 pulled, wake scheduled.
         assert!(Pin::new(&mut s).poll_next(&mut cx).is_pending());
         assert_eq!(h.pulled.load(Ordering::SeqCst), 0);
-        assert!(wake_count.load(Ordering::SeqCst) > 0, "waker registered, not lost");
+        assert!(
+            wake_count.load(Ordering::SeqCst) > 0,
+            "waker registered, not lost"
+        );
         // Each re-poll (as the wake requests) pulls exactly one more.
         for expected in 1..=4usize {
             assert!(Pin::new(&mut s).poll_next(&mut cx).is_pending());

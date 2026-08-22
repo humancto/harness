@@ -1282,6 +1282,7 @@ dependencies = [
  "futures",
  "harness-brain",
  "harness-core",
+ "harness-orchestrator",
  "harness-policy",
  "harness-vault",
  "jsonschema",
@@ -1414,6 +1415,7 @@ dependencies = [
 name = "harness-orchestrator"
 version = "0.0.0"
 dependencies = [
+ "futures",
  "harness-core",
  "harness-policy",
  "parking_lot",
