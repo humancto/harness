@@ -252,6 +252,9 @@ where
             this.finished = true;
             return Poll::Ready(Some(FanoutEvent::End(summary)));
         }
+        // Deadline wins over any not-yet-emitted completions: a future
+        // that finished in the same tick still counts as dropped. The
+        // deadline is a hard stop, not a flush point.
         if let Some(deadline) = this.deadline.as_mut() {
             if deadline.as_mut().poll(cx).is_ready() {
                 this.deadline = None; // never poll a resolved future again
