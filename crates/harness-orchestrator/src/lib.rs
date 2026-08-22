@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod dag;
 pub mod dispatcher;
 pub mod error;
 pub mod executor;
@@ -16,6 +17,9 @@ pub mod fanout;
 pub mod index;
 pub mod results;
 
+pub use dag::{
+    DagError, DagScheduler, DagSummary, Progress, StepOutcome, StepState, MAX_PLAN_STEPS,
+};
 pub use dispatcher::{DispatchPlan, Dispatcher, LiveSet, RoundRobin, StaticLiveSet};
 pub use error::DispatchError;
 pub use executor::{policy_check, ExecutorError};

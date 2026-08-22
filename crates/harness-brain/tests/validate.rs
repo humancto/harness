@@ -217,3 +217,137 @@ fn t32_validate_plan_well_formed_still_callable() {
     let r = harness_brain::validate_plan_well_formed(&p, &shell_only());
     assert!(r.is_ok());
 }
+
+// --- 4.3 (ADR-0025): $task_output reference validation ---
+
+fn two_node_plan_with_ref(edge: bool, ref_input: serde_json::Value) -> (Plan, TaskId, TaskId) {
+    let a = TaskId::new_v7();
+    let b = TaskId::new_v7();
+    let mut tasks = HashMap::new();
+    tasks.insert(
+        a,
+        PlanNode {
+            id: a,
+            capability: "shell.exec".into(),
+            input: json!({"cmd": "ls"}),
+            resource_hints: empty_hints(),
+            timeout_ms: None,
+        },
+    );
+    tasks.insert(
+        b,
+        PlanNode {
+            id: b,
+            capability: "shell.exec".into(),
+            input: ref_input,
+            resource_hints: empty_hints(),
+            timeout_ms: None,
+        },
+    );
+    let plan = Plan {
+        id: PlanId::new_v7(),
+        name: "ref".into(),
+        tasks,
+        edges: if edge { vec![(b, a)] } else { vec![] },
+        budget: None,
+        checkpoint: None,
+        issued_by: NodeId::from_bytes([0; 16]),
+        sig: Signature::from_bytes([0u8; Signature::LEN]),
+    };
+    (plan, a, b)
+}
+
+#[test]
+fn t20_ref_to_declared_dependency_defers_schema_and_passes() {
+    // b's input would FAIL the shell schema as-is (cmd is a ref object,
+    // not a string) — the deferral is what lets it pass plan-time.
+    let (p, a, _b) = two_node_plan_with_ref(
+        true,
+        json!({"cmd": {"$task_output": TaskId::new_v7().0.to_string()}}),
+    );
+    // Fix the ref to target the actual dependency.
+    let (p2, a2, b2) = {
+        let (mut p2, a2, b2) = two_node_plan_with_ref(true, json!({}));
+        p2.tasks.get_mut(&b2).unwrap().input =
+            json!({"cmd": {"$task_output": a2.0.to_string(), "pointer": "/stdout"}});
+        (p2, a2, b2)
+    };
+    let _ = (p, a);
+    let r = validate_plan(
+        &p2,
+        0.0,
+        &PlanConstraints::default(),
+        &shell_index(),
+        &shell_only(),
+    );
+    assert!(r.is_ok(), "{r:?} — edge ({b2:?},{a2:?}) declared");
+}
+
+#[test]
+fn t21_ref_without_declared_edge_rejected() {
+    let (mut p, a, b) = two_node_plan_with_ref(false, json!({}));
+    p.tasks.get_mut(&b).unwrap().input = json!({"cmd": {"$task_output": a.0.to_string()}});
+    let r = validate_plan(
+        &p,
+        0.0,
+        &PlanConstraints::default(),
+        &shell_index(),
+        &shell_only(),
+    );
+    assert!(matches!(
+        r,
+        Err(PlanValidationError::UndeclaredOutputRef { task, referenced })
+            if task == b && referenced == a
+    ));
+}
+
+#[test]
+fn t22_malformed_ref_rejected() {
+    let (mut p, _a, b) = two_node_plan_with_ref(true, json!({}));
+    p.tasks.get_mut(&b).unwrap().input = json!({"cmd": {"$task_output": "not-a-uuid"}});
+    let r = validate_plan(
+        &p,
+        0.0,
+        &PlanConstraints::default(),
+        &shell_index(),
+        &shell_only(),
+    );
+    assert!(matches!(
+        r,
+        Err(PlanValidationError::MalformedOutputRef { task, .. }) if task == b
+    ));
+}
+
+#[test]
+fn t23_node_id_mismatch_rejected() {
+    let (mut p, a, _b) = two_node_plan_with_ref(true, json!({"cmd": "ls"}));
+    p.tasks.get_mut(&a).unwrap().id = TaskId::new_v7();
+    let r = validate_plan(
+        &p,
+        0.0,
+        &PlanConstraints::default(),
+        &shell_index(),
+        &shell_only(),
+    );
+    assert!(matches!(
+        r,
+        Err(PlanValidationError::NodeIdMismatch { key, .. }) if key == a
+    ));
+}
+
+#[test]
+fn t24_ref_free_nodes_keep_full_schema_validation() {
+    // The deferral must not weaken validation for literal inputs.
+    let p = one_node_plan("shell.exec", json!({"bogus_field": true}));
+    let r = validate_plan(
+        &p,
+        0.0,
+        &PlanConstraints::default(),
+        &shell_index(),
+        &shell_only(),
+    );
+    assert!(matches!(
+        r,
+        Err(PlanValidationError::SchemaViolation { .. })
+    ));
+}

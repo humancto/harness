@@ -21,9 +21,10 @@ pub use identity::{
     verify, Identity, KeyError, NodeId, ParseNodeIdError, PublicKey, Signature, VerifyError,
 };
 pub use protocol::{
-    Budget, BudgetAction, Capability, CapabilityRef, Cardinality, CheckpointConfig,
-    CheckpointStorage, Constraints, Cost, ExecutionPolicy, FinalResult, HashFn, Heartbeat, LeaseId,
-    LogLevel, LogLine, MergeStrategy, NodeContribution, NodeManifest, NodeStatus, PartialPolicy,
-    PartialResult, Plan, PlanNode, ResourceHints, Resources, RetryPolicy, Scope, Signable, Status,
-    Task, TaskAssign, TaskClaim, TaskResult, TaskResultMsg, TraceContext, Unsigned,
+    find_output_refs, resolve_output_refs, Budget, BudgetAction, Capability, CapabilityRef,
+    Cardinality, CheckpointConfig, CheckpointStorage, Constraints, Cost, ExecutionPolicy,
+    FinalResult, HashFn, Heartbeat, LeaseId, LogLevel, LogLine, MergeStrategy, NodeContribution,
+    NodeManifest, NodeStatus, OutputRef, OutputRefError, PartialPolicy, PartialResult, Plan,
+    PlanNode, ResourceHints, Resources, RetryPolicy, Scope, Signable, Status, Task, TaskAssign,
+    TaskClaim, TaskResult, TaskResultMsg, TraceContext, Unsigned,
 };

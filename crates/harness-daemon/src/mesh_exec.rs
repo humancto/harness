@@ -167,6 +167,100 @@ impl MeshExec for StoreMeshExec {
     }
 
     async fn await_terminal(&self, id: TaskId, deadline: Duration) -> SubTaskOutcome {
+        self.await_terminal_impl(id, deadline).await
+    }
+}
+
+/// 4.3 (ADR-0025): the DAG executor's daemon services — same store /
+/// identity / peer plumbing, unpinned submits with `plan_id` set.
+#[async_trait]
+impl harness_capabilities::PlanExec for StoreMeshExec {
+    fn submit_step(
+        &self,
+        capability: &str,
+        input: serde_json::Value,
+        parent: TaskId,
+        plan_id: harness_core::PlanId,
+        resource_hints: ResourceHints,
+        timeout_ms: u32,
+    ) -> Result<TaskId, CapabilityError> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        let mut task = Task {
+            id: TaskId::new_v7(),
+            parent: Some(parent),
+            plan_id: Some(plan_id),
+            capability: capability.to_string(),
+            input,
+            // UNPINNED — the dispatch runtime places it by cardinality
+            // over the live mesh (self included); policy is evaluated
+            // on the executing node (rule 10).
+            constraints: Constraints::default(),
+            retry: RetryPolicy {
+                // Same posthumous-work rule as mesh sub-tasks
+                // (ADR-0022): lease TTL outlives the plan's await.
+                max_attempts: 1,
+                ..RetryPolicy::default()
+            },
+            execution: ExecutionPolicy {
+                timeout_ms,
+                ..ExecutionPolicy::default()
+            },
+            resource_hints,
+            trace_ctx: TraceContext::default(),
+            issued_by: self.local_id,
+            issued_at: now_ms,
+            tags: vec![],
+            sig: Signature::from_bytes([0u8; 64]),
+        };
+        task.sign(&self.identity)
+            .map_err(|e| CapabilityError::Failed(format!("sign step: {e}")))?;
+        self.store
+            .insert_task(&task)
+            .map_err(|e| CapabilityError::Failed(format!("insert step: {e}")))?;
+        Ok(task.id)
+    }
+
+    async fn await_terminal(&self, id: TaskId, deadline: Duration) -> SubTaskOutcome {
+        self.await_terminal_impl(id, deadline).await
+    }
+
+    fn live_workers(&self) -> usize {
+        self.peers.live_snapshot(PEER_TIMEOUT).len() + 1
+    }
+
+    fn known_capabilities(&self) -> Vec<harness_core::Capability> {
+        // Union over stored manifests (self included — the self
+        // manifest is indexed at boot with every registered
+        // capability), deduplicated by id.
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        match self.store.list_manifests() {
+            Ok(manifests) => {
+                for m in manifests {
+                    for cap in m.capabilities {
+                        if seen.insert(cap.id.clone()) {
+                            out.push(cap);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "harness.plan_exec", ?e, "list_manifests");
+            }
+        }
+        out
+    }
+
+    fn progress_sink(&self) -> Option<harness_capabilities::FrameSink> {
+        self.progress.clone()
+    }
+}
+
+impl StoreMeshExec {
+    async fn await_terminal_impl(&self, id: TaskId, deadline: Duration) -> SubTaskOutcome {
         let until = tokio::time::Instant::now() + deadline;
         loop {
             match self.store.task_state(id) {

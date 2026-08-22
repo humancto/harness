@@ -433,3 +433,106 @@ async fn m04_mesh_grep_federates_across_both_nodes() {
     a.stop().await;
     b.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m05_plan_execute_chains_steps_with_output_threading() {
+    // 4.3 (ADR-0025): a two-step echo chain where step 2's input embeds
+    // step 1's output via $task_output — executed end-to-end through a
+    // real daemon (plan.execute → step rows → dispatch → executor).
+    let root = tempfile::tempdir().expect("root");
+    let identity = Arc::new(harness_mesh::identity::init_or_load(root.path()).expect("id"));
+    let trust = TrustStore::open(root.path(), identity.node_id()).expect("trust");
+    let a = boot_one(root, identity, trust, "solo", vec![]).await;
+
+    let step_a = TaskId::new_v7();
+    let step_b = TaskId::new_v7();
+    let plan = serde_json::json!({
+        "id": harness_core::PlanId::new_v7().0.to_string(),
+        "name": "chain",
+        "tasks": {
+            step_a.0.to_string(): {
+                "id": step_a.0.to_string(),
+                "capability": "echo",
+                "input": { "msg": "from-step-one" },
+                "resource_hints": {
+                    "cpu_class": "light", "memory_mb": null, "gpu_required": false,
+                    "gpu_memory_mb": null, "network_class": "none",
+                    "disk_io_class": "none", "estimated_duration_ms": null
+                },
+                "timeout_ms": null
+            },
+            step_b.0.to_string(): {
+                "id": step_b.0.to_string(),
+                "capability": "echo",
+                "input": { "carried": { "$task_output": step_a.0.to_string(), "pointer": "/echoed/msg" } },
+                "resource_hints": {
+                    "cpu_class": "light", "memory_mb": null, "gpu_required": false,
+                    "gpu_memory_mb": null, "network_class": "none",
+                    "disk_io_class": "none", "estimated_duration_ms": null
+                },
+                "timeout_ms": null
+            }
+        },
+        "edges": [[step_b.0.to_string(), step_a.0.to_string()]],
+        "budget": null,
+        "checkpoint": null,
+        "issued_by": identity_bytes(&a),
+        "sig": vec![0u8; 64],
+    });
+    let id = submit_task(
+        &a,
+        "plan.execute",
+        serde_json::json!({ "plan": plan, "timeout_ms": 30_000 }),
+        None,
+        40_000,
+    );
+    let state = wait_for_state(&a.store, id, &[TaskState::Done], Duration::from_secs(30)).await;
+    assert_eq!(state, TaskState::Done);
+
+    let row = a.store.load_task_result(id).expect("load").expect("row");
+    let output = row.output.expect("output");
+    assert_eq!(output["ok"], 2, "both steps done: {output:#}");
+    let steps = output["steps"].as_object().expect("steps");
+    let b_entry = &steps[&step_b.0.to_string()];
+    assert_eq!(b_entry["state"], "done");
+    assert_eq!(
+        b_entry["output"]["echoed"]["carried"], "from-step-one",
+        "step 1's output threaded into step 2: {b_entry:#}"
+    );
+
+    // Step rows exist with parent + plan_id set.
+    let plan_id: harness_core::PlanId =
+        serde_json::from_value(output["plan_id"].clone()).expect("plan id");
+    let rows = a.store.list_tasks_by_plan(plan_id).expect("by plan");
+    assert_eq!(rows.len(), 2, "one row per step");
+    assert!(rows.iter().all(|(_, cap, state, parent)| cap == "echo"
+        && *state == TaskState::Done
+        && *parent == Some(id)));
+    // Row ids in the aggregate map back to real rows.
+    let row_ids: Vec<&str> = steps
+        .values()
+        .filter_map(|s| s["task_id"].as_str())
+        .collect();
+    assert_eq!(row_ids.len(), 2);
+
+    // Progress frames: 2 step frames + 1 plan summary in the ring.
+    let frames: Vec<serde_json::Value> = a
+        .partials
+        .frames(id)
+        .iter()
+        .filter(|f| f.stream == "progress")
+        .map(|f| serde_json::from_str(&f.line).expect("json"))
+        .collect();
+    let step_frames = frames.iter().filter(|c| !c["step"].is_null()).count();
+    let summaries = frames
+        .iter()
+        .filter(|c| !c["plan_summary"].is_null())
+        .count();
+    assert_eq!((step_frames, summaries), (2, 1), "{frames:#?}");
+
+    a.stop().await;
+}
+
+fn identity_bytes(d: &TestDaemon) -> Vec<u8> {
+    d.node_id().as_bytes().to_vec()
+}

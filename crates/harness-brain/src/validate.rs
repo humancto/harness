@@ -46,9 +46,16 @@ pub fn validate_plan_well_formed(
 /// 3. (3.8) DAG acyclic (Kahn's).
 /// 4. (3.8) every node's capability id is in `available`.
 /// 5. (3.9) every node's `input` validates against `schemas.get(cap_id)`.
-///    Missing schema → `UnknownSchema`.
+///    Missing schema → `UnknownSchema`. **4.3 (ADR-0025):** nodes whose
+///    input embeds `$task_output` references defer this check — the
+///    resolved shape isn't known at plan time; the DAG executor
+///    re-validates the resolved input immediately before dispatch.
 /// 6. (3.9) `constraints.max_cost_usd` is respected when set:
 ///    `response_cost_usd <= cap`. Equality allowed.
+/// 7. (4.3) `tasks[k].id == k` for every entry, and every
+///    `$task_output` reference targets a direct declared dependency
+///    (an edge `(node, referenced)` exists) — data dependencies must be
+///    a subset of control dependencies.
 ///
 /// `confidence_threshold` is NOT checked here — that lives at the
 /// brain.plan executor so a low-confidence `Confident(_)` becomes an
@@ -62,8 +69,46 @@ pub fn validate_plan(
 ) -> Result<(), PlanValidationError> {
     well_formed(plan, available)?;
 
-    // 5. Per-node schema validation.
+    // 7. Key ↔ node-id agreement, and output-reference legality.
+    let mut declared: HashMap<TaskId, HashSet<TaskId>> = HashMap::new();
+    for &(from, to) in &plan.edges {
+        declared.entry(from).or_default().insert(to);
+    }
     for (task_id, node) in &plan.tasks {
+        if node.id != *task_id {
+            return Err(PlanValidationError::NodeIdMismatch {
+                key: *task_id,
+                id: node.id,
+            });
+        }
+        let refs = harness_core::find_output_refs(&node.input).map_err(|e| {
+            PlanValidationError::MalformedOutputRef {
+                task: *task_id,
+                detail: e.to_string(),
+            }
+        })?;
+        for r in &refs {
+            let ok = declared
+                .get(task_id)
+                .is_some_and(|deps| deps.contains(&r.task));
+            if !ok {
+                return Err(PlanValidationError::UndeclaredOutputRef {
+                    task: *task_id,
+                    referenced: r.task,
+                });
+            }
+        }
+    }
+
+    // 5. Per-node schema validation (deferred for ref-bearing nodes —
+    // the executor re-validates the resolved input, ADR-0025).
+    for (task_id, node) in &plan.tasks {
+        let has_refs = harness_core::find_output_refs(&node.input)
+            .map(|r| !r.is_empty())
+            .unwrap_or(false);
+        if has_refs {
+            continue;
+        }
         match schemas.validate(&node.capability, &node.input) {
             Ok(()) => {}
             Err(errors) if errors == ["unknown capability schema"] => {

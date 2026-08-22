@@ -46,6 +46,9 @@ pub mod mcp;
 
 pub mod mesh_meta;
 
+#[cfg(feature = "brain")]
+pub mod plan_exec;
+
 pub use mesh_meta::{
     enrich_with_mesh_meta, MeshExec, MeshGrepCapability, MeshSearchCapability, MeshTarget,
     SubTaskOutcome,
@@ -57,6 +60,9 @@ pub use registry::CapabilitySnapshot;
 
 #[cfg(feature = "brain")]
 pub use brain_plan::{enrich_with_brain_plan, BrainPlanCapability};
+
+#[cfg(feature = "brain")]
+pub use plan_exec::{enrich_with_plan_exec, PlanExec, PlanExecCapability};
 
 #[cfg(feature = "fs")]
 pub use fs::{

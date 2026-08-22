@@ -99,6 +99,9 @@ impl FromStr for TaskState {
     }
 }
 
+/// Step rows of one plan: `(row id, capability, state, parent id)`.
+pub type PlanStepRows = Vec<(TaskId, String, TaskState, Option<TaskId>)>;
+
 /// One row of the `tasks` table, suitable for read-back without
 /// reconstructing the full `Task` envelope (see [`Store::load_task`] for
 /// that). Surface for CLI / UI listings.
@@ -345,6 +348,57 @@ impl Store {
 
     /// List tasks in a given state, newest first by `issued_at` (Uuid v7
     /// is also sortable but we explicitly order by the indexed column).
+    /// Step rows of one plan (4.3): `(row id, capability, state,
+    /// parent id)` ordered by issue time. The 4.8 UI DAG view and the
+    /// plan E2E tests map rows to plan nodes through the aggregate
+    /// output's `steps[*].task_id`.
+    pub fn list_tasks_by_plan(
+        &self,
+        plan_id: harness_core::PlanId,
+    ) -> Result<PlanStepRows, StoreError> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, capability, state, parent_id
+                   FROM tasks
+                  WHERE plan_id = ?
+               ORDER BY issued_at ASC, id ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![plan_id.0.as_bytes()], |r| {
+                    let id_blob: Vec<u8> = r.get(0)?;
+                    let capability: String = r.get(1)?;
+                    let state: String = r.get(2)?;
+                    let parent_blob: Option<Vec<u8>> = r.get(3)?;
+                    Ok((id_blob, capability, state, parent_blob))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .map(|(id_blob, capability, state, parent_blob)| {
+                    let id_arr: [u8; 16] = id_blob
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| StoreError::Cbor("task id must be 16 bytes".into()))?;
+                    let state = state
+                        .parse::<TaskState>()
+                        .map_err(|_| StoreError::Cbor(format!("bad state {state}")))?;
+                    let parent = parent_blob
+                        .map(|b| {
+                            <[u8; 16]>::try_from(b.as_slice())
+                                .map_err(|_| StoreError::Cbor("parent id must be 16 bytes".into()))
+                        })
+                        .transpose()?
+                        .map(|arr| TaskId(uuid::Uuid::from_bytes(arr)));
+                    Ok((
+                        TaskId(uuid::Uuid::from_bytes(id_arr)),
+                        capability,
+                        state,
+                        parent,
+                    ))
+                })
+                .collect()
+        })
+    }
+
     pub fn list_tasks_by_state(&self, state: TaskState) -> Result<Vec<TaskRow>, StoreError> {
         self.with_conn(|c| {
             let mut stmt = c.prepare(

@@ -204,7 +204,7 @@ impl Serialize for Signature {
 impl<'de> Deserialize<'de> for Signature {
     fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
         struct V;
-        impl serde::de::Visitor<'_> for V {
+        impl<'de> serde::de::Visitor<'de> for V {
             type Value = Signature;
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str("64 raw bytes encoding an Ed25519 signature")
@@ -213,6 +213,29 @@ impl<'de> Deserialize<'de> for Signature {
                 let arr: [u8; Signature::LEN] = b
                     .try_into()
                     .map_err(|_| E::invalid_length(b.len(), &"exactly 64"))?;
+                Ok(Signature(arr))
+            }
+            // Human-readable formats (JSON) render `serialize_bytes` as
+            // a number sequence — accept it so envelopes that embed a
+            // Signature (e.g. a `Plan` inside `plan.execute` input, 4.3)
+            // round-trip through the JSON API surface. CBOR still takes
+            // the byte-string fast path above.
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Signature, A::Error> {
+                let mut arr = [0u8; Signature::LEN];
+                for (i, slot) in arr.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element::<u8>()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(i, &"exactly 64"))?;
+                }
+                if seq.next_element::<u8>()?.is_some() {
+                    return Err(serde::de::Error::invalid_length(
+                        Signature::LEN + 1,
+                        &"exactly 64",
+                    ));
+                }
                 Ok(Signature(arr))
             }
         }

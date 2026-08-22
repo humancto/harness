@@ -25,7 +25,10 @@ pub use cardinality::{AggregateOp, Cardinality, MergeStrategy, PartialPolicy};
 pub use dispatch::{LeaseId, TaskAssign, TaskClaim, TaskResultMsg};
 pub use heartbeat::Heartbeat;
 pub use manifest::{Capability, CapabilityRef, NodeManifest, ResourceHints, Resources, Scope};
-pub use plan::{Budget, BudgetAction, CheckpointConfig, CheckpointStorage, HashFn, Plan, PlanNode};
+pub use plan::{
+    find_output_refs, resolve_output_refs, Budget, BudgetAction, CheckpointConfig,
+    CheckpointStorage, HashFn, OutputRef, OutputRefError, Plan, PlanNode,
+};
 pub use result::{
     Cost, FinalResult, LogLevel, LogLine, NodeContribution, NodeStatus, PartialResult, Status,
     TaskResult,
