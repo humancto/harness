@@ -442,6 +442,16 @@ mod tests {
     }
 
     #[test]
+    fn plan_round_trips_through_json() {
+        // plan.execute (4.3) receives plans as JSON task input — the
+        // Signature seq-visitor makes byte fields survive JSON.
+        let p = sample_plan();
+        let j = serde_json::to_value(&p).expect("to json");
+        let back: Plan = serde_json::from_value(j).expect("from json");
+        assert_eq!(p, back);
+    }
+
+    #[test]
     fn plan_sign_then_verify() {
         let id = Identity::generate();
         let mut p = sample_plan();
