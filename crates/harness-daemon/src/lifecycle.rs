@@ -380,6 +380,9 @@ impl DaemonOrchestrator {
                 identity.clone(),
                 capabilities.downgrade(),
                 heartbeat.peers(),
+                // 4.2: per-target progress frames ride the same partial
+                // pipeline as shell line frames (ADR-0024).
+                Some(partial_streamer.sink()),
             );
             harness_capabilities::enrich_with_mesh_meta(&capabilities, mesh_exec);
         }

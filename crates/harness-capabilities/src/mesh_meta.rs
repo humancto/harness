@@ -92,6 +92,13 @@ pub trait MeshExec: Send + Sync + 'static {
 
     /// Await the sub-task's terminal result, up to `deadline`.
     async fn await_terminal(&self, id: TaskId, deadline: Duration) -> SubTaskOutcome;
+
+    /// Sink for per-target progress frames (4.2, ADR-0024). `None`
+    /// (the default) disables emission — pure unit-test fakes stay
+    /// silent, and the daemon wires the partial-stream sink in.
+    fn progress_sink(&self) -> Option<crate::traits::FrameSink> {
+        None
+    }
 }
 
 fn clamp_timeout(input: &JsonValue) -> u64 {

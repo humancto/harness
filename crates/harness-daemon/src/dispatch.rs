@@ -896,7 +896,10 @@ impl TaskChannelHandlers for DispatchRuntime {
         for frame in frames {
             let stream = frame.get("stream").and_then(|s| s.as_str());
             let line = frame.get("line").and_then(|l| l.as_str());
-            if let (Some(stream @ ("stdout" | "stderr")), Some(line)) = (stream, line) {
+            // "progress" (4.2, ADR-0024): structured per-target fan-out
+            // telemetry rides the same pipe as child output lines.
+            if let (Some(stream @ ("stdout" | "stderr" | "progress")), Some(line)) = (stream, line)
+            {
                 buffers.append(msg.task_id, stream, line.to_string());
             }
         }
@@ -1446,6 +1449,15 @@ mod tests {
             f.remote.node_id(),
             partial_msg(&f.remote, task.id, &[("stdout", "three")]),
         );
+        // 4.2: "progress" frames are accepted; unknown kinds still drop.
+        f.runtime.on_partial(
+            f.remote.node_id(),
+            partial_msg(
+                &f.remote,
+                task.id,
+                &[("progress", r#"{"completed":1}"#), ("bogus", "nope")],
+            ),
+        );
 
         let frames = buffers.frames(task.id);
         let got: Vec<(String, String)> = frames
@@ -1458,11 +1470,12 @@ mod tests {
                 ("stdout".into(), "one".into()),
                 ("stderr".into(), "two".into()),
                 ("stdout".into(), "three".into()),
+                ("progress".into(), r#"{"completed":1}"#.into()),
             ]
         );
         // Ring seqs are per-task append order.
         assert_eq!(frames[0].seq, 0);
-        assert_eq!(frames[2].seq, 2);
+        assert_eq!(frames[3].seq, 3);
     }
 
     #[tokio::test]
