@@ -120,6 +120,18 @@ impl HeartbeatService {
         self.events.clone()
     }
 
+    /// Record one already-received (and transport-verified) heartbeat
+    /// into the peer table and publish the [`TableEvent`]. The
+    /// 3.3-fanout daemon's per-connection channel router calls this
+    /// instead of [`HeartbeatService::register_peer`]'s legacy listener.
+    /// Returns `was_new`.
+    pub fn record_incoming(&self, hb: Heartbeat) -> bool {
+        let node_id = hb.node_id;
+        let was_new = self.peers.record(hb);
+        let _ = self.events.send(TableEvent::Recorded { node_id, was_new });
+        was_new
+    }
+
     /// Build + sign a heartbeat from `snapshot`, then `send` it to
     /// every connection in `targets`. Errors per-connection are
     /// `tracing::warn`-ed and swallowed — one slow / dead peer must

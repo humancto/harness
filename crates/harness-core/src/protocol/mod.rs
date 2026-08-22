@@ -12,6 +12,7 @@
 //! `NodeContribution`, `Budget`, `CheckpointConfig`, ...).
 
 pub mod cardinality;
+pub mod dispatch;
 pub mod heartbeat;
 pub mod manifest;
 pub mod plan;
@@ -21,6 +22,7 @@ pub mod support;
 pub mod task;
 
 pub use cardinality::{AggregateOp, Cardinality, MergeStrategy, PartialPolicy};
+pub use dispatch::{LeaseId, TaskAssign, TaskClaim, TaskResultMsg};
 pub use heartbeat::Heartbeat;
 pub use manifest::{Capability, CapabilityRef, NodeManifest, ResourceHints, Resources, Scope};
 pub use plan::{Budget, BudgetAction, CheckpointConfig, CheckpointStorage, HashFn, Plan, PlanNode};

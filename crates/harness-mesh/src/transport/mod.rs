@@ -18,12 +18,14 @@
 //! - [`TransportError`] — single enum for every fallible path.
 
 mod cert;
+mod channel;
 mod connection;
 mod envelope;
 mod error;
 mod quic;
 mod verifier;
 
+pub use channel::ChannelStream;
 pub use connection::{Connection, IncomingConnection};
 pub use envelope::{channels, Sequenced, MAX_FRAME_BYTES};
 pub use error::TransportError;

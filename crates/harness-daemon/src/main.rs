@@ -4,6 +4,7 @@
 
 mod executor;
 mod lifecycle;
+mod peer_net;
 
 use std::sync::Arc;
 

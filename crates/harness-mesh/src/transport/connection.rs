@@ -14,14 +14,22 @@
 //! - `close` is cancel-safe.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
+use dashmap::DashMap;
 use harness_core::{PublicKey, Signable};
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
 
+use crate::transport::channel::{encode_channel_header, read_channel_header, ChannelStream};
 use crate::transport::envelope::{encode_frame, RecvFramer, ReplayTable, Sequenced};
 use crate::transport::error::TransportError;
+
+/// How long the accept-router waits for a freshly-accepted stream to
+/// deliver its channel header before discarding the stream.
+const CHANNEL_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A QUIC handshake has succeeded; the peer pubkey is known. The application
 /// has not yet decided whether to keep the connection — it does so by
@@ -127,6 +135,15 @@ pub struct Connection {
     /// Synchronizes lazy stream initialization across send/recv tasks.
     init: tokio::sync::OnceCell<()>,
     replay: ReplayTable,
+    /// Outbound named channels, one per channel name (3.3-fanout). See
+    /// [`Connection::channel`].
+    channels: DashMap<&'static str, Arc<ChannelStream>>,
+    /// Serializes channel opens so two concurrent `channel()` calls for
+    /// the same name cannot both open a stream.
+    channel_open_lock: Mutex<()>,
+    /// Names already accepted inbound — a second stream for the same
+    /// name is reset (bounds per-peer buffered-stream memory).
+    accepted_channels: DashMap<&'static str, ()>,
 }
 
 struct RecvState {
@@ -158,6 +175,9 @@ impl Connection {
             }),
             init: tokio::sync::OnceCell::new(),
             replay: ReplayTable::new(),
+            channels: DashMap::new(),
+            channel_open_lock: Mutex::new(()),
+            accepted_channels: DashMap::new(),
         }
     }
 
@@ -269,6 +289,143 @@ impl Connection {
         Ok(())
     }
 
+    /// Close without consuming (registry eviction path — the losing
+    /// duplicate in a `ConnMap` tiebreak is behind an `Arc`).
+    pub fn close_ref(&self) {
+        self.inner.close(0u32.into(), b"duplicate-connection");
+    }
+
+    /// True once the underlying QUIC connection is closed or lost.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.inner.close_reason().is_some()
+    }
+
+    /// True if the local side dialed this connection. Both endpoints of
+    /// a connection agree on who the dialer is, which makes it usable in
+    /// the deterministic duplicate-connection tiebreak (ADR-0017).
+    #[must_use]
+    pub fn is_dialer(&self) -> bool {
+        matches!(self.side, Side::Dialer)
+    }
+
+    /// Get-or-open the outbound [`ChannelStream`] for `name` (one per
+    /// channel name per connection). The stream opens with the
+    /// `[0xC5][len][name]` header; the peer's accept-router routes it by
+    /// name. On a send error, call [`Connection::evict_channel`] and
+    /// retry once — the next call reopens a fresh stream.
+    pub async fn channel(&self, name: &'static str) -> Result<Arc<ChannelStream>, TransportError> {
+        if let Some(ch) = self.channels.get(name) {
+            return Ok(ch.clone());
+        }
+        let _guard = self.channel_open_lock.lock().await;
+        if let Some(ch) = self.channels.get(name) {
+            return Ok(ch.clone());
+        }
+        let (mut send, recv) = self
+            .inner
+            .open_bi()
+            .await
+            .map_err(TransportError::from_quinn_connection_error)?;
+        send.write_all(&encode_channel_header(name)).await?;
+        let ch = Arc::new(ChannelStream::new(name, self.pubkey, send, recv));
+        self.channels.insert(name, ch.clone());
+        Ok(ch)
+    }
+
+    /// Drop the cached outbound channel for `name` (after a send error).
+    pub fn evict_channel(&self, name: &'static str) {
+        self.channels.remove(name);
+    }
+
+    /// Forget an inbound channel registration. Called by the owner of an
+    /// accepted [`ChannelStream`] when its recv loop ends, so a peer that
+    /// re-opens the channel (e.g. after evicting its send side on error)
+    /// is not rejected as a duplicate.
+    pub fn release_accepted_channel(&self, name: &'static str) {
+        self.accepted_channels.remove(name);
+    }
+
+    /// Test-only: open a raw stream with an arbitrary (possibly bogus or
+    /// duplicate) channel-header name, bypassing the one-per-name cache.
+    /// Exercises the accept-router's reject paths from integration tests.
+    #[doc(hidden)]
+    pub async fn raw_open_named_stream_for_test(&self, name: &str) -> Result<(), TransportError> {
+        let (mut send, recv) = self
+            .inner
+            .open_bi()
+            .await
+            .map_err(TransportError::from_quinn_connection_error)?;
+        #[allow(clippy::cast_possible_truncation)]
+        let len = name.len() as u16;
+        let mut header = Vec::with_capacity(3 + name.len());
+        header.push(crate::transport::channel::CHANNEL_MAGIC);
+        header.extend_from_slice(&len.to_be_bytes());
+        header.extend_from_slice(name.as_bytes());
+        send.write_all(&header).await?;
+        // Keep the halves alive so the stream stays open from the peer's
+        // point of view; the reject paths these tests exercise depend on
+        // the stream not FIN-ing immediately.
+        std::mem::forget(send);
+        std::mem::forget(recv);
+        Ok(())
+    }
+
+    /// Accept the next inbound named channel stream. **Exactly one task
+    /// per connection may call this in a loop** (the accept-router) —
+    /// it is the sole `accept_bi` consumer for channel-based
+    /// connections. Streams with a malformed/unknown header, a header
+    /// that doesn't arrive within [`CHANNEL_HEADER_TIMEOUT`], or a name
+    /// that already has an accepted stream are reset and skipped without
+    /// affecting the connection.
+    pub async fn accept_channel(&self) -> Result<Arc<ChannelStream>, TransportError> {
+        loop {
+            let (send, mut recv) = self
+                .inner
+                .accept_bi()
+                .await
+                .map_err(TransportError::from_quinn_connection_error)?;
+            let header =
+                tokio::time::timeout(CHANNEL_HEADER_TIMEOUT, read_channel_header(&mut recv)).await;
+            let name = match header {
+                Ok(Ok(name)) => name,
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        target: "harness.transport",
+                        peer = %self.pubkey.fingerprint_hex(),
+                        error = %e,
+                        "rejecting inbound stream with bad channel header"
+                    );
+                    let _ = recv.stop(1u32.into());
+                    drop(send);
+                    continue;
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        target: "harness.transport",
+                        peer = %self.pubkey.fingerprint_hex(),
+                        "rejecting inbound stream: channel header timed out"
+                    );
+                    let _ = recv.stop(1u32.into());
+                    drop(send);
+                    continue;
+                }
+            };
+            if self.accepted_channels.insert(name, ()).is_some() {
+                tracing::warn!(
+                    target: "harness.transport",
+                    peer = %self.pubkey.fingerprint_hex(),
+                    channel = name,
+                    "rejecting duplicate inbound stream for already-open channel"
+                );
+                let _ = recv.stop(1u32.into());
+                drop(send);
+                continue;
+            }
+            return Ok(Arc::new(ChannelStream::new(name, self.pubkey, send, recv)));
+        }
+    }
+
     /// Drive the framer until a complete frame is assembled. Cancel-safe:
     /// the framer + any partially-consumed `Bytes` chunk live on `self`
     /// (under `recv_state: Mutex<RecvState>`). If a `read_chunk` returns
@@ -326,7 +483,9 @@ impl Connection {
 /// Sync helper: drain `framer.leftover` into a working buffer, run the
 /// state machine, stash remainder. Returns `Some(frame)` if a complete
 /// frame fell out, `None` if leftover wasn't enough.
-fn try_decode_from_leftover(framer: &mut RecvFramer) -> Result<Option<Vec<u8>>, TransportError> {
+pub(crate) fn try_decode_from_leftover(
+    framer: &mut RecvFramer,
+) -> Result<Option<Vec<u8>>, TransportError> {
     let mut buf = framer.take_leftover();
     if buf.is_empty() {
         return Ok(None);
@@ -341,7 +500,7 @@ fn try_decode_from_leftover(framer: &mut RecvFramer) -> Result<Option<Vec<u8>>, 
 /// Sync helper: combine `framer.leftover` (if any) with a freshly-read
 /// `chunk`, run the state machine, stash remainder. Returns
 /// `Some(frame)` on completion, `None` if more chunks are needed.
-fn try_decode_combined(
+pub(crate) fn try_decode_combined(
     framer: &mut RecvFramer,
     chunk: Bytes,
 ) -> Result<Option<Vec<u8>>, TransportError> {

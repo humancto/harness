@@ -230,6 +230,110 @@ impl Store {
         })
     }
 
+    /// CAS `submitted → dispatched` AND record which node the task was
+    /// routed to, in one UPDATE. Returns `Ok(true)` if this call won the
+    /// race, `Ok(false)` if the row was in another state or absent.
+    ///
+    /// This is the 3.3-fanout "claim ownership" hop from ADR-0009: only
+    /// the `DispatchService` performs it; the executor claims from
+    /// `dispatched` onward.
+    pub fn try_dispatch_task(&self, id: TaskId, node: NodeId) -> Result<bool, StoreError> {
+        self.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE tasks SET state = 'dispatched', assigned_node = ?1
+                  WHERE id = ?2 AND state = 'submitted'",
+                params![node.as_bytes(), id.0.as_bytes()],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
+    /// Worker-side ingest of a remote assignment: insert the task with the
+    /// row born at `dispatched`, assigned to `assigned_node` (the local
+    /// node). Idempotent — a re-delivered assignment after a reconnect is
+    /// a no-op (`Ok(false)`); the `dispatched → claimed` CAS already
+    /// guarantees single execution.
+    pub fn insert_task_dispatched(
+        &self,
+        task: &Task,
+        assigned_node: NodeId,
+    ) -> Result<bool, StoreError> {
+        let bytes = task
+            .canonical_bytes()
+            .map_err(|e| StoreError::Cbor(e.to_string()))?;
+        let sig = task.sig_field().to_bytes();
+        self.with_conn(|c| {
+            let n = c.execute(
+                "INSERT OR IGNORE INTO tasks (
+                    id, parent_id, plan_id, capability, state,
+                    issued_by, issued_at, canonical_cbor, signature,
+                    assigned_node
+                ) VALUES (?, ?, ?, ?, 'dispatched', ?, ?, ?, ?, ?)",
+                params![
+                    task.id.0.as_bytes(),
+                    task.parent.map(|p| p.0.as_bytes().to_vec()),
+                    task.plan_id.map(|p| p.0.as_bytes().to_vec()),
+                    task.capability,
+                    task.issued_by.as_bytes(),
+                    i64::try_from(task.issued_at).unwrap_or(i64::MAX),
+                    bytes,
+                    sig.as_slice(),
+                    assigned_node.as_bytes(),
+                ],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
+    /// Which node the task is currently assigned to (`None` while
+    /// `submitted` or for pre-3.3 rows).
+    pub fn assigned_node(&self, id: TaskId) -> Result<Option<NodeId>, StoreError> {
+        self.with_conn(|c| {
+            let blob: Option<Option<Vec<u8>>> = c
+                .query_row(
+                    "SELECT assigned_node FROM tasks WHERE id = ?",
+                    params![id.0.as_bytes()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            blob.flatten()
+                .map(|b| {
+                    <[u8; 16]>::try_from(b.as_slice())
+                        .map(NodeId::from_bytes)
+                        .map_err(|_| StoreError::Cbor("assigned_node must be 16 bytes".into()))
+                })
+                .transpose()
+        })
+    }
+
+    /// List tasks in `state` assigned to `assigned` (or with no
+    /// assignment when `assigned` is `None`), oldest first — dispatch
+    /// and execution loops drain FIFO.
+    pub fn list_tasks_by_state_assigned(
+        &self,
+        state: TaskState,
+        assigned: Option<NodeId>,
+    ) -> Result<Vec<TaskRow>, StoreError> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, capability, state, issued_by, issued_at,
+                        completed_by, started_at, finished_at
+                   FROM tasks
+                  WHERE state = ?1
+                    AND ((?2 IS NULL AND assigned_node IS NULL)
+                         OR assigned_node = ?2)
+               ORDER BY issued_at ASC",
+            )?;
+            let rows = stmt
+                .query_map(
+                    params![state.as_str(), assigned.map(|n| n.as_bytes().to_vec())],
+                    |r| Ok(row_to_task_row(r)),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter().collect::<Result<Vec<_>, _>>()
+        })
+    }
+
     /// List tasks in a given state, newest first by `issued_at` (Uuid v7
     /// is also sortable but we explicitly order by the indexed column).
     pub fn list_tasks_by_state(&self, state: TaskState) -> Result<Vec<TaskRow>, StoreError> {

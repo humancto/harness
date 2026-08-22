@@ -37,6 +37,7 @@ harness-api         = { workspace = true }
 harness-store        = { workspace = true }
 harness-capabilities = { workspace = true, features = ["fs"] }
 harness-policy       = { workspace = true }
+harness-orchestrator = { workspace = true }
 harness-vault        = { workspace = true }
 harness-brain        = { workspace = true, features = ["localfast"] }
 reqwest             = { workspace = true }

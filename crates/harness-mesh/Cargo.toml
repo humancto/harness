@@ -38,6 +38,7 @@ rand         = { workspace = true }
 argon2       = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
-proptest = { workspace = true }
-uuid     = { workspace = true }
+tempfile   = { workspace = true }
+proptest   = { workspace = true }
+uuid       = { workspace = true }
+serde_json = { workspace = true }
