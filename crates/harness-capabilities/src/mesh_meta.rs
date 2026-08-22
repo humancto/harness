@@ -364,7 +364,12 @@ struct DriveCtx {
     /// JSON key holding the per-target result array (`"matches"` for
     /// grep, `"hits"` for search) — for the frame's `items` count.
     items_key: &'static str,
-    /// This controller's pair count (the `task_results` denominator).
+    /// This controller's pair count — the `task_results` `progress`
+    /// denominator, deliberately PER-CONTROLLER while the frame chunks'
+    /// `completed`/`total` are cross-controller (shared counters). The
+    /// `TaskResult`s are discarded by `drive_fanout` today; an external
+    /// consumer of the §14.8 stream must not "fix" either side to match
+    /// the other (diff review MINOR-4).
     expected: u64,
 }
 

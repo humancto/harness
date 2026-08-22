@@ -125,7 +125,10 @@ controller until 4.5 (ADR-0023).
 closures; `timed_out` added to the counters so the summary schema is producible; ADR-0024
 reconciles 4.2's telemetry-over-partials with 4.5's deferred federated `PartialResult`
 streaming). The spawned-driver/bounded-mpsc bridge is deliberately unbuilt until a
-detached consumer exists (owner: 4.5).
+detached consumer exists (owner: 4.5). Diff review APPROVE with 4 telemetry-edge notes
+recorded in ADR-0024 "Accepted losses"; **Phase 6 hardening carry**: preserve
+`PartialBuffers` `next_seq` across ring-entry eviction/recreation so seq-cursored
+consumers (WS, CLI) don't suppress reborn frames under >256 concurrent tasks.
 
 ## Phase 4 — next up
 

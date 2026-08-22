@@ -83,6 +83,24 @@ authoritative. Ring eviction under >256 concurrent tasks loses telemetry
 only. A ≤64-target fan-out emits ≤65 frames (~200–300 B each) — inside
 every existing bound.
 
+Three more accepted edges (diff review):
+
+- **Retry re-emission.** A wrapper task retried after lease expiry
+  (`max_attempts` default 3) appends a second full frame series —
+  including a second summary — to the same task ring, exactly as a
+  retried shell task duplicates stdout. Consumers key on the *last*
+  summary frame, not "the" summary frame.
+- **Early-end summaries count completed targets only.** On a deadline or
+  fail-fast end, pairs never completed appear in the terminal output's
+  `failures[]` but not in the summary counters, so
+  `ok + failed + timed_out < total` — the gap is the never-completed
+  pairs. The terminal output stays authoritative.
+- **Ring-entry recreation resets `seq`.** If an active task's ring entry
+  is evicted (>256 tracked tasks) and later recreated, `seq` restarts at
+  0 and seq-cursored consumers (WS socket, CLI poll) suppress the reborn
+  frames. Preserving `next_seq` across recreation is a Phase 6 hardening
+  note in STATE.md.
+
 ## Deferred
 
 UI live per-node progress bars consuming `RunStreamFrame` → **4.8** (the
