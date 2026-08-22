@@ -373,7 +373,7 @@ async fn submit_task(
         .ok_or_else(|| anyhow::anyhow!("submit response missing task_id: {body}"))
 }
 
-async fn poll_until_terminal(
+pub(crate) async fn poll_until_terminal(
     client: &reqwest::Client,
     api_base: &str,
     token: &str,

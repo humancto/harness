@@ -66,6 +66,30 @@ impl Store {
         })
     }
 
+    /// Every stored manifest (self + announced peers), unordered.
+    /// The 3.11 mesh meta-capabilities enumerate fan-out targets from
+    /// this; liveness filtering happens at the caller.
+    pub fn list_manifests(&self) -> Result<Vec<NodeManifest>, StoreError> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare("SELECT node_id FROM node_manifests")?;
+            let ids: Vec<Vec<u8>> = stmt
+                .query_map([], |r| r.get::<_, Vec<u8>>(0))?
+                .collect::<Result<_, _>>()?;
+            Ok(ids)
+        })
+        .and_then(|ids| {
+            ids.into_iter()
+                .filter_map(|blob| {
+                    <[u8; 16]>::try_from(blob.as_slice())
+                        .ok()
+                        .map(NodeId::from_bytes)
+                })
+                .map(|id| self.load_manifest(id))
+                .filter_map(Result::transpose)
+                .collect()
+        })
+    }
+
     /// Drop a manifest and (via FK CASCADE) all derived index rows.
     pub fn delete_manifest(&self, node_id: NodeId) -> Result<(), StoreError> {
         self.with_conn(|c| {

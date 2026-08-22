@@ -345,6 +345,21 @@ impl DaemonOrchestrator {
             .await
             .map_err(|e| anyhow::anyhow!("mcp.toml load failed at {}: {e}", mcp_path.display()))?;
         }
+        // Phase 3.11: mesh.grep / mesh.search federated wrappers.
+        // Registered before brain.plan so the planner's capability
+        // snapshot sees them. Self-owned scopes run in-process via the
+        // weak registry; remote scopes become pinned sub-tasks routed
+        // by the dispatch runtime (ADR-0022).
+        {
+            let mesh_exec = crate::mesh_exec::StoreMeshExec::new(
+                store.clone(),
+                identity.clone(),
+                capabilities.downgrade(),
+                heartbeat.peers(),
+            );
+            harness_capabilities::enrich_with_mesh_meta(&capabilities, mesh_exec);
+        }
+
         // Phase 3.8/3.9: register `brain.plan` with a backend lineup.
         // Lives last in the enricher list so it observes every other
         // registered capability via `WeakCapabilityRegistry::snapshot`.
@@ -510,6 +525,12 @@ impl DaemonOrchestrator {
     pub(crate) fn mesh_addr(&self) -> SocketAddr {
         #[allow(clippy::expect_used)]
         self.transport.local_addr().expect("transport bound")
+    }
+
+    /// Peer table handle for test liveness waits.
+    #[cfg(test)]
+    pub(crate) fn peer_table(&self) -> harness_mesh::heartbeat::PeerTable {
+        self.heartbeat.peers()
     }
 
     /// Store handle for test assertions.

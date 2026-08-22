@@ -21,6 +21,7 @@ use crate::lifecycle::{DaemonOrchestrator, DaemonRuntimeConfig};
 struct TestDaemon {
     identity: Arc<Identity>,
     store: Store,
+    peers: harness_mesh::heartbeat::PeerTable,
     mesh_addr: SocketAddr,
     stop_tx: watch::Sender<bool>,
     handle: tokio::task::JoinHandle<()>,
@@ -93,6 +94,7 @@ async fn boot_one(
         .expect("build daemon");
     let mesh_addr = orch.mesh_addr();
     let store = orch.store();
+    let peers = orch.peer_table();
     let (stop_tx, stop_rx) = watch::channel(false);
     let handle = tokio::spawn(async move {
         let _ = orch.run_until(stop_rx).await;
@@ -100,6 +102,7 @@ async fn boot_one(
     TestDaemon {
         identity,
         store,
+        peers,
         mesh_addr,
         stop_tx,
         handle,
@@ -184,12 +187,15 @@ async fn wait_for_state(
     }
 }
 
-/// Wait until `a`'s capability index (via its store manifests) knows `b`.
+/// Wait until both nodes hold each other's manifest AND at least one
+/// heartbeat (the `mesh_meta` target filter requires peer liveness).
 async fn wait_for_mesh(a: &TestDaemon, b: &TestDaemon) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let seen = a.store.load_manifest(b.node_id()).ok().flatten().is_some()
-            && b.store.load_manifest(a.node_id()).ok().flatten().is_some();
+            && b.store.load_manifest(a.node_id()).ok().flatten().is_some()
+            && a.peers.get(&b.node_id()).is_some()
+            && b.peers.get(&a.node_id()).is_some();
         if seen {
             return;
         }
@@ -314,4 +320,74 @@ allow = [{ cmd = "sleep", any_args = true }]
     );
 
     a.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m04_mesh_grep_federates_across_both_nodes() {
+    // 3.11: a single mesh.grep task fans out to fs.grep on every
+    // node/scope and concat-merges the results with provenance.
+    let root_a = tempfile::tempdir().expect("root a");
+    let root_b = tempfile::tempdir().expect("root b");
+    let data_a = tempfile::tempdir().expect("data a");
+    let data_b = tempfile::tempdir().expect("data b");
+    std::fs::write(data_a.path().join("alpha.txt"), "the needle in a\n").expect("write a");
+    std::fs::write(
+        data_b.path().join("beta.txt"),
+        "another needle in b\nplain line\n",
+    )
+    .expect("write b");
+    for (root, data, id) in [(&root_a, &data_a, "docs-a"), (&root_b, &data_b, "docs-b")] {
+        std::fs::write(
+            root.path().join("scopes.toml"),
+            format!(
+                "[[scope]]\nid=\"{id}\"\nkind=\"directory\"\nlabel=\"L\"\nroot=\"{}\"\n",
+                data.path().display()
+            ),
+        )
+        .expect("scopes.toml");
+    }
+
+    let id_a = Arc::new(harness_mesh::identity::init_or_load(root_a.path()).expect("id a"));
+    let id_b = Arc::new(harness_mesh::identity::init_or_load(root_b.path()).expect("id b"));
+    let trust_a = TrustStore::open(root_a.path(), id_a.node_id()).expect("trust a");
+    let trust_b = TrustStore::open(root_b.path(), id_b.node_id()).expect("trust b");
+    trust_a.add(peer_of(&id_b, "node-b")).expect("a trusts b");
+    trust_b.add(peer_of(&id_a, "node-a")).expect("b trusts a");
+    let a = boot_one(root_a, id_a, trust_a, "node-a", vec![]).await;
+    let b = boot_one(root_b, id_b, trust_b, "node-b", vec![a.mesh_addr]).await;
+    wait_for_mesh(&a, &b).await;
+
+    let id = submit_task(
+        &a,
+        "mesh.grep",
+        serde_json::json!({ "pattern": "needle", "timeout_ms": 15_000 }),
+        None, // Anyone — either node may coordinate
+        20_000,
+    );
+    let state = wait_for_state(&a.store, id, &[TaskState::Done], Duration::from_secs(30)).await;
+    assert_eq!(state, TaskState::Done);
+
+    let row = a.store.load_task_result(id).expect("load").expect("row");
+    let output = row.output.expect("output");
+    let results = output["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 2, "both scopes must contribute: {output:#}");
+    let scopes: Vec<&str> = results
+        .iter()
+        .map(|r| r["scope"].as_str().unwrap())
+        .collect();
+    assert!(scopes.contains(&"docs-a") && scopes.contains(&"docs-b"));
+    // Each block's matches carry the file + line.
+    for block in results {
+        let matches = block["result"]["matches"].as_array().expect("matches");
+        assert_eq!(matches.len(), 1, "one needle per scope: {block:#}");
+        // Pin the real fs.grep MatchDto field names the CLI renders.
+        assert!(matches[0]["path"].as_str().is_some());
+        assert!(matches[0]["line_number"].as_u64().is_some());
+        assert!(matches[0]["line"].as_str().unwrap().contains("needle"));
+    }
+    assert_eq!(output["provenance"]["targets_ok"], 2);
+    assert_eq!(output["failures"].as_array().expect("failures").len(), 0);
+
+    a.stop().await;
+    b.stop().await;
 }

@@ -7,6 +7,7 @@ mod executor;
 #[cfg(test)]
 mod fanout_tests;
 mod lifecycle;
+mod mesh_exec;
 mod peer_net;
 
 use std::sync::Arc;
@@ -31,6 +32,43 @@ fn main() -> Result<()> {
         SyncOutcome::SubmitRequested(args) => run_async_cli(harness_cli::run_submit(args)),
         SyncOutcome::TasksRequested(args) => run_async_cli(harness_cli::run_tasks(args)),
         SyncOutcome::RunRequested(args) => dispatch_run(args),
+        SyncOutcome::SearchRequested(args) => {
+            dispatch_outcome(harness_cli::query::run_search(args))
+        }
+        SyncOutcome::GrepRequested(args) => dispatch_outcome(harness_cli::query::run_grep(args)),
+    }
+}
+
+/// Like [`dispatch_run`] for any future resolving to a [`RunOutcome`]
+/// (`harness search` / `harness grep`).
+fn dispatch_outcome<F>(fut: F) -> Result<()>
+where
+    F: std::future::Future<Output = Result<RunOutcome>>,
+{
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
+    let outcome: RunOutcome = runtime.block_on(fut)?;
+    emit_outcome(&outcome);
+    if outcome.code != 0 {
+        std::process::exit(outcome.code);
+    }
+    Ok(())
+}
+
+fn emit_outcome(outcome: &RunOutcome) {
+    if !outcome.stdout.is_empty() {
+        #[allow(clippy::print_stdout)]
+        {
+            print!("{}", outcome.stdout);
+        }
+    }
+    if !outcome.stderr.is_empty() {
+        #[allow(clippy::print_stderr)]
+        {
+            eprint!("{}", outcome.stderr);
+        }
     }
 }
 
