@@ -41,6 +41,11 @@ pub enum Action<'a> {
     /// invokes the underlying inference engine.
     Llm { model: &'a str },
 
+    /// Per-tool MCP gate, evaluated on the executing node before
+    /// `mcp.<server>.<tool>` (3.7) forwards the call to the MCP
+    /// server subprocess. Default deny, like shell (ADR-0018).
+    Mcp { server: &'a str, tool: &'a str },
+
     /// Per-tag secret-access gate. Reserved for Phase 3.6-encrypted,
     /// where the policy will gate which capabilities can read which
     /// `secret/...` tags. In Phase 3.6a the evaluator returns
@@ -151,6 +156,7 @@ fn evaluate_against(policy: &Policy, ctx: &EvalContext<'_>) -> Decision {
     match ctx.action {
         Action::Shell { cmd, args } => evaluate_shell(policy, ctx.from_node, cmd, args),
         Action::Llm { model } => evaluate_llm(policy, ctx.from_node, model),
+        Action::Mcp { server, tool } => evaluate_mcp(policy, ctx.from_node, server, tool),
         // Phase 3.6a: tag access is unconditionally allowed. The
         // evaluator hook is here so 3.6-encrypted can gate without a
         // source-compat break. See ADR-0012.
@@ -301,6 +307,57 @@ fn evaluate_llm(policy: &Policy, from_node: &str, model: &str) -> Decision {
     // No rule matched in a non-empty allow list.
     Decision::Deny {
         reason: format!("no [llm].allow rule matched {model}"),
+    }
+}
+
+// ─────────────────────────────────────────── MCP evaluation (3.7)
+
+/// Evaluate `Action::Mcp { server, tool }` against `[mcp]`.
+///
+/// Default-deny, symmetric with shell: MCP tools are arbitrary code
+/// shipped by external server processes, so nothing runs unless the
+/// operator wrote an allow rule. `[mcp]` absent or empty → deny.
+/// Order: trust short-circuit → deny pass → allow pass → deny.
+/// See ADR-0018.
+fn evaluate_mcp(policy: &Policy, from_node: &str, server: &str, tool: &str) -> Decision {
+    let mcp = &policy.mcp;
+
+    // Trust short-circuit (symmetric with shell / llm).
+    let trust = resolve_trust(&mcp.from, from_node);
+    if matches!(trust, TrustLevel::Untrusted) {
+        return Decision::Deny {
+            reason: format!("untrusted source node {from_node:?}"),
+        };
+    }
+
+    // Deny pass first, declaration order.
+    for rule in &mcp.deny {
+        if mcp_rule_matches(rule, server, tool) {
+            return Decision::Deny {
+                reason: format!("denied by [mcp].deny rule for {server}/{tool}"),
+            };
+        }
+    }
+
+    // Allow pass.
+    for rule in &mcp.allow {
+        if mcp_rule_matches(rule, server, tool) {
+            return Decision::Allow;
+        }
+    }
+
+    Decision::Deny {
+        reason: format!("no [mcp].allow rule matched {server}/{tool}"),
+    }
+}
+
+fn mcp_rule_matches(rule: &crate::config::McpRule, server: &str, tool: &str) -> bool {
+    if rule.server != server {
+        return false;
+    }
+    match rule.tool.as_deref() {
+        None => true, // server-wide rule
+        Some(t) => t == tool,
     }
 }
 

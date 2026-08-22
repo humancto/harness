@@ -325,6 +325,26 @@ impl DaemonOrchestrator {
                 cloud_client,
             );
         }
+        // Phase 3.7: load `~/.harness/mcp.toml`, spawn the configured
+        // MCP servers, and register one `mcp.<server>.<tool>` cap per
+        // discovered tool. Missing file → info log, no MCP caps.
+        // Parse / validation errors are fatal — refusing to start
+        // beats silently skipping a misconfigured integration. Each
+        // configured server is then best-effort: one server failing
+        // to spawn logs a warning and is skipped, the daemon still
+        // boots (ADR-0018). Runs before `brain.plan` registration so
+        // the planner's capability snapshot sees the MCP tools.
+        #[cfg(feature = "mcp")]
+        {
+            let mcp_path = config.harness_root.join("mcp.toml");
+            harness_capabilities::enrich_with_mcp_from_path(
+                &capabilities,
+                policy_engine.clone(),
+                &mcp_path,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("mcp.toml load failed at {}: {e}", mcp_path.display()))?;
+        }
         // Phase 3.8/3.9: register `brain.plan` with a backend lineup.
         // Lives last in the enricher list so it observes every other
         // registered capability via `WeakCapabilityRegistry::snapshot`.

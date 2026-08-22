@@ -29,6 +29,14 @@ pub struct Policy {
     /// (Deliberately `Option` to distinguish "absent" from "empty".)
     #[serde(default)]
     pub llm: Option<LlmPolicy>,
+
+    /// `[mcp]` section — Phase 3.7. Default (section absent or empty)
+    /// is **deny-all**, matching shell: MCP tools are arbitrary code
+    /// provided by external servers, so an operator must opt in
+    /// explicitly. Non-`Option` because absent and empty mean the
+    /// same thing here (unlike `[llm]`).
+    #[serde(default)]
+    pub mcp: McpPolicy,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -195,6 +203,35 @@ pub struct LlmAllowModel {
 #[serde(deny_unknown_fields)]
 pub struct LlmAllowPrefix {
     pub model_prefix: String,
+}
+
+/// `[mcp]` policy section — Phase 3.7 (`mcp.<server>.<tool>` proxy
+/// capabilities). Deny pass runs first (declaration order, first match
+/// wins), then the allow pass; anything unmatched is denied. An empty
+/// section (or no section at all) therefore denies every MCP call —
+/// same posture as shell (ADR-0018).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpPolicy {
+    #[serde(default)]
+    pub allow: Vec<McpRule>,
+
+    #[serde(default)]
+    pub deny: Vec<McpRule>,
+
+    #[serde(default)]
+    pub from: HashMap<String, TrustLevel>,
+}
+
+/// One `[mcp].allow` / `[mcp].deny` rule. `server` is required; `tool`
+/// is optional — omitted means "every tool on that server".
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpRule {
+    pub server: String,
+
+    #[serde(default)]
+    pub tool: Option<String>,
 }
 
 impl Policy {
