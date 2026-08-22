@@ -26,6 +26,14 @@ pub enum DispatchError {
     #[error("pinned scope {scope_id:?} has no owner")]
     PinnedScopeUnowned { scope_id: String },
 
+    /// 4.4 (ADR-0026): live advertisers exist but every one is
+    /// hard-gated by resource constraints (paused, missing GPU,
+    /// memory/VRAM over capacity, pinned-full). Transient by nature —
+    /// callers must WAIT (bounded by the task's own deadline), never
+    /// terminalize on the eligibility window (plan review BLOCKER-1).
+    #[error("all live nodes resource-gated for capability {capability:?}")]
+    ResourceGated { capability: String },
+
     /// `must_be_local` is true and only cloud-tagged nodes were eligible.
     /// Stub today; wiring lands in 3.6 when cloud capabilities ship.
     #[error("must_be_local: no local-tagged eligible nodes")]
