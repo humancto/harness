@@ -70,7 +70,7 @@ When an item lands, flip its checkbox **in the same PR** as `STATE.md` is update
 - [x] **3.10** `fs.list` / `fs.read` / `fs.search` / `fs.grep` (Owner cardinality, Tantivy or sqlite-FTS index).
   - [x] **3.10a** Scope plumbing + `fs.list` + `fs.read` with TOCTOU-free path confinement via `cap-std`. ADR-0015.
   - [x] **3.10-fts** sqlite-FTS5 index + `fs.search` + `fs.grep`. Per-scope sidecar DB (`~/.harness/index/`), bm25 + snippet(), incremental mtime reindex; `fs.grep` streams via the cap-std walk (no index). ADR-0016.
-- [ ] **3.11** `mesh.search` / `mesh.grep` federated wrappers (fan-out + Concat / Rerank merge).
+- [x] **3.11** `mesh.search` / `mesh.grep` federated wrappers (fan-out + Concat / score-sort merge; true Rerank needs a reranker capability → Phase 5). ADR-0022. CLI `harness search` / `harness grep`.
 
 ## Phase 4 — Distribution patterns
 

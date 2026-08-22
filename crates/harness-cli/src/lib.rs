@@ -27,6 +27,7 @@ use clap::{Parser, Subcommand};
 use harness_mesh::pairing::PairingCode;
 use harness_mesh::{identity, PendingPairings, TrustStore};
 
+pub mod query;
 pub mod run;
 pub use run::{run_run, RunOutcome};
 
@@ -62,8 +63,37 @@ pub enum Command {
     /// `harness run -- uname -a`. `--all`/`--on <node>`/`--where` are
     /// parsed; cross-node dispatch lands in 3.3-fanout.
     Run(RunArgs),
+    /// Federated full-text search across every node's indexed scopes
+    /// (`mesh.search`, Phase 3.11).
+    Search(QueryArgs),
+    /// Federated grep across every node's scopes (`mesh.grep`, 3.11).
+    Grep(QueryArgs),
     /// Placeholder — clean teardown of `~/.harness/` is a Phase 6 concern.
     Leave(LeaveArgs),
+}
+
+/// Args shared by `harness search` and `harness grep`.
+#[derive(Debug, clap::Args)]
+pub struct QueryArgs {
+    /// The query (search) or pattern (grep).
+    pub term: String,
+    /// Treat the grep pattern as a literal string, not a regex.
+    #[arg(long)]
+    pub literal: bool,
+    /// Case-insensitive matching (grep).
+    #[arg(long)]
+    pub ignore_case: bool,
+    /// Overall federated timeout in milliseconds (default 30000).
+    #[arg(long)]
+    pub timeout_ms: Option<u64>,
+    /// Max ranked hits to return (search).
+    #[arg(long)]
+    pub limit: Option<u64>,
+    #[arg(long)]
+    pub root: Option<std::path::PathBuf>,
+    /// Daemon API base URL.
+    #[arg(long, default_value = "http://127.0.0.1:19198")]
+    pub api: String,
 }
 
 #[derive(Debug, clap::Args)]
@@ -227,6 +257,8 @@ pub fn run(cli: Cli) -> Result<SyncOutcome> {
         Command::Submit(args) => Ok(SyncOutcome::SubmitRequested(args)),
         Command::Tasks(args) => Ok(SyncOutcome::TasksRequested(args)),
         Command::Run(args) => Ok(SyncOutcome::RunRequested(args)),
+        Command::Search(args) => Ok(SyncOutcome::SearchRequested(args)),
+        Command::Grep(args) => Ok(SyncOutcome::GrepRequested(args)),
         Command::Daemon(args) => Ok(SyncOutcome::DaemonRequested(args)),
     }
 }
@@ -241,6 +273,8 @@ pub enum SyncOutcome {
     SubmitRequested(SubmitArgs),
     TasksRequested(TasksArgs),
     RunRequested(RunArgs),
+    SearchRequested(QueryArgs),
+    GrepRequested(QueryArgs),
 }
 
 fn cmd_init(args: InitArgs) -> Result<String> {

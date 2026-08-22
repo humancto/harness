@@ -44,6 +44,12 @@ pub mod llm_local;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 
+pub mod mesh_meta;
+
+pub use mesh_meta::{
+    enrich_with_mesh_meta, MeshExec, MeshGrepCapability, MeshSearchCapability, MeshTarget,
+    SubTaskOutcome,
+};
 pub use registry::{CapabilityRegistry, RegistryError, WeakCapabilityRegistry};
 
 #[cfg(feature = "brain")]

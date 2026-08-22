@@ -66,6 +66,17 @@ impl WeakCapabilityRegistry {
             .collect()
     }
 
+    /// Look up one capability without extending the registry's
+    /// lifetime. `None` when the id is unregistered or the registry
+    /// has been dropped. The 3.11 mesh meta-capabilities use this to
+    /// run `fs.*` sub-calls in-process for self-owned scopes.
+    #[must_use]
+    pub fn get(&self, id: &str) -> Option<Arc<dyn Capability>> {
+        let strong = self.inner.upgrade()?;
+        let g = strong.read();
+        g.get(id).cloned()
+    }
+
     /// Atomic snapshot of `(refs, schemas)` under one `RwLock::read()`
     /// so a concurrent registration cannot give callers inconsistent
     /// views. Available only when the `brain` feature is on (because

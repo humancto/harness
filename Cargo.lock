@@ -1234,6 +1234,7 @@ dependencies = [
  "blake3",
  "cap-std",
  "dirs",
+ "futures",
  "harness-brain",
  "harness-core",
  "harness-policy",
