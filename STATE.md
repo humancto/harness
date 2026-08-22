@@ -1,7 +1,7 @@
 # Harness Implementation State
 
-**Current phase:** 2 → 3 (tasks flow complete; fleet exec next)
-**Last updated:** 2026-05-03 (post-2.9)
+**Current phase:** 3 (fleet exec live; 3.3-gossip / 3.3-ui / 3.2-stream / 3.6-encrypted / 3.11 remain)
+**Last updated:** 2026-08-22 (post-3.3-fanout PR-A2)
 
 ## Phase 2 summary (post-merge)
 
@@ -42,18 +42,22 @@ Tests: 410 passing. ADRs 0001-0007 in place. Each PR atomic, expert-reviewed, CI
 | TBD | 3.8   | `brain.plan` Template tier — `harness-brain` crate, `WeakCapabilityRegistry`, `Unsigned<Plan>` + `CapabilityRef` in core. ADR-0013                                                                                                      |
 | TBD | 3.9   | `brain.plan` LocalFast tier — `LocalFastBackend` (Ollama, feature-gated), `CapabilitySchemaIndex`, `validate_plan` (schema + cost), `PlanningPolicy` gets `confidence_threshold`/`prefer_local_models`/`default_max_cost_usd`. ADR-0014 |
 | TBD | 3.10a | Scope plumbing + `fs.list` + `fs.read` with TOCTOU-free path confinement via `cap-std`. `~/.harness/scopes.toml` operator config; `Owner` cardinality declared (forward-compat for 3.3-fanout); `fs` feature opt-in. ADR-0015           |
+| #33 | 3.6b  | `llm.cloud.openai` + `llm.cloud.gemini` — mechanical mirrors of 3.6a; Gemini path-embedded model-name validation; key never in URLs. +34 tests                                                                                          |
+| #34 | 3.10-fts | `fs.search` (sqlite-FTS5 sidecar index per scope, incremental mtime reindex, bm25+snippet) + `fs.grep` (index-free bounded cap-std walk + regex). ADR-0016. Completes item 3.10. +34 tests                                          |
+| #35 | 3.3-A1 | Fanout wire+index plumbing: named channel streams (header + per-channel caps + per-stream replay), PeerNet (ConnMap w/ min-dialer tiebreak, single accept-router per conn, bounded per-peer outbound queues), manifest announce → CapabilityIndex/ScopeIndex/store, TaskAssign/Claim/ResultMsg envelopes, V0005 `assigned_node`. ADR-0017 |
+| A2  | 3.3-A2 | Dispatch runtime + CLI: DispatchService (Submitted-poll → eligible_with_rr over MeshLiveSet → self/remote route, lease TTL = max(lease_ms, timeout+15s), expire_pass w/ max-attempts → Expired, undispatchable → Submitted→Failed supervisor hop), worker ingest (idempotent + terminal-resend) + claim ack + signed result reply, executor now polls Dispatched(assigned=self), API node_name/os/capabilities enrichment + SubmitRequest.execution, CLI `run --all/--on/--where` with concurrent fan-out + `[node]` interleaving. 3 two-daemon money tests incl. exactly-once under short leases and worker-death terminal failure |
 
-Tests as of 3.10a merge: **669 passing** (+37 vs. 3.9). Round-1 review caught path-safety TOCTOU (canonicalize+prefix-check has a race window; fixed by switching to `cap_std::fs::Dir`), unbounded `fs.read` allocation (fixed via stat-first + `take(HARD_MAX + 1)`), false `--on <node>` claim (rewritten — `submit --on` doesn't exist; 3.10a only routes end-to-end on the owning node). All 8 round-1 fixes applied; round-2 caught `cap-std` major version (`"3"` → `"4"`), `Dir::entries()` ordering (fragility in t13), and base64 expansion documentation. Implementation surfaced one runtime bug: sync `open()` on a FIFO blocks the runtime worker thread, defeating `tokio::time::timeout` — fixed by stat-first via `Dir::metadata` (`fstatat`, never blocks) before `open`.
+Tests as of 3.3-fanout PR-A2: **784 passing** (669 at 3.10a merge) (+37 vs. 3.9). Round-1 review caught path-safety TOCTOU (canonicalize+prefix-check has a race window; fixed by switching to `cap_std::fs::Dir`), unbounded `fs.read` allocation (fixed via stat-first + `take(HARD_MAX + 1)`), false `--on <node>` claim (rewritten — `submit --on` doesn't exist; 3.10a only routes end-to-end on the owning node). All 8 round-1 fixes applied; round-2 caught `cap-std` major version (`"3"` → `"4"`), `Dir::entries()` ordering (fragility in t13), and base64 expansion documentation. Implementation surfaced one runtime bug: sync `open()` on a FIFO blocks the runtime worker thread, defeating `tokio::time::timeout` — fixed by stat-first via `Dir::metadata` (`fstatat`, never blocks) before `open`.
 
 ## Phase 3 carryovers (deferred from Phase 2)
 
 These will land alongside their natural Phase 3 home, not as a "phase 2.10":
 
-1. **QUIC envelope channels** (`harness.task.assign|claim|result`, `harness.gossip.state`) → ships with **3.3** (`harness run --all`) since the worker-side listener loop is the same primitive.
-2. **Heartbeat `replica_head` field for anti-entropy** (wire-format change, ADR-pending) → ships with the gossip transport in 3.3.
-3. **Dispatcher async runtime** (`Dispatcher::submit / on_result / expire_pass`) → ships with 3.3.
+1. ~~**QUIC envelope channels** (`harness.task.assign|claim|result`)~~ → SHIPPED in 3.3-fanout (ADR-0017). `harness.gossip.state` remains → **3.3-gossip**.
+2. **Heartbeat `replica_head` field for anti-entropy** (wire-format change, ADR-pending) → **3.3-gossip**.
+3. ~~**Dispatcher async runtime**~~ → SHIPPED in 3.3-fanout PR-A2 (`DispatchRuntime`: poll/route/lease/expire/claim/result).
 4. **JSON-Schema input validation** of `Task.input` against `Capability::input_schema` → ships with **3.1** (policy engine) since both gate on capability metadata.
-5. **WS `/api/v1/runs/<task_id>` per-task result stream** → ships when the worker emits `FinalResult` over QUIC (3.3).
+5. **WS `/api/v1/runs/<task_id>` per-task result stream** → **3.3-gossip** (workers now emit `FinalResult` over QUIC; the WS bridge remains).
 6. **`assert!`-on-duplicate at registry compile time** → cosmetic; runtime check is fine for the static built-in set.
 7. **`GET /api/v1/capabilities` schema completeness** — currently emits id/version/cardinality/cost_hint without the full `input_schema`. Phase 3.x will surface schemas as part of the registry.
 
@@ -81,6 +85,19 @@ These will land alongside their natural Phase 3 home, not as a "phase 2.10":
 ## Blocked
 
 - (nothing)
+
+## 3.3-fanout carried risks (review follow-ups; owners named)
+
+From the PR-A1 diff review (APPROVE, 5 minors) + ADR-0017:
+
+1. ~~`expire_and_reset_task` worker guard + `try_complete_pending_or_claimed`~~ — landed in PR-A2 with tests.
+2. **Drop-guard for `release_accepted_channel`** — a panicking `TaskChannelHandlers` impl would skip the release and permanently block that channel name until reconnect. Handlers are currently panic-free store calls; fix alongside 3.2-stream's channel work.
+3. **Router header-read is inline** — a malicious trusted peer opening headerless streams stalls that peer's own router 5 s per stream (self-inflicted only). Move the header read off the accept loop in 3.2-stream.
+4. **Announce is fire-once per connection** — a twice-failed announce send isn't retried until re-adopt; with index-driven routing that becomes a 30 s terminal-Failed for tasks aimed at that node. Consider announce-failure → connection close in 3.3-gossip.
+5. **Same-dialer duplicate divergence** — both sides can briefly close both duplicate connections; recovery leans on discovery-event redial (the `dialed` set never forgets). Note for Phase 4 hardening.
+6. **Wire fixtures for TaskAssign/Claim/ResultMsg** — no insta pins yet (heartbeat/manifest have them). Add in 3.3-gossip before mixed-version nodes exist.
+7. **Federated cardinality routes to a single node until Phase 4.5** (documented in ADR-0017); `redundancy=2` speculative execution untouched (6.2).
+8. **`FinalResult.started_at`/`wall_ms` not tracked** until Phase 5 cost tracking (mirror `finished_at`/0).
 
 ## Open decisions / carried risks
 

@@ -36,7 +36,8 @@ use parking_lot::Mutex as ParkingMutex;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
-use crate::peer_net::{MeshIndexes, NoopHandlers, PeerNet};
+use crate::dispatch::DispatchRuntime;
+use crate::peer_net::{MeshIndexes, PeerNet};
 
 /// One-shot factory + run-loop for the daemon. Holds owned references
 /// to every long-lived subsystem.
@@ -52,6 +53,8 @@ pub(crate) struct DaemonOrchestrator {
     executor: crate::executor::LocalExecutor,
     /// Per-peer connection registry + channel router. Phase 3.3-fanout.
     peer_net: Arc<PeerNet>,
+    /// Issuer+worker dispatch runtime. Phase 3.3-fanout PR-A2.
+    dispatch: Arc<DispatchRuntime>,
     /// Coordinated shutdown — flipped to `true` on ctrl-c. The executor
     /// loop watches this; future loops can subscribe too.
     shutdown_tx: watch::Sender<bool>,
@@ -417,21 +420,35 @@ impl DaemonOrchestrator {
             manifest_scopes,
         )
         .map_err(|e| anyhow::anyhow!("sign self manifest: {e}"))?;
+        let cap_index = Arc::new(harness_orchestrator::CapabilityIndex::new());
+        let scope_index = Arc::new(harness_orchestrator::ScopeIndex::new());
         let mesh_indexes = Arc::new(MeshIndexes {
-            caps: harness_orchestrator::CapabilityIndex::new(),
-            scopes: harness_orchestrator::ScopeIndex::new(),
+            caps: cap_index.clone(),
+            scopes: scope_index.clone(),
             store: Some(store.clone()),
         });
+        // The dispatch runtime is both the issuer-side dispatcher and
+        // the worker-side assign/reply handler (PR-A2, ADR-0017).
+        let dispatch_runtime = DispatchRuntime::new(
+            store.clone(),
+            identity.clone(),
+            capabilities.clone(),
+            harness_orchestrator::Dispatcher::with_indexes(cap_index, scope_index),
+            persistent_trust.clone(),
+            heartbeat.peers(),
+        );
         let peer_net = PeerNet::new(
             identity.clone(),
             heartbeat.clone(),
             mesh_indexes,
-            Arc::new(NoopHandlers),
+            dispatch_runtime.clone(),
             self_manifest,
         );
+        dispatch_runtime.attach_net(&peer_net);
 
         let api_state =
             harness_api::ApiStateBuilder::new(identity.clone(), config.mesh_name.clone())
+                .with_node_name(config.node_name.clone())
                 .with_peers(heartbeat.peers())
                 .with_capabilities(cap_ids)
                 .with_auth(auth)
@@ -455,6 +472,7 @@ impl DaemonOrchestrator {
             persistent_trust,
             executor,
             peer_net,
+            dispatch: dispatch_runtime,
             shutdown_tx,
             tasks: ParkingMutex::new(Vec::new()),
             listeners: Arc::new(ParkingMutex::new(Vec::new())),
@@ -467,9 +485,47 @@ impl DaemonOrchestrator {
         self.api_handle.local_addr()
     }
 
+    /// Bound QUIC address (tests wire two daemons via static peers).
+    #[cfg(test)]
+    pub(crate) fn mesh_addr(&self) -> SocketAddr {
+        #[allow(clippy::expect_used)]
+        self.transport.local_addr().expect("transport bound")
+    }
+
+    /// Store handle for test assertions.
+    #[cfg(test)]
+    pub(crate) fn store(&self) -> harness_store::Store {
+        #[allow(clippy::expect_used)]
+        self.api_state
+            .store
+            .clone()
+            .expect("daemon always has a store")
+    }
+
     /// Spawn every loop and block until SIGINT/SIGTERM (or until a fatal
     /// task panics).
     pub(crate) async fn run_until_signal(self) -> Result<()> {
+        self.start_loops();
+        tokio::signal::ctrl_c().await.ok();
+        tracing::info!(target: "harness.daemon", "shutdown requested");
+        let _ = self.shutdown_tx.send(true);
+        self.shutdown().await;
+        Ok(())
+    }
+
+    /// Test variant: run until `stop` flips, then shut down cleanly.
+    #[cfg(test)]
+    pub(crate) async fn run_until(self, mut stop: watch::Receiver<bool>) -> Result<()> {
+        self.start_loops();
+        let _ = stop.changed().await;
+        let _ = self.shutdown_tx.send(true);
+        self.shutdown().await;
+        Ok(())
+    }
+
+    /// Spawn every long-running loop (idempotence not required — called
+    /// exactly once from the run entrypoints).
+    fn start_loops(&self) {
         // Heartbeat broadcaster: per-tick snapshot pulls fresh local
         // metadata. For 1.11 the snapshot is static (no resource
         // sampling yet — that's a Phase 6 hardening item); the brain
@@ -535,11 +591,25 @@ impl DaemonOrchestrator {
         });
         self.tasks.lock().push(exec_handle);
 
-        tokio::signal::ctrl_c().await.ok();
-        tracing::info!(target: "harness.daemon", "shutdown requested");
-        let _ = self.shutdown_tx.send(true);
-        self.shutdown().await;
-        Ok(())
+        // Phase 3.3-fanout PR-A2: dispatch + lease-expiry + worker-reply
+        // loops.
+        let dispatch_handle = tokio::spawn(
+            self.dispatch
+                .clone()
+                .run_dispatch_loop(self.shutdown_tx.subscribe()),
+        );
+        self.tasks.lock().push(dispatch_handle);
+        let expire_handle = tokio::spawn(
+            self.dispatch
+                .clone()
+                .run_expire_loop(self.shutdown_tx.subscribe()),
+        );
+        self.tasks.lock().push(expire_handle);
+        let reply_handle = tokio::spawn(self.dispatch.clone().run_reply_pump(
+            self.executor.subscribe_terminal(),
+            self.shutdown_tx.subscribe(),
+        ));
+        self.tasks.lock().push(reply_handle);
     }
 
     async fn shutdown(self) {

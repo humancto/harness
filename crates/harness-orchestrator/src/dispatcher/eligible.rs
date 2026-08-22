@@ -1,21 +1,35 @@
 //! Eligibility computation — pure routing.
 
+use std::sync::Arc;
+
 use harness_core::{Cardinality, NodeId, Task};
 
 use crate::dispatcher::{filter, live_set::LiveSet, round_robin::RoundRobin, DispatchPlan};
 use crate::error::DispatchError;
 use crate::index::{CapabilityIndex, ScopeIndex};
 
+/// The indexes are `Arc`-shared since 3.3-fanout: the daemon's announce
+/// path writes them (manifest upserts) while the dispatch runtime reads
+/// them through this type. Both index types are internally locked.
 #[derive(Debug, Default)]
 pub struct Dispatcher {
-    capabilities: CapabilityIndex,
-    scopes: ScopeIndex,
+    capabilities: Arc<CapabilityIndex>,
+    scopes: Arc<ScopeIndex>,
 }
 
 impl Dispatcher {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build around externally-owned (shared) indexes.
+    #[must_use]
+    pub fn with_indexes(capabilities: Arc<CapabilityIndex>, scopes: Arc<ScopeIndex>) -> Self {
+        Self {
+            capabilities,
+            scopes,
+        }
     }
 
     pub fn capability_index(&self) -> &CapabilityIndex {

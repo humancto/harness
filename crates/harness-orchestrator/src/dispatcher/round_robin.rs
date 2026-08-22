@@ -25,6 +25,16 @@ impl RoundRobin {
         Self::default()
     }
 
+    /// Seed the cursor for `capability` from a persisted value
+    /// (`Store::last_dispatched`) — only if no in-memory cursor exists
+    /// yet, so a live cursor is never rewound.
+    pub fn seed(&self, capability: &str, last: NodeId) {
+        self.inner
+            .lock()
+            .entry(capability.to_string())
+            .or_insert(last);
+    }
+
     /// Pick the next eligible node after the persisted cursor. `eligible`
     /// must already be sorted (the dispatcher keeps it sorted). Updates
     /// the cursor as a side-effect.

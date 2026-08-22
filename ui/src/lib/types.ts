@@ -22,6 +22,9 @@ export interface PeerDto {
   last_seen_ms_ago: number;
   resources: ResourcesDto | null;
   capabilities_summary: string[];
+  // 3.3-fanout: from the announced manifest; absent until it lands.
+  node_name?: string | null;
+  os?: string | null;
 }
 
 export interface LocalDto extends PeerDto {
@@ -38,6 +41,7 @@ export interface PeersSnapshot {
 
 export interface StatusDto {
   node_id: string;
+  node_name?: string;
   pubkey_fp: string;
   mesh_name: string;
   brain_score: number;

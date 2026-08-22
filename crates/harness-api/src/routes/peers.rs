@@ -12,7 +12,7 @@ pub async fn get_peers(State(state): State<ApiState>) -> Json<PeersSnapshot> {
     let local_status = state.local_status.read().clone();
     let pubkey = state.local_pubkey();
 
-    let local_peer = PeerDto::local(
+    let mut local_peer = PeerDto::local(
         state.local_node_id,
         pubkey,
         &local_status.mesh_name,
@@ -21,13 +21,24 @@ pub async fn get_peers(State(state): State<ApiState>) -> Json<PeersSnapshot> {
         local_status.seq,
         local_status.capabilities.clone(),
     );
+    local_peer.node_name = Some(local_status.node_name.clone());
     let local = LocalDto::new(local_peer);
 
+    // 3.3-fanout: enrich each peer from its announced manifest (name,
+    // os, real capability list) when the store has one.
     let peers: Vec<PeerDto> = state
         .peers
         .snapshot()
         .iter()
-        .map(|entry| PeerDto::from_entry(entry, &local_status.mesh_name))
+        .map(|entry| {
+            let mut dto = PeerDto::from_entry(entry, &local_status.mesh_name);
+            if let Some(store) = &state.store {
+                if let Ok(Some(manifest)) = store.load_manifest(entry.heartbeat.node_id) {
+                    dto.enrich_from_manifest(&manifest);
+                }
+            }
+            dto
+        })
         .collect();
 
     Json(PeersSnapshot {

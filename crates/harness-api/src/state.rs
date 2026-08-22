@@ -18,6 +18,9 @@ use crate::event::MeshEvent;
 #[derive(Clone, Debug)]
 pub struct LocalStatus {
     pub mesh_name: String,
+    /// This node's mesh hostname (`HARNESS_NODE_NAME` / OS hostname).
+    /// Distinct from `mesh_name`. Empty until the daemon sets it.
+    pub node_name: String,
     pub leader_belief: Option<NodeId>,
     pub brain_score: i32,
     pub seq: u64,
@@ -30,6 +33,7 @@ impl LocalStatus {
     pub fn new(mesh_name: impl Into<String>) -> Self {
         Self {
             mesh_name: mesh_name.into(),
+            node_name: String::new(),
             leader_belief: None,
             brain_score: 0,
             seq: 0,
@@ -106,6 +110,7 @@ impl ApiState {
 pub struct ApiStateBuilder {
     identity: Arc<Identity>,
     mesh_name: String,
+    node_name: String,
     peers: Option<PeerTable>,
     events: Option<broadcast::Sender<MeshEvent>>,
     capabilities: Vec<String>,
@@ -121,6 +126,7 @@ impl ApiStateBuilder {
         Self {
             identity,
             mesh_name: mesh_name.into(),
+            node_name: String::new(),
             peers: None,
             events: None,
             capabilities: vec![],
@@ -129,6 +135,12 @@ impl ApiStateBuilder {
             policy: None,
             secrets: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_node_name(mut self, node_name: impl Into<String>) -> Self {
+        self.node_name = node_name.into();
+        self
     }
 
     #[must_use]
@@ -177,6 +189,7 @@ impl ApiStateBuilder {
     pub fn build(self) -> ApiState {
         let local_node_id = self.identity.public_key().node_id();
         let mut status = LocalStatus::new(self.mesh_name);
+        status.node_name = self.node_name;
         status.capabilities = self.capabilities;
         let events = self
             .events

@@ -2,7 +2,10 @@
 //! surface into a real `harness` binary.
 #![forbid(unsafe_code)]
 
+mod dispatch;
 mod executor;
+#[cfg(test)]
+mod fanout_tests;
 mod lifecycle;
 mod peer_net;
 

@@ -1199,6 +1199,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures",
  "harness-core",
  "harness-mesh",
  "reqwest",
