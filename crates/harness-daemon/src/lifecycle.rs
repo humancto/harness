@@ -258,6 +258,24 @@ impl DaemonOrchestrator {
                     harness_capabilities::FsReadCapability::new(scope_registry.clone()),
                 ))
                 .expect("BUG: fs.read registered twice");
+            // Phase 3.10-fts: fs.grep (index-free streaming scan) +
+            // fs.search (sqlite-FTS5 sidecar index under
+            // <harness_root>/index/). ADR-0016.
+            #[allow(clippy::expect_used)]
+            capabilities
+                .register(std::sync::Arc::new(
+                    harness_capabilities::FsGrepCapability::new(scope_registry.clone()),
+                ))
+                .expect("BUG: fs.grep registered twice");
+            #[allow(clippy::expect_used)]
+            capabilities
+                .register(std::sync::Arc::new(
+                    harness_capabilities::FsSearchCapability::new(
+                        scope_registry.clone(),
+                        config.harness_root.join("index"),
+                    ),
+                ))
+                .expect("BUG: fs.search registered twice");
         }
         // Phase 3.4: discover locally-installed Ollama models and
         // register one `llm.local.<model>` cap per. Best-effort —

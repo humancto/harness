@@ -16,10 +16,11 @@ echo = []
 shell = []
 llm = ["dep:reqwest", "dep:url", "dep:harness-vault"]
 brain = ["dep:harness-brain"]
-# 3.10a — fs.list + fs.read. Opt-in (NOT in default) because cap-std +
-# base64 add transitive deps that minimal consumers (CLI, future
-# embedded UIs) shouldn't pay for. Daemon enables explicitly.
-fs   = ["dep:cap-std", "dep:base64", "dep:toml", "dep:dirs"]
+# 3.10a — fs.list + fs.read; 3.10-fts — fs.search + fs.grep. Opt-in
+# (NOT in default) because cap-std + base64 + rusqlite (bundled SQLite
+# with FTS5) + regex add transitive deps that minimal consumers (CLI,
+# future embedded UIs) shouldn't pay for. Daemon enables explicitly.
+fs   = ["dep:cap-std", "dep:base64", "dep:toml", "dep:dirs", "dep:rusqlite", "dep:regex"]
 
 [dependencies]
 harness-core   = { workspace = true }
@@ -40,6 +41,8 @@ cap-std        = { workspace = true, optional = true }
 base64         = { workspace = true, optional = true }
 toml           = { workspace = true, optional = true }
 dirs           = { workspace = true, optional = true }
+rusqlite       = { workspace = true, optional = true }
+regex          = { workspace = true, optional = true }
 
 [dev-dependencies]
 wiremock       = { workspace = true }

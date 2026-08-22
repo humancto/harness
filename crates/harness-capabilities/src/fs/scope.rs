@@ -25,6 +25,7 @@
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use cap_std::ambient_authority;
@@ -40,9 +41,35 @@ pub struct ScopeConfig {
     pub label: String,
     pub canonical_root: PathBuf,
     pub root_dir: Dir,
-    /// Always `false` in 3.10a; 3.10-fts will set `true` when an FTS
-    /// index is built.
-    pub indexed: bool,
+    /// `true` once the 3.10-fts FTS5 index builder has completed at
+    /// least one successful build for this scope (this process).
+    indexed: AtomicBool,
+    /// Unix seconds of the last successful index build; 0 = never.
+    last_indexed_secs: AtomicU64,
+}
+
+impl ScopeConfig {
+    /// Whether an FTS5 index build has completed for this scope.
+    #[must_use]
+    pub fn is_indexed(&self) -> bool {
+        self.indexed.load(Ordering::Relaxed)
+    }
+
+    /// Unix seconds of the last successful index build, if any.
+    #[must_use]
+    pub fn last_indexed_secs(&self) -> Option<u64> {
+        match self.last_indexed_secs.load(Ordering::Relaxed) {
+            0 => None,
+            s => Some(s),
+        }
+    }
+
+    /// Record a successful index build. Called by the 3.10-fts index
+    /// builder; reflected in the next `NodeManifest::scopes` snapshot.
+    pub fn mark_indexed(&self, unix_secs: u64) {
+        self.last_indexed_secs.store(unix_secs, Ordering::Relaxed);
+        self.indexed.store(true, Ordering::Relaxed);
+    }
 }
 
 impl std::fmt::Debug for ScopeConfig {
@@ -52,7 +79,7 @@ impl std::fmt::Debug for ScopeConfig {
             .field("kind", &self.kind)
             .field("label", &self.label)
             .field("canonical_root", &self.canonical_root)
-            .field("indexed", &self.indexed)
+            .field("indexed", &self.is_indexed())
             .finish_non_exhaustive()
     }
 }
@@ -113,7 +140,8 @@ impl ScopeRegistry {
                 label: entry.label,
                 canonical_root,
                 root_dir,
-                indexed: false,
+                indexed: AtomicBool::new(false),
+                last_indexed_secs: AtomicU64::new(0),
             });
             if by_id.insert(entry.id.clone(), cfg).is_some() {
                 return Err(ScopeError::DuplicateId(entry.id));
@@ -137,9 +165,10 @@ impl ScopeRegistry {
         self.by_id.is_empty()
     }
 
-    /// Snapshot for `NodeManifest::scopes`. `indexed: false`,
-    /// `last_indexed: None` in 3.10a; 3.10-fts will set them after
-    /// each index build.
+    /// Snapshot for `NodeManifest::scopes`. `indexed` / `last_indexed`
+    /// reflect the 3.10-fts index builder's progress in this process
+    /// (via [`ScopeConfig::mark_indexed`]); both start false / `None`
+    /// on daemon start.
     #[must_use]
     pub fn manifest_scopes(&self) -> Vec<harness_core::Scope> {
         let mut out: Vec<harness_core::Scope> = self
@@ -149,8 +178,8 @@ impl ScopeRegistry {
                 kind: c.kind.clone(),
                 id: c.id.clone(),
                 label: c.label.clone(),
-                indexed: c.indexed,
-                last_indexed: None,
+                indexed: c.is_indexed(),
+                last_indexed: c.last_indexed_secs(),
             })
             .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
