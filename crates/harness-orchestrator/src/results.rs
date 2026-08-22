@@ -161,7 +161,14 @@ where
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    // Progress values are exact fractions of small integers (k/n for
+    // n ≤ 64) — strict equality is intentional and stable.
+    clippy::float_cmp
+)]
 mod tests {
     use super::*;
     use crate::fanout::{FanoutController, FanoutSpec, WindowPolicy};

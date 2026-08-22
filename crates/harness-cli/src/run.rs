@@ -380,9 +380,26 @@ pub(crate) async fn poll_until_terminal(
     task_id: &str,
     deadline: Duration,
 ) -> Result<JsonValue> {
+    poll_until_terminal_with(client, api_base, token, task_id, deadline, |_| {}).await
+}
+
+/// Like [`poll_until_terminal`], invoking `on_new_partials` with each
+/// batch of not-yet-seen `partials` frames (4.2 progress rendering).
+/// Frames are deduped across polls by their ring `seq`, so the callback
+/// sees every frame at most once — including those on the terminal
+/// envelope.
+pub(crate) async fn poll_until_terminal_with(
+    client: &reqwest::Client,
+    api_base: &str,
+    token: &str,
+    task_id: &str,
+    deadline: Duration,
+    mut on_new_partials: impl FnMut(&[JsonValue]),
+) -> Result<JsonValue> {
     let url = format!("{api_base}/api/v1/tasks/{task_id}");
     let started = Instant::now();
     let mut backoff = Duration::from_millis(POLL_INITIAL_MS);
+    let mut last_seq: Option<u64> = None;
 
     loop {
         if started.elapsed() >= deadline {
@@ -398,6 +415,7 @@ pub(crate) async fn poll_until_terminal(
             bail!("poll failed: HTTP {}", resp.status());
         }
         let body: JsonValue = resp.json().await.context("decode poll response")?;
+        deliver_new_partials(&body, &mut last_seq, &mut on_new_partials);
         let state = body.get("state").and_then(|s| s.as_str()).unwrap_or("");
         if matches!(state, "done" | "failed" | "expired" | "cancelled") {
             return Ok(body);
@@ -411,6 +429,38 @@ pub(crate) async fn poll_until_terminal(
         }
         tokio::time::sleep(next).await;
         backoff = (backoff * 2).min(Duration::from_millis(POLL_MAX_MS));
+    }
+}
+
+/// Extract frames with `seq > *last_seq` from an envelope's `partials`
+/// array, advance the cursor, and hand them to the callback.
+fn deliver_new_partials(
+    envelope: &JsonValue,
+    last_seq: &mut Option<u64>,
+    on_new_partials: &mut impl FnMut(&[JsonValue]),
+) {
+    let Some(frames) = envelope.get("partials").and_then(JsonValue::as_array) else {
+        return;
+    };
+    let fresh: Vec<JsonValue> = frames
+        .iter()
+        .filter(|f| {
+            let seq = f.get("seq").and_then(JsonValue::as_u64);
+            match (seq, *last_seq) {
+                (Some(s), Some(prev)) => s > prev,
+                (Some(_), None) => true,
+                (None, _) => false,
+            }
+        })
+        .cloned()
+        .collect();
+    if let Some(max) = fresh
+        .iter()
+        .filter_map(|f| f.get("seq").and_then(JsonValue::as_u64))
+        .max()
+    {
+        *last_seq = Some(max);
+        on_new_partials(&fresh);
     }
 }
 
@@ -479,6 +529,48 @@ fn prefix_lines(node_label: &str, body: &str) -> String {
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deliver_new_partials_dedups_by_seq_across_polls() {
+        let mut last_seq = None;
+        let seen: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(vec![]);
+        let mut cb = |frames: &[JsonValue]| {
+            seen.borrow_mut()
+                .extend(frames.iter().filter_map(|f| f["seq"].as_u64()));
+        };
+        // First envelope: two frames.
+        deliver_new_partials(
+            &serde_json::json!({ "partials": [
+                { "seq": 0, "stream": "progress", "line": "a" },
+                { "seq": 1, "stream": "stdout", "line": "b" },
+            ]}),
+            &mut last_seq,
+            &mut cb,
+        );
+        // Second envelope repeats 0-1 and adds 2 (ring replay in the
+        // next poll) — only 2 must reach the callback.
+        deliver_new_partials(
+            &serde_json::json!({ "partials": [
+                { "seq": 0, "stream": "progress", "line": "a" },
+                { "seq": 1, "stream": "stdout", "line": "b" },
+                { "seq": 2, "stream": "progress", "line": "c" },
+            ]}),
+            &mut last_seq,
+            &mut cb,
+        );
+        // Identical envelope: nothing new, callback not invoked.
+        deliver_new_partials(
+            &serde_json::json!({ "partials": [
+                { "seq": 2, "stream": "progress", "line": "c" },
+            ]}),
+            &mut last_seq,
+            &mut cb,
+        );
+        assert_eq!(*seen.borrow(), vec![0, 1, 2], "each frame exactly once");
+        // Envelope without partials is a no-op.
+        deliver_new_partials(&serde_json::json!({}), &mut last_seq, &mut cb);
+        assert_eq!(*seen.borrow(), vec![0, 1, 2]);
+    }
 
     fn node(label: &str, byte: u8, os: &str, caps: &[&str], is_self: bool) -> NodeRef {
         NodeRef {

@@ -139,6 +139,30 @@ pub async fn ws_run(
     ws.on_upgrade(move |socket| stream_task(socket, store, partials, task_id))
 }
 
+/// Push frames with `seq > last_seq` (if any) as one
+/// [`RunPartialsEvent`], advancing the cursor. `Err(())` = socket gone.
+async fn push_new_partials(
+    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    partials: &crate::partials::PartialBuffers,
+    task_id: TaskId,
+    last_seq: &mut Option<u64>,
+) -> Result<(), ()> {
+    let fresh: Vec<crate::partials::PartialFrame> = partials
+        .frames(task_id)
+        .into_iter()
+        .filter(|f| last_seq.is_none_or(|s| f.seq > s))
+        .collect();
+    let Some(max) = fresh.iter().map(|f| f.seq).max() else {
+        return Ok(());
+    };
+    *last_seq = Some(max);
+    let event = RunPartialsEvent { partials: fresh };
+    let payload = serde_json::to_string(&event).map_err(|err| {
+        tracing::error!(target: "harness.api.runs", ?err, "serialize RunPartialsEvent");
+    })?;
+    sender.send(Message::Text(payload)).await.map_err(|_| ())
+}
+
 async fn stream_task(
     socket: WebSocket,
     store: harness_store::Store,
@@ -159,24 +183,8 @@ async fn stream_task(
                 // Partials first: on the terminal tick this is the
                 // final sweep, so per-target results always precede
                 // the terminal state frame (4.2, ADR-0024).
-                let fresh: Vec<crate::partials::PartialFrame> = partials
-                    .frames(task_id)
-                    .into_iter()
-                    .filter(|f| last_seq.is_none_or(|s| f.seq > s))
-                    .collect();
-                if let Some(max) = fresh.iter().map(|f| f.seq).max() {
-                    last_seq = Some(max);
-                    let event = RunPartialsEvent { partials: fresh };
-                    let payload = match serde_json::to_string(&event) {
-                        Ok(p) => p,
-                        Err(err) => {
-                            tracing::error!(target: "harness.api.runs", ?err, "serialize RunPartialsEvent");
-                            break;
-                        }
-                    };
-                    if sender.send(Message::Text(payload)).await.is_err() {
-                        break;
-                    }
+                if push_new_partials(&mut sender, &partials, task_id, &mut last_seq).await.is_err() {
+                    break;
                 }
                 let task_state = match store.task_state(task_id) {
                     Ok(Some(s)) => s,

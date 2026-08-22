@@ -115,10 +115,17 @@ These will land alongside their natural Phase 3 home, not as a "phase 2.10":
 | --- | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | #44 | 4.1  | `FanoutController` (harness-orchestrator): pure pull-based Stream, window = clamp(2×N_workers, 4, 64) recomputed per refill, Drop-as-cancel, deadline + FailFast with drop accounting. mesh_meta rewired: remote sub-task rows now O(window) via two concurrently-polled controllers (locals keep the ADR-0022 Fixed(4) bound). ADR-0023. +17 tests (907 total) |
 
+| #45 | 4.2  | Result streams (ADR-0024): `results::task_results` — the §14.8 `Stream<TaskResult>` over FanoutStream (recoverable ResultMapper, never Final); `StreamKind::Progress` riding the 3.2-stream pipe (no new wire channels); mesh_meta emits per-target + one summary frame; `WS /runs/:id` pushes seq-deduped `partials` batches with a guaranteed pre-terminal sweep; CLI `grep`/`search` render TTY-gated incremental progress; types.ts mirrors the full contract for 4.8. +14 tests |
+
 4.1 review round 1 (plan): 2 majors fixed pre-implementation — index-resolved failure
 provenance; two controller instances so local scans stay ≤4 and remote submission isn't
 starved behind local work. `PartialPolicy::Wait` aliased to `ReturnPartial` at the
 controller until 4.5 (ADR-0023).
+4.2 reviews: plan round 1 REVISE (single recoverable mapper object instead of two boxed
+closures; `timed_out` added to the counters so the summary schema is producible; ADR-0024
+reconciles 4.2's telemetry-over-partials with 4.5's deferred federated `PartialResult`
+streaming). The spawned-driver/bounded-mpsc bridge is deliberately unbuilt until a
+detached consumer exists (owner: 4.5).
 
 ## Phase 4 — next up
 
