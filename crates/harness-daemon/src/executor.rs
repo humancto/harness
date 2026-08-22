@@ -33,6 +33,11 @@ pub(crate) struct LocalExecutor {
     local_node: NodeId,
     local_node_name: Arc<str>,
     sem: Arc<tokio::sync::Semaphore>,
+    /// Fired once per task reaching a terminal state (Done/Failed) with
+    /// its result row written. The 3.3-fanout worker reply path
+    /// subscribes; the assign-time terminal-resend covers missed events
+    /// (ADR-0017).
+    terminal_tx: tokio::sync::broadcast::Sender<TaskId>,
 }
 
 impl std::fmt::Debug for LocalExecutor {
@@ -53,13 +58,20 @@ impl LocalExecutor {
         max_concurrent: usize,
     ) -> Self {
         let max = max_concurrent.max(1);
+        let (terminal_tx, _) = tokio::sync::broadcast::channel(256);
         Self {
             store,
             registry,
             local_node,
             local_node_name,
             sem: Arc::new(tokio::sync::Semaphore::new(max)),
+            terminal_tx,
         }
+    }
+
+    /// Subscribe to terminal-task notifications (see `terminal_tx`).
+    pub(crate) fn subscribe_terminal(&self) -> tokio::sync::broadcast::Receiver<TaskId> {
+        self.terminal_tx.subscribe()
     }
 
     /// Defaults `max_concurrent` to `available_parallelism().clamp(2, 8)`.
@@ -90,11 +102,20 @@ impl LocalExecutor {
 
     /// One polling iteration. Public so tests can step the loop
     /// deterministically.
+    ///
+    /// 3.3-fanout: the executor claims only `Dispatched` rows assigned
+    /// to the local node. The `Submitted → Dispatched` hop belongs
+    /// exclusively to the `DispatchService` (ADR-0009's seam) — local
+    /// tasks arrive here after it routes them to self; remote
+    /// assignments arrive via `insert_task_dispatched`.
     pub(crate) async fn poll_once(&self) {
-        let rows = match self.store.list_tasks_by_state(TaskState::Submitted) {
+        let rows = match self
+            .store
+            .list_tasks_by_state_assigned(TaskState::Dispatched, Some(self.local_node))
+        {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(target: "harness.executor", ?e, "list_tasks_by_state");
+                tracing::warn!(target: "harness.executor", ?e, "list_tasks_by_state_assigned");
                 return;
             }
         };
@@ -102,21 +123,10 @@ impl LocalExecutor {
             let id = row.id;
             let cap_id = row.capability;
 
-            // Climb the ladder: Submitted → Dispatched → Claimed → Running.
-            // Each CAS targets a single legal hop. If any hop loses (someone
-            // else got there first, or the row vanished), abandon and try
+            // Climb the ladder: Dispatched → Claimed → Running. Each CAS
+            // targets a single legal hop. If any hop loses (someone else
+            // got there first, or the row vanished), abandon and try
             // again next tick.
-            match self
-                .store
-                .try_transition_task(id, TaskState::Submitted, TaskState::Dispatched)
-            {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(e) => {
-                    tracing::warn!(target: "harness.executor", ?e, "submitted→dispatched");
-                    continue;
-                }
-            }
             match self
                 .store
                 .try_transition_task(id, TaskState::Dispatched, TaskState::Claimed)
@@ -168,19 +178,22 @@ impl LocalExecutor {
         let store = self.store.clone();
         let local_node = self.local_node;
         let local_node_name = self.local_node_name.clone();
+        let terminal_tx = self.terminal_tx.clone();
+
+        // 3.3-fanout issuer-name plumbing (ADR-0009): a remote issuer's
+        // display name comes from its announced manifest; fall back to
+        // the node-id when the manifest hasn't landed yet.
+        let issued_by_name: Arc<str> = if task.issued_by == local_node {
+            local_node_name.clone()
+        } else {
+            match self.store.load_manifest(task.issued_by) {
+                Ok(Some(m)) if !m.hostname.is_empty() => Arc::from(m.hostname.as_str()),
+                _ => Arc::from(task.issued_by.to_string().as_str()),
+            }
+        };
 
         tokio::spawn(async move {
             let _permit = permit;
-
-            // 3.3a single-daemon: issuer == self. 3.3-fanout will plumb
-            // real issuer names from the manifest map. Warn until then.
-            if task.issued_by != local_node {
-                tracing::warn!(
-                    target: "harness.executor",
-                    issued_by = ?task.issued_by,
-                    "task issued by non-local node; 3.3-fanout will plumb issuer name (ADR-0009)"
-                );
-            }
 
             // task.tags is already an owned Vec; clone-into-Arc<[String]>
             // is one allocation. Read from the loaded task envelope so
@@ -190,7 +203,7 @@ impl LocalExecutor {
                 local_node,
                 local_node_name: local_node_name.clone(),
                 issued_by: task.issued_by,
-                issued_by_name: local_node_name.clone(),
+                issued_by_name,
                 task_id: id,
                 tags,
             };
@@ -227,6 +240,7 @@ impl LocalExecutor {
                     let _ = store.replica_apply_local(&failed_replica(id, now, local_node, &msg));
                 }
             }
+            let _ = terminal_tx.send(id);
         });
     }
 
@@ -247,6 +261,7 @@ impl LocalExecutor {
         let _ = self
             .store
             .replica_apply_local(&failed_replica(id, now, self.local_node, msg));
+        let _ = self.terminal_tx.send(id);
     }
 }
 
@@ -490,6 +505,11 @@ mod tests {
                 local_node(),
             ))
             .expect("insert");
+        // 3.3-fanout: the DispatchService owns Submitted→Dispatched;
+        // tests seed the executor's input state directly.
+        assert!(store
+            .try_dispatch_task(id, local_node())
+            .expect("seed dispatch"));
 
         exec.poll_once().await;
         let st = wait_terminal(&store, id).await;
@@ -519,6 +539,11 @@ mod tests {
                 local_node(),
             ))
             .expect("insert");
+        // 3.3-fanout: the DispatchService owns Submitted→Dispatched;
+        // tests seed the executor's input state directly.
+        assert!(store
+            .try_dispatch_task(id, local_node())
+            .expect("seed dispatch"));
 
         exec.poll_once().await;
         let st = wait_terminal(&store, id).await;
@@ -548,6 +573,11 @@ mod tests {
                 local_node(),
             ))
             .expect("insert");
+        // 3.3-fanout: the DispatchService owns Submitted→Dispatched;
+        // tests seed the executor's input state directly.
+        assert!(store
+            .try_dispatch_task(id, local_node())
+            .expect("seed dispatch"));
 
         exec.poll_once().await;
         let st = wait_terminal(&store, id).await;
@@ -575,6 +605,11 @@ mod tests {
                 local_node(),
             ))
             .expect("insert");
+        // 3.3-fanout: the DispatchService owns Submitted→Dispatched;
+        // tests seed the executor's input state directly.
+        assert!(store
+            .try_dispatch_task(id, local_node())
+            .expect("seed dispatch"));
 
         exec.poll_once().await;
         wait_terminal(&store, id).await;
@@ -623,6 +658,11 @@ mod tests {
                 local_node(),
             ))
             .expect("insert");
+        // 3.3-fanout: the DispatchService owns Submitted→Dispatched;
+        // tests seed the executor's input state directly.
+        assert!(store
+            .try_dispatch_task(id, local_node())
+            .expect("seed dispatch"));
 
         exec.poll_once().await;
         wait_terminal(&store, id).await;

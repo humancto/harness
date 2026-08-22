@@ -42,13 +42,22 @@ impl TaskState {
 
     /// Lifecycle transitions per PRD §14.1. Centralized so every callsite
     /// agrees on what's legal.
+    ///
+    /// `Submitted → Failed` is a documented supervisor hop added by
+    /// 3.3-fanout (ADR-0017): a task that stays undispatchable past its
+    /// deadline window (no eligible node, pinned node never live) is
+    /// failed terminally by the `DispatchService` without inventing a
+    /// fake `Dispatched → Claimed → Failed` history.
     #[must_use]
     pub fn can_transition_to(self, next: Self) -> bool {
         matches!(
             (self, next),
             (
                 TaskState::Submitted,
-                TaskState::Planned | TaskState::Dispatched | TaskState::Cancelled
+                TaskState::Planned
+                    | TaskState::Dispatched
+                    | TaskState::Cancelled
+                    | TaskState::Failed
             ) | (
                 TaskState::Planned,
                 TaskState::Dispatched | TaskState::Cancelled

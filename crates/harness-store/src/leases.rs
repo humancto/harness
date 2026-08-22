@@ -196,18 +196,23 @@ impl Store {
     /// Atomically: mark the lease `expired` AND transition the parent task
     /// back to `submitted` for re-dispatch. Returns `Ok(true)` if both
     /// transitions applied.
+    ///
+    /// The task reset is guarded on `assigned_node = <this lease's
+    /// worker>` (3.3-fanout / ADR-0017): an orphan or stale lease whose
+    /// task has since been re-dispatched to a different node must not
+    /// yank that newer assignment back to `submitted`.
     pub fn expire_and_reset_task(&self, lease_id: LeaseId) -> Result<bool, StoreError> {
         self.with_conn(|c| {
             let tx = c.unchecked_transaction()?;
-            let task_blob: Option<Vec<u8>> = tx
+            let row: Option<(Vec<u8>, Option<Vec<u8>>)> = tx
                 .query_row(
-                    "SELECT task_id FROM leases
+                    "SELECT task_id, worker_id FROM leases
                       WHERE lease_id = ? AND state IN ('pending', 'claimed')",
                     params![lease_id.0.as_bytes()],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
-            let Some(task_blob) = task_blob else {
+            let Some((task_blob, worker_blob)) = row else {
                 return Ok(false);
             };
             tx.execute(
@@ -217,11 +222,48 @@ impl Store {
             )?;
             tx.execute(
                 "UPDATE tasks SET state = 'submitted', assigned_node = NULL
-                  WHERE id = ? AND state IN ('dispatched', 'claimed', 'running')",
-                params![task_blob],
+                  WHERE id = ?1
+                    AND state IN ('dispatched', 'claimed', 'running')
+                    AND (assigned_node = ?2 OR (?2 IS NULL AND assigned_node IS NULL))",
+                params![task_blob, worker_blob],
             )?;
             tx.commit()?;
             Ok(true)
+        })
+    }
+
+    /// Atomically transition `pending|claimed → expired` WITHOUT
+    /// touching the task row. The dispatch runtime's terminal-expiry
+    /// branch must win this CAS before writing any terminal state, so
+    /// an in-flight result (`try_complete_pending_or_claimed`) and the
+    /// expiry path cannot both terminate the same task (3.3-fanout
+    /// PR-A2 review M1). Returns `Ok(false)` when the lease is already
+    /// terminal — the caller lost the race and must not write anything.
+    pub fn try_expire_lease(&self, lease_id: LeaseId) -> Result<bool, StoreError> {
+        self.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE leases SET state = 'expired'
+                  WHERE lease_id = ? AND state IN ('pending', 'claimed')",
+                params![lease_id.0.as_bytes()],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
+    /// Atomically transition `pending|claimed → completed`. The result
+    /// path uses this instead of [`Store::try_complete`]: a worker's
+    /// `TaskClaim` travels on a different stream than its result, so a
+    /// lost claim must not cause a valid result to be dropped
+    /// (3.3-fanout review R3). Returns `Ok(false)` when the lease is
+    /// already terminal (`expired`/`completed`/`released`) or absent.
+    pub fn try_complete_pending_or_claimed(&self, lease_id: LeaseId) -> Result<bool, StoreError> {
+        self.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE leases SET state = 'completed'
+                  WHERE lease_id = ? AND state IN ('pending', 'claimed')",
+                params![lease_id.0.as_bytes()],
+            )?;
+            Ok(n == 1)
         })
     }
 
@@ -474,9 +516,10 @@ mod tests {
         let id = Identity::generate();
         let task = signed_task(&id);
         s.insert_task(&task).expect("task");
-        s.transition_task(task.id, crate::TaskState::Dispatched)
-            .expect("dispatch");
         let worker = NodeId::from_bytes([2; 16]);
+        // Dispatch WITH the assignment recorded — the reset is guarded
+        // on the lease worker matching `assigned_node` (ADR-0017).
+        assert!(s.try_dispatch_task(task.id, worker).expect("dispatch"));
         let lease = s.create_lease(task.id, worker, 5_000, 1).expect("create");
         assert!(s.expire_and_reset_task(lease.lease_id).expect("expire"));
         assert_eq!(

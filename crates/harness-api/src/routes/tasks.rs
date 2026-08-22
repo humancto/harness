@@ -7,8 +7,7 @@ use axum::{
     Json,
 };
 use harness_core::{
-    Constraints, ExecutionPolicy, ResourceHints, RetryPolicy, Signable, Signature, Task, TaskId,
-    TraceContext,
+    Constraints, ResourceHints, RetryPolicy, Signable, Signature, Task, TaskId, TraceContext,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -24,6 +23,10 @@ pub struct SubmitRequest {
     pub input: JsonValue,
     #[serde(default)]
     pub constraints: Option<Constraints>,
+    /// Optional execution policy override (3.3-fanout: `harness run`
+    /// aligns `timeout_ms` so lease TTLs dominate runtime; ADR-0017).
+    #[serde(default)]
+    pub execution: Option<harness_core::ExecutionPolicy>,
     /// Caller hints (3.5). Optional. Honored variably by capabilities;
     /// e.g. `["interactive"]` opts out of the LLM micro-batcher.
     #[serde(default)]
@@ -76,7 +79,7 @@ pub async fn submit_handler(
         input: req.input,
         constraints: req.constraints.unwrap_or_default(),
         retry: RetryPolicy::default(),
-        execution: ExecutionPolicy::default(),
+        execution: req.execution.unwrap_or_default(),
         resource_hints: ResourceHints {
             cpu_class: harness_core::protocol::CpuClass::Light,
             memory_mb: None,

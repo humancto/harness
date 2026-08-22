@@ -79,6 +79,14 @@ pub struct PeerDto {
     pub last_seen_ms_ago: u64,
     pub resources: Option<ResourcesDto>,
     pub capabilities_summary: Vec<String>,
+    /// Mesh hostname from the announced manifest (3.3-fanout). `None`
+    /// when the manifest hasn't landed yet.
+    #[serde(default)]
+    pub node_name: Option<String>,
+    /// Operating system from the announced manifest (`--where os:` in
+    /// 3.3-fanout).
+    #[serde(default)]
+    pub os: Option<String>,
 }
 
 impl PeerDto {
@@ -114,7 +122,17 @@ impl PeerDto {
             last_seen_ms_ago,
             resources: Some(ResourcesDto::from_heartbeat(hb)),
             capabilities_summary: vec![],
+            node_name: None,
+            os: None,
         }
+    }
+
+    /// Enrich from the announced manifest (3.3-fanout): hostname, os,
+    /// and the real capability list.
+    pub fn enrich_from_manifest(&mut self, manifest: &harness_core::NodeManifest) {
+        self.node_name = Some(manifest.hostname.clone());
+        self.os = Some(manifest.resources.os.clone());
+        self.capabilities_summary = manifest.capabilities.iter().map(|c| c.id.clone()).collect();
     }
 
     /// Synthesize a "self" peer for the local node — there is no
@@ -140,6 +158,8 @@ impl PeerDto {
             last_seen_ms_ago: 0,
             resources: None,
             capabilities_summary: capabilities,
+            node_name: None,
+            os: None,
         }
     }
 }
@@ -189,6 +209,10 @@ pub struct StatusDto {
     pub node_id: String,
     pub pubkey_fp: String,
     pub mesh_name: String,
+    /// This node's mesh hostname (3.3-fanout: `--on <name>` resolution
+    /// and `[node]` output labels). May be empty on old daemons.
+    #[serde(default)]
+    pub node_name: String,
     pub brain_score: i32,
     pub leader_belief: Option<String>,
     pub started_at_ms: u64,

@@ -182,3 +182,100 @@ fn t07_expire_and_reset_clears_assignment() {
         "reset must clear assigned_node or re-dispatch will see a stale owner"
     );
 }
+
+#[test]
+fn t08_try_complete_pending_or_claimed() {
+    // A result whose claim was lost must still complete the lease (R3).
+    let s = fresh_store();
+    let id = TaskId::new_v7();
+    s.insert_task(&dummy_task(id)).expect("insert");
+    let node = NodeId::from_bytes(NODE_A);
+    assert!(s.try_dispatch_task(id, node).expect("dispatch"));
+    let lease = s.create_lease(id, node, 60_000, 1).expect("lease");
+
+    // Straight from `pending` (no claim ever arrived).
+    assert!(s
+        .try_complete_pending_or_claimed(lease.lease_id)
+        .expect("complete from pending"));
+    // Second completion attempt: lease is terminal now.
+    assert!(!s
+        .try_complete_pending_or_claimed(lease.lease_id)
+        .expect("already completed"));
+
+    // And from `claimed` on a fresh lease.
+    let id2 = TaskId::new_v7();
+    s.insert_task(&dummy_task(id2)).expect("insert2");
+    assert!(s.try_dispatch_task(id2, node).expect("dispatch2"));
+    let lease2 = s.create_lease(id2, node, 60_000, 1).expect("lease2");
+    assert!(s.try_claim(lease2.lease_id, node).expect("claim"));
+    assert!(s
+        .try_complete_pending_or_claimed(lease2.lease_id)
+        .expect("complete from claimed"));
+}
+
+#[test]
+fn t09_expire_and_reset_guarded_by_lease_worker() {
+    // An orphan lease naming a different worker must not reset a task
+    // that has since been (re-)dispatched elsewhere (R12).
+    let s = fresh_store();
+    let id = TaskId::new_v7();
+    s.insert_task(&dummy_task(id)).expect("insert");
+    let node_a = NodeId::from_bytes(NODE_A);
+    let node_b = NodeId::from_bytes(NODE_B);
+
+    // Task is assigned to B, but the stale lease names A.
+    assert!(s.try_dispatch_task(id, node_b).expect("dispatch to b"));
+    let stale = s.create_lease(id, node_a, 1, 1).expect("stale lease");
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    assert!(s.expire_and_reset_task(stale.lease_id).expect("expire"));
+    // Lease is expired, but the task assignment to B survives.
+    assert_eq!(
+        s.task_state(id).expect("state"),
+        Some(TaskState::Dispatched),
+        "guarded reset must not touch a task assigned to another node"
+    );
+    assert_eq!(s.assigned_node(id).expect("assigned"), Some(node_b));
+}
+
+#[test]
+fn t10_submitted_to_failed_supervisor_hop_is_legal() {
+    let s = fresh_store();
+    let id = TaskId::new_v7();
+    s.insert_task(&dummy_task(id)).expect("insert");
+    assert!(s
+        .try_transition_task(id, TaskState::Submitted, TaskState::Failed)
+        .expect("supervisor hop"));
+    assert_eq!(s.task_state(id).expect("state"), Some(TaskState::Failed));
+}
+
+#[test]
+fn t11_try_expire_lease_cas_semantics() {
+    let s = fresh_store();
+    let id = TaskId::new_v7();
+    s.insert_task(&dummy_task(id)).expect("insert");
+    let node = NodeId::from_bytes(NODE_A);
+    assert!(s.try_dispatch_task(id, node).expect("dispatch"));
+    let lease = s.create_lease(id, node, 60_000, 1).expect("lease");
+
+    // Wins from pending; task row untouched.
+    assert!(s.try_expire_lease(lease.lease_id).expect("expire"));
+    assert_eq!(
+        s.task_state(id).expect("state"),
+        Some(TaskState::Dispatched)
+    );
+    // Second attempt loses (already terminal).
+    assert!(!s.try_expire_lease(lease.lease_id).expect("re-expire"));
+
+    // Completed lease: expiry loses.
+    let id2 = TaskId::new_v7();
+    s.insert_task(&dummy_task(id2)).expect("insert2");
+    assert!(s.try_dispatch_task(id2, node).expect("dispatch2"));
+    let lease2 = s.create_lease(id2, node, 60_000, 1).expect("lease2");
+    assert!(s
+        .try_complete_pending_or_claimed(lease2.lease_id)
+        .expect("complete"));
+    assert!(!s
+        .try_expire_lease(lease2.lease_id)
+        .expect("expire completed"));
+}

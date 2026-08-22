@@ -12,6 +12,7 @@ pub async fn get_status(State(state): State<ApiState>) -> Json<StatusDto> {
         node_id: format!("{}", state.local_node_id),
         pubkey_fp: pubkey.fingerprint_hex(),
         mesh_name: status.mesh_name,
+        node_name: status.node_name,
         brain_score: status.brain_score,
         leader_belief: status.leader_belief.map(|id| format!("{id}")),
         started_at_ms: system_time_to_ms(status.started_at),

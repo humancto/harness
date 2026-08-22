@@ -1,4 +1,4 @@
-//! `harness run` clap parsing + 3.3-fanout error paths.
+//! `harness run` clap parsing + target-selector plumbing.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -33,7 +33,10 @@ fn t16_parses_run_with_inner_double_dash() {
 }
 
 #[test]
-fn t17_run_all_returns_clear_3_3_fanout_error() {
+fn t17_run_all_is_a_live_target_no_fanout_bail() {
+    // 3.3-fanout: --all no longer short-circuits with a "deferred"
+    // error — it proceeds to auth/mesh resolution (which fails here
+    // because no daemon is running, proving we got past validation).
     let cli = parse(&["harness", "run", "--all", "--", "uname"]);
     let Command::Run(args) = cli.command else {
         panic!("expected Run");
@@ -42,8 +45,16 @@ fn t17_run_all_returns_clear_3_3_fanout_error() {
         .enable_all()
         .build()
         .expect("rt");
-    let err = rt.block_on(run_run(args)).expect_err("must error");
-    assert!(err.to_string().contains("3.3-fanout"), "got: {err}");
+    let err = rt.block_on(run_run(args)).expect_err("no daemon running");
+    let msg = format!("{err:#}");
+    assert!(
+        !msg.contains("3.3-fanout"),
+        "fanout bail must be gone: {msg}"
+    );
+    assert!(
+        msg.contains("authenticate") || msg.contains("mesh view"),
+        "must fail at auth/mesh resolution, got: {msg}"
+    );
 }
 
 #[test]
@@ -70,7 +81,9 @@ fn t20_run_on_self_does_not_error_at_parse() {
 }
 
 #[test]
-fn t21_run_on_remote_host_returns_3_3_fanout_error() {
+fn t21_run_on_remote_host_resolves_against_mesh() {
+    // Remote --on targets resolve against the live mesh view now;
+    // with no daemon the failure is at auth/mesh fetch, not a bail.
     let cli = parse(&["harness", "run", "--on", "macbook-archy", "--", "uname"]);
     let Command::Run(args) = cli.command else {
         panic!("expected Run");
@@ -79,13 +92,17 @@ fn t21_run_on_remote_host_returns_3_3_fanout_error() {
         .enable_all()
         .build()
         .expect("rt");
-    let err = rt.block_on(run_run(args)).expect_err("must error");
-    assert!(err.to_string().contains("3.3-fanout"));
+    let err = rt.block_on(run_run(args)).expect_err("no daemon running");
+    let msg = format!("{err:#}");
+    assert!(
+        !msg.contains("3.3-fanout"),
+        "fanout bail must be gone: {msg}"
+    );
 }
 
 #[test]
-fn t22_run_where_returns_3_3_fanout_error() {
-    let cli = parse(&["harness", "run", "--where", "tag=foo", "--", "uname"]);
+fn t22_run_where_parses_and_resolves_against_mesh() {
+    let cli = parse(&["harness", "run", "--where", "cap:echo", "--", "uname"]);
     let Command::Run(args) = cli.command else {
         panic!("expected Run");
     };
@@ -93,6 +110,10 @@ fn t22_run_where_returns_3_3_fanout_error() {
         .enable_all()
         .build()
         .expect("rt");
-    let err = rt.block_on(run_run(args)).expect_err("must error");
-    assert!(err.to_string().contains("3.3-fanout"));
+    let err = rt.block_on(run_run(args)).expect_err("no daemon running");
+    let msg = format!("{err:#}");
+    assert!(
+        !msg.contains("3.3-fanout"),
+        "fanout bail must be gone: {msg}"
+    );
 }

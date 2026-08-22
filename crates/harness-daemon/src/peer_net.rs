@@ -61,8 +61,9 @@ pub(crate) trait TaskChannelHandlers: Send + Sync + 'static {
     }
 }
 
-/// PR-A1 default: nothing produces task-channel traffic yet; anything
-/// that arrives is logged and dropped.
+/// Log-and-drop handlers for tests and for daemon configurations with
+/// no dispatch runtime.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct NoopHandlers;
 
 impl TaskChannelHandlers for NoopHandlers {
@@ -79,8 +80,8 @@ impl TaskChannelHandlers for NoopHandlers {
 
 /// The dispatcher-facing routing indexes, fed by manifest announces.
 pub(crate) struct MeshIndexes {
-    pub caps: CapabilityIndex,
-    pub scopes: ScopeIndex,
+    pub caps: Arc<CapabilityIndex>,
+    pub scopes: Arc<ScopeIndex>,
     /// Persistent mirror (`Store::upsert_manifest`). `None` in unit
     /// tests that only exercise the in-memory indexes.
     pub store: Option<Store>,
@@ -685,8 +686,8 @@ mod tests {
             Transport::bind(loopback(), identity.clone(), TransportTrust::new()).expect("bind");
         let heartbeat = Arc::new(HeartbeatService::new(identity.clone()));
         let indexes = Arc::new(MeshIndexes {
-            caps: CapabilityIndex::new(),
-            scopes: ScopeIndex::new(),
+            caps: Arc::new(CapabilityIndex::new()),
+            scopes: Arc::new(ScopeIndex::new()),
             store: None,
         });
         let manifest =
