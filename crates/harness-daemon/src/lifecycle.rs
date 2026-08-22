@@ -187,32 +187,37 @@ impl DaemonOrchestrator {
         };
         let policy_engine = std::sync::Arc::new(policy_engine);
 
-        // Phase 3.6a: load `~/.harness/secrets.toml` if present. Missing
-        // file → empty store (capabilities that need a secret will
-        // surface a clear `not configured` error at execute time).
-        // Permission / parse errors abort startup — silently bypassing
-        // a credential file is worse than refusing to start.
-        let secrets_path = config.harness_root.join("secrets.toml");
-        let plaintext_store = match harness_vault::PlaintextStore::load_from_path(&secrets_path) {
-            Ok(s) => s,
-            Err(harness_vault::SecretsError::Io { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                tracing::info!(
-                    path = %secrets_path.display(),
-                    "no secrets.toml found; capabilities requiring secrets will fail until configured"
-                );
-                harness_vault::PlaintextStore::empty()
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "secrets load failed at {}: {e}",
-                    secrets_path.display()
-                ));
-            }
-        };
+        // Phase 3.6-encrypted (ADR-0021): open `~/.harness/secrets.enc`,
+        // encrypted under a key derived from the node identity secret.
+        // A legacy plaintext `secrets.toml` is transparently migrated
+        // (re-encrypted; the plaintext file is left for the operator to
+        // delete). Missing both → empty store (capabilities that need a
+        // secret surface a clear `not configured` error at execute
+        // time). Permission / parse / decrypt errors abort startup —
+        // silently bypassing a credential file is worse than refusing
+        // to start.
+        let vault_key = harness_vault::derive_vault_key(&identity.to_secret_bytes());
+        let enc_path = config.harness_root.join("secrets.enc");
+        let legacy_path = config.harness_root.join("secrets.toml");
+        let (enc_store, vault_origin) =
+            harness_vault::EncryptedStore::open_with_migration(&enc_path, &legacy_path, &vault_key)
+                .map_err(|e| {
+                    anyhow::anyhow!("secrets load failed at {}: {e}", enc_path.display())
+                })?;
+        drop(vault_key);
+        match vault_origin {
+            harness_vault::VaultOrigin::Missing => tracing::info!(
+                path = %enc_path.display(),
+                "no credential store found; capabilities requiring secrets will fail until configured"
+            ),
+            // Encrypted-load and migration details (incl. the
+            // delete-the-plaintext-file warning) are logged inside
+            // `open_with_migration`.
+            harness_vault::VaultOrigin::Encrypted
+            | harness_vault::VaultOrigin::MigratedFromPlaintext => {}
+        }
         let secrets: std::sync::Arc<dyn harness_vault::SecretsStore> =
-            std::sync::Arc::new(plaintext_store);
+            std::sync::Arc::new(enc_store);
 
         // Phase 3.10a: load `~/.harness/scopes.toml` if present. Missing
         // file → empty registry (`fs.*` advertise no scopes; calls fail
@@ -453,6 +458,9 @@ impl DaemonOrchestrator {
             config.node_name.clone(),
             capabilities.manifests(),
             manifest_scopes,
+            // Tag NAMES only, never values (ADR-0021): lets peers route
+            // `requires_secrets` capabilities to nodes holding the tags.
+            secrets.tags(),
         )
         .map_err(|e| anyhow::anyhow!("sign self manifest: {e}"))?;
         let cap_index = Arc::new(harness_orchestrator::CapabilityIndex::new());
@@ -471,6 +479,7 @@ impl DaemonOrchestrator {
             harness_orchestrator::Dispatcher::with_indexes(cap_index, scope_index),
             persistent_trust.clone(),
             heartbeat.peers(),
+            secrets.clone(),
         );
         let peer_net = PeerNet::new(
             identity.clone(),

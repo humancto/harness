@@ -59,11 +59,11 @@ When an item lands, flip its checkbox **in the same PR** as `STATE.md` is update
   - [x] **3.3-ui** UI Remote Shell mode with `[node-name]` interleaving.
 - [x] **3.4** `llm.local.<model>` auto-registration from `ollama list` (PR #26). HTTP discovery + execution; ADR-0010 covers default-allow + DoS bounds + `Action::Llm` extensibility.
 - [x] **3.5** Local-LLM micro-batcher (PR #27). Dedup-within-window + interactive-tag bypass + forward-compat hook. ADR-0011 — true multi-prompt batching deferred until a vLLM/TGI backend lands (Ollama doesn't support it).
-- [ ] **3.6** `llm.cloud.{claude,openai,gemini}` capabilities + secrets-by-tag reference.
+- [x] **3.6** `llm.cloud.{claude,openai,gemini}` capabilities + secrets-by-tag reference.
   - [x] **3.6a** Claude provider + `harness-vault` plaintext credential store + `Action::Secret` policy hook + `Capability::requires_secrets` manifest field (PR #28). ADR-0012.
   - [x] **3.6-openai** OpenAI provider (mechanical, mirrors 3.6a).
   - [x] **3.6-gemini** Gemini provider (mechanical, mirrors 3.6a).
-  - [ ] **3.6-encrypted** Encrypted-at-rest + replicated credentials per PRD §10.5; tag-aware dispatcher routing on `requires_secrets`.
+  - [x] **3.6-encrypted** Encrypted-at-rest + replicated credentials per PRD §10.5; tag-aware dispatcher routing on `requires_secrets` (replication → 6.5). `secrets.enc` (ChaCha20-Poly1305, key = blake3::derive_key over identity seed) + transparent plaintext migration + `NodeManifest::secret_tags` + daemon-side `SecretAwareLiveSet` routing filter. ADR-0021.
 - [x] **3.7** `mcp.proxy` via `rmcp`: subprocess MCP servers, expose tools as `mcp.<server>.<tool>`.
 - [x] **3.8** `brain.plan` Template backend. `harness-brain` crate with `PlannerBackend` trait + four-state `PlanOutcome` + `TemplateBackend` (run:/shell:/...); `WeakCapabilityRegistry` for snapshot-without-leak; `Unsigned<Plan>` + `CapabilityRef` in core. ADR-0013.
 - [x] **3.9** `brain.plan` LocalFast backend (tier 1) + plan validation. `harness-brain::LocalFastBackend` (Ollama-backed, feature-gated); `CapabilitySchemaIndex` with eager `jsonschema` compile; `validate_plan` superset of well-formedness + schema-match + cost-cap; `WeakCapabilityRegistry::snapshot` for atomic (refs, schemas) view; PRD §15.2 confidence threshold at executor; `harness-policy::PlanningPolicy` gains `confidence_threshold`/`prefer_local_models`/`default_max_cost_usd`. ADR-0014.

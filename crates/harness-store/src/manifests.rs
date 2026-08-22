@@ -123,6 +123,7 @@ mod tests {
             pubkey: *id.public_key(),
             capabilities: vec![],
             scopes: vec![],
+            secret_tags: vec![],
             resources: Resources {
                 cpu_cores: 0,
                 ram_total_mb: 0,

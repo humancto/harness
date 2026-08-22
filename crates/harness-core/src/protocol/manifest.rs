@@ -113,6 +113,20 @@ pub struct NodeManifest {
     pub pubkey: PublicKey,
     pub capabilities: Vec<Capability>,
     pub scopes: Vec<Scope>,
+    /// Secret tag *names* present in this node's local vault (PRD
+    /// §10.5), e.g. `"secret/openai-api-key"`. Names only — values
+    /// never appear in a manifest, and the `secret/[a-z0-9-]+` tag
+    /// grammar makes smuggling a value into a name impossible. Used by
+    /// the dispatcher (3.6-encrypted) to route tasks whose capability
+    /// declares `requires_secrets` only to nodes holding those tags.
+    ///
+    /// Wire-level back-compat mirrors [`Capability::requires_secrets`]:
+    /// `serde(default)` decodes pre-3.6-encrypted manifests as
+    /// `vec![]`; `skip_serializing_if` keeps the encoded bytes (and
+    /// therefore the signature payload) identical to the prior shape
+    /// whenever the vault is empty. See ADR-0021.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_tags: Vec<String>,
     pub resources: Resources,
     /// Unix seconds when this node first joined the mesh.
     pub online_since: u64,
@@ -294,6 +308,7 @@ mod tests {
                 indexed: false,
                 last_indexed: None,
             }],
+            secret_tags: vec![],
             resources: Resources {
                 cpu_cores: 12,
                 ram_total_mb: 32_768,
@@ -308,6 +323,63 @@ mod tests {
         assert_eq!(m, round_trip(&m));
     }
 
+    /// Wire-level back-compat for `NodeManifest::secret_tags`, mirroring
+    /// `capability_requires_secrets_round_trip`:
+    ///
+    /// 1. An empty `secret_tags` produces CBOR that does NOT carry the
+    ///    key (byte parity with pre-3.6-encrypted manifests, so old
+    ///    signatures keep verifying).
+    /// 2. CBOR produced WITHOUT the field decodes to `vec![]`.
+    /// 3. A non-empty `secret_tags` round-trips losslessly and is
+    ///    covered by the signature.
+    #[test]
+    fn node_manifest_secret_tags_round_trip() {
+        let id = crate::Identity::from_secret_bytes(&[0x43u8; 32]);
+        let mut m = NodeManifest {
+            node_id: id.node_id(),
+            hostname: "vault-node".into(),
+            pubkey: *id.public_key(),
+            capabilities: vec![],
+            scopes: vec![],
+            secret_tags: vec![],
+            resources: Resources {
+                cpu_cores: 1,
+                ram_total_mb: 1,
+                gpu: None,
+                os: "linux".into(),
+                arch: "x86_64".into(),
+            },
+            online_since: 0,
+            version: SemVer::new(0, 0, 0),
+            sig: Signature::from_bytes([0u8; 64]),
+        };
+
+        // 1: empty vec is not serialized.
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&m, &mut buf).expect("ser");
+        let needle = b"secret_tags";
+        assert!(
+            !buf.windows(needle.len()).any(|w| w == needle),
+            "empty secret_tags must not appear in the CBOR bytes"
+        );
+
+        // 2: that same CBOR decodes back to `vec![]`.
+        let decoded: NodeManifest =
+            ciborium::de::from_reader(buf.as_slice()).expect("de empty-shape");
+        assert_eq!(decoded.secret_tags, Vec::<String>::new());
+
+        // 3: non-empty round-trip, signed and verified.
+        m.secret_tags = vec![
+            "secret/claude-api-key".to_string(),
+            "secret/openai-api-key".to_string(),
+        ];
+        m.sign(&id).expect("sign");
+        let rt = round_trip(&m);
+        assert_eq!(rt, m);
+        rt.verify_signature(id.public_key())
+            .expect("signature must cover secret_tags");
+    }
+
     #[test]
     fn node_manifest_sign_then_verify() {
         let id = crate::Identity::from_secret_bytes(&[0x37u8; 32]);
@@ -317,6 +389,7 @@ mod tests {
             pubkey: *id.public_key(),
             capabilities: vec![],
             scopes: vec![],
+            secret_tags: vec![],
             resources: Resources {
                 cpu_cores: 1,
                 ram_total_mb: 1,

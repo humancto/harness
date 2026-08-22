@@ -261,6 +261,7 @@ fn canonical_node_manifest_fixture() -> NodeManifest {
         pubkey: *id.public_key(),
         capabilities: vec![],
         scopes: vec![],
+        secret_tags: vec![],
         resources: Resources {
             cpu_cores: 8,
             ram_total_mb: 16_384,

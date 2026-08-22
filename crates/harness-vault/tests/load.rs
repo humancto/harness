@@ -26,6 +26,7 @@ fn write_secrets(contents: &str) -> (TempDir, std::path::PathBuf) {
 }
 
 #[test]
+#[serial] // reads env-overridable tags — must not race t03's set_var
 fn t01_load_from_toml_resolves_tag() {
     let (_dir, path) = write_secrets(
         "\"secret/claude-api-key\" = \"sk-ant-deadbeef\"\n\
