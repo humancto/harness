@@ -62,6 +62,7 @@ fn insert_signed_task(store: &Store, identity: &Identity) -> TaskId {
 struct Fixture {
     identity: Arc<Identity>,
     store: Store,
+    partials: Arc<harness_api::PartialBuffers>,
     addr: std::net::SocketAddr,
     server: harness_api::ServerHandle,
 }
@@ -69,12 +70,14 @@ struct Fixture {
 async fn boot() -> Fixture {
     let identity = Arc::new(Identity::generate());
     let store = Store::open_memory().expect("store");
+    let partials = Arc::new(harness_api::PartialBuffers::new());
     let auth = Arc::new(AuthProvider::new(Some(
         AdminFile::from_password("hunter2").expect("hash"),
     )));
     let state = ApiStateBuilder::new(identity.clone(), "runs-ws-test")
         .with_auth(auth)
         .with_store(store.clone())
+        .with_partials(partials.clone())
         .build();
     let server = serve("127.0.0.1:0".parse().unwrap(), state)
         .await
@@ -83,6 +86,7 @@ async fn boot() -> Fixture {
     Fixture {
         identity,
         store,
+        partials,
         addr,
         server,
     }
@@ -184,6 +188,65 @@ async fn ws_streams_states_to_done_with_output_then_closes() {
     dedup.dedup();
     assert_eq!(seen_states, dedup, "frames must be pushed only on change");
 
+    expect_close(&mut ws).await;
+    f.server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_pushes_mixed_partials_before_terminal_frame() {
+    // 4.2 (ADR-0024): partials frames — progress AND stdout in one
+    // ring — interleave with state frames; the final sweep precedes
+    // the terminal frame; no seq is resent on the same socket.
+    let f = boot().await;
+    let id = insert_signed_task(&f.store, &f.identity);
+    let mut ws = connect(f.addr, id).await;
+    let first = next_json(&mut ws).await;
+    assert_eq!(first["state"], "submitted");
+
+    f.partials.append(id, "stdout", "line one".into());
+    f.partials
+        .append(id, "progress", r#"{"completed":1,"total":2}"#.into());
+    let ev = next_json(&mut ws).await;
+    let frames = ev["partials"].as_array().expect("partials frame");
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[0]["seq"], 0);
+    assert_eq!(frames[0]["stream"], "stdout");
+    assert_eq!(frames[1]["stream"], "progress");
+    assert_eq!(frames[1]["line"], r#"{"completed":1,"total":2}"#);
+
+    // More frames + terminal in the same window: the sweep must land
+    // before the terminal state frame, without resending seqs 0-1.
+    f.partials
+        .append(id, "progress", r#"{"summary":{"total":2}}"#.into());
+    let node = f.identity.node_id();
+    assert!(f.store.try_dispatch_task(id, node).expect("dispatch"));
+    for (from, to) in [
+        (TaskState::Dispatched, TaskState::Claimed),
+        (TaskState::Claimed, TaskState::Running),
+        (TaskState::Running, TaskState::Done),
+    ] {
+        assert!(f.store.try_transition_task(id, from, to).expect("hop"));
+    }
+    f.store
+        .write_task_result_done(id, &serde_json::json!({"ok": true}), 42, node)
+        .expect("result");
+
+    let mut saw_sweep = false;
+    loop {
+        let ev = next_json(&mut ws).await;
+        if let Some(frames) = ev["partials"].as_array() {
+            assert!(!saw_sweep, "partials must not follow the terminal frame");
+            let seqs: Vec<u64> = frames.iter().map(|f| f["seq"].as_u64().unwrap()).collect();
+            assert_eq!(seqs, vec![2], "only the unsent frame, once");
+            saw_sweep = true;
+            continue;
+        }
+        let state = ev["state"].as_str().expect("state or partials");
+        if state == "done" {
+            assert!(saw_sweep, "final sweep must precede the terminal frame");
+            break;
+        }
+    }
     expect_close(&mut ws).await;
     f.server.shutdown().await;
 }

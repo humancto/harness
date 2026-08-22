@@ -100,8 +100,17 @@ export type TaskState =
   | "expired"
   | "cancelled";
 
+// One buffered partial frame — crates/harness-api/src/partials.rs
+// `PartialFrame`. `stream` is "stdout" | "stderr" | "progress" (4.2).
+export interface PartialFrame {
+  seq: number;
+  stream: string;
+  line: string;
+}
+
 // GET /api/v1/tasks/{id} — output/error/completed_at_ms are omitted
-// (not null) until the task is terminal.
+// (not null) until the task is terminal. `partials` carries the live
+// frame ring (3.2-stream) including "progress" telemetry (4.2).
 export interface TaskDetailDto {
   id: string;
   capability: string;
@@ -111,6 +120,7 @@ export interface TaskDetailDto {
   completed_at_ms?: number;
   output?: unknown;
   error?: string;
+  partials?: PartialFrame[];
 }
 
 // One frame of `WS /api/v1/runs/<task_id>` — must match
@@ -121,6 +131,39 @@ export interface RunStreamEvent {
   state: TaskState | string;
   output?: unknown;
   error?: string;
+}
+
+// Partial-frame batch on the same socket (4.2, ADR-0024) — must match
+// runs.rs `RunPartialsEvent`. Interleaves with RunStreamEvent frames;
+// the final batch always precedes the terminal state frame.
+export interface RunPartialsEvent {
+  partials: PartialFrame[];
+}
+
+// Every frame the runs socket can carry: discriminate on the presence
+// of `partials` vs `state`.
+export type RunStreamFrame = RunStreamEvent | RunPartialsEvent;
+
+// Parsed `line` of a "progress" PartialFrame emitted by mesh.grep /
+// mesh.search (crates/harness-capabilities/src/mesh_meta.rs): either a
+// per-target completion or the single final summary.
+export interface MeshProgressChunk {
+  target?: { node: string; node_name: string; scope: string };
+  outcome?: "ok" | "failed" | "timed_out";
+  items?: number;
+  error?: string;
+  completed?: number;
+  total?: number;
+  ok?: number;
+  failed?: number;
+  timed_out?: number;
+  summary?: {
+    total: number;
+    ok: number;
+    failed: number;
+    timed_out: number;
+    truncated_targets: number;
+  };
 }
 
 // shell.exec `output` payload (harness-capabilities shell executor).

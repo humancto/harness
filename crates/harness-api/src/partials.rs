@@ -36,7 +36,7 @@ pub struct PartialFrame {
     /// 0; after ring eviction the retained frames' `seq` values reveal
     /// how many were dropped.
     pub seq: u64,
-    /// `"stdout"` | `"stderr"`.
+    /// `"stdout"` | `"stderr"` | `"progress"` (4.2, ADR-0024).
     pub stream: String,
     pub line: String,
 }
