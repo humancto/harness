@@ -65,6 +65,33 @@ pub struct ExecutionPolicy {
     pub lease_ms: u32,
 }
 
+impl ExecutionPolicy {
+    /// API-boundary bounds (4.4, carried risk 12 / ADR-0026). 610 s max
+    /// preserves the CLI's engineered +5 s slack over the 600 s
+    /// capability ceiling (shell/llm.local); lease max ≥ max timeout +
+    /// the dispatcher's 15 s slack.
+    pub const MIN_TIMEOUT_MS: u32 = 1_000;
+    pub const MAX_TIMEOUT_MS: u32 = 610_000;
+    pub const MIN_LEASE_MS: u32 = 1_000;
+    pub const MAX_LEASE_MS: u32 = 900_000;
+
+    /// Clamp caller-supplied values into sane bounds. Applied where
+    /// tasks are CREATED (the API submit path) — never on wire ingest,
+    /// where mutating a signed envelope would break verification.
+    /// `redundancy` normalizes to 1 (accepted-but-ignored until 6.2).
+    #[must_use]
+    pub fn clamped(self) -> Self {
+        Self {
+            redundancy: 1,
+            timeout_ms: self
+                .timeout_ms
+                .clamp(Self::MIN_TIMEOUT_MS, Self::MAX_TIMEOUT_MS),
+            on_partial: self.on_partial,
+            lease_ms: self.lease_ms.clamp(Self::MIN_LEASE_MS, Self::MAX_LEASE_MS),
+        }
+    }
+}
+
 impl Default for ExecutionPolicy {
     fn default() -> Self {
         Self {
@@ -131,6 +158,34 @@ mod tests {
             disk_io_class: DiskIoClass::None,
             estimated_duration_ms: None,
         }
+    }
+
+    #[test]
+    fn execution_policy_clamped_bounds_and_identity() {
+        let wild = ExecutionPolicy {
+            redundancy: 9,
+            timeout_ms: u32::MAX,
+            on_partial: PartialPolicy::FailFast,
+            lease_ms: 0,
+        };
+        let c = wild.clamped();
+        assert_eq!(c.timeout_ms, ExecutionPolicy::MAX_TIMEOUT_MS);
+        assert_eq!(c.lease_ms, ExecutionPolicy::MIN_LEASE_MS);
+        assert_eq!(c.redundancy, 1);
+        // In-bounds values pass through untouched.
+        let sane = ExecutionPolicy {
+            redundancy: 1,
+            timeout_ms: 30_000,
+            on_partial: PartialPolicy::FailFast,
+            lease_ms: 10_000,
+        };
+        assert_eq!(sane.clamped(), sane);
+        // The CLI's engineered 605s slack survives (review MINOR-5).
+        let cli = ExecutionPolicy {
+            timeout_ms: 605_000,
+            ..sane
+        };
+        assert_eq!(cli.clamped().timeout_ms, 605_000);
     }
 
     fn sample_task() -> Task {

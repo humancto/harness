@@ -28,7 +28,7 @@ pub const PRESSURE_FLOOR: f64 = 0.05;
 pub const INFLIGHT_CORES: f64 = 0.5;
 /// Assumed task memory demand when hints don't declare one.
 pub const DEFAULT_TASK_MB: u32 = 256;
-/// Score divisor for battery-powered nodes (PRD §14.3 cost_weight).
+/// Score divisor for battery-powered nodes (PRD §14.3 `cost_weight`).
 pub const BATTERY_COST_WEIGHT: f64 = 2.0;
 /// EWMA smoothing for [`SuccessTracker`].
 const SUCCESS_ALPHA: f64 = 0.2;
@@ -176,9 +176,6 @@ pub fn fit_score(hints: &ResourceHints, snap: &NodeSnapshot, success_rate: f64) 
 /// better floor.
 #[must_use]
 pub fn effective_hints(task: &ResourceHints, capability: Option<&ResourceHints>) -> ResourceHints {
-    let Some(cap) = capability else {
-        return task.clone();
-    };
     fn max_opt(a: Option<u32>, b: Option<u32>) -> Option<u32> {
         match (a, b) {
             (Some(x), Some(y)) => Some(x.max(y)),
@@ -192,6 +189,9 @@ pub fn effective_hints(task: &ResourceHints, capability: Option<&ResourceHints>)
             _ => 2, // Pinned and future classes: most demanding
         }
     }
+    let Some(cap) = capability else {
+        return task.clone();
+    };
     ResourceHints {
         cpu_class: if cpu_rank(task.cpu_class) >= cpu_rank(cap.cpu_class) {
             task.cpu_class
@@ -261,8 +261,10 @@ mod tests {
     #[test]
     fn t01_hard_gates_zero_the_score() {
         let h = hints();
-        let mut snap = NodeSnapshot::default();
-        snap.paused = true;
+        let snap = NodeSnapshot {
+            paused: true,
+            ..NodeSnapshot::default()
+        };
         assert_eq!(fit_score(&h, &snap, 1.0), 0.0, "paused");
 
         let mut gpu = hints();
