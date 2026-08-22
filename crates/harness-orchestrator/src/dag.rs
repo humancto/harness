@@ -299,7 +299,10 @@ impl DagScheduler {
         // ancestor. Unreachable post-validation; if a future bug breaks
         // it, fail visibly (skip the strays) instead of hanging.
         if self.in_flight_count == 0 && self.waiting_count > 0 {
-            debug_assert!(false, "DAG invariant broken: waiting steps with nothing in flight");
+            debug_assert!(
+                false,
+                "DAG invariant broken: waiting steps with nothing in flight"
+            );
             let strays: Vec<TaskId> = self
                 .states
                 .iter()
@@ -495,8 +498,7 @@ mod tests {
         let v = ids(5);
         let (a, b, c, d, e) = (v[0], v[1], v[2], v[3], v[4]);
         // Branch 1: b→a, d→b. Branch 2: c (root), e→c. a fails.
-        let mut s =
-            DagScheduler::new(&plan_of(&v, vec![(b, a), (d, b), (e, c)])).expect("new");
+        let mut s = DagScheduler::new(&plan_of(&v, vec![(b, a), (d, b), (e, c)])).expect("new");
         assert_eq!(s.take_initial_ready(), vec![a, c]);
         let p = s
             .complete(a, StepOutcome::Failed("boom".into()))
@@ -610,8 +612,7 @@ mod tests {
     fn t10_deterministic_ready_order_and_deps_accessor() {
         let v = ids(4);
         let (a, b, c, d) = (v[0], v[1], v[2], v[3]);
-        let mut s =
-            DagScheduler::new(&plan_of(&v, vec![(d, a), (d, b), (d, c)])).expect("new");
+        let mut s = DagScheduler::new(&plan_of(&v, vec![(d, a), (d, b), (d, c)])).expect("new");
         // All three roots ready, sorted.
         assert_eq!(s.take_initial_ready(), vec![a, b, c]);
         let mut deps = s.deps_of(d).to_vec();

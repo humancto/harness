@@ -94,6 +94,135 @@ impl Signable for Plan {
     }
 }
 
+// --- `$task_output` references (roadmap 4.3, ADR-0025) ---------------
+//
+// A `PlanNode.input` may embed, anywhere in its JSON tree, an object of
+// the reserved shape
+//
+// ```json
+// {"$task_output": "<step TaskId as uuid string>", "pointer": "/opt/json/pointer"}
+// ```
+//
+// which the DAG executor replaces with the referenced step's output
+// (or the value at the RFC 6901 `pointer` within it) before dispatch.
+// `$task_output` is a reserved key: an object containing it is ALWAYS
+// treated as a reference, and any other shape around it is malformed.
+// A reference is only legal to a direct declared dependency — enforced
+// by plan validation (harness-brain) and again by the executor.
+
+/// One parsed `$task_output` reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputRef {
+    pub task: TaskId,
+    /// RFC 6901 JSON pointer into the referenced output.
+    pub pointer: Option<String>,
+}
+
+/// Reference walking / resolution failures.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OutputRefError {
+    #[error("malformed $task_output reference: {0}")]
+    Malformed(String),
+    #[error("reference to unavailable task output {}", .0.0)]
+    UnknownTask(TaskId),
+    #[error("pointer {pointer:?} not found in output of task {}", .task.0)]
+    PointerMiss { task: TaskId, pointer: String },
+}
+
+fn parse_ref(obj: &serde_json::Map<String, JsonValue>) -> Result<OutputRef, OutputRefError> {
+    let raw = obj
+        .get("$task_output")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| OutputRefError::Malformed("$task_output must be a uuid string".into()))?;
+    let task = raw
+        .parse::<uuid::Uuid>()
+        .map(TaskId)
+        .map_err(|_| OutputRefError::Malformed(format!("not a uuid: {raw}")))?;
+    let pointer = match obj.get("pointer") {
+        None => None,
+        Some(JsonValue::String(p)) => Some(p.clone()),
+        Some(_) => return Err(OutputRefError::Malformed("pointer must be a string".into())),
+    };
+    if obj.keys().any(|k| k != "$task_output" && k != "pointer") {
+        return Err(OutputRefError::Malformed(
+            "reference object allows only $task_output and pointer keys".into(),
+        ));
+    }
+    Ok(OutputRef { task, pointer })
+}
+
+/// Every `$task_output` reference in `input`, in walk order. A
+/// malformed reference (the reserved key present with the wrong shape)
+/// is an error, not a skip.
+pub fn find_output_refs(input: &JsonValue) -> Result<Vec<OutputRef>, OutputRefError> {
+    let mut out = Vec::new();
+    collect_refs(input, &mut out)?;
+    Ok(out)
+}
+
+fn collect_refs(v: &JsonValue, out: &mut Vec<OutputRef>) -> Result<(), OutputRefError> {
+    match v {
+        JsonValue::Object(obj) => {
+            if obj.contains_key("$task_output") {
+                out.push(parse_ref(obj)?);
+                return Ok(());
+            }
+            for child in obj.values() {
+                collect_refs(child, out)?;
+            }
+            Ok(())
+        }
+        JsonValue::Array(items) => {
+            for child in items {
+                collect_refs(child, out)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// `input` with every reference replaced via `lookup`. `lookup`
+/// returning `None` fails resolution (the referenced output is not
+/// available — undeclared dependency or unsettled step).
+pub fn resolve_output_refs(
+    input: &JsonValue,
+    lookup: &dyn Fn(TaskId) -> Option<JsonValue>,
+) -> Result<JsonValue, OutputRefError> {
+    match input {
+        JsonValue::Object(obj) => {
+            if obj.contains_key("$task_output") {
+                let r = parse_ref(obj)?;
+                let output = lookup(r.task).ok_or(OutputRefError::UnknownTask(r.task))?;
+                return match &r.pointer {
+                    None => Ok(output),
+                    Some(p) => {
+                        output
+                            .pointer(p)
+                            .cloned()
+                            .ok_or_else(|| OutputRefError::PointerMiss {
+                                task: r.task,
+                                pointer: p.clone(),
+                            })
+                    }
+                };
+            }
+            let mut resolved = serde_json::Map::with_capacity(obj.len());
+            for (k, child) in obj {
+                resolved.insert(k.clone(), resolve_output_refs(child, lookup)?);
+            }
+            Ok(JsonValue::Object(resolved))
+        }
+        JsonValue::Array(items) => Ok(JsonValue::Array(
+            items
+                .iter()
+                .map(|child| resolve_output_refs(child, lookup))
+                .collect::<Result<_, _>>()?,
+        )),
+        other => Ok(other.clone()),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
@@ -258,6 +387,58 @@ mod tests {
             };
             assert_eq!(b, round_trip(&b));
         }
+    }
+
+    #[test]
+    fn output_refs_found_and_resolved_with_pointer() {
+        let dep = TaskId::new_v7();
+        let input = serde_json::json!({
+            "msg": { "$task_output": dep.0.to_string(), "pointer": "/echoed/msg" },
+            "nested": [ { "$task_output": dep.0.to_string() } ],
+            "literal": 42,
+        });
+        let refs = find_output_refs(&input).expect("find");
+        assert_eq!(refs.len(), 2);
+        assert!(refs.iter().all(|r| r.task == dep));
+        assert_eq!(refs[0].pointer.as_deref(), Some("/echoed/msg"));
+
+        let output = serde_json::json!({ "echoed": { "msg": "hi" } });
+        let resolved =
+            resolve_output_refs(&input, &|t| (t == dep).then(|| output.clone())).expect("resolve");
+        assert_eq!(resolved["msg"], "hi");
+        assert_eq!(resolved["nested"][0], output);
+        assert_eq!(resolved["literal"], 42);
+    }
+
+    #[test]
+    fn output_ref_malformed_shapes_error() {
+        for bad in [
+            serde_json::json!({ "$task_output": 7 }),
+            serde_json::json!({ "$task_output": "not-a-uuid" }),
+            serde_json::json!({ "$task_output": TaskId::new_v7().0.to_string(), "pointer": 3 }),
+            serde_json::json!({ "$task_output": TaskId::new_v7().0.to_string(), "extra": true }),
+        ] {
+            assert!(matches!(
+                find_output_refs(&bad),
+                Err(OutputRefError::Malformed(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn output_ref_unknown_task_and_pointer_miss() {
+        let dep = TaskId::new_v7();
+        let input = serde_json::json!({ "$task_output": dep.0.to_string() });
+        assert!(matches!(
+            resolve_output_refs(&input, &|_| None),
+            Err(OutputRefError::UnknownTask(t)) if t == dep
+        ));
+        let with_ptr =
+            serde_json::json!({ "$task_output": dep.0.to_string(), "pointer": "/missing" });
+        assert!(matches!(
+            resolve_output_refs(&with_ptr, &|_| Some(serde_json::json!({"a": 1}))),
+            Err(OutputRefError::PointerMiss { .. })
+        ));
     }
 
     #[test]

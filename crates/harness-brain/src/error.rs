@@ -62,4 +62,17 @@ pub enum PlanValidationError {
 
     #[error("estimated cost ${estimated_usd:.4} exceeds cap ${max_usd:.4}")]
     CostExceeded { estimated_usd: f64, max_usd: f64 },
+
+    #[error("plan.tasks key {key:?} disagrees with its node id {id:?}")]
+    NodeIdMismatch { key: TaskId, id: TaskId },
+
+    #[error("task {task:?} has a malformed $task_output reference: {detail}")]
+    MalformedOutputRef { task: TaskId, detail: String },
+
+    #[error(
+        "task {task:?} input references output of {referenced:?}, which is not a \
+         declared direct dependency (data dependencies must be a subset of control \
+         dependencies — add the edge)"
+    )]
+    UndeclaredOutputRef { task: TaskId, referenced: TaskId },
 }
