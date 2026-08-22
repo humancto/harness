@@ -514,6 +514,8 @@ impl DaemonOrchestrator {
             self_manifest,
         );
         dispatch_runtime.attach_net(&peer_net);
+        // 4.4: local terminals feed the shared success EWMA (MAJOR-2).
+        let executor = executor.with_success_tracker(dispatch_runtime.success_tracker());
         // 3.2-stream: issuer-side partials land in the shared ring; the
         // worker-side streamer needs the runtime for issuer lookup +
         // wire access.
@@ -638,6 +640,15 @@ impl DaemonOrchestrator {
                 .as_ref()
                 .and_then(|s| s.replica_head().ok())
                 .unwrap_or_default();
+            // 4.4 (ADR-0026): advertise a truthful queue depth — tasks
+            // assigned to self and not yet terminal — so other issuers'
+            // fit_score sees real cross-issuer load. cpu/ram/gpu
+            // sampling stays a Phase 6 hardening item.
+            let queue_depth = snapshot_store
+                .as_ref()
+                .and_then(|s| s.count_inflight_by_node().ok())
+                .and_then(|m| m.get(&local_id).copied())
+                .map_or(0, |n| u16::try_from(n).unwrap_or(u16::MAX));
             let s = snapshot_state.local_status.read();
             let cfg = HeartbeatPublisherConfig {
                 version: harness_core::SemVer {
@@ -646,6 +657,7 @@ impl DaemonOrchestrator {
                     patch: 0,
                 },
                 replica_head,
+                queue_depth,
                 ..HeartbeatPublisherConfig::default()
             };
             let leader = s.leader_belief.unwrap_or(local_id);

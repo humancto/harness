@@ -279,3 +279,33 @@ fn t11_try_expire_lease_cas_semantics() {
         .try_expire_lease(lease2.lease_id)
         .expect("expire completed"));
 }
+
+#[test]
+fn t12_count_inflight_by_node_groups_non_terminal_assignments() {
+    let s = fresh_store();
+    let node_a = NodeId::from_bytes([0xAA; 16]);
+    let node_b = NodeId::from_bytes([0xBB; 16]);
+    // 2 dispatched to A, 1 to B, 1 unassigned Submitted, 1 Done on A.
+    let mut ids = vec![];
+    for _ in 0..5 {
+        let id = TaskId::new_v7();
+        s.insert_task(&dummy_task(id)).expect("insert");
+        ids.push(id);
+    }
+    assert!(s.try_dispatch_task(ids[0], node_a).expect("cas"));
+    assert!(s.try_dispatch_task(ids[1], node_a).expect("cas"));
+    assert!(s.try_dispatch_task(ids[2], node_b).expect("cas"));
+    // ids[3] stays Submitted. ids[4] goes terminal on A.
+    assert!(s.try_dispatch_task(ids[4], node_a).expect("cas"));
+    for (from, to) in [
+        (TaskState::Dispatched, TaskState::Claimed),
+        (TaskState::Claimed, TaskState::Running),
+        (TaskState::Running, TaskState::Done),
+    ] {
+        assert!(s.try_transition_task(ids[4], from, to).expect("hop"));
+    }
+    let counts = s.count_inflight_by_node().expect("count");
+    assert_eq!(counts.get(&node_a), Some(&2), "terminal row not counted");
+    assert_eq!(counts.get(&node_b), Some(&1));
+    assert_eq!(counts.len(), 2, "unassigned rows not counted");
+}

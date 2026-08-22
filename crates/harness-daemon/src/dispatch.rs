@@ -38,7 +38,10 @@ use harness_core::{
 };
 use harness_mesh::heartbeat::{PeerTable, PEER_TIMEOUT};
 use harness_mesh::TrustStore;
-use harness_orchestrator::{DispatchError, DispatchPlan, Dispatcher, LiveSet, RoundRobin};
+use harness_orchestrator::{
+    effective_hints, DispatchError, DispatchPlan, Dispatcher, LiveSet, LoadView, NodeSnapshot,
+    RoundRobin, SuccessTracker,
+};
 use harness_store::{Store, TaskState};
 use parking_lot::Mutex as ParkingMutex;
 use tokio::sync::watch;
@@ -106,6 +109,74 @@ struct ReplyObligation {
     lease_id: LeaseId,
 }
 
+/// Per-poll load view (4.4, ADR-0026): heartbeat snapshots from the
+/// `PeerTable`, capacity from stored manifests, in-flight counts from
+/// one group-by store query, plus same-poll reservations so one batch
+/// doesn't pile onto a single node.
+struct StoreLoadView<'a> {
+    runtime: &'a DispatchRuntime,
+    inflight: HashMap<NodeId, u32>,
+    reserved: ParkingMutex<HashMap<NodeId, u32>>,
+}
+
+impl<'a> StoreLoadView<'a> {
+    fn new(runtime: &'a DispatchRuntime) -> Self {
+        let inflight = runtime.store.count_inflight_by_node().unwrap_or_else(|e| {
+            tracing::warn!(target: "harness.dispatch", ?e, "count_inflight_by_node");
+            HashMap::new()
+        });
+        Self {
+            runtime,
+            inflight,
+            reserved: ParkingMutex::new(HashMap::new()),
+        }
+    }
+
+    fn note_assigned(&self, node: NodeId) {
+        *self.reserved.lock().entry(node).or_insert(0) += 1;
+    }
+}
+
+impl LoadView for StoreLoadView<'_> {
+    fn snapshot(&self, node: &NodeId) -> NodeSnapshot {
+        let mut snap = NodeSnapshot::default();
+        // Capacity from the stored manifest (self manifest indexed at boot).
+        if let Ok(Some(m)) = self.runtime.store.load_manifest(*node) {
+            snap.cpu_cores = m.resources.cpu_cores;
+            snap.ram_total_mb = m.resources.ram_total_mb;
+            snap.has_gpu = m.resources.gpu.is_some();
+            snap.gpu_total_mb = m.resources.gpu.as_ref().map_or(0, |g| g.vram_mb);
+        }
+        // Load from the latest heartbeat (zeros until Phase 6 sampling).
+        if let Some(entry) = self.runtime.peers.get(node) {
+            let hb = &entry.heartbeat;
+            snap.cpu_busy_pct = hb.cpu_busy_pct;
+            snap.cpu_pinned_count = hb.cpu_pinned_count;
+            snap.ram_used_mb = hb.ram_used_mb;
+            if hb.ram_total_mb > 0 {
+                snap.ram_total_mb = hb.ram_total_mb;
+            }
+            snap.gpu_used_mb = hb.gpu_used_mb;
+            if hb.gpu_total_mb > 0 {
+                snap.gpu_total_mb = hb.gpu_total_mb;
+            }
+            // max, not sum: no double-count once in_flight populates (1.5).
+            snap.reported_inflight = u32::from(hb.queue_depth)
+                .max(u32::try_from(hb.in_flight.len()).unwrap_or(u32::MAX));
+            snap.paused = hb.paused;
+            snap.on_battery = hb.on_battery;
+        }
+        let assigned = self.inflight.get(node).copied().unwrap_or(0);
+        let reserved = self.reserved.lock().get(node).copied().unwrap_or(0);
+        snap.assigned_inflight = assigned.saturating_add(reserved);
+        snap
+    }
+
+    fn success_rate(&self, node: &NodeId) -> f64 {
+        self.runtime.success.rate(node)
+    }
+}
+
 pub(crate) struct DispatchRuntime {
     store: Store,
     identity: Arc<Identity>,
@@ -132,6 +203,9 @@ pub(crate) struct DispatchRuntime {
     /// the API (3.2-stream, ADR-0020). Set once from lifecycle; when
     /// unset (bare unit-test fixtures), inbound partials are dropped.
     partials: OnceLock<Arc<PartialBuffers>>,
+    /// 4.4 (ADR-0026): per-node dispatch-outcome EWMA. Shared with the
+    /// local executor so local terminals feed it too (review MAJOR-2).
+    success: Arc<SuccessTracker>,
 }
 
 impl DispatchRuntime {
@@ -160,7 +234,14 @@ impl DispatchRuntime {
             reply: ParkingMutex::new(HashMap::new()),
             elig_failures: ParkingMutex::new(HashMap::new()),
             partials: OnceLock::new(),
+            success: Arc::new(SuccessTracker::new()),
         })
+    }
+
+    /// The shared success tracker — the local executor records its own
+    /// terminals here so the self node's rate is honest (ADR-0026).
+    pub(crate) fn success_tracker(&self) -> Arc<SuccessTracker> {
+        self.success.clone()
     }
 
     /// Test introspection: how many result replies this worker owes.
@@ -260,7 +341,16 @@ impl DispatchRuntime {
                 return;
             }
         };
-        for row in rows.into_iter().take(DISPATCH_BATCH) {
+        // 4.4: fresh-first batch (carried risk 10) — tasks not yet in
+        // the eligibility-failure map go first, so up to 16 known-
+        // undispatchable tasks can't starve a fresh one.
+        let known_failing: std::collections::HashSet<TaskId> =
+            self.elig_failures.lock().keys().copied().collect();
+        let batch = select_batch(rows, &known_failing, DISPATCH_BATCH);
+        // One load view per pass; same-poll assignments are reserved so
+        // the batch spreads (ADR-0026).
+        let loads = StoreLoadView::new(self);
+        for row in batch {
             let task = match self.store.load_task(row.id) {
                 Ok(Some(t)) => t,
                 Ok(None) => continue,
@@ -271,6 +361,13 @@ impl DispatchRuntime {
             };
             let cardinality = self.cardinality_for(&task.capability);
             self.seed_rr_cursor(&task.capability);
+            // Score with the max-demand union of task + capability hints
+            // (the API stamps default hints on most submits).
+            let cap_hints = self
+                .registry
+                .get(&task.capability)
+                .map(|c| c.manifest().resource_hints);
+            let hints = effective_hints(&task.resource_hints, cap_hints.as_ref());
             // Liveness ∩ secret capability (ADR-0021): nodes missing a
             // tag the capability requires are not candidates. When that
             // empties the set the existing eligibility-failure window →
@@ -280,11 +377,18 @@ impl DispatchRuntime {
                 runtime: self,
                 capability: &task.capability,
             };
-            match self
-                .dispatcher
-                .eligible_with_rr(&task, &cardinality, &live, &self.rr)
-            {
-                Ok(DispatchPlan::Single { node }) => self.dispatch_to(&task, node),
+            match self.dispatcher.eligible_scored(
+                &task,
+                &hints,
+                &cardinality,
+                &live,
+                &loads,
+                &self.rr,
+            ) {
+                Ok(DispatchPlan::Single { node }) => {
+                    loads.note_assigned(node);
+                    self.dispatch_to(&task, node);
+                }
                 Ok(DispatchPlan::Federated { nodes }) => {
                     // Real federated fan-out + merge is Phase 4.5. Until
                     // then a federated-cardinality task runs on the first
@@ -454,6 +558,22 @@ impl DispatchRuntime {
     }
 
     fn eligibility_failure(&self, task: &Task, err: &DispatchError) {
+        // 4.4 (ADR-0026 / review BLOCKER-1): a load-gated task is a
+        // QUEUED task, not an undispatchable one — never start the
+        // terminal window for it. It waits bounded only by its own
+        // deadline, exactly like work queued behind a busy executor.
+        if matches!(err, DispatchError::ResourceGated { .. }) {
+            self.elig_failures.lock().remove(&task.id);
+            let deadline_expired = task
+                .constraints
+                .deadline
+                .is_some_and(|d| now_unix_ms() >= d);
+            if !deadline_expired {
+                return; // keep waiting; gates re-evaluate every poll
+            }
+            self.fail_undispatchable(task, &format!("deadline exceeded while {err}"));
+            return;
+        }
         let now = Instant::now();
         let first = *self.elig_failures.lock().entry(task.id).or_insert(now);
         let window_expired =
@@ -465,30 +585,31 @@ impl DispatchRuntime {
         if !(window_expired || deadline_expired) {
             return; // keep retrying next poll
         }
-        let msg = format!("undispatchable: {err}");
+        self.fail_undispatchable(task, &format!("undispatchable: {err}"));
+        self.elig_failures.lock().remove(&task.id);
+    }
+
+    fn fail_undispatchable(&self, task: &Task, msg: &str) {
         if let Ok(true) =
             self.store
                 .try_transition_task(task.id, TaskState::Submitted, TaskState::Failed)
         {
+            tracing::warn!(target: "harness.dispatch", task = %task.id.0, %msg, "task failed terminally");
+            let now_ms = now_unix_ms();
+            if let Err(e) = self
+                .store
+                .write_task_result_failed(task.id, msg, now_ms, self.local_id)
             {
-                tracing::warn!(target: "harness.dispatch", task = %task.id.0, %msg, "task failed terminally");
-                let now_ms = now_unix_ms();
-                if let Err(e) =
-                    self.store
-                        .write_task_result_failed(task.id, &msg, now_ms, self.local_id)
-                {
-                    tracing::warn!(target: "harness.dispatch", ?e, "write undispatchable result");
-                }
-                let _ = self.store.replica_apply_local(&ReplicatedTaskState {
-                    task_id: task.id,
-                    state: ReplicatedState::Failed,
-                    at_ms: now_ms,
-                    source: self.local_id,
-                    output_preview: Some(msg.into_bytes().into_iter().take(256).collect()),
-                });
+                tracing::warn!(target: "harness.dispatch", ?e, "write undispatchable result");
             }
+            let _ = self.store.replica_apply_local(&ReplicatedTaskState {
+                task_id: task.id,
+                state: ReplicatedState::Failed,
+                at_ms: now_ms,
+                source: self.local_id,
+                output_preview: Some(msg.as_bytes().iter().copied().take(256).collect()),
+            });
         }
-        self.elig_failures.lock().remove(&task.id);
     }
 
     pub(crate) fn expire_pass(&self) {
@@ -540,6 +661,9 @@ impl DispatchRuntime {
                         break;
                     }
                 }
+                if let Some(worker) = lease.worker_id {
+                    self.success.record(worker, false);
+                }
                 let msg = format!("lease expired after {} attempts", lease.attempt);
                 tracing::warn!(target: "harness.dispatch", task = %lease.task_id.0, %msg, "task expired terminally");
                 if let Err(e) =
@@ -562,6 +686,11 @@ impl DispatchRuntime {
                     attempt = lease.attempt,
                     "lease expired; resetting for re-dispatch"
                 );
+                // The strongest per-node signal: this worker held the
+                // lease and didn't finish (review MINOR-6).
+                if let Some(worker) = lease.worker_id {
+                    self.success.record(worker, false);
+                }
                 let _ = self.store.expire_and_reset_task(lease.lease_id);
             }
         }
@@ -807,6 +936,9 @@ impl TaskChannelHandlers for DispatchRuntime {
                 return;
             }
         }
+        // Feed the tracker only after the CAS accepted the result —
+        // duplicate frames never double-count (review MINOR-6).
+        self.success.record(from, msg.result.status == Status::Ok);
         let task_id = msg.result.task_id;
         let now = msg.result.finished_at;
         if msg.result.status == Status::Ok {
@@ -908,6 +1040,7 @@ impl TaskChannelHandlers for DispatchRuntime {
     /// Issuer side: the assign never made it onto the wire.
     fn on_assign_send_failed(&self, node: NodeId, lease_id: LeaseId) {
         tracing::warn!(target: "harness.dispatch", %node, "assign send failed; resetting lease");
+        self.success.record(node, false);
         let _ = self.store.expire_and_reset_task(lease_id);
     }
 }
@@ -938,6 +1071,24 @@ fn lease_ttl_ms(task: &Task) -> u32 {
     let timeout_plus_slack = u64::from(task.execution.timeout_ms).saturating_add(LEASE_SLACK_MS);
     let ttl = u64::from(task.execution.lease_ms).max(timeout_plus_slack);
     u32::try_from(ttl).unwrap_or(u32::MAX)
+}
+
+/// Fresh-first dispatch batch (4.4, carried risk 10): tasks NOT already
+/// in the eligibility-failure map go first (submission order preserved
+/// within each partition), so up to `batch` known-undispatchable tasks
+/// can't starve fresh work. Known-failing tasks still retry whenever the
+/// batch has room. Tradeoff (ADR-0026): under a sustained full batch of
+/// fresh tasks, a known-failing task's terminal write is deferred past
+/// the window until the first non-full poll — harmless while waiting.
+fn select_batch(
+    rows: Vec<harness_store::TaskRow>,
+    known_failing: &std::collections::HashSet<TaskId>,
+    batch: usize,
+) -> Vec<harness_store::TaskRow> {
+    let (fresh, failing): (Vec<_>, Vec<_>) = rows
+        .into_iter()
+        .partition(|r| !known_failing.contains(&r.id));
+    fresh.into_iter().chain(failing).take(batch).collect()
 }
 
 fn now_unix_ms() -> u64 {
@@ -1741,5 +1892,119 @@ mod tests {
         assert!(f
             .runtime
             .node_has_required_secrets(f.local.node_id(), SECRET_CAP));
+    }
+
+    #[test]
+    fn t20_select_batch_fresh_first() {
+        let mk = |n: u8| harness_store::TaskRow {
+            id: TaskId::new_v7(),
+            capability: format!("c{n}"),
+            state: TaskState::Submitted,
+            issued_by: NodeId::from_bytes([n; 16]),
+            issued_at: u64::from(n),
+            completed_by: None,
+            started_at: None,
+            finished_at: None,
+        };
+        let rows: Vec<_> = (0..5).map(mk).collect();
+        let failing: std::collections::HashSet<TaskId> =
+            [rows[0].id, rows[1].id].into_iter().collect();
+        let batch = select_batch(rows.clone(), &failing, 3);
+        // Fresh (2,3,4) first, in submission order; failing fill the rest.
+        assert_eq!(batch[0].id, rows[2].id);
+        assert_eq!(batch[1].id, rows[3].id);
+        assert_eq!(batch[2].id, rows[4].id);
+        // Room left → failing tasks still retry.
+        let batch = select_batch(rows.clone(), &failing, 5);
+        assert_eq!(batch.len(), 5);
+        assert_eq!(batch[3].id, rows[0].id, "failing retained in order");
+        // Empty and all-failing cases.
+        assert!(select_batch(vec![], &failing, 3).is_empty());
+        let all: std::collections::HashSet<TaskId> = rows.iter().map(|r| r.id).collect();
+        assert_eq!(select_batch(rows, &all, 2).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn t21_scored_dispatch_prefers_less_loaded_node() {
+        let f = fixture();
+        let a = Identity::generate();
+        let b = Identity::generate();
+        add_live_candidate(&f, &a, vec![SECRET_TAG.to_string()]);
+        add_live_candidate(&f, &b, vec![SECRET_TAG.to_string()]);
+        // Load node A with 3 in-flight rows.
+        for _ in 0..3 {
+            let t = signed_task_for(&f.local, SECRET_CAP);
+            f.store.insert_task(&t).expect("insert");
+            assert!(f.store.try_dispatch_task(t.id, a.node_id()).expect("cas"));
+        }
+        // Fresh task must route to the idle node B regardless of RR.
+        for _ in 0..2 {
+            let t = signed_task_for(&f.local, SECRET_CAP);
+            f.store.insert_task(&t).expect("insert");
+            f.runtime.poll_submitted_once();
+            assert_eq!(
+                f.store.last_dispatched(SECRET_CAP).expect("cursor"),
+                Some(b.node_id()),
+                "idle node must win argmax over the loaded one"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn t22_paused_node_waits_instead_of_terminal_failure() {
+        // BLOCKER-1 regression: a load-gated task must NOT be failed
+        // after the eligibility window — it waits like queued work.
+        let f = fixture();
+        let a = Identity::generate();
+        add_live_candidate(&f, &a, vec![SECRET_TAG.to_string()]);
+        let mut hb = live_heartbeat(a.node_id());
+        hb.paused = true;
+        hb.seq = 2;
+        f.peers.record(hb);
+
+        let t = signed_task_for(&f.local, SECRET_CAP);
+        f.store.insert_task(&t).expect("insert");
+        // Poll past the (test) eligibility window.
+        f.runtime.poll_submitted_once();
+        tokio::time::sleep(Duration::from_millis(ELIGIBILITY_WINDOW_MS + 200)).await;
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.task_state(t.id).expect("state"),
+            Some(TaskState::Submitted),
+            "resource-gated task keeps waiting"
+        );
+        // Node un-pauses → next poll dispatches it.
+        let mut hb = live_heartbeat(a.node_id());
+        hb.seq = 3;
+        f.peers.record(hb);
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.last_dispatched(SECRET_CAP).expect("cursor"),
+            Some(a.node_id()),
+            "gate lifts when the node resumes"
+        );
+    }
+
+    #[tokio::test]
+    async fn t23_success_feed_flips_selection_to_reliable_node() {
+        let f = fixture();
+        let a = Identity::generate();
+        let b = Identity::generate();
+        add_live_candidate(&f, &a, vec![SECRET_TAG.to_string()]);
+        add_live_candidate(&f, &b, vec![SECRET_TAG.to_string()]);
+        // Node A accumulates failures (as the send-failed / expiry /
+        // result feed points would produce them).
+        for _ in 0..25 {
+            f.runtime.success.record(a.node_id(), false);
+        }
+        assert!(f.runtime.success.rate(&a.node_id()) < 0.1);
+        let t = signed_task_for(&f.local, SECRET_CAP);
+        f.store.insert_task(&t).expect("insert");
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.last_dispatched(SECRET_CAP).expect("cursor"),
+            Some(b.node_id()),
+            "unreliable node must lose ranking"
+        );
     }
 }

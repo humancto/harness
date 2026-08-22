@@ -348,6 +348,41 @@ impl Store {
 
     /// List tasks in a given state, newest first by `issued_at` (Uuid v7
     /// is also sortable but we explicitly order by the indexed column).
+    /// In-flight (Dispatched|Claimed|Running) task counts grouped by
+    /// `assigned_node` — the issuer-side load signal for 4.4 scoring.
+    pub fn count_inflight_by_node(
+        &self,
+    ) -> Result<std::collections::HashMap<NodeId, u32>, StoreError> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT assigned_node, COUNT(*)
+                   FROM tasks
+                  WHERE state IN ('dispatched','claimed','running')
+                    AND assigned_node IS NOT NULL
+               GROUP BY assigned_node",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    let blob: Vec<u8> = r.get(0)?;
+                    let n: i64 = r.get(1)?;
+                    Ok((blob, n))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut out = std::collections::HashMap::with_capacity(rows.len());
+            for (blob, n) in rows {
+                let arr: [u8; 16] = blob
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| StoreError::Cbor("assigned_node must be 16 bytes".into()))?;
+                out.insert(
+                    NodeId::from_bytes(arr),
+                    u32::try_from(n).unwrap_or(u32::MAX),
+                );
+            }
+            Ok(out)
+        })
+    }
+
     /// Step rows of one plan (4.3): `(row id, capability, state,
     /// parent id)` ordered by issue time. The 4.8 UI DAG view and the
     /// plan E2E tests map rows to plan nodes through the aggregate

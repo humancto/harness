@@ -130,7 +130,9 @@ pub fn fit_score(hints: &ResourceHints, snap: &NodeSnapshot, success_rate: f64) 
         }
     }
     let is_pinned = matches!(hints.cpu_class, harness_core::protocol::CpuClass::Pinned);
-    if is_pinned && snap.cpu_cores > 0 && u32::from(snap.cpu_pinned_count) >= u32::from(snap.cpu_cores)
+    if is_pinned
+        && snap.cpu_cores > 0
+        && u32::from(snap.cpu_pinned_count) >= u32::from(snap.cpu_cores)
     {
         return 0.0; // §14.9: full for further pinned tasks
     }
@@ -161,7 +163,9 @@ pub fn fit_score(hints: &ResourceHints, snap: &NodeSnapshot, success_rate: f64) 
         1.0
     };
 
-    soft(cpu_pressure) * soft(mem_pressure) * soft(gpu_pressure)
+    soft(cpu_pressure)
+        * soft(mem_pressure)
+        * soft(gpu_pressure)
         * success_rate.clamp(MIN_SUCCESS_RATE, 1.0)
         / cost_weight
 }
@@ -232,7 +236,12 @@ impl SuccessTracker {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, clippy::float_cmp)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::float_cmp
+)]
 mod tests {
     use super::*;
     use harness_core::protocol::{CpuClass, DiskIoClass, NetworkClass};

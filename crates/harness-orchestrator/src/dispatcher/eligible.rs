@@ -219,7 +219,6 @@ impl Dispatcher {
     /// Scores within this relative band of the best are ties, resolved
     /// round-robin (determinism + starvation avoidance).
     pub const TIE_EPSILON: f64 = 0.01;
-
 }
 
 fn read_scope_field(task: &Task, field: &str) -> Result<String, DispatchError> {
@@ -724,8 +723,15 @@ mod scored_tests {
         let t = task_for("echo");
         for _ in 0..6 {
             let a = pick(
-                d.eligible_scored(&t, &empty_hints_pub(), &Cardinality::Anyone, &live, &loads, &rr_scored)
-                    .unwrap(),
+                d.eligible_scored(
+                    &t,
+                    &empty_hints_pub(),
+                    &Cardinality::Anyone,
+                    &live,
+                    &loads,
+                    &rr_scored,
+                )
+                .unwrap(),
             );
             let b = pick(
                 d.eligible_with_rr(&t, &Cardinality::Anyone, &live, &rr_plain)
@@ -754,8 +760,15 @@ mod scored_tests {
         let t = task_for("echo");
         for _ in 0..4 {
             let chosen = pick(
-                d.eligible_scored(&t, &empty_hints_pub(), &Cardinality::Anyone, &live, &loads, &rr)
-                    .unwrap(),
+                d.eligible_scored(
+                    &t,
+                    &empty_hints_pub(),
+                    &Cardinality::Anyone,
+                    &live,
+                    &loads,
+                    &rr,
+                )
+                .unwrap(),
             );
             assert_ne!(chosen, node(1), "loaded node must lose argmax");
         }
@@ -777,7 +790,14 @@ mod scored_tests {
         let rr = RoundRobin::new();
         let t = task_for("echo");
         let err = d
-            .eligible_scored(&t, &empty_hints_pub(), &Cardinality::Anyone, &live, &loads, &rr)
+            .eligible_scored(
+                &t,
+                &empty_hints_pub(),
+                &Cardinality::Anyone,
+                &live,
+                &loads,
+                &rr,
+            )
             .unwrap_err();
         assert!(matches!(err, DispatchError::ResourceGated { .. }));
     }
@@ -797,8 +817,15 @@ mod scored_tests {
         let t = task_for("echo");
         for _ in 0..6 {
             let chosen = pick(
-                d.eligible_scored(&t, &empty_hints_pub(), &Cardinality::Anyone, &live, &loads, &rr)
-                    .unwrap(),
+                d.eligible_scored(
+                    &t,
+                    &empty_hints_pub(),
+                    &Cardinality::Anyone,
+                    &live,
+                    &loads,
+                    &rr,
+                )
+                .unwrap(),
             );
             assert_ne!(chosen, node(2), "paused node never selected");
         }
@@ -829,15 +856,29 @@ mod scored_tests {
         let rr = RoundRobin::new();
         let t = task_for("echo");
         let chosen = pick(
-            d.eligible_scored(&t, &empty_hints_pub(), &Cardinality::Anyone, &live, &loads, &rr)
-                .unwrap(),
+            d.eligible_scored(
+                &t,
+                &empty_hints_pub(),
+                &Cardinality::Anyone,
+                &live,
+                &loads,
+                &rr,
+            )
+            .unwrap(),
         );
         assert_eq!(chosen, node(1), "idle big node wins first placement");
         // Load it up: placement rebalances to the small nodes.
         loads.snapshots.get_mut(&node(1)).unwrap().assigned_inflight = 20;
         let chosen = pick(
-            d.eligible_scored(&t, &empty_hints_pub(), &Cardinality::Anyone, &live, &loads, &rr)
-                .unwrap(),
+            d.eligible_scored(
+                &t,
+                &empty_hints_pub(),
+                &Cardinality::Anyone,
+                &live,
+                &loads,
+                &rr,
+            )
+            .unwrap(),
         );
         assert_ne!(chosen, node(1), "loaded big node loses");
     }
@@ -869,8 +910,15 @@ mod scored_tests {
         let picks: Vec<NodeId> = (0..4)
             .map(|_| {
                 pick(
-                    d.eligible_scored(&t, &empty_hints_pub(), &Cardinality::Anyone, &live, &loads, &rr)
-                        .unwrap(),
+                    d.eligible_scored(
+                        &t,
+                        &empty_hints_pub(),
+                        &Cardinality::Anyone,
+                        &live,
+                        &loads,
+                        &rr,
+                    )
+                    .unwrap(),
                 )
             })
             .collect();
