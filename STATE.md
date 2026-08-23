@@ -146,6 +146,15 @@ cloud/template) — deferred, not dropped: `brain.plan`'s input schema is
 `additionalProperties: false` with no tier-selection field; needs a schema extension
 (natural home: 5.x backlog alongside escalation knobs).**
 
+5.5 review round 2 (diff): APPROVE at head — mint extraction byte-preserving, signature
+soundness (constant-time verified in vendored digest source; independent Python vector),
+no secret leakage (reqwest basic_auth sets the header sensitive — verified in vendored
+source), canned-plan fixture EMPIRICALLY deserialized against the real `Plan` serde,
+env coupling harmless, docs exact. Adopted follow-ups: sid recorded only AFTER a
+successful mint (a refused delivery stays retryable); t04 asserts the outbound basic-auth
+header; NIT doc-comments (redaction-wall crossing; Twilio's separator-less HMAC concat
+attacked and found unexploitable — ADR'd).
+
 5.5 review round 1 (plan): REVISE, all adopted pre-implementation — BLOCKER-1: no
 reusable mint path existed (submit_handler inlines auth+clamp+sign+insert+replica) —
 extracted `mint_task`; BLOCKER-2: harness-api has no executor, so the planned

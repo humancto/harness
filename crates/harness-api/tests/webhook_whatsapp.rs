@@ -216,9 +216,15 @@ async fn t04_full_conversation_plans_executes_and_replies() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    use base64::Engine as _;
     let mock = MockServer::start().await;
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("{SID}:{TOKEN}"));
     Mock::given(method("POST"))
         .and(path(format!("/2010-04-01/Accounts/{SID}/Messages.json")))
+        .and(wiremock::matchers::header(
+            "authorization",
+            format!("Basic {basic}").as_str(),
+        ))
         .respond_with(ResponseTemplate::new(201))
         .expect(1)
         .mount(&mock)

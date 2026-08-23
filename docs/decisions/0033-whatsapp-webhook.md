@@ -78,6 +78,13 @@ operator work, never a blocker.
 
 ## Dependencies (stopping-condition record)
 
+Twilio's key‖value concatenation has no separators, so an on-path
+attacker could re-split captured pairs without breaking the MAC —
+attacked and found unexploitable here (re-splitting cannot forge an
+allowlisted `From` nor alter `Body` bytes; worst case deletes a
+field, which fails the allowlist or empties the goal). Inherited
+from Twilio's scheme, not fixable on our side.
+
 `hmac` is the only NEW lockfile entry. `sha1` was already in the
 lock (axum's `ws` feature via tungstenite) — the direct dep adds no
 new code to the tree. `base64`, `serde_urlencoded`, `reqwest` are

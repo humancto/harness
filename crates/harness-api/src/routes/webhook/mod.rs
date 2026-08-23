@@ -96,6 +96,15 @@ pub struct SeenSids {
 const SEEN_SIDS_CAP: usize = 512;
 
 impl SeenSids {
+    /// Is `sid` already recorded? (Diff review MINOR-2: the handler
+    /// checks membership BEFORE the fallible admission/permit/mint
+    /// steps and records only after the mint succeeds — a refused
+    /// delivery must stay retryable.)
+    #[must_use]
+    pub fn contains(&self, sid: &str) -> bool {
+        !sid.is_empty() && self.set.contains(sid)
+    }
+
     /// Record `sid`; returns `false` if it was already present (a
     /// provider retry — the caller must NOT mint again).
     pub fn insert(&mut self, sid: &str) -> bool {

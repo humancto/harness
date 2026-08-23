@@ -74,28 +74,23 @@ fn form_value<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
-/// `POST /webhook/whatsapp`. Body arrives as
-/// `application/x-www-form-urlencoded`; extracted as a raw `String`
-/// so the SAME decoded pairs feed the signature and the fields (axum's
-/// `Form` would consume the body and lose repeated keys).
-pub async fn whatsapp_handler(
-    State(state): State<ApiState>,
-    uri: Uri,
-    headers: HeaderMap,
-    body: String,
-) -> axum::response::Response {
+/// Signature preamble: reconstruct the public URL and validate the
+/// `X-Twilio-Signature` header over it. `Err` is the ready-to-return
+/// refusal response.
+fn verify_signature(
+    state: &ApiState,
+    headers: &HeaderMap,
+    uri: &Uri,
+    pairs: &[(String, String)],
+) -> Result<(), axum::response::Response> {
     // Fail closed: no auth token configured ⇒ the adapter does not
     // exist. Never accept an unsigned webhook.
     let Some(auth_token) = state.secrets.get(AUTH_TOKEN_TAG) else {
-        return (
+        return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(json!({ "error": "adapter_unconfigured", "missing": AUTH_TOKEN_TAG })),
         )
-            .into_response();
-    };
-
-    let Ok(pairs) = serde_urlencoded::from_str::<Vec<(String, String)>>(&body) else {
-        return (StatusCode::BAD_REQUEST, "malformed form body").into_response();
+            .into_response());
     };
 
     let host = headers
@@ -116,10 +111,29 @@ pub async fn whatsapp_handler(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
     if signature.is_empty()
-        || !validate_twilio_signature(auth_token.as_bytes(), &signed_url, &pairs, signature)
+        || !validate_twilio_signature(auth_token.as_bytes(), &signed_url, pairs, signature)
     {
         tracing::warn!(target: "harness.api.webhook", %signed_url, "twilio signature rejected");
-        return (StatusCode::FORBIDDEN, "signature mismatch").into_response();
+        return Err((StatusCode::FORBIDDEN, "signature mismatch").into_response());
+    }
+    Ok(())
+}
+
+/// `POST /webhook/whatsapp`. Body arrives as
+/// `application/x-www-form-urlencoded`; extracted as a raw `String`
+/// so the SAME decoded pairs feed the signature and the fields (axum's
+/// `Form` would consume the body and lose repeated keys).
+pub async fn whatsapp_handler(
+    State(state): State<ApiState>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: String,
+) -> axum::response::Response {
+    let Ok(pairs) = serde_urlencoded::from_str::<Vec<(String, String)>>(&body) else {
+        return (StatusCode::BAD_REQUEST, "malformed form body").into_response();
+    };
+    if let Err(refusal) = verify_signature(&state, &headers, &uri, &pairs) {
+        return refusal;
     }
 
     // Sender gate (deny-all default): the signature authenticates
@@ -143,9 +157,11 @@ pub async fn whatsapp_handler(
 
     // Provider retry dedup (Codex P1): Twilio replays the same signed
     // request when a response is lost; re-minting would double-run
-    // the goal. Same-ack semantics for the retry.
-    let message_sid = form_value(&pairs, "MessageSid").unwrap_or("");
-    if !state.webhook.seen_sids.lock().insert(message_sid) {
+    // the goal. Membership is checked HERE but the sid is recorded
+    // only after the mint succeeds (diff review MINOR-2) — a "mesh
+    // busy" or mint failure must leave the delivery retryable.
+    let message_sid = form_value(&pairs, "MessageSid").unwrap_or("").to_string();
+    if state.webhook.seen_sids.lock().contains(&message_sid) {
         tracing::info!(
             target: "harness.api.webhook",
             sid = %message_sid,
@@ -188,6 +204,7 @@ pub async fn whatsapp_handler(
                 .into_response();
         }
     };
+    state.webhook.seen_sids.lock().insert(&message_sid);
 
     let short = format!("{}", plan_id.0.as_hyphenated())
         .chars()
@@ -370,6 +387,11 @@ async fn send_reply(state: &ApiState, inbound_from: &str, inbound_to: &str, body
     let Some(token) = state.secrets.get(AUTH_TOKEN_TAG) else {
         return; // handler already required it; vanished mid-flight
     };
+    // Deliberate crossing of SecretValue's redaction wall (diff
+    // review NIT-4): reqwest's basic_auth takes Display types, so the
+    // credentials exist briefly as plain Strings here. reqwest builds
+    // the header with set_sensitive(true) and never logs it; the
+    // Strings drop at function exit.
     let sid_str = String::from_utf8_lossy(sid.as_bytes()).to_string();
     let token_str = String::from_utf8_lossy(token.as_bytes()).to_string();
 
