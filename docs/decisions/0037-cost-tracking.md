@@ -68,6 +68,13 @@ LEDGER here in `harness-cost`.
   of billed-then-failed cloud calls still never trips a budget.
 - **Retry overwrite:** `ON CONFLICT DO UPDATE` on the result row
   means a billed-then-retried call counts once (known undercount).
+- **Cloud PLANNING spend is untracked:** `brain.plan` is a LocalFast
+  capability and the brain's `CloudBackend` does not parse `usage` —
+  a cloud-escalated planning call's real dollars are invisible to
+  both enforcement and the ledger. (The `estimated_cost_usd` field
+  is the LLM's plan-cost self-estimate — repricing it would be a
+  category error.) Fix path: parse usage in the cloud planner and
+  attach it to the brain.plan result.
 - **Price drift:** built-ins go stale; overrides + unpriced-unknown
   bound the damage. Issuer-side re-pricing from tokens (instead of
   accepting the CloudPaid claim) is the recorded upgrade path.

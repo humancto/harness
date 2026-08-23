@@ -15,5 +15,5 @@
 pub mod ledger;
 pub mod pricing;
 
-pub use ledger::{CostLedger, CostTotals, PlanCost};
+pub use ledger::{CostLedger, CostTotals, DayCost, IssuerCost, PlanCost};
 pub use pricing::{install_pricing, price_usd, Pricing};

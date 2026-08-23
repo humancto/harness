@@ -296,6 +296,24 @@ pub(crate) struct DispatchRuntime {
 }
 
 impl DispatchRuntime {
+    /// 5.9 (ADR-0037): issuer-side cost gate — judged against the
+    /// ISSUER'S OWN local manifest (same binary, same first-party
+    /// hints), never the worker's gossiped announcement. This row is
+    /// the one the coordinator's ledger reads.
+    fn persist_ingested_cost(&self, task_id: TaskId, output: &serde_json::Value) {
+        if let Ok(Some(task)) = self.store.load_task(task_id) {
+            if let Some(cap) = self.registry.get(&task.capability) {
+                if let Some(usd) =
+                    crate::cost_gate::gated_cost(cap.manifest().cost_hint, output, &task.capability)
+                {
+                    if let Err(e) = self.store.write_result_cost(task_id, usd) {
+                        tracing::warn!(target: "harness.cost", ?e, "write_result_cost (ingest)");
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) fn new(
         store: Store,
         identity: Arc<Identity>,
@@ -1290,22 +1308,7 @@ impl TaskChannelHandlers for DispatchRuntime {
                 {
                     tracing::warn!(target: "harness.dispatch", ?e, "write remote result");
                 }
-                // 5.9 (ADR-0037): issuer-side cost gate — judged
-                // against the ISSUER'S OWN local manifest (same
-                // binary, same first-party hints), never the worker's
-                // gossiped announcement. This row is the one the
-                // coordinator's ledger reads.
-                if let Ok(Some(task)) = self.store.load_task(task_id) {
-                    if let Some(cap) = self.registry.get(&task.capability) {
-                        if let Some(usd) = crate::cost_gate::gated_cost(
-                            cap.manifest().cost_hint,
-                            &msg.result.output,
-                            &task.capability,
-                        ) {
-                            let _ = self.store.write_result_cost(task_id, usd);
-                        }
-                    }
-                }
+                self.persist_ingested_cost(task_id, &msg.result.output);
                 let preview = serde_json::to_vec(&msg.result.output)
                     .ok()
                     .map(|v| v.into_iter().take(256).collect());

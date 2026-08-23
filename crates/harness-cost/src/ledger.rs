@@ -54,10 +54,25 @@ pub struct CostTotals {
     pub total_usd: f64,
     pub today_usd: f64,
     pub per_plan: Vec<PlanCost>,
-    /// `(node id hex, usd)` — descending.
-    pub per_issuer: Vec<(String, f64)>,
-    /// `(YYYY-MM-DD, usd)` — ascending by day.
-    pub per_day: Vec<(String, f64)>,
+    /// Descending by spend.
+    pub per_issuer: Vec<IssuerCost>,
+    /// Ascending by day.
+    pub per_day: Vec<DayCost>,
+}
+
+/// Per-issuing-node spend (object shape so 5.10 can grow fields).
+#[derive(Debug, Clone, Serialize)]
+pub struct IssuerCost {
+    pub node_id: String,
+    pub usd: f64,
+}
+
+/// Per-UTC-day spend.
+#[derive(Debug, Clone, Serialize)]
+pub struct DayCost {
+    /// `YYYY-MM-DD`.
+    pub day: String,
+    pub usd: f64,
 }
 
 /// Read-side aggregator. Stateless; construct per request.
@@ -69,10 +84,11 @@ impl CostLedger {
     ///
     /// # Errors
     /// Propagates store read errors.
+    #[allow(clippy::too_many_lines)]
     pub fn totals(store: &Store, now_ms: u64) -> Result<CostTotals, harness_store::StoreError> {
         let since = now_ms.saturating_sub(WINDOW_MS);
         let rows = store.recent_result_costs(since, MAX_RESULT_ROWS)?;
-        let truncated = rows.len() >= MAX_RESULT_ROWS;
+        let mut truncated = rows.len() >= MAX_RESULT_ROWS;
 
         let mut total = 0.0_f64;
         let mut today = 0.0_f64;
@@ -104,10 +120,16 @@ impl CostLedger {
         let aggregates =
             store.recent_outputs_for_capability("plan.execute", since, MAX_PLAN_AGGREGATES)?;
         let mut plans: Vec<PlanCost> = Vec::new();
+        let mut seen_plan_ids = std::collections::HashSet::new();
         for agg in &aggregates {
             let Some(plan_id) = agg.get("plan_id").and_then(serde_json::Value::as_str) else {
                 continue;
             };
+            // A re-run plan yields multiple aggregates for one id —
+            // the newest (rows are newest-first) wins, no duplicates.
+            if !seen_plan_ids.insert(plan_id.to_string()) {
+                continue;
+            }
             let actual = per_plan.remove(plan_id).unwrap_or(0.0);
             let b = agg.get("budget");
             plans.push(PlanCost {
@@ -135,6 +157,7 @@ impl CostLedger {
                     .map(str::to_string),
             });
             if plans.len() >= MAX_PER_PLAN {
+                truncated = true;
                 break;
             }
         }
@@ -142,6 +165,9 @@ impl CostLedger {
         // (still running, or the aggregate aged out) keep a bare row.
         for (pid, usd) in per_plan {
             if plans.len() >= MAX_PER_PLAN {
+                // Their dollars stay in total_usd — say the list is
+                // incomplete rather than presenting it as everything.
+                truncated = true;
                 break;
             }
             plans.push(PlanCost {
@@ -156,9 +182,15 @@ impl CostLedger {
             });
         }
 
-        let mut issuers: Vec<(String, f64)> = per_issuer.into_iter().collect();
-        issuers.sort_by(|a, b| b.1.total_cmp(&a.1));
-        issuers.truncate(MAX_PER_ISSUER);
+        let mut issuers: Vec<IssuerCost> = per_issuer
+            .into_iter()
+            .map(|(node_id, usd)| IssuerCost { node_id, usd })
+            .collect();
+        issuers.sort_by(|a, b| b.usd.total_cmp(&a.usd));
+        if issuers.len() > MAX_PER_ISSUER {
+            truncated = true;
+            issuers.truncate(MAX_PER_ISSUER);
+        }
 
         Ok(CostTotals {
             window_days: WINDOW_DAYS,
@@ -167,7 +199,10 @@ impl CostLedger {
             today_usd: today,
             per_plan: plans,
             per_issuer: issuers,
-            per_day: per_day.into_iter().collect(),
+            per_day: per_day
+                .into_iter()
+                .map(|(day, usd)| DayCost { day, usd })
+                .collect(),
         })
     }
 }

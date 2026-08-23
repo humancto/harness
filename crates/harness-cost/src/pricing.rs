@@ -13,8 +13,14 @@ type Rate = (&'static str, f64, f64);
 /// purpose: prefixes, not SKUs.
 const BUILTIN: &[Rate] = &[
     // Anthropic
-    ("claude-fable-5", 15.0, 75.0),
-    ("claude-opus-5", 10.0, 40.0),
+    ("claude-fable-5", 10.0, 50.0),
+    ("claude-opus-5", 5.0, 25.0),
+    // Current Opus 4.x generation (4.5+) — longer prefixes shadow the
+    // legacy claude-opus-4/4.1 rate below (longest-prefix-wins).
+    ("claude-opus-4-5", 5.0, 25.0),
+    ("claude-opus-4-6", 5.0, 25.0),
+    ("claude-opus-4-7", 5.0, 25.0),
+    ("claude-opus-4-8", 5.0, 25.0),
     ("claude-opus-4", 15.0, 75.0),
     ("claude-sonnet-5", 3.0, 15.0),
     ("claude-sonnet-4", 3.0, 15.0),
@@ -101,19 +107,42 @@ static INSTALLED: OnceLock<Pricing> = OnceLock::new();
 /// Install the process-wide pricing table (daemon boot, once, from
 /// policy `[cost.model_prices]`). Returns `false` if already
 /// installed (the first install wins; callers log).
+///
+/// NOTE (ADR-0037): first-install-wins is per PROCESS — tests that
+/// boot multiple daemons in one process share one table, and pricing
+/// never follows a policy reload. Tests asserting override behavior
+/// must use [`Pricing`] instances, never this global.
 pub fn install_pricing(pricing: Pricing) -> bool {
     INSTALLED.set(pricing).is_ok()
 }
 
 /// Price against the installed table (built-ins when nothing was
 /// installed) — the convenience entry point for capabilities.
+/// An unpriced model WARNS once per model id (ADR-0037: the
+/// unknown-means-unpriced posture only bounds damage if someone can
+/// notice the table went stale).
 #[must_use]
 pub fn price_usd(model: &str, prompt_tokens: u64, completion_tokens: u64) -> Option<f64> {
-    INSTALLED
-        .get()
-        .cloned()
-        .unwrap_or_default()
-        .price_usd(model, prompt_tokens, completion_tokens)
+    let priced = INSTALLED.get().map_or_else(
+        || Pricing::default().price_usd(model, prompt_tokens, completion_tokens),
+        |p| p.price_usd(model, prompt_tokens, completion_tokens),
+    );
+    if priced.is_none() && !model.is_empty() {
+        static WARNED: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            OnceLock::new();
+        let warned = WARNED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        if let Ok(mut set) = warned.lock() {
+            if set.len() < 256 && set.insert(model.to_string()) {
+                tracing::warn!(
+                    target: "harness.cost",
+                    model,
+                    "model is not in the pricing table; calls are UNPRICED — \
+                     add a [cost.model_prices] override"
+                );
+            }
+        }
+    }
+    priced
 }
 
 #[cfg(test)]

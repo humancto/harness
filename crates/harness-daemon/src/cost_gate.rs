@@ -26,7 +26,10 @@ pub(crate) fn gated_cost(hint: CostHint, output: &JsonValue, capability: &str) -
             None
         }
         (_, Some(v)) => {
-            tracing::warn!(
+            // debug, not warn: this fires per RESULT at both the
+            // worker and issuer sites — an mcp.proxy foreign output
+            // with an incidental cost_usd field would double-spam.
+            tracing::debug!(
                 target: "harness.cost",
                 capability,
                 value = v,
