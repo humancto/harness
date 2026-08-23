@@ -76,6 +76,10 @@
       });
       if (gen !== myGen) return;
       if (res.status === 401) {
+        // Recover the phase BEFORE gating (Codex P2): a stuck
+        // 'planning'/'submitting' phase would come back from re-auth
+        // with dead controls.
+        phase = 'idle';
         authed = false;
         return;
       }
@@ -93,6 +97,7 @@
         case 'aborted':
           return; // reset/cancel already updated the UI
         case 'unauthorized':
+          phase = 'idle';
           authed = false;
           return;
         case 'timeout':
@@ -134,6 +139,9 @@
       });
       if (gen !== myGen) return;
       if (res.status === 401) {
+        // Codex P2: leaving phase='submitting' would render the
+        // restored preview with permanently disabled buttons.
+        phase = 'preview';
         authed = false;
         return;
       }
