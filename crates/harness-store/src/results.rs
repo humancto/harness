@@ -224,10 +224,12 @@ impl Store {
         })
     }
 
-    /// 5.9 ledger feed: costed/completed rows joined to their task
-    /// rows, newest-first, bounded by BOTH a time window and a row
-    /// cap. Returns `(capability, plan_id?, issued_by, completed_at_ms,
-    /// cost_usd?)`.
+    /// 5.9 ledger feed: COST-BEARING completed rows joined to their
+    /// task rows, newest-first, bounded by BOTH a time window and a
+    /// row cap. NULL/zero-cost rows are excluded IN SQL, before the
+    /// cap (Codex P1 on #60: a burst of free local completions must
+    /// not evict paid rows from the window). Returns
+    /// `(capability, plan_id?, issued_by, completed_at_ms, cost_usd?)`.
     #[allow(clippy::type_complexity)]
     pub fn recent_result_costs(
         &self,
@@ -248,6 +250,7 @@ impl Store {
                 "SELECT t.capability, t.plan_id, t.issued_by, r.completed_at_ms, r.cost_usd
                    FROM task_results r JOIN tasks t ON t.id = r.task_id
                   WHERE r.completed_at_ms >= ?1
+                        AND r.cost_usd IS NOT NULL AND r.cost_usd > 0
                   ORDER BY r.completed_at_ms DESC LIMIT ?2",
             )?;
             let rows = stmt.query_map(

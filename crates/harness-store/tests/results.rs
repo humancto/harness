@@ -313,6 +313,15 @@ fn t08_result_cost_round_trip_and_ledger_queries() {
     let loaded = s.load_task_result(id).expect("load").expect("present");
     assert_eq!(loaded.cost_usd, Some(0.5));
 
+    // A NULL-cost row must be excluded IN SQL, before the cap —
+    // free completions cannot evict paid rows (Codex P1 on #60).
+    let free = TaskId::new_v7();
+    s.insert_task(&dummy_task(free, "echo")).expect("insert");
+    s.write_task_result_done(free, &json!({}), 1_500, NodeId::from_bytes([2; 16]))
+        .expect("row");
+    let rows = s.recent_result_costs(0, 1).expect("feed");
+    assert_eq!(rows.len(), 1, "cap spent on the COSTED row only");
+    assert_eq!(rows[0].4, Some(0.5));
     let rows = s.recent_result_costs(0, 100).expect("feed");
     assert_eq!(rows.len(), 1);
     let (cap, pid, by, at, cost) = &rows[0];
@@ -327,7 +336,7 @@ fn t08_result_cost_round_trip_and_ledger_queries() {
     let outs = s
         .recent_outputs_for_capability("echo", 0, 10)
         .expect("outs");
-    assert_eq!(outs.len(), 1);
+    assert_eq!(outs.len(), 2, "both echo outputs (cost is irrelevant here)");
     assert!(s
         .recent_outputs_for_capability("other", 0, 10)
         .expect("outs")
