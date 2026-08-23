@@ -22,7 +22,7 @@ pub mod support;
 pub mod task;
 
 pub use cardinality::{AggregateOp, Cardinality, MergeStrategy, PartialPolicy};
-pub use dispatch::{LeaseId, TaskAssign, TaskClaim, TaskResultMsg};
+pub use dispatch::{LeaseExtend, LeaseId, TaskAssign, TaskClaim, TaskResultMsg};
 pub use heartbeat::Heartbeat;
 pub use manifest::{Capability, CapabilityRef, NodeManifest, ResourceHints, Resources, Scope};
 pub use plan::{

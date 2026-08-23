@@ -346,9 +346,9 @@ fn heartbeat_typical_size_under_576_bytes() {
 // -----------------------------------------------------------------------------
 
 use harness_core::{
-    Constraints, Cost, ExecutionPolicy, FinalResult, LeaseId, ReplicaSyncEnvelope, ReplicatedState,
-    ReplicatedTaskState, ResourceHints, RetryPolicy, Status, Task, TaskAssign, TaskClaim,
-    TaskResultMsg, TraceContext,
+    Constraints, Cost, ExecutionPolicy, FinalResult, LeaseExtend, LeaseId, ReplicaSyncEnvelope,
+    ReplicatedState, ReplicatedTaskState, ResourceHints, RetryPolicy, Status, Task, TaskAssign,
+    TaskClaim, TaskResultMsg, TraceContext,
 };
 
 /// Second deterministic identity — the "worker" side of the dispatch
@@ -417,6 +417,24 @@ fn task_assign_wire_format_is_stable() {
     // CHANGING THIS SNAPSHOT IS A WIRE-FORMAT BREAK.
     // It requires an ADR documenting the migration story + a version bump.
     insta::assert_snapshot!("task_assign_wire_v0", hex::encode(&buf));
+}
+
+#[test]
+fn lease_extend_wire_format_is_stable() {
+    let worker = fixture_worker_identity();
+    let mut ext = LeaseExtend {
+        seq: 5,
+        lease_id: fixture_lease_id(),
+        task_id: fixture_task_id(),
+        worker: worker.node_id(),
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    ext.sign(&worker).expect("sign lease extend");
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&ext, &mut buf).expect("serialize");
+
+    // CHANGING THIS SNAPSHOT IS A WIRE-FORMAT BREAK.
+    insta::assert_snapshot!("lease_extend_wire_v0", hex::encode(&buf));
 }
 
 #[test]

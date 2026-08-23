@@ -29,8 +29,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use harness_core::{
-    Heartbeat, Identity, LeaseId, NodeId, NodeManifest, PartialResult, ReplicaSyncEnvelope,
-    Signable, TaskAssign, TaskClaim, TaskResultMsg,
+    Heartbeat, Identity, LeaseExtend, LeaseId, NodeId, NodeManifest, PartialResult,
+    ReplicaSyncEnvelope, Signable, TaskAssign, TaskClaim, TaskResultMsg,
 };
 use harness_mesh::heartbeat::{HeartbeatService, PeerTable, HEARTBEAT_INTERVAL, PEER_TIMEOUT};
 use harness_mesh::transport::{channels, ChannelStream, Connection, TransportError};
@@ -67,6 +67,12 @@ pub(crate) trait TaskChannelHandlers: Send + Sync + 'static {
     /// the lease so the task re-routes.
     fn on_assign_send_failed(&self, node: NodeId, lease_id: LeaseId) {
         let _ = (node, lease_id);
+    }
+    /// Lease extension from a worker (4.6, ADR-0028). The transport
+    /// verified the envelope signature + per-stream seq and the recv
+    /// loop checked `msg.worker == from`. Default no-op.
+    fn on_lease_extend(&self, from: NodeId, msg: LeaseExtend) {
+        let _ = (from, msg);
     }
 }
 
@@ -128,6 +134,9 @@ pub(crate) enum OutboundMsg {
     /// is dropped (no lease reset, no retry beyond the sender's single
     /// evict-and-retry) — the terminal result is authoritative.
     Partial(PartialResult),
+    /// Lease extension (4.6, ADR-0028). Fire-and-forget like Partial:
+    /// a lost extension degrades to the pre-4.6 timeout bound.
+    LeaseExtend(LeaseExtend),
 }
 
 impl OutboundMsg {
@@ -140,6 +149,7 @@ impl OutboundMsg {
             OutboundMsg::Result(_) => channels::TASK_RESULT,
             OutboundMsg::Gossip(_) => channels::GOSSIP_STATE,
             OutboundMsg::Partial(_) => channels::TASK_PARTIAL,
+            OutboundMsg::LeaseExtend(_) => channels::TASK_LEASE,
         }
     }
 }
@@ -467,6 +477,12 @@ impl PeerNet {
                 sign_or_protocol_err(&mut p, identity)?;
                 ch.send(&p).await
             }
+            OutboundMsg::LeaseExtend(e) => {
+                let mut e = *e;
+                e.seq = ch.next_seq();
+                sign_or_protocol_err(&mut e, identity)?;
+                ch.send(&e).await
+            }
         }
     }
 
@@ -583,6 +599,22 @@ impl PeerNet {
                                 peer = %peer_id,
                                 claimed = %c.worker,
                                 "claim sender does not match connection peer; dropped"
+                            );
+                        }
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                },
+                n if n == channels::TASK_LEASE => match ch.recv_sequenced::<LeaseExtend>().await {
+                    Ok(e) => {
+                        if e.worker == peer_id {
+                            self.handlers.on_lease_extend(peer_id, e);
+                        } else {
+                            tracing::warn!(
+                                target: "harness.fanout",
+                                peer = %peer_id,
+                                claimed = %e.worker,
+                                "lease-extend sender does not match connection peer; dropped"
                             );
                         }
                         Ok(())

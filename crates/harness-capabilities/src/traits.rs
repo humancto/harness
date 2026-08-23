@@ -11,7 +11,7 @@ use thiserror::Error;
 /// Per-call execution context — what's known to a capability about the
 /// caller and the local environment, plus the cancellation token tied
 /// to the lease deadline.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ExecutionContext {
     /// Local node id — capabilities embed this in any `Cost` / per-task
     /// `provenance` entries they emit.
@@ -31,6 +31,27 @@ pub struct ExecutionContext {
     /// capabilities — `llm.local.*` reads `"interactive"` to bypass
     /// the micro-batcher (3.5). `Arc<[String]>` for cheap clone.
     pub tags: Arc<[String]>,
+    /// Streaming frame sink (4.6, promoted from
+    /// `MeshExec::progress_sink` / `PlanExec::progress_sink` per
+    /// ADR-0024's deferral): the executor stamps the daemon's
+    /// partial-stream sink here so any capability can emit `Progress`
+    /// frames without bespoke plumbing. `None` disables emission.
+    pub frame_sink: Option<FrameSink>,
+}
+
+impl std::fmt::Debug for ExecutionContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Manual: `FrameSink` is an `Arc<dyn Fn>` and not `Debug`.
+        f.debug_struct("ExecutionContext")
+            .field("local_node", &self.local_node)
+            .field("local_node_name", &self.local_node_name)
+            .field("issued_by", &self.issued_by)
+            .field("issued_by_name", &self.issued_by_name)
+            .field("task_id", &self.task_id)
+            .field("tags", &self.tags)
+            .field("frame_sink", &self.frame_sink.is_some())
+            .finish()
+    }
 }
 
 /// Which child stream a [`LogFrame`] came from. Serializes as

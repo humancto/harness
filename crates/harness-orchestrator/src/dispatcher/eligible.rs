@@ -57,6 +57,15 @@ impl Dispatcher {
         cardinality: &Cardinality,
         live: &L,
     ) -> Result<DispatchPlan, DispatchError> {
+        // Owner input validation runs BEFORE any live-set consultation
+        // (4.6, PR #49 review): a missing/non-string scope field is a
+        // PERMANENT input error and must never be observable as
+        // "bench filtered someone, then Owner failed" — the daemon's
+        // breaker remap treats that combination as a transient to wait
+        // out. Validating first keeps the two failure classes disjoint.
+        if let Cardinality::Owner { scope_field } = cardinality {
+            read_scope_field(task, scope_field)?;
+        }
         let mut candidates = self.capabilities.nodes_for(&task.capability);
         candidates = live.live_subset(&candidates);
         candidates = filter::apply_constraints(candidates, &task.constraints, &self.scopes, live)?;
@@ -134,6 +143,15 @@ impl Dispatcher {
         live: &L,
         rr: &RoundRobin,
     ) -> Result<DispatchPlan, DispatchError> {
+        // Owner input validation runs BEFORE any live-set consultation
+        // (4.6, PR #49 review): a missing/non-string scope field is a
+        // PERMANENT input error and must never be observable as
+        // "bench filtered someone, then Owner failed" — the daemon's
+        // breaker remap treats that combination as a transient to wait
+        // out. Validating first keeps the two failure classes disjoint.
+        if let Cardinality::Owner { scope_field } = cardinality {
+            read_scope_field(task, scope_field)?;
+        }
         let mut candidates = self.capabilities.nodes_for(&task.capability);
         candidates = live.live_subset(&candidates);
         candidates = filter::apply_constraints(candidates, &task.constraints, &self.scopes, live)?;
@@ -181,6 +199,15 @@ impl Dispatcher {
     ) -> Result<DispatchPlan, DispatchError> {
         if !matches!(cardinality, Cardinality::Anyone) {
             return self.eligible(task, cardinality, live);
+        }
+        // Owner input validation runs BEFORE any live-set consultation
+        // (4.6, PR #49 review): a missing/non-string scope field is a
+        // PERMANENT input error and must never be observable as
+        // "bench filtered someone, then Owner failed" — the daemon's
+        // breaker remap treats that combination as a transient to wait
+        // out. Validating first keeps the two failure classes disjoint.
+        if let Cardinality::Owner { scope_field } = cardinality {
+            read_scope_field(task, scope_field)?;
         }
         let mut candidates = self.capabilities.nodes_for(&task.capability);
         candidates = live.live_subset(&candidates);

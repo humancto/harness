@@ -159,6 +159,11 @@ impl DaemonOrchestrator {
         let store = harness_store::Store::open(&harness_store::StoreConfig::at(&db_path))
             .context("open harness-store")?;
 
+        // 4.6 (ADR-0028): sweep crash-stranded claimed/running rows
+        // BEFORE any loop spawns — at this point every such row
+        // assigned to self is provably debris from a previous process.
+        crate::executor::sweep_boot_orphans(&store, identity.node_id());
+
         // Load the admin file if present; absence means the operator
         // hasn't run `harness admin set-password` yet, and mutating
         // endpoints will surface a 503 until they do.
@@ -380,9 +385,6 @@ impl DaemonOrchestrator {
                 identity.clone(),
                 capabilities.downgrade(),
                 heartbeat.peers(),
-                // 4.2: per-target progress frames ride the same partial
-                // pipeline as shell line frames (ADR-0024).
-                Some(partial_streamer.sink()),
             );
             harness_capabilities::enrich_with_mesh_meta(&capabilities, mesh_exec.clone());
             // 4.3: plan.execute — the DAG executor driver shares the
@@ -463,12 +465,16 @@ impl DaemonOrchestrator {
         // the queue, walks the lifecycle ladder, invokes the capability,
         // writes results.
         let local_node_name: Arc<str> = Arc::from(config.node_name.as_str());
+        // 4.6: the executor stamps the partial-stream sink into every
+        // ExecutionContext (ADR-0024's FrameSink promotion) — wrappers
+        // read ctx.frame_sink instead of per-trait plumbing.
         let executor = crate::executor::LocalExecutor::with_default_concurrency(
             store.clone(),
             capabilities.clone(),
             identity.node_id(),
             local_node_name.clone(),
-        );
+        )
+        .with_frame_sink(partial_streamer.sink());
 
         // Phase 3.3-fanout (PR-A1): the per-peer connection registry +
         // channel router. Announces our signed manifest on every adopted
@@ -515,7 +521,14 @@ impl DaemonOrchestrator {
         );
         dispatch_runtime.attach_net(&peer_net);
         // 4.4: local terminals feed the shared success EWMA (MAJOR-2).
-        let executor = executor.with_success_tracker(dispatch_runtime.success_tracker());
+        // 4.6: worker-side lease extensions resolve their live lease
+        // through the runtime's reply-obligation map per tick.
+        let extender_runtime = dispatch_runtime.clone();
+        let executor = executor
+            .with_success_tracker(dispatch_runtime.success_tracker())
+            .with_lease_extender(std::sync::Arc::new(move |task_id| {
+                extender_runtime.send_lease_extend(task_id);
+            }));
         // 3.2-stream: issuer-side partials land in the shared ring; the
         // worker-side streamer needs the runtime for issuer lookup +
         // wire access.

@@ -259,13 +259,17 @@ fn t11_try_expire_lease_cas_semantics() {
     let lease = s.create_lease(id, node, 60_000, 1).expect("lease");
 
     // Wins from pending; task row untouched.
-    assert!(s.try_expire_lease(lease.lease_id).expect("expire"));
+    assert!(s
+        .try_expire_lease(lease.lease_id, u64::MAX)
+        .expect("expire"));
     assert_eq!(
         s.task_state(id).expect("state"),
         Some(TaskState::Dispatched)
     );
     // Second attempt loses (already terminal).
-    assert!(!s.try_expire_lease(lease.lease_id).expect("re-expire"));
+    assert!(!s
+        .try_expire_lease(lease.lease_id, u64::MAX)
+        .expect("re-expire"));
 
     // Completed lease: expiry loses.
     let id2 = TaskId::new_v7();
@@ -276,7 +280,7 @@ fn t11_try_expire_lease_cas_semantics() {
         .try_complete_pending_or_claimed(lease2.lease_id)
         .expect("complete"));
     assert!(!s
-        .try_expire_lease(lease2.lease_id)
+        .try_expire_lease(lease2.lease_id, u64::MAX)
         .expect("expire completed"));
 }
 

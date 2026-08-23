@@ -73,6 +73,13 @@ pub mod channels {
     /// `PartialResult::seq` (stamped per-stream by the sender task).
     pub const TASK_PARTIAL: &str = "harness.task.partial";
 
+    /// Worker → issuer lease extensions (`LeaseExtend`, 4.6 ADR-0028).
+    /// Fire-and-forget liveness proof; the terminal result on
+    /// [`TASK_RESULT`] stays authoritative. Additive: an old node
+    /// resets the unknown-name stream and the connection survives —
+    /// behavior degrades to the pre-4.6 timeout bound.
+    pub const TASK_LEASE: &str = "harness.task.lease";
+
     /// LWW replica sync envelopes (PR-B / 3.3-gossip).
     pub const GOSSIP_STATE: &str = "harness.gossip.state";
 
@@ -87,6 +94,7 @@ pub mod channels {
             TASK_CLAIM => Some(TASK_CLAIM),
             TASK_RESULT => Some(TASK_RESULT),
             TASK_PARTIAL => Some(TASK_PARTIAL),
+            TASK_LEASE => Some(TASK_LEASE),
             GOSSIP_STATE => Some(GOSSIP_STATE),
             _ => None,
         }
@@ -101,6 +109,8 @@ pub mod channels {
     /// - partial: coalesced line batches, bounded at the emitter (8 KiB
     ///   lines, 4 KiB batch budget) so 64 KiB is generous headroom even
     ///   after JSON escaping (ADR-0020).
+    /// - lease: `LeaseExtend` is a fixed ~150-byte envelope — the
+    ///   64 KiB default is already generous.
     /// - everything else: the legacy 64 KiB default.
     #[must_use]
     pub fn frame_cap(channel: &'static str) -> usize {
@@ -159,6 +169,12 @@ impl Sequenced for harness_core::TaskClaim {
 }
 
 impl Sequenced for harness_core::TaskResultMsg {
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+}
+
+impl Sequenced for harness_core::LeaseExtend {
     fn seq(&self) -> u64 {
         self.seq
     }

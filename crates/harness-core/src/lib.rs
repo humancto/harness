@@ -23,8 +23,8 @@ pub use identity::{
 pub use protocol::{
     find_output_refs, resolve_output_refs, Budget, BudgetAction, Capability, CapabilityRef,
     Cardinality, CheckpointConfig, CheckpointStorage, Constraints, Cost, ExecutionPolicy,
-    FinalResult, HashFn, Heartbeat, LeaseId, LogLevel, LogLine, MergeStrategy, NodeContribution,
-    NodeManifest, NodeStatus, OutputRef, OutputRefError, PartialPolicy, PartialResult, Plan,
-    PlanNode, ResourceHints, Resources, RetryPolicy, Scope, Signable, Status, Task, TaskAssign,
-    TaskClaim, TaskResult, TaskResultMsg, TraceContext, Unsigned,
+    FinalResult, HashFn, Heartbeat, LeaseExtend, LeaseId, LogLevel, LogLine, MergeStrategy,
+    NodeContribution, NodeManifest, NodeStatus, OutputRef, OutputRefError, PartialPolicy,
+    PartialResult, Plan, PlanNode, ResourceHints, Resources, RetryPolicy, Scope, Signable, Status,
+    Task, TaskAssign, TaskClaim, TaskResult, TaskResultMsg, TraceContext, Unsigned,
 };

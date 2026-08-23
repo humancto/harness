@@ -14,8 +14,8 @@ pub use eligible::Dispatcher;
 pub use live_set::{LiveSet, StaticLiveSet};
 pub use round_robin::RoundRobin;
 pub use score::{
-    effective_hints, fit_score, LoadView, NodeSnapshot, StaticLoadView, SuccessTracker,
-    BATTERY_COST_WEIGHT, MIN_SUCCESS_RATE, PRESSURE_FLOOR,
+    effective_hints, fit_score, Breaker, LoadView, NodeSnapshot, StaticLoadView, SuccessTracker,
+    BATTERY_COST_WEIGHT, BENCH_MS, BENCH_THRESHOLD, MIN_SUCCESS_RATE, PRESSURE_FLOOR,
 };
 
 /// What the dispatcher decided for a single submission. The caller (2.4)

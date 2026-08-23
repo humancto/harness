@@ -39,8 +39,8 @@ use harness_core::{
 use harness_mesh::heartbeat::{PeerTable, PEER_TIMEOUT};
 use harness_mesh::TrustStore;
 use harness_orchestrator::{
-    effective_hints, DispatchError, DispatchPlan, Dispatcher, LiveSet, LoadView, NodeSnapshot,
-    RoundRobin, SuccessTracker,
+    effective_hints, Breaker, DispatchError, DispatchPlan, Dispatcher, LiveSet, LoadView,
+    NodeSnapshot, RoundRobin, SuccessTracker,
 };
 use harness_store::{Store, TaskState};
 use parking_lot::Mutex as ParkingMutex;
@@ -62,6 +62,16 @@ const LEASE_SLACK_MS: u64 = 15_000;
 const LEASE_SLACK_MS: u64 = 700;
 /// A task with no eligible node keeps retrying for this long (or until
 /// `constraints.deadline`), then fails terminally.
+/// 4.6 (ADR-0028): rolling lease horizon granted per accepted
+/// `LeaseExtend` — receipt time + this, hard-capped by the lease's
+/// ORIGINAL budget (`issued_at + lease TTL`). Once a worker proves it
+/// extends, its death is detected within ~one horizon instead of the
+/// full task timeout.
+#[cfg(not(test))]
+const EXTEND_HORIZON_MS: u64 = 30_000;
+#[cfg(test)]
+const EXTEND_HORIZON_MS: u64 = 2_000;
+
 #[cfg(not(test))]
 const ELIGIBILITY_WINDOW_MS: u64 = 30_000;
 #[cfg(test)]
@@ -101,6 +111,35 @@ impl LiveSet for SecretAwareLiveSet<'_> {
             && self
                 .runtime
                 .node_has_required_secrets(*node, self.capability)
+    }
+}
+
+/// 4.6 (ADR-0028): bench-aware layer over the liveness ∩ secrets set.
+/// `breaker: None` = passthrough (pinned tasks and Federated fan-outs
+/// bypass the bench — operator intent and availability-first
+/// respectively). Counts filtered nodes so the caller can distinguish
+/// "no eligible nodes at all" from "eligible nodes exist but every one
+/// is benched" — the latter is ≤60 s transient and must WAIT, not burn
+/// the terminal eligibility window (plan review MAJOR-8).
+struct BreakerAwareLiveSet<'a> {
+    inner: SecretAwareLiveSet<'a>,
+    breaker: Option<&'a Breaker>,
+    filtered: std::sync::atomic::AtomicUsize,
+}
+
+impl LiveSet for BreakerAwareLiveSet<'_> {
+    fn is_live(&self, node: &NodeId) -> bool {
+        if !self.inner.is_live(node) {
+            return false;
+        }
+        if let Some(breaker) = self.breaker {
+            if breaker.is_benched(node) {
+                self.filtered
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -227,6 +266,20 @@ pub(crate) struct DispatchRuntime {
     /// `DispatchPlan::Federated` parents atomically and drives them to
     /// a terminal with per-node provenance.
     federated: Arc<crate::federated::FederatedCoordinator>,
+    /// 4.6 (ADR-0028): tasks whose next dispatch attempt is deferred
+    /// (lease-expiry retry or assign-send failure), keyed to the
+    /// instant the backoff ends. In-memory by design: a restart
+    /// forgets backoffs, so the first post-boot poll retries
+    /// immediately — one extra attempt after a crash, never a tight
+    /// loop. Backing-off tasks also sit in `gated` so they batch in
+    /// the WAITING class.
+    backoff: ParkingMutex<HashMap<TaskId, tokio::time::Instant>>,
+    /// 4.6 (ADR-0028, PRD §14.5): per-node circuit breaker — 5
+    /// consecutive NODE-HEALTH failures (lease expiry, send failure;
+    /// never task-level result statuses) bench a node for 60 s from
+    /// `Anyone`/`Owner` candidate sets. Self is never benched; pinned
+    /// tasks and Federated fan-outs bypass the bench.
+    breaker: Arc<Breaker>,
 }
 
 impl DispatchRuntime {
@@ -260,7 +313,31 @@ impl DispatchRuntime {
             partials: OnceLock::new(),
             success: Arc::new(SuccessTracker::new()),
             gated: ParkingMutex::new(std::collections::HashSet::new()),
+            backoff: ParkingMutex::new(HashMap::new()),
+            breaker: Arc::new(Breaker::new()),
         })
+    }
+
+    /// 4.6: node-health failure feed (lease expiry / send failure).
+    /// Self is never benched — a single-node install must not gate its
+    /// whole queue on its own task outcomes.
+    fn record_node_failure(&self, node: NodeId) {
+        if node != self.local_id {
+            self.breaker.record_failure(node);
+        }
+    }
+
+    /// Test introspection: the circuit breaker.
+    #[cfg(test)]
+    pub(crate) fn breaker(&self) -> &Breaker {
+        &self.breaker
+    }
+
+    /// Test introspection: is the task inside the terminal eligibility
+    /// window?
+    #[cfg(test)]
+    pub(crate) fn has_elig_failure(&self, id: TaskId) -> bool {
+        self.elig_failures.lock().contains_key(&id)
     }
 
     /// The shared success tracker — the local executor records its own
@@ -401,6 +478,12 @@ impl DispatchRuntime {
                     continue;
                 }
             };
+            // 4.6 (ADR-0028): a backing-off task waits out its delay
+            // in the gated class (deadline enforced inside — plan
+            // review MAJOR-7).
+            if self.waits_in_backoff(&task) {
+                continue;
+            }
             let cardinality = self.cardinality_for(&task.capability);
             self.seed_rr_cursor(&task.capability);
             // Score with the max-demand union of task + capability hints
@@ -414,10 +497,23 @@ impl DispatchRuntime {
             // tag the capability requires are not candidates. When that
             // empties the set the existing eligibility-failure window →
             // terminal `undispatchable` path applies unchanged.
-            let live = SecretAwareLiveSet {
-                inner: self.live_set(),
-                runtime: self,
-                capability: &task.capability,
+            let live = BreakerAwareLiveSet {
+                inner: SecretAwareLiveSet {
+                    inner: self.live_set(),
+                    runtime: self,
+                    capability: &task.capability,
+                },
+                // Pinned tasks (operator intent) and Federated fan-outs
+                // (availability-first; a benched node just shows up
+                // non-Ok in provenance) bypass the bench.
+                breaker: if task.constraints.pin_to_node.is_some()
+                    || matches!(cardinality, Cardinality::Federated { .. })
+                {
+                    None
+                } else {
+                    Some(&self.breaker)
+                },
+                filtered: std::sync::atomic::AtomicUsize::new(0),
             };
             match self.dispatcher.eligible_scored(
                 &task,
@@ -477,7 +573,11 @@ impl DispatchRuntime {
                     // a routing bug, not a task failure.
                     tracing::error!(target: "harness.dispatch", task = %task.id.0, "unknown dispatch plan");
                 }
-                Err(err) => self.eligibility_failure(&task, &err),
+                Err(err) => {
+                    let bench_filtered =
+                        live.filtered.load(std::sync::atomic::Ordering::Relaxed) > 0;
+                    self.eligibility_failure(&task, &err, bench_filtered);
+                }
             }
         }
     }
@@ -550,8 +650,12 @@ impl DispatchRuntime {
 
     fn dispatch_to(&self, task: &Task, node: NodeId) {
         self.elig_failures.lock().remove(&task.id);
-        if let Err(e) = self.store.set_last_dispatched(&task.capability, node) {
-            tracing::warn!(target: "harness.dispatch", ?e, "persist rr cursor");
+        // 4.6 (ADR-0027 carry): pinned routes never consult RR — don't
+        // churn the cursor N times per federated fan-out.
+        if task.constraints.pin_to_node.is_none() {
+            if let Err(e) = self.store.set_last_dispatched(&task.capability, node) {
+                tracing::warn!(target: "harness.dispatch", ?e, "persist rr cursor");
+            }
         }
         match self.store.try_dispatch_task(task.id, node) {
             Ok(true) => {}
@@ -623,16 +727,32 @@ impl DispatchRuntime {
                 %err,
                 "assign enqueue failed; resetting for re-dispatch"
             );
-            let _ = self.store.expire_and_reset_task(lease.lease_id);
+            self.record_node_failure(node);
+            if let Ok(true) = self.store.expire_and_reset_task(lease.lease_id) {
+                // 4.6 (risk 9): back off before re-routing so a dead
+                // pin isn't hammered every 100 ms poll.
+                self.schedule_backoff(task.id, &task.retry, attempt);
+            }
         }
     }
 
-    fn eligibility_failure(&self, task: &Task, err: &DispatchError) {
+    fn eligibility_failure(&self, task: &Task, err: &DispatchError, bench_filtered: bool) {
         // 4.4 (ADR-0026 / review BLOCKER-1): a load-gated task is a
         // QUEUED task, not an undispatchable one — never start the
         // terminal window for it. It waits bounded only by its own
         // deadline, exactly like work queued behind a busy executor.
-        if matches!(err, DispatchError::ResourceGated { .. }) {
+        //
+        // 4.6 (ADR-0028): "every candidate is benched" is the same
+        // shape — a ≤60 s transient. When the breaker filtered anyone,
+        // NoEligibleNodes and Owner-empty errors join the waiting arm
+        // instead of burning the terminal window (the sole-benched-
+        // owner case included; plan review MAJOR-8).
+        let bench_gated = bench_filtered
+            && matches!(
+                err,
+                DispatchError::NoEligibleNodes { .. } | DispatchError::Owner { .. }
+            );
+        if bench_gated || matches!(err, DispatchError::ResourceGated { .. }) {
             self.elig_failures.lock().remove(&task.id);
             self.gated.lock().insert(task.id);
             let deadline_expired = task
@@ -695,11 +815,9 @@ impl DispatchRuntime {
             }
         };
         for lease in expired {
-            let max_attempts = self
-                .store
-                .load_task(lease.task_id)
-                .ok()
-                .flatten()
+            let task_row = self.store.load_task(lease.task_id).ok().flatten();
+            let max_attempts = task_row
+                .as_ref()
                 .map_or(3, |t| u32::from(t.retry.max_attempts));
             if lease.attempt >= max_attempts {
                 // Terminal expiry joins the lease-CAS discipline (review
@@ -707,7 +825,7 @@ impl DispatchRuntime {
                 // means a result completed the lease between
                 // `find_expired`'s snapshot and now — that result owns
                 // the terminal state; write nothing.
-                match self.store.try_expire_lease(lease.lease_id) {
+                match self.store.try_expire_lease(lease.lease_id, now) {
                     Ok(true) => {}
                     Ok(false) => {
                         tracing::debug!(
@@ -736,6 +854,7 @@ impl DispatchRuntime {
                 }
                 if let Some(worker) = lease.worker_id {
                     self.success.record(worker, false);
+                    self.record_node_failure(worker);
                 }
                 let msg = format!("lease expired after {} attempts", lease.attempt);
                 tracing::warn!(target: "harness.dispatch", task = %lease.task_id.0, %msg, "task expired terminally");
@@ -759,12 +878,96 @@ impl DispatchRuntime {
                     attempt = lease.attempt,
                     "lease expired; resetting for re-dispatch"
                 );
-                // The strongest per-node signal: this worker held the
-                // lease and didn't finish (review MINOR-6).
-                if let Some(worker) = lease.worker_id {
-                    self.success.record(worker, false);
+                // Guarded on expires_at < now: a LeaseExtend landing
+                // after find_expired's snapshot makes this reset lose
+                // (plan review MAJOR-3 — the worker is provably alive).
+                // Failure signals are recorded ONLY when the expiry CAS
+                // wins (PR #49 review): a lost race means the worker
+                // extended — counting it could bench a live node.
+                if let Ok(true) = self
+                    .store
+                    .expire_and_reset_task_if_unextended(lease.lease_id, now)
+                {
+                    // The strongest per-node signal: this worker held
+                    // the lease and didn't finish (review MINOR-6).
+                    if let Some(worker) = lease.worker_id {
+                        self.success.record(worker, false);
+                        self.record_node_failure(worker);
+                    }
+                    // 4.6 (ADR-0028): the retry waits out its backoff in
+                    // the WAITING batch class — no more immediate
+                    // re-dispatch hammering a dead pin.
+                    if let Some(task) = task_row.as_ref() {
+                        self.schedule_backoff(task.id, &task.retry, lease.attempt);
+                    }
                 }
-                let _ = self.store.expire_and_reset_task(lease.lease_id);
+            }
+        }
+        // 4.6 hygiene (plan review MINOR-12): entries whose task left
+        // `Submitted` sideways (cancel, terminal) must not live forever.
+        self.prune_waiting_sets();
+    }
+
+    /// 4.6 (ADR-0028): is this Submitted task still waiting out a
+    /// retry backoff? `true` = skip it this poll (it stays batched in
+    /// the WAITING class). The deadline is enforced HERE — no other
+    /// check is reachable while the task is never scored (plan review
+    /// MAJOR-7).
+    fn waits_in_backoff(&self, task: &Task) -> bool {
+        // Copy the instant out — holding the guard through this body
+        // would deadlock on the re-locks below (parking_lot is not
+        // reentrant).
+        let Some(until) = self.backoff.lock().get(&task.id).copied() else {
+            return false;
+        };
+        if tokio::time::Instant::now() >= until {
+            self.backoff.lock().remove(&task.id);
+            return false;
+        }
+        let deadline_expired = task
+            .constraints
+            .deadline
+            .is_some_and(|d| now_unix_ms() >= d);
+        if deadline_expired {
+            self.backoff.lock().remove(&task.id);
+            self.gated.lock().remove(&task.id);
+            self.fail_undispatchable(
+                task,
+                "deadline exceeded while backing off between retry attempts",
+            );
+        } else {
+            self.gated.lock().insert(task.id);
+        }
+        true
+    }
+
+    /// Defer `task`'s next dispatch attempt by its retry policy's
+    /// backoff for the attempt that just failed (4.6, ADR-0028).
+    fn schedule_backoff(&self, task_id: TaskId, retry: &harness_core::RetryPolicy, attempt: u32) {
+        let delay = backoff_delay(retry, attempt);
+        self.backoff
+            .lock()
+            .insert(task_id, tokio::time::Instant::now() + delay);
+        // Inserted into the waiting class NOW so the next poll never
+        // burns a fresh-class batch slot on it (review MINOR-12).
+        self.gated.lock().insert(task_id);
+    }
+
+    /// Drop backoff/gated bookkeeping for tasks no longer `Submitted`.
+    /// Covers the UNION of both sets (PR #49 review): resource-gated,
+    /// bench-gated, and federated slot-starved tasks live in `gated`
+    /// without a backoff entry, and a sideways exit (operator cancel)
+    /// would otherwise leak them forever.
+    fn prune_waiting_sets(&self) {
+        let mut ids: std::collections::HashSet<TaskId> =
+            self.backoff.lock().keys().copied().collect();
+        ids.extend(self.gated.lock().iter().copied());
+        for id in ids {
+            let still_submitted =
+                matches!(self.store.task_state(id), Ok(Some(TaskState::Submitted)));
+            if !still_submitted {
+                self.backoff.lock().remove(&id);
+                self.gated.lock().remove(&id);
             }
         }
     }
@@ -1014,6 +1217,10 @@ impl TaskChannelHandlers for DispatchRuntime {
         // Feed the tracker only after the CAS accepted the result —
         // duplicate frames never double-count (review MINOR-6).
         self.success.record(from, msg.result.status == Status::Ok);
+        // 4.6: ANY accepted result proves node liveness — even a Failed
+        // one clears the breaker streak (task-level outcomes are not
+        // node-health signals).
+        self.breaker.record_ok(from);
         let task_id = msg.result.task_id;
         let now = msg.result.finished_at;
         if msg.result.status == Status::Ok {
@@ -1116,11 +1323,116 @@ impl TaskChannelHandlers for DispatchRuntime {
     fn on_assign_send_failed(&self, node: NodeId, lease_id: LeaseId) {
         tracing::warn!(target: "harness.dispatch", %node, "assign send failed; resetting lease");
         self.success.record(node, false);
-        let _ = self.store.expire_and_reset_task(lease_id);
+        self.record_node_failure(node);
+        // 4.6 (risk 9, plan review MAJOR-6): the ASYNC send-failure
+        // path — a half-dead peer accepts the enqueue and fails in the
+        // sender task — must back off too, or the retry loop hammers
+        // every 100 ms for the whole eligibility window.
+        let lease = self.store.fetch_lease(lease_id).ok().flatten();
+        if let Ok(true) = self.store.expire_and_reset_task(lease_id) {
+            if let Some(lease) = lease {
+                if let Ok(Some(task)) = self.store.load_task(lease.task_id) {
+                    self.schedule_backoff(task.id, &task.retry, lease.attempt);
+                }
+            }
+        }
+    }
+
+    /// 4.6 (ADR-0028): a worker's rolling liveness proof. The transport
+    /// verified the envelope signature against the connection peer and
+    /// the recv loop checked `msg.worker == from`; here the store CAS
+    /// additionally guards on the lease's own `worker_id`, so a stale
+    /// or cross-attempt extension is a silent no-op. The new expiry is
+    /// `now + EXTEND_HORIZON_MS`, hard-capped by the lease's ORIGINAL
+    /// budget (`issued_at + lease TTL`) — a wedged or malicious
+    /// extender can never hold a lease past the task's own declared
+    /// budget (plan review BLOCKER-2), and the unconditional set means
+    /// the first extension SHRINKS a long lease to the rolling horizon
+    /// (fast dead-worker detection; plan review BLOCKER-1).
+    fn on_lease_extend(&self, from: NodeId, msg: harness_core::LeaseExtend) {
+        let Some(lease) = self.store.fetch_lease(msg.lease_id).ok().flatten() else {
+            return;
+        };
+        if lease.task_id != msg.task_id {
+            tracing::warn!(
+                target: "harness.dispatch",
+                %from,
+                lease = %msg.lease_id.0,
+                "lease-extend task_id does not match lease; dropped"
+            );
+            return;
+        }
+        // A task that already reached a terminal state (operator
+        // cancel included) must not have its lease kept alive until
+        // the budget cap (PR #49 review).
+        match self.store.task_state(lease.task_id) {
+            Ok(Some(TaskState::Dispatched | TaskState::Claimed | TaskState::Running)) => {}
+            _ => return,
+        }
+        let Some(task) = self.store.load_task(lease.task_id).ok().flatten() else {
+            return;
+        };
+        let budget_cap = lease
+            .issued_at
+            .saturating_add(u64::from(lease_ttl_ms(&task)));
+        let new_expiry = now_unix_ms()
+            .saturating_add(EXTEND_HORIZON_MS)
+            .min(budget_cap);
+        match self
+            .store
+            .extend_lease_for_worker(msg.lease_id, from, new_expiry)
+        {
+            Ok(true) => {
+                tracing::trace!(
+                    target: "harness.dispatch",
+                    task = %lease.task_id.0,
+                    %from,
+                    new_expiry,
+                    "lease extended"
+                );
+            }
+            Ok(false) => {} // terminal lease / wrong worker: silent no-op
+            Err(e) => {
+                tracing::warn!(target: "harness.dispatch", ?e, "extend_lease_for_worker");
+            }
+        }
     }
 }
 
 impl DispatchRuntime {
+    /// Worker side (4.6): send one `LeaseExtend` for `task_id` if we
+    /// still owe its issuer a result. Resolves `{issuer, lease_id}`
+    /// from the LIVE reply-obligation map on every call — a
+    /// re-delivered assign's fresh lease is picked up automatically
+    /// (plan review MAJOR-5). No obligation (locally-issued task, or
+    /// already replied) = no-op. Fire-and-forget sends.
+    pub(crate) fn send_lease_extend(&self, task_id: TaskId) {
+        let Some((issuer, lease_id)) = self
+            .reply
+            .lock()
+            .get(&task_id)
+            .map(|o| (o.issuer, o.lease_id))
+        else {
+            return;
+        };
+        let msg = harness_core::LeaseExtend {
+            seq: 0, // stamped per-stream by the sender task
+            lease_id,
+            task_id,
+            worker: self.local_id,
+            sig: harness_core::Signature::from_bytes([0u8; 64]),
+        };
+        let send = self
+            .net()
+            .ok_or(SendToError::NoConnection)
+            .and_then(|net| net.send_to(issuer, OutboundMsg::LeaseExtend(msg)));
+        if let Err(err) = send {
+            // Best-effort: a lost extension degrades to the pre-4.6
+            // timeout bound; the next tick retries.
+            tracing::debug!(target: "harness.dispatch", task = %task_id.0, %err, "lease-extend send failed");
+        }
+    }
+
     fn send_claim(&self, issuer: NodeId, lease_id: LeaseId, task_id: TaskId) {
         let claim = TaskClaim {
             seq: 0, // stamped per-stream by the sender task
@@ -1142,6 +1454,22 @@ impl DispatchRuntime {
 
 /// `ttl = max(lease_ms, timeout_ms + slack)` — the lease must outlive
 /// the longest legitimate execution (ADR-0017 / R2).
+/// Exponential retry backoff for the attempt that just failed
+/// (1-based), from the task's own `RetryPolicy` (4.6, ADR-0028).
+/// Overflow-safe: exponent clamped, saturating math, `backoff_max_ms`
+/// caps the result; zero-valued policy fields are floored to 1.
+fn backoff_delay(retry: &harness_core::RetryPolicy, attempt: u32) -> Duration {
+    let mult = u64::from(retry.backoff_multiplier.max(1));
+    let exp = attempt.saturating_sub(1);
+    // Exact growth until it saturates — an exponent clamp would silently
+    // flatten valid schedules below `backoff_max_ms` (PR #49 review).
+    let factor = mult.checked_pow(exp).unwrap_or(u64::MAX);
+    let ms = u64::from(retry.backoff_initial_ms.max(1))
+        .saturating_mul(factor)
+        .min(u64::from(retry.backoff_max_ms.max(1)));
+    Duration::from_millis(ms)
+}
+
 fn lease_ttl_ms(task: &Task) -> u32 {
     let timeout_plus_slack = u64::from(task.execution.timeout_ms).saturating_add(LEASE_SLACK_MS);
     let ttl = u64::from(task.execution.lease_ms).max(timeout_plus_slack);
@@ -1978,6 +2306,489 @@ mod tests {
             f.runtime.is_gated(submitted[0]),
             "slot-starved parent must batch in the waiting class"
         );
+    }
+
+    // ---- 4.6 (ADR-0028): retry / send-failure backoff -----------------
+
+    #[test]
+    fn backoff_delay_schedule_and_clamps() {
+        let default_policy = RetryPolicy::default(); // 250ms, x2, max 30s
+        assert_eq!(
+            backoff_delay(&default_policy, 1),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            backoff_delay(&default_policy, 2),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            backoff_delay(&default_policy, 3),
+            Duration::from_millis(1000)
+        );
+        // Max cap engages long before overflow could.
+        assert_eq!(
+            backoff_delay(&default_policy, 30),
+            Duration::from_millis(30_000)
+        );
+        // PR #49 review: growth continues EXACTLY to the configured cap
+        // — no hidden exponent clamp flattening valid schedules.
+        let wide = RetryPolicy {
+            max_attempts: 255,
+            backoff_initial_ms: 1,
+            backoff_multiplier: 2,
+            backoff_max_ms: 1_000_000,
+        };
+        assert_eq!(backoff_delay(&wide, 18), Duration::from_millis(131_072));
+        assert_eq!(backoff_delay(&wide, 21), Duration::from_millis(1_000_000));
+        // Hostile/zero fields are floored, never panic or zero-delay.
+        let zeros = RetryPolicy {
+            max_attempts: 3,
+            backoff_initial_ms: 0,
+            backoff_multiplier: 0,
+            backoff_max_ms: 0,
+        };
+        assert_eq!(backoff_delay(&zeros, 5), Duration::from_millis(1));
+        // Saturating exponent: u32::MAX attempt with max multiplier.
+        let hot = RetryPolicy {
+            max_attempts: 255,
+            backoff_initial_ms: u32::MAX,
+            backoff_multiplier: u8::MAX,
+            backoff_max_ms: u32::MAX,
+        };
+        assert_eq!(
+            backoff_delay(&hot, u32::MAX),
+            Duration::from_millis(u64::from(u32::MAX))
+        );
+    }
+
+    /// Send-failure path (risk 9): a failed assign backs the task off in
+    /// the waiting class instead of re-dispatching every poll.
+    #[tokio::test(start_paused = true)]
+    async fn t17_send_failure_backs_off_then_redispatches() {
+        let f = fixture();
+        let peer = Identity::generate();
+        add_live_candidate(&f, &peer, vec![SECRET_TAG.to_string()]);
+
+        let task = signed_task_for(&f.local, SECRET_CAP);
+        f.store.insert_task(&task).expect("insert");
+
+        // Poll 1: routed to the peer, enqueue fails (no net) → reset +
+        // backoff (attempt 1 → 250 ms).
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.task_state(task.id).unwrap(),
+            Some(TaskState::Submitted)
+        );
+        assert_eq!(f.store.list_leases_for_task(task.id).unwrap().len(), 1);
+        assert!(f.runtime.is_gated(task.id), "backing off in waiting class");
+
+        // Poll 2, still inside the backoff window: NO new lease.
+        tokio::time::advance(Duration::from_millis(50)).await;
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.list_leases_for_task(task.id).unwrap().len(),
+            1,
+            "no re-dispatch while backing off"
+        );
+
+        // Past the delay: re-dispatched (second lease minted).
+        tokio::time::advance(Duration::from_millis(300)).await;
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.list_leases_for_task(task.id).unwrap().len(),
+            2,
+            "re-dispatch after the backoff elapses"
+        );
+    }
+
+    /// Lease-expiry path: the reset task waits out its attempt's backoff.
+    #[tokio::test(start_paused = true)]
+    async fn t18_expired_lease_backs_off_before_redispatch() {
+        let f = fixture();
+        let peer = Identity::generate();
+        add_live_candidate(&f, &peer, vec![SECRET_TAG.to_string()]);
+
+        let task = signed_task_for(&f.local, SECRET_CAP);
+        f.store.insert_task(&task).expect("insert");
+        assert!(f
+            .store
+            .try_dispatch_task(task.id, peer.node_id())
+            .expect("dispatch"));
+        // Attempt 2 of 3 (non-terminal expiry), zero TTL: expired now.
+        f.store
+            .create_lease(task.id, peer.node_id(), 0, 2)
+            .expect("lease");
+        // find_expired is strict (`expires_at < now`, wall clock —
+        // start_paused only freezes tokio time): step past the minting
+        // millisecond.
+        std::thread::sleep(Duration::from_millis(2));
+
+        f.runtime.expire_pass();
+        assert_eq!(
+            f.store.task_state(task.id).unwrap(),
+            Some(TaskState::Submitted),
+            "non-terminal expiry resets for re-dispatch"
+        );
+        assert!(f.runtime.is_gated(task.id), "waiting class at reset time");
+
+        // Attempt 2 backoff = 500 ms: inside it, no new lease.
+        f.runtime.poll_submitted_once();
+        assert_eq!(f.store.list_leases_for_task(task.id).unwrap().len(), 1);
+
+        tokio::time::advance(Duration::from_millis(600)).await;
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.list_leases_for_task(task.id).unwrap().len(),
+            2,
+            "re-dispatch after attempt-2 backoff"
+        );
+    }
+
+    /// Plan review MAJOR-7: the deadline is enforced IN the backoff-skip
+    /// path — a task must never be dispatched to a fresh worker past
+    /// `constraints.deadline`.
+    #[tokio::test(start_paused = true)]
+    async fn t19_deadline_elapsed_during_backoff_is_terminal() {
+        let f = fixture();
+        let peer = Identity::generate();
+        add_live_candidate(&f, &peer, vec![SECRET_TAG.to_string()]);
+
+        let mut task = signed_task_for(&f.local, SECRET_CAP);
+        // Deadline in the near "future" relative to task data — but
+        // wall-clock-elapsed by the time the backoff poll runs.
+        task.constraints.deadline = Some(1);
+        task.sign(&f.local).expect("re-sign");
+        f.store.insert_task(&task).expect("insert");
+
+        // Poll 1 dispatches (deadline is only enforced on failure
+        // paths); send fails → backoff.
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.task_state(task.id).unwrap(),
+            Some(TaskState::Submitted)
+        );
+        // Poll 2 inside the backoff window: deadline elapsed → terminal.
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.task_state(task.id).unwrap(),
+            Some(TaskState::Failed),
+            "deadline enforced while backing off"
+        );
+        let row = f
+            .store
+            .load_task_result(task.id)
+            .expect("load")
+            .expect("row");
+        assert!(row
+            .error
+            .expect("error")
+            .contains("deadline exceeded while backing off"));
+        assert!(!f.runtime.is_gated(task.id), "bookkeeping cleaned up");
+    }
+
+    /// Plan review MINOR-12: entries for tasks that left `Submitted`
+    /// sideways are pruned, never immortal.
+    #[tokio::test(start_paused = true)]
+    async fn t20_backoff_bookkeeping_pruned_for_cancelled_tasks() {
+        let f = fixture();
+        let peer = Identity::generate();
+        add_live_candidate(&f, &peer, vec![SECRET_TAG.to_string()]);
+
+        let task = signed_task_for(&f.local, SECRET_CAP);
+        f.store.insert_task(&task).expect("insert");
+        f.runtime.poll_submitted_once(); // send-fail → backoff + gated
+        assert!(f.runtime.is_gated(task.id));
+
+        // Operator cancels the task out from under the backoff.
+        f.store
+            .transition_task(task.id, TaskState::Cancelled)
+            .expect("cancel");
+        f.runtime.expire_pass(); // prune pass
+        assert!(
+            !f.runtime.is_gated(task.id),
+            "cancelled task pruned from waiting sets"
+        );
+    }
+
+    // ---- 4.6 (ADR-0028): circuit breaker -------------------------------
+
+    fn bench(f: &Fixture, node: NodeId) {
+        for _ in 0..harness_orchestrator::dispatcher::BENCH_THRESHOLD {
+            f.runtime.breaker().record_failure(node);
+        }
+        assert!(f.runtime.breaker().is_benched(&node));
+    }
+
+    /// A benched node is excluded from Anyone routing; a healthy peer
+    /// takes every dispatch.
+    #[tokio::test]
+    async fn t24_benched_node_excluded_from_candidates() {
+        let f = fixture();
+        let benched = Identity::generate();
+        let healthy = Identity::generate();
+        add_live_candidate(&f, &benched, vec![SECRET_TAG.to_string()]);
+        add_live_candidate(&f, &healthy, vec![SECRET_TAG.to_string()]);
+        bench(&f, benched.node_id());
+
+        for _ in 0..3 {
+            let t = signed_task_for(&f.local, SECRET_CAP);
+            f.store.insert_task(&t).expect("insert");
+            f.runtime.poll_submitted_once();
+            assert_eq!(
+                f.store.last_dispatched(SECRET_CAP).expect("cursor"),
+                Some(healthy.node_id()),
+                "benched node must never be routed to"
+            );
+        }
+    }
+
+    /// All candidates benched ⇒ the task WAITS in the gated class (a
+    /// ≤60 s transient), never entering the terminal eligibility
+    /// window; a liveness proof un-benches and it dispatches.
+    #[tokio::test]
+    async fn t25_all_benched_waits_gated_not_terminal() {
+        let f = fixture();
+        let only = Identity::generate();
+        add_live_candidate(&f, &only, vec![SECRET_TAG.to_string()]);
+        bench(&f, only.node_id());
+
+        let t = signed_task_for(&f.local, SECRET_CAP);
+        f.store.insert_task(&t).expect("insert");
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.task_state(t.id).unwrap(),
+            Some(TaskState::Submitted)
+        );
+        assert!(f.runtime.is_gated(t.id), "all-benched waits in gated class");
+        assert!(
+            !f.runtime.has_elig_failure(t.id),
+            "the terminal window must never start for a bench-gated task"
+        );
+
+        // Liveness proof clears the bench; the task dispatches.
+        f.runtime.breaker().record_ok(only.node_id());
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.list_leases_for_task(t.id).expect("leases").len(),
+            1,
+            "dispatched once the bench clears"
+        );
+    }
+
+    /// Pinned tasks bypass the bench — operator intent wins.
+    #[tokio::test]
+    async fn t26_pin_bypasses_bench() {
+        let f = fixture();
+        let benched = Identity::generate();
+        add_live_candidate(&f, &benched, vec![SECRET_TAG.to_string()]);
+        bench(&f, benched.node_id());
+
+        let mut t = signed_task_for(&f.local, SECRET_CAP);
+        t.constraints.pin_to_node = Some(benched.node_id());
+        t.sign(&f.local).expect("re-sign");
+        f.store.insert_task(&t).expect("insert");
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.list_leases_for_task(t.id).expect("leases").len(),
+            1,
+            "pinned dispatch proceeds to the benched node"
+        );
+    }
+
+    /// Self is never benched: a burst of local failures must not gate
+    /// a single-node install's queue.
+    #[tokio::test]
+    async fn t27_self_is_never_benched() {
+        let f = fixture();
+        for _ in 0..20 {
+            // Through the guarded feed, not the raw breaker.
+            f.runtime
+                .on_assign_send_failed(f.local.node_id(), harness_core::LeaseId::new_v7());
+        }
+        assert!(!f.runtime.breaker().is_benched(&f.local.node_id()));
+    }
+
+    /// The node-health feed benches through the real failure path:
+    /// five failed sends to the same peer.
+    #[tokio::test]
+    async fn t28_send_failures_feed_the_breaker() {
+        let f = fixture();
+        let peer = Identity::generate();
+        add_live_candidate(&f, &peer, vec![SECRET_TAG.to_string()]);
+        for _ in 0..harness_orchestrator::dispatcher::BENCH_THRESHOLD {
+            let t = signed_task_for(&f.local, SECRET_CAP);
+            f.store.insert_task(&t).expect("insert");
+            assert!(f
+                .store
+                .try_dispatch_task(t.id, peer.node_id())
+                .expect("cas"));
+            let lease = f
+                .store
+                .create_lease(t.id, peer.node_id(), 5_000, 1)
+                .expect("lease");
+            f.runtime
+                .on_assign_send_failed(peer.node_id(), lease.lease_id);
+        }
+        assert!(
+            f.runtime.breaker().is_benched(&peer.node_id()),
+            "five consecutive send failures bench the peer"
+        );
+    }
+
+    // ---- 4.6 (ADR-0028): lease extension, issuer side -----------------
+
+    fn seeded_lease(f: &Fixture, worker: NodeId, timeout_ms: u32) -> (Task, harness_store::Lease) {
+        let mut task = signed_task_for(&f.local, SECRET_CAP);
+        task.execution.timeout_ms = timeout_ms;
+        task.sign(&f.local).expect("re-sign");
+        f.store.insert_task(&task).expect("insert");
+        assert!(f.store.try_dispatch_task(task.id, worker).expect("cas"));
+        let ttl = lease_ttl_ms(&task);
+        let lease = f
+            .store
+            .create_lease(task.id, worker, ttl, 1)
+            .expect("lease");
+        (task, lease)
+    }
+
+    /// BLOCKER-1: the first extension SHRINKS a long lease to the
+    /// rolling horizon — fast dead-worker detection engages.
+    #[tokio::test]
+    async fn t21_extension_shrinks_long_lease_to_rolling_horizon() {
+        let f = fixture();
+        let worker = Identity::generate();
+        // 60 s task ⇒ lease ≈ 60.7 s out. Horizon (test) = 2 s.
+        let (task, lease) = seeded_lease(&f, worker.node_id(), 60_000);
+        let original_expiry = lease.expires_at;
+
+        f.runtime.on_lease_extend(
+            worker.node_id(),
+            harness_core::LeaseExtend {
+                seq: 1,
+                lease_id: lease.lease_id,
+                task_id: task.id,
+                worker: worker.node_id(),
+                sig: Signature::from_bytes([0u8; 64]),
+            },
+        );
+        let now = now_unix_ms();
+        let extended = f
+            .store
+            .fetch_lease(lease.lease_id)
+            .expect("fetch")
+            .expect("present");
+        assert!(
+            extended.expires_at < original_expiry,
+            "first extension must SHRINK the lease: {} !< {original_expiry}",
+            extended.expires_at
+        );
+        assert!(
+            extended.expires_at <= now + EXTEND_HORIZON_MS + 1_000 && extended.expires_at >= now,
+            "rolling horizon: {} vs now {now}",
+            extended.expires_at
+        );
+    }
+
+    /// BLOCKER-2: extensions never exceed the lease's original budget.
+    #[tokio::test]
+    async fn t22_extension_clamped_by_original_budget() {
+        let f = fixture();
+        let worker = Identity::generate();
+        // 1 s task ⇒ budget ≈ issued_at + 1.7 s (test slack 700ms),
+        // SMALLER than the 2 s horizon: the clamp must engage.
+        let (task, lease) = seeded_lease(&f, worker.node_id(), 1_000);
+        let budget_cap = lease.issued_at + u64::from(lease_ttl_ms(&task));
+
+        f.runtime.on_lease_extend(
+            worker.node_id(),
+            harness_core::LeaseExtend {
+                seq: 1,
+                lease_id: lease.lease_id,
+                task_id: task.id,
+                worker: worker.node_id(),
+                sig: Signature::from_bytes([0u8; 64]),
+            },
+        );
+        let extended = f
+            .store
+            .fetch_lease(lease.lease_id)
+            .expect("fetch")
+            .expect("present");
+        assert!(
+            extended.expires_at <= budget_cap,
+            "extension past the original budget: {} > {budget_cap}",
+            extended.expires_at
+        );
+    }
+
+    /// Guards: wrong worker, task-id mismatch, terminal lease — all
+    /// silent no-ops.
+    #[tokio::test]
+    async fn t23_extension_guards_reject_stale_and_forged() {
+        let f = fixture();
+        let worker = Identity::generate();
+        let (task, lease) = seeded_lease(&f, worker.node_id(), 60_000);
+        let original = f
+            .store
+            .fetch_lease(lease.lease_id)
+            .expect("fetch")
+            .expect("present")
+            .expires_at;
+
+        // Wrong worker (transport pins from; the store guard is the
+        // second fence).
+        f.runtime.on_lease_extend(
+            NodeId::from_bytes([9; 16]),
+            harness_core::LeaseExtend {
+                seq: 1,
+                lease_id: lease.lease_id,
+                task_id: task.id,
+                worker: NodeId::from_bytes([9; 16]),
+                sig: Signature::from_bytes([0u8; 64]),
+            },
+        );
+        // Task-id mismatch.
+        f.runtime.on_lease_extend(
+            worker.node_id(),
+            harness_core::LeaseExtend {
+                seq: 2,
+                lease_id: lease.lease_id,
+                task_id: TaskId::new_v7(),
+                worker: worker.node_id(),
+                sig: Signature::from_bytes([0u8; 64]),
+            },
+        );
+        assert_eq!(
+            f.store
+                .fetch_lease(lease.lease_id)
+                .expect("fetch")
+                .expect("present")
+                .expires_at,
+            original,
+            "guarded extensions must not move the expiry"
+        );
+
+        // Terminal lease (cross-attempt replay shape): no resurrection.
+        assert!(f
+            .store
+            .try_expire_lease(lease.lease_id, u64::MAX)
+            .expect("expire"));
+        f.runtime.on_lease_extend(
+            worker.node_id(),
+            harness_core::LeaseExtend {
+                seq: 3,
+                lease_id: lease.lease_id,
+                task_id: task.id,
+                worker: worker.node_id(),
+                sig: Signature::from_bytes([0u8; 64]),
+            },
+        );
+        let after = f
+            .store
+            .fetch_lease(lease.lease_id)
+            .expect("fetch")
+            .expect("present");
+        assert_eq!(after.state, harness_store::LeaseState::Expired);
     }
 
     #[tokio::test]

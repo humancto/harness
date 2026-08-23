@@ -70,11 +70,6 @@ pub trait PlanExec: Send + Sync + 'static {
     /// schema index from this union (ADR-0025), so remote-only
     /// capabilities validate for real.
     fn known_capabilities(&self) -> Vec<ManifestEntry>;
-
-    /// Sink for per-step progress frames (4.2). `None` disables.
-    fn progress_sink(&self) -> Option<FrameSink> {
-        None
-    }
 }
 
 /// One resolved, validated step handed to the fan-out window.
@@ -287,7 +282,8 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
     let started = tokio::time::Instant::now();
     let mut scheduler = DagScheduler::new(&plan)
         .map_err(|e| CapabilityError::InvalidInput(format!("plan graph rejected: {e}")))?;
-    let sink = exec.progress_sink();
+    // 4.6: sink rides ExecutionContext (ADR-0024 promotion).
+    let sink = ctx.frame_sink.clone();
     let mut records: HashMap<TaskId, StepRecord> = plan
         .tasks
         .iter()
@@ -678,6 +674,18 @@ mod tests {
     /// `(row, capability, input, parent, plan_id)`.
     type SubmitRecord = (TaskId, String, JsonValue, TaskId, PlanId);
 
+    /// 4.6: tests capture frames by stamping a recording closure into
+    /// the ctx (the executor's role in production).
+    fn ctx_with_sink() -> (ExecutionContext, Frames) {
+        let frames: Frames = Arc::new(Mutex::new(vec![]));
+        let sink_frames = frames.clone();
+        let mut c = ctx();
+        c.frame_sink = Some(Arc::new(move |task: TaskId, frame: LogFrame| {
+            sink_frames.lock().push((task, frame));
+        }));
+        (c, frames)
+    }
+
     fn ctx() -> ExecutionContext {
         ExecutionContext {
             local_node: NodeId::from_bytes([1; 16]),
@@ -686,6 +694,7 @@ mod tests {
             issued_by_name: Arc::from("self"),
             task_id: TaskId::new_v7(),
             tags: Arc::from(Vec::<String>::new()),
+            frame_sink: None,
         }
     }
 
@@ -725,7 +734,6 @@ mod tests {
         non_terminal: AtomicUsize,
         peak: AtomicUsize,
         workers: usize,
-        frames: Option<Frames>,
     }
 
     impl FakePlanExec {
@@ -737,15 +745,7 @@ mod tests {
                 non_terminal: AtomicUsize::new(0),
                 peak: AtomicUsize::new(0),
                 workers,
-                frames: None,
             })
-        }
-
-        fn with_frames(workers: usize, open_gate: usize) -> (Arc<Self>, Frames) {
-            let frames: Frames = Arc::new(Mutex::new(vec![]));
-            let mut inner = Self::new(workers, open_gate);
-            Arc::get_mut(&mut inner).unwrap().frames = Some(frames.clone());
-            (inner, frames)
         }
     }
 
@@ -793,14 +793,6 @@ mod tests {
         }
         fn known_capabilities(&self) -> Vec<ManifestEntry> {
             vec![echo_entry()]
-        }
-        fn progress_sink(&self) -> Option<FrameSink> {
-            self.frames.as_ref().map(|frames| {
-                let frames = frames.clone();
-                Arc::new(move |task: TaskId, frame: LogFrame| {
-                    frames.lock().push((task, frame));
-                }) as FrameSink
-            })
         }
     }
 
@@ -1071,9 +1063,9 @@ mod tests {
     async fn t08_progress_frames_per_step_plus_summary() {
         let ids = sorted_ids(2);
         let (a, b) = (ids[0], ids[1]);
-        let (exec, frames) = FakePlanExec::with_frames(1, 100);
+        let exec = FakePlanExec::new(1, 100);
         let cap = PlanExecCapability::new(exec);
-        let c = ctx();
+        let (c, frames) = ctx_with_sink();
         let task = c.task_id;
         cap.execute(
             &c,

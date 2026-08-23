@@ -22,6 +22,13 @@ use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 
 const POLL_INTERVAL_MS: u64 = 100;
+/// 4.6 (ADR-0028): cadence of worker-side `LeaseExtend` ticks while a
+/// remote-issued task executes. Small in test builds so the money test
+/// exercises the rolling horizon in seconds.
+#[cfg(not(test))]
+const EXTEND_INTERVAL_MS: u64 = 10_000;
+#[cfg(test)]
+const EXTEND_INTERVAL_MS: u64 = 300;
 /// Concurrent coordinators per node — IO-idle awaiting, so wider than
 /// the CPU-sized work pool but still bounded (ADR-0027).
 const COORD_PERMITS: usize = 16;
@@ -50,6 +57,16 @@ pub(crate) struct LocalExecutor {
     /// self node's rate stays pinned at the optimistic prior while
     /// remote failures accrue (review MAJOR-2).
     success: Option<Arc<harness_orchestrator::SuccessTracker>>,
+    /// 4.6 (ADR-0028): the daemon's partial-stream sink, stamped into
+    /// every `ExecutionContext` so capabilities emit Progress frames
+    /// without per-trait plumbing. None in bare test fixtures.
+    frame_sink: Option<harness_capabilities::FrameSink>,
+    /// 4.6 (ADR-0028): worker-side lease-extension hook, called every
+    /// `EXTEND_INTERVAL_MS` while a REMOTE-issued task executes. The
+    /// dispatch runtime resolves the live lease per call (a
+    /// re-delivered assign's fresh lease is picked up automatically).
+    /// None in bare fixtures and for issuerless installs.
+    lease_extender: Option<Arc<dyn Fn(TaskId) + Send + Sync>>,
 }
 
 impl std::fmt::Debug for LocalExecutor {
@@ -80,7 +97,25 @@ impl LocalExecutor {
             coord_sem: Arc::new(tokio::sync::Semaphore::new(COORD_PERMITS)),
             terminal_tx,
             success: None,
+            frame_sink: None,
+            lease_extender: None,
         }
+    }
+
+    /// Attach the worker-side lease-extension hook (4.6, ADR-0028).
+    pub(crate) fn with_lease_extender(
+        mut self,
+        extender: Arc<dyn Fn(TaskId) + Send + Sync>,
+    ) -> Self {
+        self.lease_extender = Some(extender);
+        self
+    }
+
+    /// Attach the partial-stream sink stamped into every
+    /// `ExecutionContext` (4.6, ADR-0028).
+    pub(crate) fn with_frame_sink(mut self, sink: harness_capabilities::FrameSink) -> Self {
+        self.frame_sink = Some(sink);
+        self
     }
 
     /// Test-only: shrink the coordination pool to exercise skip paths.
@@ -247,6 +282,14 @@ impl LocalExecutor {
         let success = self.success.clone();
         let local_node_name = self.local_node_name.clone();
         let terminal_tx = self.terminal_tx.clone();
+        let frame_sink = self.frame_sink.clone();
+        // 4.6: spawn the extender ONLY for remote-issued rows — locally
+        // issued tasks have no lease to extend.
+        let extender = if task.issued_by == self.local_node {
+            None
+        } else {
+            self.lease_extender.clone()
+        };
 
         // 3.3-fanout issuer-name plumbing (ADR-0009): a remote issuer's
         // display name comes from its announced manifest; fall back to
@@ -274,13 +317,19 @@ impl LocalExecutor {
                 issued_by_name,
                 task_id: id,
                 tags,
+                frame_sink,
             };
+
+            let extender_task = spawn_extender(extender, id);
 
             // S2: panic boundary. A panicking capability cannot wedge
             // the daemon — write a Failed terminal, free the permit.
             let outcome = std::panic::AssertUnwindSafe(cap.execute(&ctx, task.input))
                 .catch_unwind()
                 .await;
+            if let Some(h) = extender_task {
+                h.abort();
+            }
 
             let now = now_unix_ms();
             if let Some(t) = &success {
@@ -334,6 +383,81 @@ impl LocalExecutor {
             .replica_apply_local(&failed_replica(id, now, self.local_node, msg));
         let _ = self.terminal_tx.send(id);
     }
+}
+
+/// 4.6 (ADR-0028): boot orphan sweep — run ONCE at daemon build, before
+/// any loop spawns (so every `claimed|running(assigned=self)` row is
+/// provably crash debris from a previous process; ADR-0027's headline
+/// carry).
+///
+/// - LOCALLY-issued rows → `Failed` with an honest reason: they have no
+///   lease and no coordinator left to recover them.
+/// - REMOTE-issued rows → reset to `Dispatched(self)`: the executor
+///   re-executes after boot (at-least-once, the re-dispatch doctrine)
+///   and the issuer's own recovery (lease expiry → re-assign →
+///   terminal-resend) then ships the REAL result — a synthetic stored
+///   Failed would poison the issuer's retry budget through the
+///   terminal-resend arm (plan review MAJOR-10).
+pub(crate) fn sweep_boot_orphans(store: &Store, local_node: NodeId) {
+    for state in [TaskState::Claimed, TaskState::Running] {
+        let rows = match store.list_tasks_by_state_assigned(state, Some(local_node)) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(target: "harness.executor", ?e, "orphan sweep list");
+                continue;
+            }
+        };
+        for row in rows {
+            if row.issued_by == local_node {
+                let msg = format!(
+                    "orphaned by daemon restart (was {} at boot)",
+                    state.as_str()
+                );
+                if let Ok(true) = store.sweep_orphan_to_failed(row.id, local_node) {
+                    tracing::warn!(
+                        target: "harness.executor",
+                        task = %row.id.0,
+                        %msg,
+                        "boot orphan failed terminally"
+                    );
+                    let now = now_unix_ms();
+                    if let Err(e) = store.write_task_result_failed(row.id, &msg, now, local_node) {
+                        tracing::warn!(target: "harness.executor", ?e, "orphan result write");
+                    }
+                    let _ =
+                        store.replica_apply_local(&failed_replica(row.id, now, local_node, &msg));
+                }
+            } else if let Ok(true) = store.sweep_orphan_to_dispatched(row.id, local_node) {
+                tracing::info!(
+                    target: "harness.executor",
+                    task = %row.id.0,
+                    "boot orphan reset for re-execution (remote-issued)"
+                );
+            }
+        }
+    }
+}
+
+/// 4.6 (ADR-0028): rolling liveness proof while a remote-issued task
+/// executes. The hook re-resolves the live lease per tick; the caller
+/// aborts the returned task the moment the capability future settles,
+/// so a finished/panicked task never extends. The immediate first
+/// interval tick is consumed — short tasks send no extension at all.
+fn spawn_extender(
+    extender: Option<Arc<dyn Fn(TaskId) + Send + Sync>>,
+    id: TaskId,
+) -> Option<tokio::task::JoinHandle<()>> {
+    extender.map(|hook| {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(EXTEND_INTERVAL_MS));
+            tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            tick.tick().await; // immediate tick: skip
+            loop {
+                tick.tick().await;
+                hook(id);
+            }
+        })
+    })
 }
 
 fn now_unix_ms() -> u64 {
@@ -597,6 +721,257 @@ mod tests {
             Some(serde_json::json!({"echoed": {"msg": "hi"}}))
         );
         assert!(result.error.is_none());
+    }
+
+    /// 4.6 (ADR-0028): the executor stamps its frame sink into every
+    /// `ExecutionContext` — a capability emitting through ctx.frame_sink
+    /// needs no bespoke plumbing.
+    #[tokio::test]
+    async fn t16_executor_stamps_frame_sink_into_ctx() {
+        struct SinkCap;
+        #[async_trait]
+        impl Capability for SinkCap {
+            fn id(&self) -> &str {
+                "sink.probe"
+            }
+            fn manifest(&self) -> ManifestEntry {
+                manifest_for("sink.probe")
+            }
+            async fn execute(
+                &self,
+                ctx: &ExecutionContext,
+                _: JsonValue,
+            ) -> Result<JsonValue, CapabilityError> {
+                if let Some(sink) = &ctx.frame_sink {
+                    sink(
+                        ctx.task_id,
+                        harness_capabilities::LogFrame {
+                            stream: harness_capabilities::StreamKind::Progress,
+                            line: "{\"probe\":true}".into(),
+                        },
+                    );
+                }
+                Ok(serde_json::json!({"ok": true}))
+            }
+        }
+
+        let store = fresh_store();
+        let frames: Arc<parking_lot::Mutex<Vec<(TaskId, harness_capabilities::LogFrame)>>> =
+            Arc::new(parking_lot::Mutex::new(vec![]));
+        let sink_frames = frames.clone();
+        let sink: harness_capabilities::FrameSink = Arc::new(move |task_id, frame| {
+            sink_frames.lock().push((task_id, frame));
+        });
+        let exec = LocalExecutor::new(
+            store.clone(),
+            registry_with(Arc::new(SinkCap)),
+            local_node(),
+            Arc::from("self"),
+            1,
+        )
+        .with_frame_sink(sink);
+
+        let id = TaskId::new_v7();
+        store
+            .insert_task(&dummy_task(
+                id,
+                "sink.probe",
+                serde_json::json!({}),
+                local_node(),
+            ))
+            .expect("insert");
+        assert!(store
+            .try_dispatch_task(id, local_node())
+            .expect("seed dispatch"));
+        exec.poll_once().await;
+        assert_eq!(wait_terminal(&store, id).await, TaskState::Done);
+        let captured = frames.lock();
+        assert_eq!(captured.len(), 1, "one frame through the stamped sink");
+        assert_eq!(captured[0].0, id);
+        assert_eq!(
+            captured[0].1.stream,
+            harness_capabilities::StreamKind::Progress
+        );
+    }
+
+    /// 4.6 (ADR-0028): the extender ticks while a REMOTE-issued task
+    /// executes and stops the moment the capability settles; locally
+    /// issued tasks never spawn one.
+    #[tokio::test(start_paused = true)]
+    async fn t17_lease_extender_ticks_during_execution_and_stops() {
+        struct SlowCap;
+        #[async_trait]
+        impl Capability for SlowCap {
+            fn id(&self) -> &str {
+                "slow.cap"
+            }
+            fn manifest(&self) -> ManifestEntry {
+                manifest_for("slow.cap")
+            }
+            async fn execute(
+                &self,
+                _: &ExecutionContext,
+                _: JsonValue,
+            ) -> Result<JsonValue, CapabilityError> {
+                tokio::time::sleep(Duration::from_millis(1_000)).await;
+                Ok(serde_json::json!({"ok": true}))
+            }
+        }
+
+        let store = fresh_store();
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let hook_ticks = ticks.clone();
+        let exec = LocalExecutor::new(
+            store.clone(),
+            registry_with(Arc::new(SlowCap)),
+            local_node(),
+            Arc::from("self"),
+            1,
+        )
+        .with_lease_extender(Arc::new(move |_task| {
+            hook_ticks.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        // REMOTE-issued row (issuer != local): the extender must run.
+        let remote_issuer = Identity::generate();
+        let mut task = dummy_task(
+            TaskId::new_v7(),
+            "slow.cap",
+            serde_json::json!({}),
+            remote_issuer.node_id(),
+        );
+        task.sign(&remote_issuer).expect("sign");
+        assert!(store
+            .insert_task_dispatched(&task, local_node())
+            .expect("ingest"));
+        exec.poll_once().await;
+        assert_eq!(wait_terminal(&store, task.id).await, TaskState::Done);
+        // 1 s execution at 300 ms interval (immediate tick consumed):
+        // ~3 ticks. At least one proves the extender ran.
+        let during = ticks.load(Ordering::SeqCst);
+        assert!(
+            (1..=4).contains(&during),
+            "extender ticked while executing: {during}"
+        );
+        // After settling the extender is aborted: no more ticks.
+        tokio::time::sleep(Duration::from_millis(2_000)).await;
+        assert_eq!(
+            ticks.load(Ordering::SeqCst),
+            during,
+            "extender must stop when the capability settles"
+        );
+
+        // LOCALLY-issued task: never spawns an extender.
+        let local_task = dummy_task(
+            TaskId::new_v7(),
+            "slow.cap",
+            serde_json::json!({}),
+            local_node(),
+        );
+        store.insert_task(&local_task).expect("insert");
+        assert!(store
+            .try_dispatch_task(local_task.id, local_node())
+            .expect("dispatch"));
+        exec.poll_once().await;
+        assert_eq!(wait_terminal(&store, local_task.id).await, TaskState::Done);
+        assert_eq!(
+            ticks.load(Ordering::SeqCst),
+            during,
+            "locally-issued tasks never extend"
+        );
+    }
+
+    /// 4.6 (ADR-0028): the boot sweep splits by issuer — locally
+    /// issued orphans fail with a reason; remote-issued ones reset to
+    /// Dispatched(self) for re-execution; everything else untouched.
+    #[tokio::test]
+    async fn t18_boot_orphan_sweep_splits_by_issuer() {
+        let store = fresh_store();
+        let me = local_node();
+        let remote = Identity::generate();
+
+        // Locally-issued orphan at Running(self).
+        let local_orphan = dummy_task(TaskId::new_v7(), "echo", serde_json::json!({}), me);
+        store.insert_task(&local_orphan).expect("insert");
+        store.try_dispatch_task(local_orphan.id, me).expect("cas");
+        store
+            .transition_task(local_orphan.id, TaskState::Claimed)
+            .expect("claim");
+        store
+            .transition_task(local_orphan.id, TaskState::Running)
+            .expect("run");
+
+        // Remote-issued orphan at Claimed(self).
+        let mut remote_orphan = dummy_task(
+            TaskId::new_v7(),
+            "echo",
+            serde_json::json!({}),
+            remote.node_id(),
+        );
+        remote_orphan.sign(&remote).expect("sign");
+        assert!(store
+            .insert_task_dispatched(&remote_orphan, me)
+            .expect("ingest"));
+        store
+            .transition_task(remote_orphan.id, TaskState::Claimed)
+            .expect("claim");
+
+        // Control rows the sweep must NOT touch: a Dispatched(self)
+        // row and a Running row assigned to ANOTHER node.
+        let dispatched = dummy_task(TaskId::new_v7(), "echo", serde_json::json!({}), me);
+        store.insert_task(&dispatched).expect("insert");
+        store.try_dispatch_task(dispatched.id, me).expect("cas");
+        let other = dummy_task(TaskId::new_v7(), "echo", serde_json::json!({}), me);
+        store.insert_task(&other).expect("insert");
+        store
+            .try_dispatch_task(other.id, remote.node_id())
+            .expect("cas");
+        store
+            .transition_task(other.id, TaskState::Claimed)
+            .expect("claim");
+        store
+            .transition_task(other.id, TaskState::Running)
+            .expect("run");
+
+        sweep_boot_orphans(&store, me);
+
+        assert_eq!(
+            store.task_state(local_orphan.id).unwrap(),
+            Some(TaskState::Failed),
+            "local orphan fails terminally"
+        );
+        let row = store
+            .load_task_result(local_orphan.id)
+            .expect("load")
+            .expect("row");
+        assert!(row
+            .error
+            .expect("error")
+            .contains("orphaned by daemon restart"));
+
+        assert_eq!(
+            store.task_state(remote_orphan.id).unwrap(),
+            Some(TaskState::Dispatched),
+            "remote orphan resets for re-execution"
+        );
+        assert!(
+            store
+                .load_task_result(remote_orphan.id)
+                .expect("load")
+                .is_none(),
+            "no synthetic terminal for remote orphans (issuer retry budget)"
+        );
+
+        assert_eq!(
+            store.task_state(dispatched.id).unwrap(),
+            Some(TaskState::Dispatched),
+            "dispatched rows untouched"
+        );
+        assert_eq!(
+            store.task_state(other.id).unwrap(),
+            Some(TaskState::Running),
+            "other nodes' rows untouched"
+        );
     }
 
     // t08 — unknown capability: Failed with descriptive error.
