@@ -536,3 +536,151 @@ async fn m05_plan_execute_chains_steps_with_output_threading() {
 fn identity_bytes(d: &TestDaemon) -> Vec<u8> {
     d.node_id().as_bytes().to_vec()
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m06_mesh_info_federates_with_provenance_and_frames() {
+    // 4.5 (ADR-0027): the first real Cardinality::Federated capability
+    // end-to-end over QUIC — submit mesh.info on A, the coordinator
+    // fans pinned sub-tasks to both nodes, Concat-merges the items, and
+    // persists 2×Ok provenance; stage frames ride the partial ring.
+    let (a, b) = boot_pair(None).await;
+    wait_for_mesh(&a, &b).await;
+
+    let id = submit_task(&a, "mesh.info", serde_json::json!({}), None, 20_000);
+    let state = wait_for_state(&a.store, id, &[TaskState::Done], Duration::from_secs(30)).await;
+    assert_eq!(state, TaskState::Done);
+
+    let row = a.store.load_task_result(id).expect("load").expect("row");
+    let output = row.output.expect("output");
+    let items = output["items"].as_array().expect("items");
+    assert_eq!(items.len(), 2, "one inventory item per node: {output:#}");
+    let names: Vec<&str> = items
+        .iter()
+        .map(|i| i["node_name"].as_str().expect("node_name"))
+        .collect();
+    assert!(
+        names.contains(&"node-a") && names.contains(&"node-b"),
+        "both node names present: {names:?}"
+    );
+    assert_eq!(output["merge"]["strategy"], "concat");
+    assert!(
+        output["merge"].get("failures").is_none(),
+        "clean run has no failures block"
+    );
+
+    // Persisted provenance: both nodes Ok, one item each, node ids match
+    // the DispatchPlan's sorted order.
+    let provenance = row.provenance.expect("provenance");
+    assert_eq!(provenance.len(), 2);
+    let mut expected: Vec<NodeId> = vec![a.node_id(), b.node_id()];
+    expected.sort();
+    for (contribution, node) in provenance.iter().zip(&expected) {
+        assert_eq!(contribution.node_id, *node);
+        assert_eq!(
+            contribution.status,
+            harness_core::protocol::NodeStatus::Ok,
+            "provenance: {provenance:?}"
+        );
+        assert_eq!(contribution.item_count, 1);
+    }
+
+    // 4.2 pipe: discovered + 2 streaming + merging stage frames in the
+    // issuer's ring (coordinator is local to the issuer).
+    let stages: Vec<String> = a
+        .partials
+        .frames(id)
+        .iter()
+        .filter(|f| f.stream == "progress")
+        .filter_map(|f| {
+            serde_json::from_str::<serde_json::Value>(&f.line)
+                .ok()
+                .and_then(|v| {
+                    v.pointer("/federated/stage")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+        })
+        .collect();
+    assert_eq!(
+        stages.first().map(String::as_str),
+        Some("discovered"),
+        "stages: {stages:?}"
+    );
+    assert_eq!(stages.iter().filter(|s| *s == "streaming").count(), 2);
+    assert!(stages.iter().any(|s| s == "merging"));
+
+    // Mixed-version / pin rule end-to-end: a PINNED federated-cardinality
+    // task must execute on that node (DispatchPlan::Single), not
+    // re-coordinate — the old-issuer wire path.
+    let pinned = submit_task(
+        &a,
+        "mesh.info",
+        serde_json::json!({}),
+        Some(b.node_id()),
+        10_000,
+    );
+    let state =
+        wait_for_state(&a.store, pinned, &[TaskState::Done], Duration::from_secs(20)).await;
+    assert_eq!(state, TaskState::Done);
+    let row = a.store.load_task_result(pinned).expect("load").expect("row");
+    let output = row.output.expect("output");
+    let items = output["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "pinned: executes on B alone: {output:#}");
+    assert_eq!(items[0]["node_name"], "node-b");
+    assert!(
+        row.provenance.is_none(),
+        "single-node execution carries no federated provenance"
+    );
+
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m07_mesh_info_node_death_returns_partial_with_failed_provenance() {
+    // 4.5: kill B while it still looks live, then federate. The B
+    // sub-task dies (send failure → lease/eligibility machinery →
+    // Failed), ReturnPartial merges A's item alone, and provenance
+    // records B as non-Ok.
+    let (a, b) = boot_pair(None).await;
+    wait_for_mesh(&a, &b).await;
+
+    // Stop B; within the peer-timeout window A still counts it live and
+    // fans out to it.
+    let b_id = b.node_id();
+    b.stop().await;
+
+    let id = submit_task(&a, "mesh.info", serde_json::json!({}), None, 30_000);
+    let state = wait_for_state(&a.store, id, &[TaskState::Done], Duration::from_secs(45)).await;
+    assert_eq!(state, TaskState::Done, "ReturnPartial: A's item still merges");
+
+    let row = a.store.load_task_result(id).expect("load").expect("row");
+    let output = row.output.expect("output");
+    let items = output["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "only A contributed: {output:#}");
+    assert_eq!(items[0]["node_name"], "node-a");
+    let failures = output["merge"]["failures"].as_array().expect("failures");
+    assert_eq!(failures.len(), 1, "B reported in merge.failures");
+    assert_eq!(failures[0]["node"], b_id.to_string());
+
+    let provenance = row.provenance.expect("provenance");
+    assert_eq!(provenance.len(), 2);
+    let b_contribution = provenance
+        .iter()
+        .find(|c| c.node_id == b_id)
+        .expect("B in provenance");
+    assert!(
+        !matches!(b_contribution.status, harness_core::protocol::NodeStatus::Ok),
+        "B must be non-Ok: {provenance:?}"
+    );
+    let a_contribution = provenance
+        .iter()
+        .find(|c| c.node_id == a.node_id())
+        .expect("A in provenance");
+    assert_eq!(
+        a_contribution.status,
+        harness_core::protocol::NodeStatus::Ok
+    );
+
+    a.stop().await;
+}

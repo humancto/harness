@@ -300,6 +300,29 @@ pub async fn get_handler(
         if let Some(err) = r.error {
             body["error"] = serde_json::json!(err);
         }
+        // 4.5 (ADR-0027): federated results carry per-node provenance
+        // — [{node_id, status, duration_ms, item_count}]. OMITTED for
+        // single-node results (additive JSON, 4.8 UI contract).
+        if let Some(provenance) = r.provenance {
+            let rows: Vec<serde_json::Value> = provenance
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "node_id": c.node_id.to_string(),
+                        "status": match c.status {
+                            harness_core::protocol::NodeStatus::Ok => "ok",
+                            harness_core::protocol::NodeStatus::Failed => "failed",
+                            harness_core::protocol::NodeStatus::TimedOut => "timed_out",
+                            harness_core::protocol::NodeStatus::Skipped => "skipped",
+                            _ => "unknown",
+                        },
+                        "duration_ms": c.duration_ms,
+                        "item_count": c.item_count,
+                    })
+                })
+                .collect();
+            body["provenance"] = serde_json::json!(rows);
+        }
     }
     (StatusCode::OK, Json(body)).into_response()
 }
