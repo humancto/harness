@@ -174,6 +174,11 @@ impl DaemonOrchestrator {
         // assigned to self is provably debris from a previous process.
         crate::executor::sweep_boot_orphans(&store, identity.node_id());
 
+        // 5.11 (ADR-0039): a plan that crashed and is never resubmitted
+        // keeps its checkpoints forever — drop the ones nobody can
+        // still resume from.
+        crate::executor::sweep_stale_checkpoints(&store);
+
         // 4.7 (ADR-0029): the shared backpressure switch — heartbeat
         // producer, API surface, and local dispatch view all consult
         // this one instance.

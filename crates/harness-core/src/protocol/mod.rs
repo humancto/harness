@@ -26,7 +26,7 @@ pub use dispatch::{LeaseExtend, LeaseId, TaskAssign, TaskClaim, TaskResultMsg};
 pub use heartbeat::Heartbeat;
 pub use manifest::{Capability, CapabilityRef, NodeManifest, ResourceHints, Resources, Scope};
 pub use plan::{
-    find_output_refs, resolve_output_refs, Budget, BudgetAction, CheckpointConfig,
+    find_output_refs, input_hash, resolve_output_refs, Budget, BudgetAction, CheckpointConfig,
     CheckpointStorage, HashFn, OutputRef, OutputRefError, Plan, PlanNode,
 };
 pub use result::{

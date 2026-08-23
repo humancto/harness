@@ -481,6 +481,25 @@ impl LocalExecutor {
     }
 }
 
+/// 5.11 (ADR-0039): boot-time age sweep for checkpoints. Rows exist to
+/// let an interrupted plan resume; a plan nobody resubmits within the
+/// retention window never will, so its rows are dead weight. Run once
+/// at daemon build, beside the orphan sweep.
+pub(crate) const CHECKPOINT_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+pub(crate) fn sweep_stale_checkpoints(store: &Store) {
+    let cutoff = now_unix_ms().saturating_sub(CHECKPOINT_RETENTION_MS);
+    match store.checkpoint_sweep_older_than(cutoff) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            target: "harness.executor",
+            rows = n,
+            "swept checkpoints older than the retention window"
+        ),
+        Err(e) => tracing::warn!(target: "harness.executor", ?e, "checkpoint sweep"),
+    }
+}
+
 /// 4.6 (ADR-0028): boot orphan sweep — run ONCE at daemon build, before
 /// any loop spawns (so every `claimed|running(assigned=self)` row is
 /// provably crash debris from a previous process; ADR-0027's headline
