@@ -163,6 +163,16 @@ cap-std           = "4"
 # Standard JSON binary carrier (Phase 3.10a — fs.read with encoding=base64).
 base64            = "0.22"
 
+# Twilio webhook signature validation (Phase 5.5, ADR-0033). HMAC-SHA1
+# is Twilio's wire contract, not a choice. `sha1` is already in the
+# lock via axum's ws feature (tungstenite); `hmac` is the only new
+# lockfile entry. Both pure-Rust RustCrypto.
+hmac              = "0.12"
+sha1              = "0.10"
+# Form decoding for webhook signature material (already in the lock
+# via axum/reqwest; direct dep so harness-api can name it).
+serde_urlencoded  = "0.7"
+
 # Line-oriented pattern matching (Phase 3.10-fts — fs.grep). Linear-time
 # engine; already in the tree transitively via tracing-subscriber's
 # env-filter, so this adds no new transitive weight.

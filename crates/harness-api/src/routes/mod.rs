@@ -8,6 +8,7 @@ pub mod peers;
 pub mod runs;
 pub mod status;
 pub mod tasks;
+pub mod webhook;
 
 use axum::{
     http::StatusCode,

@@ -76,7 +76,7 @@ pub struct TaskSummaryDto {
 /// ceiling — an exact one would serialize every submit through a write
 /// transaction. A count ERROR fails open: admission is protective, and
 /// the insert below surfaces a genuinely broken store as a 500.
-fn check_admission(store: &harness_store::Store) -> Option<axum::response::Response> {
+pub(crate) fn check_admission(store: &harness_store::Store) -> Option<axum::response::Response> {
     match store.count_tasks_by_state(harness_store::TaskState::Submitted) {
         Ok(backlog) if backlog >= MAX_SUBMITTED_BACKLOG => Some(
             (
@@ -101,29 +101,18 @@ fn check_admission(store: &harness_store::Store) -> Option<axum::response::Respo
     }
 }
 
-/// `POST /api/v1/tasks` — sign with the local Identity, persist via Store,
-/// return the new task id. The actual dispatch (assigning to a worker
-/// across QUIC) lands when the QUIC envelope channels wire in a follow-up.
-pub async fn submit_handler(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(req): Json<SubmitRequest>,
-) -> axum::response::Response {
-    if !is_authenticated(&state.auth, &headers) {
-        return unauthorized();
-    }
-    let Some(store) = state.store.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "store_not_configured" })),
-        )
-            .into_response();
-    };
-
-    if let Some(refusal) = check_admission(store) {
-        return refusal;
-    }
-
+/// 5.5 (ADR-0033): THE task-minting path — clamp, build, sign, insert,
+/// replica-mirror. Shared by the authenticated `submit_handler` and the
+/// signature-validated webhook adapters; never duplicated (the easy
+/// mistakes are forgetting the clamp or `replica_apply_local`).
+///
+/// Callers gate BEFORE minting (auth + admission for the HTTP path;
+/// Twilio signature + allowlist + admission for webhooks).
+pub(crate) fn mint_task(
+    state: &ApiState,
+    store: &harness_store::Store,
+    req: SubmitRequest,
+) -> Result<TaskId, &'static str> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -171,20 +160,12 @@ pub async fn submit_handler(
 
     if let Err(err) = task.sign(&state.identity) {
         tracing::error!(target: "harness.api.tasks", ?err, "sign task");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "sign_failed" })),
-        )
-            .into_response();
+        return Err("sign_failed");
     }
 
     if let Err(err) = store.insert_task(&task) {
         tracing::error!(target: "harness.api.tasks", ?err, "insert task");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "store_insert_failed" })),
-        )
-            .into_response();
+        return Err("store_insert_failed");
     }
 
     // Mirror the initial state into the replica map so any peer
@@ -201,14 +182,47 @@ pub async fn submit_handler(
         tracing::warn!(target: "harness.api.tasks", ?err, "replica_apply_local");
     }
 
-    (
-        StatusCode::CREATED,
-        Json(SubmitResponse {
-            task_id: format!("{}", task.id.0.as_hyphenated()),
-            state: "submitted".into(),
-        }),
-    )
-        .into_response()
+    Ok(task.id)
+}
+
+/// `POST /api/v1/tasks` — sign with the local Identity, persist via Store,
+/// return the new task id. The actual dispatch (assigning to a worker
+/// across QUIC) lands when the QUIC envelope channels wire in a follow-up.
+pub async fn submit_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<SubmitRequest>,
+) -> axum::response::Response {
+    if !is_authenticated(&state.auth, &headers) {
+        return unauthorized();
+    }
+    let Some(store) = state.store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "store_not_configured" })),
+        )
+            .into_response();
+    };
+
+    if let Some(refusal) = check_admission(store) {
+        return refusal;
+    }
+
+    match mint_task(&state, store, req) {
+        Ok(id) => (
+            StatusCode::CREATED,
+            Json(SubmitResponse {
+                task_id: format!("{}", id.0.as_hyphenated()),
+                state: "submitted".into(),
+            }),
+        )
+            .into_response(),
+        Err(code) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": code })),
+        )
+            .into_response(),
+    }
 }
 
 /// Query surface of `GET /api/v1/tasks` (4.8).
