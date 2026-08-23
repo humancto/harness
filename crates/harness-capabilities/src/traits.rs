@@ -95,6 +95,18 @@ pub enum CapabilityError {
     NotImplemented,
 }
 
+/// Which executor pool a capability runs under (4.5, ADR-0027 —
+/// closing ADR-0022's cross-node wedge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionClass {
+    /// Does real local work — bounded by the executor's CPU-sized pool.
+    Work,
+    /// Spends its runtime awaiting OTHER tasks' results (`mesh.*`,
+    /// `plan.execute`). Bounded by a wider dedicated pool, so held
+    /// permits can never starve the sub-tasks they await.
+    Coordination,
+}
+
 /// One capability — a typed unit of work the daemon advertises and can
 /// execute. Capabilities are stateless across calls; per-call state
 /// lives in the future returned by `execute`.
@@ -110,6 +122,13 @@ pub trait Capability: Send + Sync + 'static {
     /// `id`, `version.major`, `cardinality`, and the schema hash from
     /// this entry.
     fn manifest(&self) -> ManifestEntry;
+
+    /// Which executor pool this capability runs under. Defaulted to
+    /// [`ExecutionClass::Work`] — only coordinators (capabilities whose
+    /// body mostly awaits other tasks) override.
+    fn execution_class(&self) -> ExecutionClass {
+        ExecutionClass::Work
+    }
 
     /// Execute one call. The runtime promises to respect the lease
     /// deadline — capabilities don't need to track time themselves

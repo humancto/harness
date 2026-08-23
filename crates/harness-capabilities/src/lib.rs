@@ -44,6 +44,7 @@ pub mod llm_local;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 
+pub mod mesh_info;
 pub mod mesh_meta;
 
 #[cfg(feature = "brain")]
@@ -69,10 +70,14 @@ pub use fs::{
     FsGrepCapability, FsListCapability, FsReadCapability, FsSearchCapability, ScopeConfig,
     ScopeError, ScopeRegistry,
 };
-pub use traits::{Capability, CapabilityError, ExecutionContext, FrameSink, LogFrame, StreamKind};
+pub use traits::{
+    Capability, CapabilityError, ExecutionClass, ExecutionContext, FrameSink, LogFrame, StreamKind,
+};
 
 #[cfg(feature = "echo")]
 pub use echo::EchoCapability;
+
+pub use mesh_info::MeshInfoCapability;
 
 #[cfg(all(feature = "shell", unix))]
 pub use shell::ShellExecCapability;
@@ -128,6 +133,9 @@ pub fn default_registry_with_shell_sink(
     {
         let _ = registry.register(std::sync::Arc::new(EchoCapability::new()));
     }
+    // 4.5 (ADR-0027): mesh.info — the first Federated built-in. Always
+    // on: it reads only ExecutionContext + std::env::consts.
+    let _ = registry.register(std::sync::Arc::new(MeshInfoCapability::new()));
     #[cfg(all(feature = "shell", unix))]
     {
         let cap = match shell_sink {

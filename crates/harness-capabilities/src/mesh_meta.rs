@@ -607,6 +607,11 @@ impl MeshGrepCapability {
 
 #[async_trait]
 impl Capability for MeshGrepCapability {
+    fn execution_class(&self) -> crate::traits::ExecutionClass {
+        // Coordinator: awaits remote sub-tasks (ADR-0027 wedge fix).
+        crate::traits::ExecutionClass::Coordination
+    }
+
     fn id(&self) -> &'static str {
         "mesh.grep"
     }
@@ -712,6 +717,11 @@ impl MeshSearchCapability {
 
 #[async_trait]
 impl Capability for MeshSearchCapability {
+    fn execution_class(&self) -> crate::traits::ExecutionClass {
+        // Coordinator: awaits remote sub-tasks (ADR-0027 wedge fix).
+        crate::traits::ExecutionClass::Coordination
+    }
+
     fn id(&self) -> &'static str {
         "mesh.search"
     }

@@ -521,6 +521,9 @@ impl DaemonOrchestrator {
         // wire access.
         dispatch_runtime.attach_partials(partial_buffers.clone());
         partial_streamer.attach_dispatch(&dispatch_runtime);
+        // 4.5: the federated coordinator's stage/streaming frames ride
+        // the same partial pipeline (ADR-0027).
+        dispatch_runtime.attach_federated_sink(partial_streamer.sink());
 
         // Phase 3.3-gossip: LWW replica sync over `harness.gossip.state`
         // + heartbeat replica_head anti-entropy (ADR-0019).

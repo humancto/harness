@@ -20,9 +20,7 @@ use harness_core::{
     Signature, Task, TaskId, TraceContext,
 };
 use harness_mesh::heartbeat::{PeerTable, PEER_TIMEOUT};
-use harness_store::{Store, TaskState};
-
-const AWAIT_POLL_MS: u64 = 100;
+use harness_store::Store;
 
 pub(crate) struct StoreMeshExec {
     store: Store,
@@ -113,49 +111,16 @@ impl MeshExec for StoreMeshExec {
         parent: TaskId,
         timeout_ms: u32,
     ) -> Result<TaskId, CapabilityError> {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-            .unwrap_or(0);
-        let mut task = Task {
-            id: TaskId::new_v7(),
-            parent: Some(parent),
-            plan_id: None,
-            capability: capability.to_string(),
+        // Shared with the federated coordinator (4.5) — signed,
+        // parent-linked, pinned, max_attempts=1 (posthumous-work rule).
+        let task = crate::subtask::build_pinned_subtask(
+            &self.identity,
+            capability,
             input,
-            constraints: Constraints {
-                pin_to_node: Some(pin_to),
-                ..Constraints::default()
-            },
-            retry: RetryPolicy {
-                // No lease-expiry retry: the lease TTL (timeout + slack)
-                // always outlives the wrapper's await deadline, so a
-                // retry could only ever fire posthumously — pure orphan
-                // work (review MINOR-1/2, ADR-0022 §Orphaned sub-tasks).
-                max_attempts: 1,
-                ..RetryPolicy::default()
-            },
-            execution: ExecutionPolicy {
-                timeout_ms,
-                ..ExecutionPolicy::default()
-            },
-            resource_hints: ResourceHints {
-                cpu_class: harness_core::protocol::CpuClass::Light,
-                memory_mb: None,
-                gpu_required: false,
-                gpu_memory_mb: None,
-                network_class: harness_core::protocol::NetworkClass::Light,
-                disk_io_class: harness_core::protocol::DiskIoClass::Light,
-                estimated_duration_ms: None,
-            },
-            trace_ctx: TraceContext::default(),
-            issued_by: self.local_id,
-            issued_at: now_ms,
-            tags: vec![],
-            sig: Signature::from_bytes([0u8; 64]),
-        };
-        task.sign(&self.identity)
-            .map_err(|e| CapabilityError::Failed(format!("sign sub-task: {e}")))?;
+            pin_to,
+            parent,
+            timeout_ms,
+        )?;
         self.store
             .insert_task(&task)
             .map_err(|e| CapabilityError::Failed(format!("insert sub-task: {e}")))?;
@@ -267,35 +232,7 @@ impl harness_capabilities::PlanExec for StoreMeshExec {
 
 impl StoreMeshExec {
     async fn await_terminal_impl(&self, id: TaskId, deadline: Duration) -> SubTaskOutcome {
-        let until = tokio::time::Instant::now() + deadline;
-        loop {
-            match self.store.task_state(id) {
-                Ok(Some(TaskState::Done)) => {
-                    return match self.store.load_task_result(id) {
-                        Ok(Some(row)) => {
-                            SubTaskOutcome::Done(row.output.unwrap_or(serde_json::Value::Null))
-                        }
-                        _ => SubTaskOutcome::Failed("done without result row".into()),
-                    };
-                }
-                Ok(Some(TaskState::Failed | TaskState::Expired | TaskState::Cancelled)) => {
-                    let err = self
-                        .store
-                        .load_task_result(id)
-                        .ok()
-                        .flatten()
-                        .and_then(|r| r.error)
-                        .unwrap_or_else(|| "sub-task failed".into());
-                    return SubTaskOutcome::Failed(err);
-                }
-                Ok(_) => {}
-                Err(e) => return SubTaskOutcome::Failed(format!("store error: {e}")),
-            }
-            if tokio::time::Instant::now() >= until {
-                return SubTaskOutcome::TimedOut;
-            }
-            tokio::time::sleep(Duration::from_millis(AWAIT_POLL_MS)).await;
-        }
+        crate::subtask::await_terminal(&self.store, id, deadline).await
     }
 }
 

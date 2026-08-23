@@ -6,6 +6,7 @@ mod dispatch;
 mod executor;
 #[cfg(test)]
 mod fanout_tests;
+mod federated;
 mod gossip;
 #[cfg(test)]
 mod gossip_tests;
@@ -13,6 +14,7 @@ mod lifecycle;
 mod mesh_exec;
 mod partial_stream;
 mod peer_net;
+mod subtask;
 
 use std::sync::Arc;
 

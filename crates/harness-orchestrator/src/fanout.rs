@@ -133,8 +133,9 @@ pub struct FanoutSpec<I, O> {
     pub deadline: Option<BoxFuture<'static, ()>>,
     /// `FailFast` → the first `Failed`/`TimedOut` item ends the fan-out
     /// and drops all in-flight work. `ReturnPartial` continues past
-    /// failures. `Wait` is aliased to `ReturnPartial` until 4.5 defines
-    /// federated wait semantics (ADR-0023).
+    /// failures. `Wait` drives like `ReturnPartial` at the controller —
+    /// the all-contributions-required enforcement is the federated
+    /// engine's merge-time responsibility (ADR-0027).
     pub on_failure: PartialPolicy,
 }
 

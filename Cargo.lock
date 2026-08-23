@@ -1359,6 +1359,7 @@ dependencies = [
  "harness-capabilities",
  "harness-cli",
  "harness-core",
+ "harness-merge",
  "harness-mesh",
  "harness-orchestrator",
  "harness-policy",
@@ -1379,6 +1380,11 @@ dependencies = [
 [[package]]
 name = "harness-merge"
 version = "0.0.0"
+dependencies = [
+ "harness-core",
+ "serde_json",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "harness-mesh"
@@ -1423,6 +1429,8 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
  "tracing",
 ]
 

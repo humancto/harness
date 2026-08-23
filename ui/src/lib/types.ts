@@ -121,6 +121,19 @@ export interface TaskDetailDto {
   output?: unknown;
   error?: string;
   partials?: PartialFrame[];
+  // 4.5 (ADR-0027): per-node contributions of a Federated result —
+  // omitted for single-node results.
+  provenance?: NodeContribution[];
+}
+
+// One node's contribution to a federated result — must match the
+// provenance rows built in crates/harness-api/src/routes/tasks.rs
+// (from harness-core's NodeContribution).
+export interface NodeContribution {
+  node_id: string;
+  status: "ok" | "failed" | "timed_out" | "skipped" | string;
+  duration_ms: number;
+  item_count: number;
 }
 
 // One frame of `WS /api/v1/runs/<task_id>` — must match
