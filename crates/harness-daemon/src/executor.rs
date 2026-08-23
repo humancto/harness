@@ -167,16 +167,16 @@ impl LocalExecutor {
             let coord_permit = match self
                 .registry
                 .get(&cap_id)
-                .map(|c| c.execution_class())
-                .unwrap_or(harness_capabilities::ExecutionClass::Work)
-            {
+                .map_or(harness_capabilities::ExecutionClass::Work, |c| {
+                    c.execution_class()
+                }) {
                 harness_capabilities::ExecutionClass::Coordination => {
                     match self.coord_sem.clone().try_acquire_owned() {
                         Ok(p) => Some(p),
                         Err(_) => continue, // pool full: natural queueing
                     }
                 }
-                _ => None,
+                harness_capabilities::ExecutionClass::Work => None,
             };
             processed += 1;
 
@@ -757,7 +757,12 @@ mod tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::unnecessary_literal_bound
+)]
 mod class_tests {
     use super::tests::*;
     use super::*;

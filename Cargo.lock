@@ -1359,6 +1359,7 @@ dependencies = [
  "harness-capabilities",
  "harness-cli",
  "harness-core",
+ "harness-merge",
  "harness-mesh",
  "harness-orchestrator",
  "harness-policy",

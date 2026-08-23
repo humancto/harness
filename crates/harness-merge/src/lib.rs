@@ -109,10 +109,10 @@ pub fn merge(strategy: &MergeStrategy, inputs: &[NodeOutput]) -> Result<Merged, 
         .map(|v| u64::try_from(v.len()).unwrap_or(u64::MAX))
         .collect();
     let all: Vec<JsonValue> = per_node.into_iter().flatten().collect();
-    let total = all.len();
 
+    // `Concat` (and any future item strategy) falls to the wildcard:
+    // keep everything in node order.
     let (items, extra): (Vec<JsonValue>, Option<JsonValue>) = match strategy {
-        MergeStrategy::Concat => (all, None),
         MergeStrategy::Dedupe { key } => {
             let mut seen = std::collections::HashSet::new();
             let mut out = Vec::new();

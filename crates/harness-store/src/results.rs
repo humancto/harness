@@ -30,7 +30,8 @@ pub struct TaskResult {
 }
 
 fn encode_provenance(provenance: &[NodeContribution]) -> Result<String, StoreError> {
-    serde_json::to_string(provenance).map_err(|e| StoreError::Cbor(format!("encode provenance: {e}")))
+    serde_json::to_string(provenance)
+        .map_err(|e| StoreError::Cbor(format!("encode provenance: {e}")))
 }
 
 impl Store {
@@ -56,7 +57,7 @@ impl Store {
         provenance: &[NodeContribution],
     ) -> Result<(), StoreError> {
         let json = encode_provenance(provenance)?;
-        self.write_done_inner(task_id, output, completed_at_ms, completed_by, Some(json))
+        self.write_done_inner(task_id, output, completed_at_ms, completed_by, Some(&json))
     }
 
     fn write_done_inner(
@@ -65,7 +66,7 @@ impl Store {
         output: &JsonValue,
         completed_at_ms: u64,
         completed_by: NodeId,
-        provenance_json: Option<String>,
+        provenance_json: Option<&str>,
     ) -> Result<(), StoreError> {
         let output_json = serde_json::to_string(output)
             .map_err(|e| StoreError::Cbor(format!("encode output: {e}")))?;
@@ -113,7 +114,7 @@ impl Store {
         provenance: &[NodeContribution],
     ) -> Result<(), StoreError> {
         let json = encode_provenance(provenance)?;
-        self.write_failed_inner(task_id, error, completed_at_ms, completed_by, Some(json))
+        self.write_failed_inner(task_id, error, completed_at_ms, completed_by, Some(&json))
     }
 
     fn write_failed_inner(
@@ -122,7 +123,7 @@ impl Store {
         error: &str,
         completed_at_ms: u64,
         completed_by: NodeId,
-        provenance_json: Option<String>,
+        provenance_json: Option<&str>,
     ) -> Result<(), StoreError> {
         self.with_conn(|c| {
             c.execute(

@@ -223,6 +223,10 @@ pub(crate) struct DispatchRuntime {
     /// less gated work can't starve other capabilities (diff review
     /// BLOCKER-1).
     gated: ParkingMutex<std::collections::HashSet<TaskId>>,
+    /// 4.5 (ADR-0027): federated fan-out/merge coordinator. Claims
+    /// `DispatchPlan::Federated` parents atomically and drives them to
+    /// a terminal with per-node provenance.
+    federated: Arc<crate::federated::FederatedCoordinator>,
 }
 
 impl DispatchRuntime {
@@ -236,10 +240,13 @@ impl DispatchRuntime {
         secrets: Arc<dyn harness_vault::SecretsStore>,
     ) -> Arc<Self> {
         let local_id = identity.node_id();
+        let federated =
+            crate::federated::FederatedCoordinator::new(store.clone(), identity.clone());
         Arc::new(Self {
             store,
             identity,
             local_id,
+            federated,
             registry,
             dispatcher,
             rr: RoundRobin::new(),
@@ -276,6 +283,12 @@ impl DispatchRuntime {
     /// Share the API's partial-output ring buffers (3.2-stream).
     pub(crate) fn attach_partials(&self, buffers: Arc<PartialBuffers>) {
         let _ = self.partials.set(buffers);
+    }
+
+    /// Wire the federated coordinator's progress-frame sink (4.5) —
+    /// the same `PartialStreamer::sink()` the wrappers use.
+    pub(crate) fn attach_federated_sink(&self, sink: harness_capabilities::FrameSink) {
+        self.federated.attach_sink(sink);
     }
 
     /// Worker side: the issuer of a task we ingested from the wire and
@@ -414,17 +427,32 @@ impl DispatchRuntime {
                     self.dispatch_to(&task, node);
                 }
                 Ok(DispatchPlan::Federated { nodes }) => {
-                    // Real federated fan-out + merge is Phase 4.5. Until
-                    // then a federated-cardinality task runs on the first
-                    // eligible node (ADR-0017).
-                    if let Some(node) = nodes.first().copied() {
-                        tracing::debug!(
+                    // 4.5 (ADR-0027): hand the parent to the federated
+                    // coordinator. It claims atomically (submitted →
+                    // running(self)) and a detached driver fans out /
+                    // merges / terminalizes. `false` = no coordination
+                    // slot free: the task stays Submitted and retries
+                    // next poll (queueing, never failure).
+                    self.gated.lock().remove(&task.id);
+                    self.elig_failures.lock().remove(&task.id);
+                    let Cardinality::Federated {
+                        merge,
+                        on_node_failure,
+                    } = cardinality
+                    else {
+                        // eligible_scored only returns Federated plans
+                        // for Federated cardinality; a mismatch is a
+                        // routing bug, not a task failure.
+                        tracing::error!(
                             target: "harness.dispatch",
                             task = %task.id.0,
-                            "federated cardinality routed to single node until 4.5"
+                            "federated plan for non-federated cardinality"
                         );
-                        self.dispatch_to(&task, node);
-                    }
+                        continue;
+                    };
+                    let _ = self
+                        .federated
+                        .try_start(&task, nodes, merge, on_node_failure);
                 }
                 Ok(_) => {
                     // `DispatchPlan` is non_exhaustive; unknown plans are
@@ -816,7 +844,9 @@ impl DispatchRuntime {
                 node_id: self.local_id,
             },
             logs: Vec::new(),
-            provenance: Vec::new(),
+            // 4.5: federated parents persist per-node contributions in
+            // the V0006 column; everything else stays empty.
+            provenance: row.provenance.unwrap_or_default(),
             sig: harness_core::Signature::from_bytes([0u8; 64]),
         };
         if let Err(e) = result.sign(&self.identity) {

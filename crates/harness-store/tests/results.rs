@@ -206,8 +206,13 @@ fn t06_plain_writes_leave_provenance_none_and_replace_clears_it() {
         .is_some());
 
     // …then a plain retry write must clear it (excluded.provenance = NULL).
-    s.write_task_result_done(id, &json!({"v": 2}), 1_700_000_000_200, NodeId::from_bytes([2; 16]))
-        .expect("plain write");
+    s.write_task_result_done(
+        id,
+        &json!({"v": 2}),
+        1_700_000_000_200,
+        NodeId::from_bytes([2; 16]),
+    )
+    .expect("plain write");
     let loaded = s.load_task_result(id).expect("load").expect("present");
     assert_eq!(loaded.output, Some(json!({"v": 2})));
     assert!(loaded.provenance.is_none());

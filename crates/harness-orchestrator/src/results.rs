@@ -97,17 +97,12 @@ where
     let (tx, rx) = tokio::sync::mpsc::channel(capacity.max(1));
     let driver = Box::pin(async move {
         let mut stream = stream;
-        loop {
-            match futures::StreamExt::next(&mut stream).await {
-                Some(item) => {
-                    if tx.send(item).await.is_err() {
-                        // Receiver dropped: abandon the fan-out
-                        // (in-flight runner futures are Drop-cancelled
-                        // with the inner stream inside into_mapper).
-                        break;
-                    }
-                }
-                None => break,
+        while let Some(item) = futures::StreamExt::next(&mut stream).await {
+            if tx.send(item).await.is_err() {
+                // Receiver dropped: abandon the fan-out (in-flight
+                // runner futures are Drop-cancelled with the inner
+                // stream inside into_mapper).
+                break;
             }
         }
         stream.into_mapper()
