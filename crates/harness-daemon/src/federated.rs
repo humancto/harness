@@ -149,8 +149,27 @@ impl FederatedCoordinator {
             merge,
             on_node_failure,
         };
+        let store = self.store.clone();
+        let task_id = task.id;
+        let local_id = self.local_id;
         tokio::spawn(async move {
-            driver.drive(nodes).await;
+            // Panic boundary (diff review MAJOR-1): without it a panic
+            // anywhere in the driver (sink closure, merge, terminal
+            // writes) unwinds the task, releases the slot, and strands
+            // the parent at `Running` with no lease until a daemon
+            // restart. Mirror the executor's catch_unwind -> Failed.
+            let outcome =
+                futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async move {
+                    driver.drive(nodes).await;
+                }))
+                .await;
+            if let Err(payload) = outcome {
+                let msg = format!(
+                    "federated coordinator panicked: {}",
+                    crate::executor::describe_panic(payload.as_ref())
+                );
+                fail_parent(&store, task_id, local_id, &msg, &[]);
+            }
             drop(permit);
         });
         true
@@ -202,6 +221,10 @@ impl Driver {
         }}));
 
         // Global budget: the parent's own timeout, floored at 1 s.
+        // Anchored at COORDINATION START, not submit — a parent that
+        // queued for a slot still gets its full budget (the queueing-
+        // never-failure doctrine); `constraints.deadline` remains the
+        // dispatch loop's concern, not the coordinator's (ADR-0027).
         let global_ms = u64::from(self.task.execution.timeout_ms).max(1000);
         let until = tokio::time::Instant::now() + Duration::from_millis(global_ms);
         let window = WindowPolicy::default_per_workers().effective(n.max(1));
@@ -483,32 +506,7 @@ impl Driver {
     }
 
     fn terminalize_failed(&self, msg: &str, provenance: &[NodeContribution]) {
-        tracing::warn!(
-            target: "harness.federated",
-            task = %self.task.id.0,
-            %msg,
-            "federated task failed"
-        );
-        let now = now_unix_ms();
-        if !self.transition_terminal(TaskState::Failed) {
-            return;
-        }
-        if let Err(e) = self.store.write_task_result_failed_with_provenance(
-            self.task.id,
-            msg,
-            now,
-            self.local_id,
-            provenance,
-        ) {
-            tracing::warn!(target: "harness.federated", ?e, "write federated failed result");
-        }
-        let _ = self.store.replica_apply_local(&ReplicatedTaskState {
-            task_id: self.task.id,
-            state: ReplicatedState::Failed,
-            at_ms: now,
-            source: self.local_id,
-            output_preview: Some(msg.as_bytes().iter().copied().take(256).collect()),
-        });
+        fail_parent(&self.store, self.task.id, self.local_id, msg, provenance);
     }
 
     fn transition_terminal(&self, terminal: TaskState) -> bool {
@@ -697,6 +695,54 @@ fn flatten_errors(
         ));
     }
     msg
+}
+
+/// Fail the parent: `Running -> Failed` CAS + result row + replica.
+/// Free-standing so the spawn-level panic fallback can reach it after
+/// the `Driver` has been consumed (diff review MAJOR-1).
+fn fail_parent(
+    store: &Store,
+    task_id: TaskId,
+    local_id: NodeId,
+    msg: &str,
+    provenance: &[NodeContribution],
+) {
+    tracing::warn!(
+        target: "harness.federated",
+        task = %task_id.0,
+        %msg,
+        "federated task failed"
+    );
+    let now = now_unix_ms();
+    match store.try_transition_task(task_id, TaskState::Running, TaskState::Failed) {
+        Ok(true) => {}
+        Ok(false) => {
+            // Cancelled out from under us (operator action) — that
+            // terminal owns the row; write nothing.
+            tracing::debug!(
+                target: "harness.federated",
+                task = %task_id.0,
+                "parent no longer Running at terminalize; skipping"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(target: "harness.federated", ?e, "terminalize federated parent");
+            return;
+        }
+    }
+    if let Err(e) =
+        store.write_task_result_failed_with_provenance(task_id, msg, now, local_id, provenance)
+    {
+        tracing::warn!(target: "harness.federated", ?e, "write federated failed result");
+    }
+    let _ = store.replica_apply_local(&ReplicatedTaskState {
+        task_id,
+        state: ReplicatedState::Failed,
+        at_ms: now,
+        source: local_id,
+        output_preview: Some(msg.as_bytes().iter().copied().take(256).collect()),
+    });
 }
 
 fn now_unix_ms() -> u64 {
@@ -1218,6 +1264,60 @@ mod tests {
         }
         assert_eq!(wait_terminal(&store, queued.id).await, TaskState::Done);
         queued_workers.abort();
+    }
+
+    /// Diff review MAJOR-1: a panic anywhere in the driver must not
+    /// strand the parent at `Running` — the spawn-level catch_unwind
+    /// terminalizes it Failed and the coordination slot is released.
+    #[tokio::test(start_paused = true)]
+    async fn f08_driver_panic_terminalizes_failed_and_frees_slot() {
+        let store = Store::open_memory().expect("store");
+        let identity = Arc::new(Identity::generate());
+        let coordinator = FederatedCoordinator::with_slots(store.clone(), identity.clone(), 1);
+        // A sink that explodes on the very first stage frame.
+        let sink: FrameSink = Arc::new(|_, _| panic!("sink exploded"));
+        coordinator.attach_sink(sink);
+
+        let task = parent_task(&identity, 30_000);
+        store.insert_task(&task).expect("insert parent");
+        assert!(coordinator.try_start(
+            &task,
+            vec![NodeId::from_bytes([1; 16])],
+            MergeStrategy::Concat,
+            PartialPolicy::ReturnPartial,
+        ));
+        let state = wait_terminal(&store, task.id).await;
+        assert_eq!(
+            state,
+            TaskState::Failed,
+            "panic must terminalize, not strand"
+        );
+        let row = store
+            .load_task_result(task.id)
+            .expect("load")
+            .expect("present");
+        let error = row.error.expect("error");
+        assert!(
+            error.contains("panicked") && error.contains("sink exploded"),
+            "panic payload surfaces in the error: {error}"
+        );
+
+        // The single slot must be free again: a fresh claim succeeds
+        // (poll like the dispatch loop — the permit drops after the
+        // catch_unwind resolves).
+        let task2 = parent_task(&identity, 30_000);
+        store.insert_task(&task2).expect("insert second");
+        loop {
+            if coordinator.try_start(
+                &task2,
+                vec![NodeId::from_bytes([1; 16])],
+                MergeStrategy::Concat,
+                PartialPolicy::ReturnPartial,
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// BLOCKER-1 regression: concurrent claim attempts on the same

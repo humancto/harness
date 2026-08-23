@@ -95,9 +95,6 @@ pub enum CapabilityError {
     NotImplemented,
 }
 
-/// One capability — a typed unit of work the daemon advertises and can
-/// execute. Capabilities are stateless across calls; per-call state
-/// lives in the future returned by `execute`.
 /// Which executor pool a capability runs under (4.5, ADR-0027 —
 /// closing ADR-0022's cross-node wedge).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +107,9 @@ pub enum ExecutionClass {
     Coordination,
 }
 
+/// One capability — a typed unit of work the daemon advertises and can
+/// execute. Capabilities are stateless across calls; per-call state
+/// lives in the future returned by `execute`.
 #[async_trait]
 pub trait Capability: Send + Sync + 'static {
     /// Stable id, e.g. `"echo"` or `"shell.exec"`. Must match the id

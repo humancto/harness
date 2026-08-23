@@ -14,8 +14,9 @@ workspace = true
 harness-core   = { workspace = true }
 harness-policy = { workspace = true }
 futures        = { workspace = true }
-# Runtime-agnostic sync primitives only (the into_channel bridge);
-# no tokio runtime is pulled in.
+# Runtime-agnostic: this crate itself needs only the sync primitives
+# (the into_channel bridge). Workspace feature unification can still
+# link more when built alongside the daemon.
 tokio          = { workspace = true, default-features = false, features = ["sync"] }
 tokio-stream   = { workspace = true }
 thiserror      = { workspace = true }

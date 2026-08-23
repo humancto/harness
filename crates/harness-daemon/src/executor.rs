@@ -343,7 +343,7 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn describe_panic(payload: &(dyn std::any::Any + Send)) -> String {
+pub(crate) fn describe_panic(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
         return (*s).to_string();
     }

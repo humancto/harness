@@ -275,6 +275,12 @@ impl DispatchRuntime {
         self.reply.lock().len()
     }
 
+    /// Test introspection: is the task batched in the waiting class?
+    #[cfg(test)]
+    pub(crate) fn is_gated(&self, id: TaskId) -> bool {
+        self.gated.lock().contains(&id)
+    }
+
     /// Wire the back-reference after `PeerNet::new`.
     pub(crate) fn attach_net(&self, net: &Arc<PeerNet>) {
         let _ = self.net.set(Arc::downgrade(net));
@@ -433,7 +439,6 @@ impl DispatchRuntime {
                     // merges / terminalizes. `false` = no coordination
                     // slot free: the task stays Submitted and retries
                     // next poll (queueing, never failure).
-                    self.gated.lock().remove(&task.id);
                     self.elig_failures.lock().remove(&task.id);
                     let Cardinality::Federated {
                         merge,
@@ -442,17 +447,30 @@ impl DispatchRuntime {
                     else {
                         // eligible_scored only returns Federated plans
                         // for Federated cardinality; a mismatch is a
-                        // routing bug, not a task failure.
-                        tracing::error!(
-                            target: "harness.dispatch",
-                            task = %task.id.0,
-                            "federated plan for non-federated cardinality"
+                        // routing bug — terminalize with a visible
+                        // reason rather than retrying forever (diff
+                        // review NIT-8).
+                        self.gated.lock().remove(&task.id);
+                        self.fail_undispatchable(
+                            &task,
+                            "internal: federated plan for non-federated cardinality",
                         );
                         continue;
                     };
-                    let _ = self
+                    if self
                         .federated
-                        .try_start(&task, nodes, merge, on_node_failure);
+                        .try_start(&task, nodes, merge, on_node_failure)
+                    {
+                        self.gated.lock().remove(&task.id);
+                    } else {
+                        // Slot-starved parents join the WAITING batch
+                        // class: a burst of ≥DISPATCH_BATCH queued
+                        // federated tasks must not monopolize the
+                        // fresh-first batch and starve other Submitted
+                        // work for the length of a coordination (diff
+                        // review MAJOR-2 — the ResourceGated doctrine).
+                        self.gated.lock().insert(task.id);
+                    }
                 }
                 Ok(_) => {
                     // `DispatchPlan` is non_exhaustive; unknown plans are
@@ -1293,6 +1311,49 @@ mod tests {
         }
     }
 
+    /// 4.5: a result row carrying provenance round-trips into a signed
+    /// `FinalResult` whose signature still verifies — the wire field
+    /// was live-but-empty before; this locks the populated path.
+    #[tokio::test]
+    async fn t00_build_final_result_signs_with_populated_provenance() {
+        let f = fixture();
+        let task = signed_task(&f.local);
+        f.store.insert_task(&task).expect("insert");
+        let provenance = vec![
+            harness_core::NodeContribution {
+                node_id: f.local.node_id(),
+                status: harness_core::protocol::NodeStatus::Ok,
+                duration_ms: 12,
+                item_count: 3,
+            },
+            harness_core::NodeContribution {
+                node_id: f.remote.node_id(),
+                status: harness_core::protocol::NodeStatus::TimedOut,
+                duration_ms: 1_000,
+                item_count: 0,
+            },
+        ];
+        f.store
+            .write_task_result_done_with_provenance(
+                task.id,
+                &serde_json::json!({"items": [1, 2, 3]}),
+                1_700_000_000_500,
+                f.local.node_id(),
+                &provenance,
+            )
+            .expect("write");
+
+        let result = f
+            .runtime
+            .build_final_result(task.id)
+            .expect("built from stored row");
+        assert_eq!(result.provenance, provenance);
+        assert_eq!(result.status, Status::Ok);
+        result
+            .verify_signature(f.local.public_key())
+            .expect("signature must verify with provenance filled");
+    }
+
     #[tokio::test]
     async fn t01_result_without_claim_completes_task_and_lease() {
         // R3: the claim was lost; the result must still land.
@@ -1865,6 +1926,58 @@ mod tests {
         f.runtime.dispatcher.capability_index().upsert_node(&m);
         f.store.upsert_manifest(&m).expect("upsert manifest");
         f.peers.record(live_heartbeat(peer.node_id()));
+    }
+
+    /// 4.5 diff review MAJOR-2: with every coordination slot busy, a
+    /// burst of queued federated parents must drop into the WAITING
+    /// batch class — not camp in the fresh class and starve every other
+    /// Submitted task for the length of a coordination.
+    #[tokio::test]
+    async fn t15_slot_starved_federated_parents_demote_to_waiting_class() {
+        let f = fixture();
+        // Local registry declares the Federated cardinality…
+        f.runtime
+            .registry
+            .register(Arc::new(harness_capabilities::MeshInfoCapability::new()))
+            .expect("register mesh.info");
+        // …and a live peer advertises it (the candidate set).
+        let peer = Identity::generate();
+        let mut m = signed_peer_manifest(&peer, vec![]);
+        m.capabilities = vec![harness_capabilities::Capability::manifest(
+            &harness_capabilities::MeshInfoCapability::new(),
+        )];
+        m.sign(&peer).expect("re-sign");
+        f.runtime.dispatcher.capability_index().upsert_node(&m);
+        f.store.upsert_manifest(&m).expect("upsert");
+        f.peers.record(live_heartbeat(peer.node_id()));
+
+        // One more parent than there are coordination slots. The
+        // coordinations hang (no executor / no net in this fixture), so
+        // the slots stay busy.
+        let n = crate::federated::MAX_FEDERATED_COORDINATORS + 1;
+        let mut ids = Vec::new();
+        for _ in 0..n {
+            let t = signed_task_for(&f.local, "mesh.info");
+            f.store.insert_task(&t).expect("insert");
+            ids.push(t.id);
+        }
+        f.runtime.poll_submitted_once();
+
+        let mut running = 0;
+        let mut submitted = Vec::new();
+        for id in &ids {
+            match f.store.task_state(*id).expect("state").expect("present") {
+                TaskState::Running => running += 1,
+                TaskState::Submitted => submitted.push(*id),
+                other => panic!("unexpected state {other:?}"),
+            }
+        }
+        assert_eq!(running, crate::federated::MAX_FEDERATED_COORDINATORS);
+        assert_eq!(submitted.len(), 1, "one parent had no slot");
+        assert!(
+            f.runtime.is_gated(submitted[0]),
+            "slot-starved parent must batch in the waiting class"
+        );
     }
 
     #[tokio::test]

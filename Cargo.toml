@@ -44,7 +44,10 @@ harness-ui           = { path = "crates/harness-ui",           version = "0.0.0"
 harness-vault        = { path = "crates/harness-vault",        version = "0.0.0" }
 
 # Async runtime
-tokio       = { version = "1.42", features = ["full"] }
+# default-features = false so member crates can narrow to a feature
+# subset (harness-orchestrator wants ["sync"] only); tokio's default
+# feature set is empty, so this is behavior-neutral for everyone else.
+tokio       = { version = "1.42", default-features = false, features = ["full"] }
 tokio-util  = { version = "0.7" }
 futures     = { version = "0.3" }
 

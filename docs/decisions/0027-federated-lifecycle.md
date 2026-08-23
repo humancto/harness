@@ -73,7 +73,10 @@ is already broadcast in every signed `NodeManifest` — no new exposure.
    sorted by `NodeId`) is the Dedupe first-wins and TopK stability
    order. `Rerank` degrades to `TopK{score_field: "score"}` until a
    reranker capability exists (Phase 5); `Custom` returns a typed
-   `CustomUnsupported` error. Merged items cap at 10 000 with
+   `CustomUnsupported` error. `Aggregate` over zero numeric items
+   errors (`AggregateNoData`) for `Min`/`Max`/`Mean` alike — a silent
+   `0.0` extremum is indistinguishable from a real one (diff review);
+   `Sum`/`Count` legitimately yield 0. Merged items cap at 10 000 with
    **reported** truncation. `NodeContribution.item_count` counts items
    CONTRIBUTED (pre-merge) — `Dedupe`/`TopK` may surface fewer than
    the sum.
@@ -86,8 +89,10 @@ is already broadcast in every signed `NodeManifest` — no new exposure.
    write clears the column — the replacing terminal owns the row.
 
 6. **Bounds.** ≤8 coordinators/daemon (no slot ⇒ the task stays
-   `Submitted` and retries next poll — queueing, never failure, the
-   ResourceGated doctrine); ≤64 nodes/fan-out (reported truncation);
+   `Submitted` in the dispatch batch's WAITING class — behind fresh
+   work, so a burst of queued federated parents can't starve other
+   Submitted tasks — and retries next poll: queueing, never failure,
+   the ResourceGated doctrine); ≤64 nodes/fan-out (reported truncation);
    window = `default_per_workers` ⇒ ≥N for N ≤ 64 (PRD's "all eligible
    in parallel") with remaining-budget timeouts (1 s floor) for late
    pulls; the 4.2 `into_channel` bridge (bounded mpsc = window) is the
@@ -108,12 +113,30 @@ is already broadcast in every signed `NodeManifest` — no new exposure.
    the capability's declaration is authoritative for federated parents;
    the task-level knob is ignored (task-level override deferred).
 
+10. **Driver panic boundary.** The spawned coordination task wraps
+   `drive()` in `catch_unwind` (the executor precedent): a panic in
+   the sink closure, merge, or terminal writes terminalizes the parent
+   `Failed` ("federated coordinator panicked: …") instead of stranding
+   it at `Running` until reboot (diff review). The coordination slot is
+   released either way.
+
+11. **Timing anchors.** The global budget (`timeout_ms`, 1 s floor) is
+   anchored at coordination START, not submit — a parent that queued
+   for a slot keeps its full budget; `constraints.deadline` stays a
+   dispatch-loop concern. Terminal-state → result-row write gaps are
+   absorbed by `await_terminal`'s bounded grace polls (10 × 100 ms)
+   rather than surfacing as false sub-task failures.
+
 ## Known carries (owner: 4.6 unless noted)
 
 - **Leaseless `Running` parent**: a daemon crash mid-coordination
   leaves the parent `Running` with no lease. Pre-existing shape (the
   executor has the same window); 4.6's supervisor sweeps
   `Running(assigned=self)` orphans at startup and adds parent leases.
+- Federated sub-task dispatch writes the RR `dispatcher_cursors` row
+  once per pinned sub-task, though Federated routing never consults RR
+  — N harmless store writes per coordination (cosmetic; clean up with
+  the 4.6 dispatch work).
 - Retry-aware `Wait`; lease extension for long coordinations;
   send-failure backoff.
 - Federated fan-outs are pressure-blind (bypass `eligible_scored` —

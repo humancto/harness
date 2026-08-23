@@ -93,6 +93,50 @@ pub fn top_k_by_score(mut items: Vec<JsonValue>, k: usize, score_field: &str) ->
     items
 }
 
+/// The `Aggregate` strategy body: pull `field` as f64 from every item
+/// and apply `op`. `Min`/`Max`/`Mean` over zero numeric items error —
+/// a silent `0.0` extremum would be indistinguishable from a real one
+/// (PR #48 diff review); `Sum`/`Count` legitimately yield 0.
+fn aggregate(op: AggregateOp, field: &str, all: &[JsonValue]) -> Result<JsonValue, MergeError> {
+    let nums: Vec<f64> = all
+        .iter()
+        .filter_map(|i| i.get(field).and_then(JsonValue::as_f64))
+        .collect();
+    let no_data = || MergeError::AggregateNoData {
+        field: field.to_string(),
+    };
+    let value = match op {
+        AggregateOp::Count => {
+            #[allow(clippy::cast_precision_loss)]
+            let v = nums.len() as f64;
+            v
+        }
+        AggregateOp::Sum => nums.iter().sum(),
+        AggregateOp::Min | AggregateOp::Max | AggregateOp::Mean if nums.is_empty() => {
+            return Err(no_data())
+        }
+        AggregateOp::Min => nums.iter().copied().fold(f64::INFINITY, f64::min),
+        AggregateOp::Max => nums.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        AggregateOp::Mean => {
+            #[allow(clippy::cast_precision_loss)]
+            let mean = nums.iter().sum::<f64>() / nums.len() as f64;
+            mean
+        }
+        // Future ops (non_exhaustive): no data semantics defined yet.
+        _ => return Err(no_data()),
+    };
+    let value = if value.is_finite() { value } else { 0.0 };
+    Ok(json!({
+        "value": value,
+        "merge": {
+            "strategy": "aggregate",
+            "op": format!("{op:?}").to_lowercase(),
+            "field": field,
+            "count": nums.len(),
+        },
+    }))
+}
+
 /// Execute a merge strategy over per-node outputs (see module docs).
 ///
 /// `Rerank { top_k, .. }` degrades to `TopK { k: top_k, score_field:
@@ -135,48 +179,7 @@ pub fn merge(strategy: &MergeStrategy, inputs: &[NodeOutput]) -> Result<Merged, 
             // Documented degradation until a reranker capability exists.
             (top_k_by_score(all, *top_k, "score"), None)
         }
-        MergeStrategy::Aggregate { op, field } => {
-            let nums: Vec<f64> = all
-                .iter()
-                .filter_map(|i| i.get(field).and_then(JsonValue::as_f64))
-                .collect();
-            let value = match op {
-                AggregateOp::Count => {
-                    #[allow(clippy::cast_precision_loss)]
-                    let v = nums.len() as f64;
-                    v
-                }
-                AggregateOp::Sum => nums.iter().sum(),
-                AggregateOp::Min => nums.iter().copied().fold(f64::INFINITY, f64::min),
-                AggregateOp::Max => nums.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-                AggregateOp::Mean => {
-                    if nums.is_empty() {
-                        return Err(MergeError::AggregateNoData {
-                            field: field.clone(),
-                        });
-                    }
-                    #[allow(clippy::cast_precision_loss)]
-                    let mean = nums.iter().sum::<f64>() / nums.len() as f64;
-                    mean
-                }
-                _ => {
-                    return Err(MergeError::AggregateNoData {
-                        field: field.clone(),
-                    })
-                }
-            };
-            let value = if value.is_finite() { value } else { 0.0 };
-            let extra = json!({
-                "value": value,
-                "merge": {
-                    "strategy": "aggregate",
-                    "op": format!("{op:?}").to_lowercase(),
-                    "field": field,
-                    "count": nums.len(),
-                },
-            });
-            (Vec::new(), Some(extra))
-        }
+        MergeStrategy::Aggregate { op, field } => (Vec::new(), Some(aggregate(*op, field, &all)?)),
         MergeStrategy::Custom { capability } => {
             return Err(MergeError::CustomUnsupported {
                 capability: capability.clone(),
@@ -345,16 +348,30 @@ mod tests {
         )
         .expect_err("no data");
         assert!(matches!(err, MergeError::AggregateNoData { .. }));
-        // Min/Max over empty numeric set stay finite (0.0), not ±inf.
+        // Min/Max over an empty numeric set error like Mean — a
+        // silent 0.0 would be indistinguishable from a real extremum
+        // of 0 (PR #48 diff review).
+        for op in [AggregateOp::Min, AggregateOp::Max] {
+            let err = merge(
+                &MergeStrategy::Aggregate {
+                    op,
+                    field: "absent".into(),
+                },
+                &inputs,
+            )
+            .expect_err("empty extremum must error");
+            assert!(matches!(err, MergeError::AggregateNoData { .. }));
+        }
+        // Non-empty Min/Max still work.
         let min = merge(
             &MergeStrategy::Aggregate {
                 op: AggregateOp::Min,
-                field: "absent".into(),
+                field: "n".into(),
             },
             &inputs,
         )
         .expect("min");
-        assert_eq!(min.output["value"], 0.0);
+        assert_eq!(min.output["value"], 2.0);
     }
 
     #[test]
