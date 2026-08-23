@@ -286,15 +286,26 @@ impl Driver {
             })
             .collect();
 
-        // Provenance is built for every terminal path — success or not.
-        let mut provenance: Vec<NodeContribution> = nodes
+        // Provenance is built for every terminal path — success or
+        // not. item_count = items CONTRIBUTED pre-merge (ADR-0027),
+        // filled here so a Wait/FailFast-failed parent still records
+        // what each Ok node did contribute (PR #48 review): identical
+        // by construction to `Merged::item_counts` (the merge engine
+        // counts `extract_items` on each input).
+        let provenance: Vec<NodeContribution> = nodes
             .iter()
             .zip(&settled)
             .map(|(node, s)| NodeContribution {
                 node_id: *node,
                 status: s.status,
                 duration_ms: s.duration_ms,
-                item_count: 0,
+                item_count: match (&s.status, &s.output) {
+                    (NodeStatus::Ok, Some(output)) => {
+                        u64::try_from(harness_merge::extract_items(output).len())
+                            .unwrap_or(u64::MAX)
+                    }
+                    _ => 0,
+                },
             })
             .collect();
 
@@ -329,14 +340,6 @@ impl Driver {
                 return;
             }
         };
-        // item_count = items CONTRIBUTED pre-merge (ADR-0027), mapped
-        // from the Ok-input order back to node positions.
-        let mut counts = merged.item_counts.iter().copied();
-        for (contribution, s) in provenance.iter_mut().zip(&settled) {
-            if matches!(s.status, NodeStatus::Ok) {
-                contribution.item_count = counts.next().unwrap_or(0);
-            }
-        }
         let mut output = merged.output;
         if let Some(merge_block) = output.get_mut("merge").and_then(JsonValue::as_object_mut) {
             if truncated_nodes > 0 {
@@ -609,16 +612,23 @@ impl ResultMapper<JsonValue> for NodeMapper {
         let pulled = self.pulled_at.lock();
         for (idx, slot) in self.settled.iter_mut().enumerate() {
             if slot.is_none() {
-                let was_pulled = u64::try_from(idx).is_ok_and(|i| pulled.contains_key(&i));
+                let pulled_instant = u64::try_from(idx)
+                    .ok()
+                    .and_then(|i| pulled.get(&i).copied());
                 *slot = Some(NodeSettle {
-                    status: if was_pulled
+                    status: if pulled_instant.is_some()
                         && summary.reason == harness_orchestrator::EndReason::DeadlineExceeded
                     {
                         NodeStatus::TimedOut
                     } else {
                         NodeStatus::Skipped
                     },
-                    duration_ms: 0,
+                    // A pulled node ran until the fan-out ended — record
+                    // the real elapsed time; zero stays reserved for
+                    // never-pulled nodes (PR #48 review).
+                    duration_ms: pulled_instant.map_or(0, |t| {
+                        u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
+                    }),
                     output: None,
                     error: None,
                 });
@@ -1034,10 +1044,16 @@ mod tests {
             error.contains("disk on fire"),
             "per-node error text: {error}"
         );
-        // Full provenance survives on the failure path.
+        // Full provenance survives on the failure path — including the
+        // Ok nodes' item counts (PR #48 review: the Wait/FailFast early
+        // return must not zero out real contributions).
         let provenance = row.provenance.expect("provenance");
         assert_eq!(provenance.len(), 3);
+        assert_eq!(provenance[0].status, NodeStatus::Ok);
+        assert_eq!(provenance[0].item_count, 1);
         assert_eq!(provenance[1].status, NodeStatus::Failed);
+        assert_eq!(provenance[1].item_count, 0);
+        assert_eq!(provenance[2].item_count, 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1113,6 +1129,12 @@ mod tests {
         let provenance = row.provenance.expect("provenance");
         assert_eq!(provenance[0].status, NodeStatus::Ok);
         assert_eq!(provenance[1].status, NodeStatus::TimedOut);
+        // PR #48 review: a pulled node that timed out consumed real time
+        // — its duration must reflect that, not read 0.
+        assert!(
+            provenance[1].duration_ms > 0,
+            "timed-out node must record elapsed duration: {provenance:?}"
+        );
         let failures = row.output.expect("output")["merge"]["failures"]
             .as_array()
             .expect("failures")
