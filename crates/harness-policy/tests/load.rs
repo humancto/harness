@@ -64,6 +64,46 @@ cloud_planner_model = "claude-opus-5"
 }
 
 #[test]
+fn t01f_planning_escalation_knobs_round_trip() {
+    use harness_policy::CloudTrigger;
+
+    // PRD §15.2 example values parse into the typed vocabulary.
+    let toml = r#"
+[planning]
+escalate_to_cloud_if = ["plan_validation_failed", "tool_not_found"]
+max_replanning_attempts = 1
+"#;
+    let p = load_from_str(toml).expect("5.3 knobs parse");
+    assert_eq!(
+        p.planning.escalate_to_cloud_if,
+        vec![
+            CloudTrigger::PlanValidationFailed,
+            CloudTrigger::ToolNotFound
+        ]
+    );
+    assert_eq!(p.planning.max_replanning_attempts, 1);
+
+    // Absent → defaults: ALL four triggers (ADR-0032 deviation from
+    // the PRD example — every real local-tier failure mode escalates)
+    // and 2 replanning attempts.
+    let p = load_from_str("[planning]\n").expect("defaults");
+    assert_eq!(p.planning.escalate_to_cloud_if.len(), 4);
+    assert!(p
+        .planning
+        .escalate_to_cloud_if
+        .contains(&CloudTrigger::BackendError));
+    assert_eq!(p.planning.max_replanning_attempts, 2);
+
+    // A typo'd trigger fails policy load LOUDLY (house rule) — never
+    // a silent narrowing.
+    let bad = r#"
+[planning]
+escalate_to_cloud_if = ["tool_notfound"]
+"#;
+    assert!(load_from_str(bad).is_err());
+}
+
+#[test]
 fn t01b_planning_3_9_fields_round_trip() {
     let toml = r#"
 [planning]
