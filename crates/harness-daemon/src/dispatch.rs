@@ -878,19 +878,22 @@ impl DispatchRuntime {
                     attempt = lease.attempt,
                     "lease expired; resetting for re-dispatch"
                 );
-                // The strongest per-node signal: this worker held the
-                // lease and didn't finish (review MINOR-6).
-                if let Some(worker) = lease.worker_id {
-                    self.success.record(worker, false);
-                    self.record_node_failure(worker);
-                }
                 // Guarded on expires_at < now: a LeaseExtend landing
                 // after find_expired's snapshot makes this reset lose
                 // (plan review MAJOR-3 — the worker is provably alive).
+                // Failure signals are recorded ONLY when the expiry CAS
+                // wins (PR #49 review): a lost race means the worker
+                // extended — counting it could bench a live node.
                 if let Ok(true) = self
                     .store
                     .expire_and_reset_task_if_unextended(lease.lease_id, now)
                 {
+                    // The strongest per-node signal: this worker held
+                    // the lease and didn't finish (review MINOR-6).
+                    if let Some(worker) = lease.worker_id {
+                        self.success.record(worker, false);
+                        self.record_node_failure(worker);
+                    }
                     // 4.6 (ADR-0028): the retry waits out its backoff in
                     // the WAITING batch class — no more immediate
                     // re-dispatch hammering a dead pin.
@@ -1444,9 +1447,12 @@ impl DispatchRuntime {
 /// caps the result; zero-valued policy fields are floored to 1.
 fn backoff_delay(retry: &harness_core::RetryPolicy, attempt: u32) -> Duration {
     let mult = u64::from(retry.backoff_multiplier.max(1));
-    let exp = attempt.saturating_sub(1).min(16);
+    let exp = attempt.saturating_sub(1);
+    // Exact growth until it saturates — an exponent clamp would silently
+    // flatten valid schedules below `backoff_max_ms` (PR #49 review).
+    let factor = mult.checked_pow(exp).unwrap_or(u64::MAX);
     let ms = u64::from(retry.backoff_initial_ms.max(1))
-        .saturating_mul(mult.saturating_pow(exp))
+        .saturating_mul(factor)
         .min(u64::from(retry.backoff_max_ms.max(1)));
     Duration::from_millis(ms)
 }
@@ -2311,6 +2317,16 @@ mod tests {
             backoff_delay(&default_policy, 30),
             Duration::from_millis(30_000)
         );
+        // PR #49 review: growth continues EXACTLY to the configured cap
+        // — no hidden exponent clamp flattening valid schedules.
+        let wide = RetryPolicy {
+            max_attempts: 255,
+            backoff_initial_ms: 1,
+            backoff_multiplier: 2,
+            backoff_max_ms: 1_000_000,
+        };
+        assert_eq!(backoff_delay(&wide, 18), Duration::from_millis(131_072));
+        assert_eq!(backoff_delay(&wide, 21), Duration::from_millis(1_000_000));
         // Hostile/zero fields are floored, never panic or zero-delay.
         let zeros = RetryPolicy {
             max_attempts: 3,
