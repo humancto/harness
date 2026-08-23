@@ -103,8 +103,10 @@ and the RR-cursor churn.
 ## Bounds and constants
 
 `EXTEND_HORIZON_MS = 30_000` (test 2 000); `EXTEND_INTERVAL_MS =
-10_000` (test 300) — horizon = 3× interval, so two consecutive lost
-extensions still keep a live worker's lease alive; `BENCH_THRESHOLD =
+10_000` (test 300) — horizon = 3× interval: ONE lost extension is
+survivable with margin; a second consecutive loss is boundary-exact
+(expiry and the next tick coincide), so treat two losses as plausible
+expiry; `BENCH_THRESHOLD =
 5`, `BENCH_MS = 60_000` (PRD literals); backoff default 250 ms × 2^n
 capped 30 s (RetryPolicy defaults).
 

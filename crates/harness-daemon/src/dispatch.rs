@@ -954,8 +954,14 @@ impl DispatchRuntime {
     }
 
     /// Drop backoff/gated bookkeeping for tasks no longer `Submitted`.
+    /// Covers the UNION of both sets (PR #49 review): resource-gated,
+    /// bench-gated, and federated slot-starved tasks live in `gated`
+    /// without a backoff entry, and a sideways exit (operator cancel)
+    /// would otherwise leak them forever.
     fn prune_waiting_sets(&self) {
-        let ids: Vec<TaskId> = self.backoff.lock().keys().copied().collect();
+        let mut ids: std::collections::HashSet<TaskId> =
+            self.backoff.lock().keys().copied().collect();
+        ids.extend(self.gated.lock().iter().copied());
         for id in ids {
             let still_submitted =
                 matches!(self.store.task_state(id), Ok(Some(TaskState::Submitted)));
@@ -1355,6 +1361,13 @@ impl TaskChannelHandlers for DispatchRuntime {
                 "lease-extend task_id does not match lease; dropped"
             );
             return;
+        }
+        // A task that already reached a terminal state (operator
+        // cancel included) must not have its lease kept alive until
+        // the budget cap (PR #49 review).
+        match self.store.task_state(lease.task_id) {
+            Ok(Some(TaskState::Dispatched | TaskState::Claimed | TaskState::Running)) => {}
+            _ => return,
         }
         let Some(task) = self.store.load_task(lease.task_id).ok().flatten() else {
             return;

@@ -787,11 +787,15 @@ allow = [{ cmd = "sleep", any_args = true }]
     // and the eligibility window (2 s test) terminalizes. All of that
     // is bounded FAR below the 60 s budget the old TTL would have
     // waited out.
-    let state = wait_for_state(&a.store, id2, &[TaskState::Failed], Duration::from_secs(25)).await;
+    let state = wait_for_state(&a.store, id2, &[TaskState::Failed], Duration::from_secs(40)).await;
     assert_eq!(state, TaskState::Failed);
+    // Independent, TIGHTER bound than the wait budget (PR #49 review):
+    // horizon 2 s + expire tick + backoff + peer-timeout 6 s +
+    // eligibility window 2 s ≈ 12 s worst case; 20 s leaves CI margin
+    // while proving detection is nowhere near the 60 s budget.
     let elapsed = killed_at.elapsed();
     assert!(
-        elapsed < Duration::from_secs(25),
+        elapsed < Duration::from_secs(20),
         "fast detection: took {elapsed:?}, budget was 60 s"
     );
     let row = a.store.load_task_result(id2).expect("load").expect("row");
