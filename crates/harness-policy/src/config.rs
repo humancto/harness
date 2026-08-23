@@ -37,6 +37,47 @@ pub struct Policy {
     /// same thing here (unlike `[llm]`).
     #[serde(default)]
     pub mcp: McpPolicy,
+
+    /// `[execution]` section — runtime plan-budget knobs (5.8,
+    /// ADR-0036). Distinct from `[planning].default_max_cost_usd`
+    /// (a planning-time ESTIMATE cap): these govern ACTUAL spend
+    /// while `plan.execute` runs.
+    #[serde(default)]
+    pub execution: ExecutionBudgetPolicy,
+}
+
+/// Runtime budget knobs for `plan.execute` (5.8, PRD §17.8).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionBudgetPolicy {
+    /// Cap applied to plans that carry NO `budget` of their own
+    /// (§17.8: "no plan may exceed $5 without explicit approval" —
+    /// a plan-carried `Budget` IS the explicit approval; planner
+    /// backends never emit one, so only the submitter can approve).
+    /// NOTE: a serde-defaulted `Option` cannot be set back to `None`
+    /// from TOML — the opt-outs are a plan-carried Budget or the
+    /// ceiling below.
+    #[serde(default = "default_plan_budget_usd")]
+    pub default_plan_budget_usd: Option<f64>,
+
+    /// Hard ceiling over EVERY plan when set — including a
+    /// plan-carried waiver (`max_cost_usd: null`). Default: none.
+    #[serde(default)]
+    pub plan_budget_ceiling_usd: Option<f64>,
+}
+
+impl Default for ExecutionBudgetPolicy {
+    fn default() -> Self {
+        Self {
+            default_plan_budget_usd: default_plan_budget_usd(),
+            plan_budget_ceiling_usd: None,
+        }
+    }
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn default_plan_budget_usd() -> Option<f64> {
+    Some(5.0)
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

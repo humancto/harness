@@ -327,7 +327,29 @@ fn truncate_chars(s: &str, max_bytes: usize) -> String {
 
 /// Render a plan.execute aggregate.
 fn render_exec(output: &JsonValue) -> RunOutcome {
-    let mut out = format!(
+    // 5.8: a budget stop arrives as aggregate status (the envelope
+    // stays "done") — surface it and the spend before the counts.
+    let status = output
+        .get("status")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("done");
+    let mut out = String::new();
+    if status != "done" {
+        let spent = output
+            .get("budget")
+            .and_then(|b| b.get("spent_usd"))
+            .and_then(JsonValue::as_f64)
+            .unwrap_or(0.0);
+        let cap = output
+            .get("budget")
+            .and_then(|b| b.get("cap_usd"))
+            .and_then(JsonValue::as_f64);
+        out.push_str(&format!(
+            "budget stop ({status}): spent ${spent:.2}{}\n",
+            cap.map(|c| format!(" of ${c:.2} cap")).unwrap_or_default()
+        ));
+    }
+    out.push_str(&format!(
         "plan {}: {} ok, {} failed, {} timed out, {} skipped ({} ms)\n",
         output
             .get("name")
@@ -350,7 +372,7 @@ fn render_exec(output: &JsonValue) -> RunOutcome {
             .get("duration_ms")
             .and_then(JsonValue::as_u64)
             .unwrap_or(0),
-    );
+    ));
     // Exit code from the aggregate counts, not error-string presence
     // (diff review MINOR-7).
     let bad = output

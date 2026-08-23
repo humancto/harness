@@ -427,7 +427,43 @@ pub(super) async fn run_conversation(
     };
     let secs = started.elapsed().as_secs();
     if exec_state == TaskState::Done {
-        (format!("✅ done — {step_count} steps in {secs}s"), true)
+        // 5.8: a Done envelope can still be a budget stop — the
+        // plan-level outcome lives in the aggregate's `status` field
+        // (plan review M2: a paused plan must not report "✅ done").
+        let aggregate = wait_result_row(state, exec_id, deadline)
+            .await
+            .and_then(|r| r.output);
+        let get_u64 = |k: &str| {
+            aggregate
+                .as_ref()
+                .and_then(|a| a.get(k))
+                .and_then(serde_json::Value::as_u64)
+        };
+        let spent = aggregate
+            .as_ref()
+            .and_then(|a| a.get("budget"))
+            .and_then(|b| b.get("spent_usd"))
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        let ok_steps = get_u64("ok").unwrap_or_else(|| u64::try_from(step_count).unwrap_or(0));
+        match aggregate
+            .as_ref()
+            .and_then(|a| a.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("done")
+        {
+            "paused_budget" => (
+                format!("⏸ paused at budget — {ok_steps}/{step_count} steps, spent ${spent:.2}"),
+                false,
+            ),
+            "aborted_budget" => (
+                format!(
+                    "🛑 stopped at budget cap — {ok_steps}/{step_count} steps, spent ${spent:.2}"
+                ),
+                false,
+            ),
+            _ => (format!("✅ done — {ok_steps} steps in {secs}s"), true),
+        }
     } else {
         let diag = wait_result_row(state, exec_id, deadline)
             .await

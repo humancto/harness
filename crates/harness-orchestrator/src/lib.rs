@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod budget;
 pub mod dag;
 pub mod dispatcher;
 pub mod error;
@@ -17,6 +18,7 @@ pub mod fanout;
 pub mod index;
 pub mod results;
 
+pub use budget::{BudgetTracker, BudgetVerdict};
 pub use dag::{
     DagError, DagScheduler, DagSummary, Progress, StepOutcome, StepState, MAX_PLAN_STEPS,
 };

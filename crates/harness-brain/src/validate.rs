@@ -166,6 +166,21 @@ pub fn validate_plan(
         }
     }
 
+    // 7. (5.8) Budget self-consistency: a plan-carried budget below
+    // the plan's own estimate is a promise the planner already knows
+    // it cannot keep. Strengthening only — plans without a Budget
+    // (all planner backends today) are untouched.
+    if let Some(budget) = plan.budget {
+        if let Some(budget_cap) = budget.max_cost_usd {
+            if response_cost_usd > budget_cap {
+                return Err(PlanValidationError::BudgetInconsistent {
+                    estimated_usd: response_cost_usd,
+                    budget_usd: budget_cap,
+                });
+            }
+        }
+    }
+
     Ok(())
 }
 

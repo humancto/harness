@@ -63,6 +63,15 @@ pub enum PlanValidationError {
     #[error("estimated cost ${estimated_usd:.4} exceeds cap ${max_usd:.4}")]
     CostExceeded { estimated_usd: f64, max_usd: f64 },
 
+    /// 5.8 (ADR-0036, future-proofing — planner backends emit
+    /// `budget: None` today): a plan whose OWN `budget.max_cost_usd`
+    /// is below its `estimated_cost_usd` promised something it
+    /// already knows it cannot afford.
+    #[error(
+        "plan budget max_cost_usd (${budget_usd}) is below its own estimated cost (${estimated_usd})"
+    )]
+    BudgetInconsistent { estimated_usd: f64, budget_usd: f64 },
+
     #[error("plan.tasks key {key:?} disagrees with its node id {id:?}")]
     NodeIdMismatch { key: TaskId, id: TaskId },
 

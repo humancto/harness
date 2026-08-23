@@ -391,6 +391,29 @@ mod unit_tests {
     use super::*;
 
     #[test]
+    fn built_plans_never_carry_a_budget() {
+        // 5.8 (ADR-0036): §17.8's "a plan-carried Budget is explicit
+        // approval" model relies on the planner being UNABLE to
+        // self-approve. Two layers, both pinned here: the LLM wire
+        // schema has no budget field (deny_unknown_fields makes one a
+        // parse error), and the built Plan hardcodes budget: None.
+        let raw = r#"{"plan":{"name":"t","tasks":[{"id":"a","capability":"echo",
+            "input":{}}],"edges":[]},"confidence":0.9}"#;
+        let llm: LlmPlanResponse = serde_json::from_str(raw).expect("parse");
+        let resp = build_response(llm, NodeId::from_bytes([7; 16])).expect("build");
+        assert!(resp.plan.0.budget.is_none(), "planner minted a budget");
+
+        let smuggled = r#"{"plan":{"name":"t","budget":{"max_cost_usd":null,
+            "soft_limit_usd":null,"on_exceed":"notify"},
+            "tasks":[{"id":"a","capability":"echo","input":{}}],"edges":[]},
+            "confidence":0.9}"#;
+        assert!(
+            serde_json::from_str::<LlmPlanResponse>(smuggled).is_err(),
+            "a budget field in the LLM response must be a parse error"
+        );
+    }
+
+    #[test]
     fn extract_bare_object() {
         assert_eq!(extract_json_object("{\"a\":1}").unwrap(), "{\"a\":1}");
     }

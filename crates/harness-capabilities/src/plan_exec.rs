@@ -92,6 +92,10 @@ struct StepRecord {
 
 pub struct PlanExecCapability {
     exec: Arc<dyn PlanExec>,
+    /// 5.8 (ADR-0036): policy default cap for budget-less plans.
+    default_plan_budget_usd: Option<f64>,
+    /// 5.8: hard ceiling over every plan when set.
+    plan_budget_ceiling_usd: Option<f64>,
     /// One plan per node: `try_acquire` and fail fast — never queue
     /// while holding an executor permit (plan review BLOCKER-1).
     inflight: Arc<tokio::sync::Semaphore>,
@@ -109,7 +113,19 @@ impl PlanExecCapability {
         Self {
             exec,
             inflight: Arc::new(tokio::sync::Semaphore::new(1)),
+            default_plan_budget_usd: Some(5.0),
+            plan_budget_ceiling_usd: None,
         }
+    }
+
+    /// Thread the mesh budget policy (5.8, ADR-0036): `default` caps
+    /// plans that carry no `Budget`; `ceiling` hard-caps everything
+    /// when set (including plan-carried waivers).
+    #[must_use]
+    pub fn with_budget_policy(mut self, default: Option<f64>, ceiling: Option<f64>) -> Self {
+        self.default_plan_budget_usd = default;
+        self.plan_budget_ceiling_usd = ceiling;
+        self
     }
 }
 
@@ -118,9 +134,17 @@ impl PlanExecCapability {
 /// # Panics
 /// If the id is already registered (a wiring bug).
 #[allow(clippy::expect_used)]
-pub fn enrich_with_plan_exec(registry: &crate::CapabilityRegistry, exec: Arc<dyn PlanExec>) {
+pub fn enrich_with_plan_exec(
+    registry: &crate::CapabilityRegistry,
+    exec: Arc<dyn PlanExec>,
+    default_plan_budget_usd: Option<f64>,
+    plan_budget_ceiling_usd: Option<f64>,
+) {
     registry
-        .register(Arc::new(PlanExecCapability::new(exec)))
+        .register(Arc::new(PlanExecCapability::new(exec).with_budget_policy(
+            default_plan_budget_usd,
+            plan_budget_ceiling_usd,
+        )))
         .expect("BUG: plan.execute registered twice");
 }
 
@@ -253,6 +277,17 @@ impl Capability for PlanExecCapability {
             .unwrap_or("fail_fast")
             == "fail_fast";
 
+        // 5.8 (ADR-0036): resolve the effective budget. The plan's
+        // own Budget wins (carrying one IS the §17.8 "explicit
+        // approval" — planner backends always emit None, pinned by
+        // test); otherwise the policy default; the ceiling hard-caps
+        // both when set.
+        let budget = harness_orchestrator::BudgetTracker::new(
+            plan.budget,
+            self.default_plan_budget_usd,
+            self.plan_budget_ceiling_usd,
+        );
+
         drive_plan(DriveArgs {
             exec: self.exec.clone(),
             ctx,
@@ -260,6 +295,7 @@ impl Capability for PlanExecCapability {
             schemas: &schemas,
             timeout,
             fail_fast,
+            budget,
         })
         .await
     }
@@ -272,6 +308,7 @@ struct DriveArgs<'a> {
     schemas: &'a CapabilitySchemaIndex,
     timeout: Duration,
     fail_fast: bool,
+    budget: harness_orchestrator::BudgetTracker,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -283,6 +320,7 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
         schemas,
         timeout,
         fail_fast,
+        mut budget,
     } = args;
     let started = tokio::time::Instant::now();
     let mut scheduler = DagScheduler::new(&plan)
@@ -310,6 +348,11 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
         Arc::new(parking_lot::Mutex::new(HashMap::new()));
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ReadyStep>(plan.tasks.len().max(1));
+    // 5.8 Pause mechanism (plan review B1): the sender lives in an
+    // Option so the driver can DROP it mid-loop — the fan-out source
+    // then drains and the stream ends with `SourceDrained` once the
+    // genuinely in-flight steps settle. No new loop-exit conditions.
+    let mut tx = Some(tx);
     // Send-order node ids: FanoutEvent::Item.index resolves through it.
     let mut sent: Vec<TaskId> = Vec::new();
 
@@ -391,13 +434,16 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
     // synchronously (they cascade like any failure).
     let mut aborted = false;
     let mut deadline_hit = false;
+    // 5.8: set once the budget's on_exceed action fires.
+    let mut budget_stop: Option<&'static str> = None;
     let initial = scheduler.take_initial_ready();
+    #[allow(clippy::expect_used)]
     if feed_ready(
         initial,
         &plan,
         &mut scheduler,
         schemas,
-        &tx,
+        tx.as_ref().expect("sender live at initial feed"),
         &mut sent,
         &mut records,
         sink.as_ref(),
@@ -436,25 +482,94 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
                             .and_modify(|r| r.state = StepState::Skipped);
                         emit_step_frame(sink.as_ref(), ctx.task_id, *skipped, &records, &row_ids);
                     }
+                    // 5.8: record ACTUAL cost from Done outputs only
+                    // (Failed outcomes carry just an error string —
+                    // the $0 undercount is frozen by test, ADR-0036).
+                    if let StepOutcome::Done(v) = &step_outcome {
+                        match budget.record(v) {
+                            harness_orchestrator::BudgetVerdict::Ok => {}
+                            harness_orchestrator::BudgetVerdict::SoftCrossed {
+                                spent_usd,
+                                limit_usd,
+                            } => {
+                                tracing::warn!(
+                                    target: "harness.plan_exec",
+                                    spent_usd,
+                                    limit_usd,
+                                    "plan spend crossed the soft budget limit"
+                                );
+                                emit_budget_frame(
+                                    sink.as_ref(),
+                                    ctx.task_id,
+                                    &json!({ "event": "soft_limit",
+                                            "spent_usd": spent_usd,
+                                            "limit_usd": limit_usd }),
+                                );
+                            }
+                            harness_orchestrator::BudgetVerdict::Exceeded {
+                                spent_usd,
+                                cap_usd,
+                                action,
+                            } => {
+                                let action_str = budget_action_str(action);
+                                tracing::warn!(
+                                    target: "harness.plan_exec",
+                                    spent_usd,
+                                    cap_usd,
+                                    action = action_str,
+                                    "plan spend exceeded the budget cap"
+                                );
+                                emit_budget_frame(
+                                    sink.as_ref(),
+                                    ctx.task_id,
+                                    &json!({ "event": "exceeded",
+                                            "spent_usd": spent_usd,
+                                            "cap_usd": cap_usd,
+                                            "action": action_str }),
+                                );
+                                match action {
+                                    harness_core::protocol::BudgetAction::Notify => {}
+                                    harness_core::protocol::BudgetAction::Pause => {
+                                        // Drop the sender: in-flight
+                                        // steps finish (their costs
+                                        // record), the source drains,
+                                        // End(SourceDrained) breaks
+                                        // the loop.
+                                        budget_stop = Some("paused_budget");
+                                        tx = None;
+                                    }
+                                    // Cancel — and any future action
+                                    // (#[non_exhaustive]) — aborts:
+                                    // the safe default.
+                                    _ => {
+                                        budget_stop = Some("aborted_budget");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if fatal && fail_fast {
                         aborted = true;
                         break;
                     }
-                    if feed_ready(
-                        progress.newly_ready,
-                        &plan,
-                        &mut scheduler,
-                        schemas,
-                        &tx,
-                        &mut sent,
-                        &mut records,
-                        sink.as_ref(),
-                        ctx.task_id,
-                        &row_ids,
-                        fail_fast,
-                    ) {
-                        aborted = true;
-                        break;
+                    if let Some(sender) = tx.as_ref() {
+                        if feed_ready(
+                            progress.newly_ready,
+                            &plan,
+                            &mut scheduler,
+                            schemas,
+                            sender,
+                            &mut sent,
+                            &mut records,
+                            sink.as_ref(),
+                            ctx.task_id,
+                            &row_ids,
+                            fail_fast,
+                        ) {
+                            aborted = true;
+                            break;
+                        }
                     }
                     if scheduler.is_settled() {
                         break;
@@ -476,11 +591,14 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
     // their own timeouts — ADR-0022) and settle the graph.
     drop(stream);
     drop(tx);
-    for skipped in scheduler.skip_remaining() {
+    // Steps stranded by a budget stop are recorded so 5.12 resume can
+    // tell budget-parked from failure-cascade skips (review m5).
+    let unscheduled = scheduler.skip_remaining();
+    for skipped in &unscheduled {
         records
-            .entry(skipped)
+            .entry(*skipped)
             .and_modify(|r| r.state = StepState::Skipped);
-        emit_step_frame(sink.as_ref(), ctx.task_id, skipped, &records, &row_ids);
+        emit_step_frame(sink.as_ref(), ctx.task_id, *skipped, &records, &row_ids);
     }
 
     let summary = scheduler.summary();
@@ -505,9 +623,19 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
             (id.0.to_string(), entry)
         })
         .collect();
-    let aggregate = json!({
+    // 5.8 (plan review B2): the task-envelope TaskState set is NOT
+    // extended — plan-level outcome lives in this aggregate `status`
+    // field. A budget stop with nothing left undone stays "done"
+    // (review m3: cancelling after the last step must not turn a
+    // complete plan into an abort).
+    let status = match budget_stop {
+        Some(s) if summary.done < summary.total => s,
+        _ => "done",
+    };
+    let mut aggregate = json!({
         "plan_id": plan.id.0.to_string(),
         "name": plan.name,
+        "status": status,
         "ok": summary.done,
         "failed": summary.failed,
         "timed_out": summary.timed_out,
@@ -515,6 +643,22 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
         "duration_ms": duration_ms,
         "steps": JsonValue::Object(steps),
     });
+    if budget.active() {
+        let mut b = json!({
+            "spent_usd": budget.spent_usd(),
+            "cap_usd": budget.cap_usd(),
+            "soft_limit_usd": budget.soft_limit_usd(),
+            "action": budget_action_str(budget.action()),
+            "triggered": budget.triggered(),
+        });
+        if budget_stop.is_some() && !unscheduled.is_empty() {
+            b["unscheduled"] = json!(unscheduled
+                .iter()
+                .map(|id| id.0.to_string())
+                .collect::<Vec<_>>());
+        }
+        aggregate["budget"] = b;
+    }
     if let Some(sink) = &sink {
         let chunk = json!({ "plan_summary": {
             "ok": summary.done, "failed": summary.failed,
@@ -530,8 +674,16 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
         );
     }
 
-    // Terminal rule (ADR-0025).
+    // Terminal rule (ADR-0025; 5.8 addition first). A budget stop is
+    // a POLICY verdict over meaningful partial results — it returns
+    // Ok with the aggregate (status names the stop) rather than
+    // discarding the budget figures into an error string (plan
+    // review B2/M1). At least one Done step recorded the tripping
+    // cost, so this never masks a total failure.
     let all_done = summary.done == summary.total;
+    if budget_stop.is_some() && summary.done > 0 {
+        return Ok(aggregate);
+    }
     if all_done || (!aborted && !deadline_hit && summary.done > 0) {
         Ok(aggregate)
     } else {
@@ -546,6 +698,30 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
             "{why}: {} ok, {} failed, {} timed out, {} skipped of {}",
             summary.done, summary.failed, summary.timed_out, summary.skipped, summary.total
         )))
+    }
+}
+
+/// 5.8: serialize a `BudgetAction` the way the wire does
+/// (`snake_case`) without going through `serde_json` for an enum.
+fn budget_action_str(action: harness_core::protocol::BudgetAction) -> &'static str {
+    match action {
+        harness_core::protocol::BudgetAction::Pause => "pause",
+        harness_core::protocol::BudgetAction::Notify => "notify",
+        _ => "cancel",
+    }
+}
+
+/// 5.8: budget events ride the same Progress stream as step frames —
+/// 5.10's Costs UI reads them; today's DAG view ignores unknown keys.
+fn emit_budget_frame(sink: Option<&FrameSink>, plan_task: TaskId, body: &JsonValue) {
+    if let Some(sink) = sink {
+        sink(
+            plan_task,
+            LogFrame {
+                stream: StreamKind::Progress,
+                line: json!({ "budget": body }).to_string(),
+            },
+        );
     }
 }
 
@@ -811,7 +987,13 @@ mod tests {
             if input.get("fail").is_some() {
                 SubTaskOutcome::Failed("step exploded".into())
             } else {
-                SubTaskOutcome::Done(json!({ "echoed": input }))
+                // 5.8: a step input carrying `cost` reports that
+                // dollar figure as its top-level output `cost_usd`.
+                let mut out = json!({ "echoed": input });
+                if let Some(c) = input.get("cost") {
+                    out["cost_usd"] = c.clone();
+                }
+                SubTaskOutcome::Done(out)
             }
         }
         fn live_workers(&self) -> usize {
@@ -844,6 +1026,28 @@ mod tests {
             sig: Signature::from_bytes([0u8; 64]),
         };
         serde_json::to_value(&plan).expect("plan json")
+    }
+
+    fn plan_json_with_budget(
+        nodes: Vec<PlanNode>,
+        edges: Vec<(TaskId, TaskId)>,
+        budget: harness_core::protocol::Budget,
+    ) -> JsonValue {
+        let mut v = plan_json(nodes, edges);
+        v["budget"] = serde_json::to_value(budget).expect("budget json");
+        v
+    }
+
+    fn usd(
+        cap: Option<f64>,
+        soft: Option<f64>,
+        on_exceed: harness_core::protocol::BudgetAction,
+    ) -> harness_core::protocol::Budget {
+        harness_core::protocol::Budget {
+            max_cost_usd: cap,
+            soft_limit_usd: soft,
+            on_exceed,
+        }
     }
 
     fn sorted_ids(n: usize) -> Vec<TaskId> {
@@ -1217,5 +1421,257 @@ mod tests {
         exec.gate.add_permits(2);
         handle.await.expect("join").expect("execute");
         assert_eq!(exec.budgets.lock().len(), 2);
+    }
+    // ───────────────────────────── 5.8 budget enforcement (ADR-0036)
+
+    use harness_core::protocol::BudgetAction;
+
+    #[tokio::test]
+    async fn e01_cancel_aborts_with_budget_aggregate() {
+        let ids = sorted_ids(3);
+        let (a, b, c_id) = (ids[0], ids[1], ids[2]);
+        let exec = FakePlanExec::new(1, 100);
+        let cap = PlanExecCapability::new(exec.clone());
+        let (c, frames) = ctx_with_sink();
+        let input = json!({ "plan": plan_json_with_budget(
+            vec![
+                node_of(a, json!({"cost": 0.6})),
+                node_of(b, json!({"cost": 0.6})),
+                node_of(c_id, json!({})),
+            ],
+            vec![(b, a), (c_id, b)],
+            usd(Some(1.0), None, BudgetAction::Cancel),
+        )});
+        let out = cap
+            .execute(&c, input)
+            .await
+            .expect("Ok, not Err: the aggregate survives");
+        assert_eq!(out["status"], "aborted_budget");
+        assert_eq!(out["ok"], 2);
+        assert_eq!(out["skipped"], 1);
+        assert_eq!(out["budget"]["triggered"], true);
+        assert!((out["budget"]["spent_usd"].as_f64().expect("spent") - 1.2).abs() < 1e-9);
+        let unscheduled = out["budget"]["unscheduled"].as_array().expect("list");
+        assert_eq!(unscheduled, &vec![json!(c_id.0.to_string())]);
+        // The exceeded frame reached the Progress stream.
+        let n = frames
+            .lock()
+            .iter()
+            .filter(|(_, f)| f.line.contains("\"event\":\"exceeded\""))
+            .count();
+        assert_eq!(n, 1, "exceeded frame emitted exactly once");
+    }
+
+    #[tokio::test]
+    async fn e02_pause_lets_in_flight_finish_then_settles_promptly() {
+        // Diamond: a → (b, c) → d. b and c run concurrently; the
+        // SECOND completion (order-independent: 0.6 + 0.6) blows the
+        // $1 cap → Pause. Both b and c count; d is never dispatched.
+        let ids = sorted_ids(4);
+        let (a, b, c_id, d) = (ids[0], ids[1], ids[2], ids[3]);
+        let exec = FakePlanExec::new(2, 100);
+        let cap = PlanExecCapability::new(exec.clone());
+        let c = ctx();
+        let input = json!({ "plan": plan_json_with_budget(
+            vec![
+                node_of(a, json!({})),
+                node_of(b, json!({"cost": 0.6})),
+                node_of(c_id, json!({"cost": 0.6})),
+                node_of(d, json!({})),
+            ],
+            vec![(b, a), (c_id, a), (d, b), (d, c_id)],
+            usd(Some(1.0), None, BudgetAction::Pause),
+        )});
+        let started = tokio::time::Instant::now();
+        let out = cap.execute(&c, input).await.expect("execute");
+        // Plan review B1: the pause path must settle promptly via
+        // SourceDrained — not hang to the 120s default plan deadline.
+        assert!(started.elapsed() < Duration::from_secs(30), "prompt settle");
+        assert_eq!(out["status"], "paused_budget");
+        assert_eq!(out["ok"], 3, "a, b AND the in-flight c all finished");
+        assert_eq!(out["skipped"], 1);
+        assert_eq!(
+            out["budget"]["unscheduled"].as_array().expect("list"),
+            &vec![json!(d.0.to_string())]
+        );
+        assert!((out["budget"]["spent_usd"].as_f64().expect("spent") - 1.2).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn e03_notify_records_but_never_stops() {
+        let ids = sorted_ids(3);
+        let (a, b, c_id) = (ids[0], ids[1], ids[2]);
+        let exec = FakePlanExec::new(1, 100);
+        let cap = PlanExecCapability::new(exec.clone());
+        let c = ctx();
+        let input = json!({ "plan": plan_json_with_budget(
+            vec![
+                node_of(a, json!({"cost": 0.6})),
+                node_of(b, json!({"cost": 0.6})),
+                node_of(c_id, json!({})),
+            ],
+            vec![(b, a), (c_id, b)],
+            usd(Some(1.0), None, BudgetAction::Notify),
+        )});
+        let out = cap.execute(&c, input).await.expect("execute");
+        assert_eq!(out["status"], "done");
+        assert_eq!(out["ok"], 3, "notify never stops execution");
+        assert_eq!(out["budget"]["triggered"], true);
+        assert_eq!(out["budget"]["action"], "notify");
+    }
+
+    #[tokio::test]
+    async fn e04_soft_limit_warns_once_without_stopping() {
+        let ids = sorted_ids(3);
+        let (a, b, c_id) = (ids[0], ids[1], ids[2]);
+        let exec = FakePlanExec::new(1, 100);
+        let cap = PlanExecCapability::new(exec.clone());
+        let (c, frames) = ctx_with_sink();
+        let input = json!({ "plan": plan_json_with_budget(
+            vec![
+                node_of(a, json!({"cost": 0.6})),
+                node_of(b, json!({"cost": 0.6})),
+                node_of(c_id, json!({"cost": 0.6})),
+            ],
+            vec![(b, a), (c_id, b)],
+            usd(Some(100.0), Some(1.0), BudgetAction::Cancel),
+        )});
+        let out = cap.execute(&c, input).await.expect("execute");
+        assert_eq!(out["status"], "done");
+        assert_eq!(out["ok"], 3);
+        assert_eq!(out["budget"]["triggered"], false);
+        let n = frames
+            .lock()
+            .iter()
+            .filter(|(_, f)| f.line.contains("\"event\":\"soft_limit\""))
+            .count();
+        assert_eq!(
+            n, 1,
+            "soft frame exactly once across two crossings-worth of spend"
+        );
+    }
+
+    #[tokio::test]
+    async fn e05_policy_default_enforces_and_plan_budget_overrides() {
+        let ids = sorted_ids(2);
+        let (a, b) = (ids[0], ids[1]);
+        let nodes = |a: TaskId, b: TaskId| {
+            vec![
+                node_of(a, json!({"cost": 0.6})),
+                node_of(b, json!({"cost": 0.6})),
+            ]
+        };
+        // No plan budget → policy default ($1, Cancel) trips.
+        let exec = FakePlanExec::new(1, 100);
+        let cap = PlanExecCapability::new(exec).with_budget_policy(Some(1.0), None);
+        let out = cap
+            .execute(
+                &ctx(),
+                json!({ "plan": plan_json(nodes(a, b), vec![(b, a)]) }),
+            )
+            .await
+            .expect("execute");
+        assert_eq!(out["status"], "done", "cap tripped on the LAST step (m3)");
+        assert_eq!(out["budget"]["triggered"], true);
+        assert_eq!(out["budget"]["action"], "cancel");
+
+        // Same steps + a THIRD would be cut; prove the default cancels.
+        let ids = sorted_ids(3);
+        let (a, b, c_id) = (ids[0], ids[1], ids[2]);
+        let exec = FakePlanExec::new(1, 100);
+        let cap = PlanExecCapability::new(exec).with_budget_policy(Some(1.0), None);
+        let mut three = nodes(a, b);
+        three.push(node_of(c_id, json!({})));
+        let out = cap
+            .execute(
+                &ctx(),
+                json!({ "plan": plan_json(three, vec![(b, a), (c_id, b)]) }),
+            )
+            .await
+            .expect("execute");
+        assert_eq!(out["status"], "aborted_budget");
+
+        // A plan-carried budget with a HIGHER cap overrides the default.
+        let ids = sorted_ids(2);
+        let (a, b) = (ids[0], ids[1]);
+        let exec = FakePlanExec::new(1, 100);
+        let cap = PlanExecCapability::new(exec).with_budget_policy(Some(1.0), None);
+        let out = cap
+            .execute(
+                &ctx(),
+                json!({ "plan": plan_json_with_budget(
+                    nodes(a, b), vec![(b, a)],
+                    usd(Some(10.0), None, BudgetAction::Cancel),
+                )}),
+            )
+            .await
+            .expect("execute");
+        assert_eq!(out["status"], "done");
+        assert_eq!(out["budget"]["triggered"], false);
+    }
+
+    #[tokio::test]
+    async fn e06_waiver_disables_default_unless_ceiling_set() {
+        let ids = sorted_ids(2);
+        let (a, b) = (ids[0], ids[1]);
+        let waived = |a: TaskId, b: TaskId| {
+            json!({ "plan": plan_json_with_budget(
+                vec![
+                    node_of(a, json!({"cost": 0.6})),
+                    node_of(b, json!({"cost": 0.6})),
+                ],
+                vec![(b, a)],
+                usd(None, None, BudgetAction::Cancel),
+            )})
+        };
+        // Waiver, no ceiling: unlimited — no budget object at all.
+        let exec = FakePlanExec::new(1, 100);
+        let cap = PlanExecCapability::new(exec).with_budget_policy(Some(0.5), None);
+        let out = cap.execute(&ctx(), waived(a, b)).await.expect("execute");
+        assert_eq!(out["status"], "done");
+        assert!(out.get("budget").is_none(), "no budget in effect");
+
+        // Waiver UNDER a ceiling: the ceiling caps it (M3).
+        let ids = sorted_ids(3);
+        let (a, b, c_id) = (ids[0], ids[1], ids[2]);
+        let exec = FakePlanExec::new(1, 100);
+        let cap = PlanExecCapability::new(exec).with_budget_policy(Some(0.5), Some(1.0));
+        let input = json!({ "plan": plan_json_with_budget(
+            vec![
+                node_of(a, json!({"cost": 0.6})),
+                node_of(b, json!({"cost": 0.6})),
+                node_of(c_id, json!({})),
+            ],
+            vec![(b, a), (c_id, b)],
+            usd(None, None, BudgetAction::Cancel),
+        )});
+        let out = cap.execute(&ctx(), input).await.expect("execute");
+        assert_eq!(out["status"], "aborted_budget");
+        assert!((out["budget"]["cap_usd"].as_f64().expect("cap") - 1.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn e07_failed_steps_contribute_zero_frozen() {
+        // M4 freeze: a cost-then-fail step reports $0 (Failed outcomes
+        // carry only an error string). 5.9's result-row costs fix it.
+        let ids = sorted_ids(2);
+        let (a, b) = (ids[0], ids[1]);
+        let exec = FakePlanExec::new(1, 100);
+        let cap = PlanExecCapability::new(exec.clone());
+        let c = ctx();
+        let input = json!({
+            "plan": plan_json_with_budget(
+                vec![
+                    node_of(a, json!({"fail": true, "cost": 5.0})),
+                    node_of(b, json!({"cost": 0.6})),
+                ],
+                vec![],
+                usd(Some(1.0), None, BudgetAction::Cancel),
+            ),
+            "on_failure": "continue",
+        });
+        let out = cap.execute(&c, input).await.expect("execute");
+        assert_eq!(out["budget"]["triggered"], false, "failed $5 never counted");
+        assert!((out["budget"]["spent_usd"].as_f64().expect("spent") - 0.6).abs() < 1e-9);
     }
 }

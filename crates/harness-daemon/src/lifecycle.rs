@@ -403,8 +403,16 @@ impl DaemonOrchestrator {
             );
             harness_capabilities::enrich_with_mesh_meta(&capabilities, mesh_exec.clone());
             // 4.3: plan.execute — the DAG executor driver shares the
-            // same daemon services (ADR-0025).
-            harness_capabilities::enrich_with_plan_exec(&capabilities, mesh_exec);
+            // same daemon services (ADR-0025). 5.8: the [execution]
+            // budget knobs thread in from the policy snapshot
+            // (available since load at startup — ADR-0036).
+            let exec_policy_snapshot = policy_engine.snapshot();
+            harness_capabilities::enrich_with_plan_exec(
+                &capabilities,
+                mesh_exec,
+                exec_policy_snapshot.execution.default_plan_budget_usd,
+                exec_policy_snapshot.execution.plan_budget_ceiling_usd,
+            );
         }
 
         // Phase 3.8/3.9: register `brain.plan` with a backend lineup.

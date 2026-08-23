@@ -142,6 +142,53 @@ fn t08_cost_exceeded_fails() {
 }
 
 #[test]
+fn t08b_plan_carried_budget_below_estimate_is_inconsistent() {
+    // 5.8 (ADR-0036, future-proofing — planner backends emit
+    // budget: None today, pinned elsewhere): a plan promising a
+    // budget below its own estimate is rejected at plan time.
+    let mut p = one_node_plan("shell.exec", json!({"cmd": "ls"}));
+    p.budget = Some(harness_core::protocol::Budget {
+        max_cost_usd: Some(0.50),
+        soft_limit_usd: None,
+        on_exceed: harness_core::protocol::BudgetAction::Cancel,
+    });
+    let r = validate_plan(
+        &p,
+        1.00,
+        &PlanConstraints::default(),
+        &shell_index(),
+        &shell_only(),
+        &no_cloud(),
+    );
+    let Err(PlanValidationError::BudgetInconsistent {
+        estimated_usd,
+        budget_usd,
+    }) = r
+    else {
+        panic!("expected BudgetInconsistent; got {r:?}");
+    };
+    assert!((estimated_usd - 1.00).abs() < f64::EPSILON);
+    assert!((budget_usd - 0.50).abs() < f64::EPSILON);
+
+    // A budget AT the estimate passes (equality allowed, like rule 6),
+    // and so does a waiver (max: None).
+    p.budget = Some(harness_core::protocol::Budget {
+        max_cost_usd: Some(1.00),
+        soft_limit_usd: None,
+        on_exceed: harness_core::protocol::BudgetAction::Cancel,
+    });
+    assert!(validate_plan(
+        &p,
+        1.00,
+        &PlanConstraints::default(),
+        &shell_index(),
+        &shell_only(),
+        &no_cloud(),
+    )
+    .is_ok());
+}
+
+#[test]
 fn t09_cost_at_cap_passes() {
     // <= not < — equality at the cap is allowed.
     let p = one_node_plan("shell.exec", json!({"cmd": "ls"}));
