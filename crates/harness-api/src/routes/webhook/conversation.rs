@@ -182,6 +182,21 @@ pub fn handle(
         return twiml(None);
     }
 
+    // Provider compliance events: when Twilio's opt-out handling
+    // fires (STOP/HELP/START keywords), the inbound webhook still
+    // arrives — tagged `OptOutType` — while Twilio owns the reply and
+    // the messaging-state change. A compliance keyword is not a goal:
+    // ack empty, mint nothing, attempt no reply of our own.
+    if let Some(opt_out) = form_value(&pairs, "OptOutType") {
+        tracing::info!(
+            target: "harness.api.webhook",
+            channel = channel.name,
+            opt_out_type = %opt_out,
+            "provider opt-out/help event; not treating body as a goal"
+        );
+        return twiml(None);
+    }
+
     let goal = form_value(&pairs, "Body").unwrap_or("").trim().to_string();
     if goal.is_empty() {
         return twiml(Some("send a goal, e.g. \"run: uname -a\""));

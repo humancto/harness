@@ -39,8 +39,12 @@ scheme, security posture, and conversion contract.
   reply economics ever matter.
 - **STOP/HELP opt-out** rests on Twilio's platform-level handling
   (default opt-out on long codes/toll-free; suppressed sends surface
-  as the existing rejected-reply warn path). Combined with the
-  deny-all allowlist there is no compliance code to write here.
+  as the existing rejected-reply warn path). The adapter's only
+  compliance code is a guard, not a replacement: inbound webhooks
+  carrying `OptOutType` (Twilio's marker that its opt-out handling
+  fired) are acked empty and never minted as goals — an allowlisted
+  operator texting STOP must not launch a mesh task or trigger a
+  reply Twilio would suppress.
 - **No new machinery decisions** — everything else is recorded reuse
   of ADR-0033 (which gains a cross-reference).
 
