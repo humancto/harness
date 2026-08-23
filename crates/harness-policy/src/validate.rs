@@ -37,6 +37,21 @@ pub(crate) fn validate(policy: &Policy) -> Result<(), PolicyError> {
     check_mcp_rules("mcp.allow", &policy.mcp.allow, &mut errors);
     check_mcp_rules("mcp.deny", &policy.mcp.deny, &mut errors);
 
+    // 5.8 (Codex P2 on #59): monetary limits must be finite and
+    // non-negative — TOML happily parses `nan`/`inf`, and a NaN cap
+    // makes every `spent > cap` comparison false, silently disabling
+    // the budget; a negative cap trips on the first $0 step.
+    check_usd(
+        "execution.default_plan_budget_usd",
+        policy.execution.default_plan_budget_usd,
+        &mut errors,
+    );
+    check_usd(
+        "execution.plan_budget_ceiling_usd",
+        policy.execution.plan_budget_ceiling_usd,
+        &mut errors,
+    );
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -89,5 +104,15 @@ fn check_cmd(field: &str, value: &str, errors: &mut Vec<String>) {
         errors.push(format!(
             "{field} contains whitespace ({value:?}); split into cmd + subcmds"
         ));
+    }
+}
+
+fn check_usd(field: &str, value: Option<f64>, errors: &mut Vec<String>) {
+    if let Some(v) = value {
+        if !v.is_finite() || v < 0.0 {
+            errors.push(format!(
+                "{field} must be a finite, non-negative dollar amount (got {v})"
+            ));
+        }
     }
 }

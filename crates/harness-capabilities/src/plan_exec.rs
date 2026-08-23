@@ -348,10 +348,14 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
         Arc::new(parking_lot::Mutex::new(HashMap::new()));
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ReadyStep>(plan.tasks.len().max(1));
-    // 5.8 Pause mechanism (plan review B1): the sender lives in an
-    // Option so the driver can DROP it mid-loop — the fan-out source
-    // then drains and the stream ends with `SourceDrained` once the
-    // genuinely in-flight steps settle. No new loop-exit conditions.
+    // 5.8 Pause mechanism (plan review B1 + Codex P1 on #59): the
+    // sender lives in an Option so the driver can DROP it mid-loop,
+    // and the fan-out SOURCE checks this flag before polling the
+    // channel — closing the sender alone would still let the window
+    // refill from `ReadyStep`s already buffered in the channel. With
+    // the flag up the source reports drained immediately, in-flight
+    // steps settle, and the stream ends with `SourceDrained`.
+    let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut tx = Some(tx);
     // Send-order node ids: FanoutEvent::Item.index resolves through it.
     let mut sent: Vec<TaskId> = Vec::new();
@@ -364,7 +368,15 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
         let parent = ctx.task_id;
         let plan_id = plan.id;
         FanoutSpec {
-            source: Box::pin(futures::stream::poll_fn(move |cx| rx.poll_recv(cx))),
+            source: Box::pin({
+                let paused = paused.clone();
+                futures::stream::poll_fn(move |cx| {
+                    if paused.load(std::sync::atomic::Ordering::Relaxed) {
+                        return std::task::Poll::Ready(None);
+                    }
+                    rx.poll_recv(cx)
+                })
+            }),
             run: Box::new(move |_index, step: ReadyStep| {
                 let exec = run_exec.clone();
                 let row_ids = row_ids.clone();
@@ -530,12 +542,14 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
                                 match action {
                                     harness_core::protocol::BudgetAction::Notify => {}
                                     harness_core::protocol::BudgetAction::Pause => {
-                                        // Drop the sender: in-flight
-                                        // steps finish (their costs
-                                        // record), the source drains,
-                                        // End(SourceDrained) breaks
-                                        // the loop.
+                                        // Raise the pause flag (the source
+                                        // stops pulling even BUFFERED steps
+                                        // — Codex P1) then drop the sender
+                                        // to wake the stream. In-flight
+                                        // steps finish and cost-record; the
+                                        // stream ends with SourceDrained.
                                         budget_stop = Some("paused_budget");
+                                        paused.store(true, std::sync::atomic::Ordering::Relaxed);
                                         tx = None;
                                     }
                                     // Cancel — and any future action
@@ -625,11 +639,13 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
         .collect();
     // 5.8 (plan review B2): the task-envelope TaskState set is NOT
     // extended — plan-level outcome lives in this aggregate `status`
-    // field. A budget stop with nothing left undone stays "done"
-    // (review m3: cancelling after the last step must not turn a
-    // complete plan into an abort).
+    // field. The discriminator is whether the stop actually PARKED
+    // work (Codex P2 on #59): a continue-mode failure before a
+    // last-step exceed leaves done < total with nothing
+    // budget-cancelled — that plan is "done", not aborted (and m3:
+    // a last-step cancel never turns a complete plan into an abort).
     let status = match budget_stop {
-        Some(s) if summary.done < summary.total => s,
+        Some(s) if !unscheduled.is_empty() => s,
         _ => "done",
     };
     let mut aggregate = json!({
@@ -1673,5 +1689,66 @@ mod tests {
         let out = cap.execute(&c, input).await.expect("execute");
         assert_eq!(out["budget"]["triggered"], false, "failed $5 never counted");
         assert!((out["budget"]["spent_usd"].as_f64().expect("spent") - 0.6).abs() < 1e-9);
+    }
+    #[tokio::test]
+    async fn e08_pause_never_dispatches_buffered_steps() {
+        // Codex P1 on #59: a wide fan-out buffers EVERY ready step in
+        // the plan-sized channel up front; pausing must stop the
+        // window refilling from that buffer, not just close the
+        // sender. 6 independent costed steps, workers=1 (window 4),
+        // cap $0.5 Pause: the first completion trips the cap; only
+        // the already-pulled window may still finish.
+        let ids = sorted_ids(6);
+        let exec = FakePlanExec::new(1, 100);
+        let cap = PlanExecCapability::new(exec.clone());
+        let c = ctx();
+        let input = json!({ "plan": plan_json_with_budget(
+            ids.iter().map(|&i| node_of(i, json!({"cost": 0.6}))).collect(),
+            vec![],
+            usd(Some(0.5), None, BudgetAction::Pause),
+        )});
+        let out = cap.execute(&c, input).await.expect("execute");
+        assert_eq!(out["status"], "paused_budget");
+        let ok = out["ok"].as_u64().expect("ok");
+        let skipped = out["skipped"].as_u64().expect("skipped");
+        // Window = clamp(2×workers, 4, 64) = 4 for workers=1: the
+        // tripping step plus up to 3 already-in-flight finish; the 2
+        // steps still sitting in the channel buffer must NOT run
+        // (pre-fix, all 6 ran and ok was 6).
+        assert!(ok <= 4, "at most the in-flight window finishes, got {ok}");
+        assert!(skipped >= 2, "buffered steps must NOT run, got {skipped}");
+        assert_eq!(ok + skipped, 6);
+        assert!(
+            out["budget"]["spent_usd"].as_f64().expect("spent") <= 2.4 + 1e-9,
+            "spend bounded by the window"
+        );
+    }
+
+    #[tokio::test]
+    async fn e09_continue_mode_failure_plus_last_step_exceed_is_done() {
+        // Codex P2 on #59: a failed step (continue mode) leaves
+        // done < total, but a last-step exceed parked NOTHING — the
+        // status discriminator is unscheduled work, not done<total.
+        let ids = sorted_ids(2);
+        let (a, b) = (ids[0], ids[1]);
+        let exec = FakePlanExec::new(1, 100);
+        let cap = PlanExecCapability::new(exec.clone());
+        let c = ctx();
+        let input = json!({
+            "plan": plan_json_with_budget(
+                vec![
+                    node_of(a, json!({"fail": true})),
+                    node_of(b, json!({"cost": 2.0})),
+                ],
+                vec![],
+                usd(Some(1.0), None, BudgetAction::Cancel),
+            ),
+            "on_failure": "continue",
+        });
+        let out = cap.execute(&c, input).await.expect("execute");
+        assert_eq!(out["status"], "done", "nothing was budget-parked");
+        assert_eq!(out["budget"]["triggered"], true);
+        assert_eq!(out["failed"], 1);
+        assert!(out["budget"].get("unscheduled").is_none());
     }
 }

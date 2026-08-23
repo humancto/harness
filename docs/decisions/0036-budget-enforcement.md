@@ -49,10 +49,12 @@ PRICING and per-plan/user/day aggregation are 5.9's `harness-cost`.
      settle Skipped. In-flight runner futures are dropped exactly
      like fail-fast (their rows orphan-complete under their own
      timeouts, ADR-0022).
-   - **Pause** — the driver drops the fan-out sender: the source
-     drains, genuinely in-flight steps FINISH (their costs record),
-     the stream ends with `SourceDrained`, and never-dispatched
-     steps settle Skipped. Without 5.11/5.12 there is nothing to
+   - **Pause** — the driver raises a pause flag consulted by the
+     fan-out SOURCE (so the window cannot refill from `ReadyStep`s
+     already buffered in the channel — Codex P1 on #59) and drops
+     the sender to wake the stream: genuinely in-flight steps FINISH
+     (their costs record), the stream ends with `SourceDrained`, and
+     both buffered and never-dispatched steps settle Skipped. Without 5.11/5.12 there is nothing to
      resume FROM — "pause" is stop-scheduling with a resumable
      record; 5.12 upgrades it. The budget object lists the
      `unscheduled` step ids so resume can tell budget-parked from
@@ -65,8 +67,11 @@ PRICING and per-plan/user/day aggregation are 5.9's `harness-cost`.
    a budget was in effect. Budget stops return **Ok** — a policy
    verdict over meaningful partial results must not discard the
    aggregate into an error string; existing fail-fast keeps its Err.
-   A stop that fires after the last step leaves `status: "done"`
-   (`triggered: true` records the event). Budget events also ride
+   The `status` discriminator is whether the stop actually PARKED
+   work (`unscheduled` non-empty) — a stop that fires after the last
+   step, or after only continue-mode failures, leaves
+   `status: "done"` (`triggered: true` records the event; Codex P2
+   on #59). Budget events also ride
    the Progress frame stream (`{"budget": {"event": ...}}`) for
    5.10's Costs UI; today's DAG view ignores unknown keys. The
    webhook reply and CLI exec renderer read `status` (a paused plan
@@ -75,6 +80,12 @@ PRICING and per-plan/user/day aggregation are 5.9's `harness-cost`.
    `BudgetInconsistent` rule — a plan whose own `budget.max_cost_usd`
    is below its `estimated_cost_usd` is rejected. Future-proofing:
    planner backends emit no budget today.
+
+7. **Limit hygiene** (Codex P2 on #59): policy load rejects
+   non-finite or negative `[execution]` dollar knobs (TOML parses
+   `nan`, which would silently disable every `spent > cap`
+   comparison); a plan-carried nonsense limit sanitizes to the
+   STRICTEST reading ($0), never "unlimited".
 
 ## Recorded limitations
 

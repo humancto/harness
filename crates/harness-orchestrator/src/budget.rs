@@ -75,6 +75,13 @@ impl BudgetTracker {
         if let Some(ceiling) = ceiling_usd {
             cap = Some(cap.map_or(ceiling, |c| c.min(ceiling)));
         }
+        // Fail-closed sanitization (Codex P2 on #59): policy values
+        // are validated at load, but a plan-carried Budget arrives
+        // from the submitter — a nonsense limit becomes the STRICTEST
+        // reading ($0), never "unlimited".
+        let sanitize = |v: Option<f64>| v.map(|x| if x.is_finite() { x.max(0.0) } else { 0.0 });
+        cap = sanitize(cap);
+        let soft = sanitize(soft);
         let active = cap.is_some() || soft.is_some();
         Self {
             cap_usd: cap,
@@ -299,6 +306,33 @@ mod tests {
             BudgetVerdict::SoftCrossed { .. }
         ));
         assert_eq!(t.record(&json!({"cost_usd": 100.0})), BudgetVerdict::Ok);
+    }
+
+    #[test]
+    fn t06_nonsense_limits_fail_closed() {
+        // A negative or non-finite cap is $0 (strictest), never
+        // unlimited: the first costed step trips it.
+        let mut t = BudgetTracker::new(
+            Some(budget(Some(-3.0), None, BudgetAction::Cancel)),
+            None,
+            None,
+        );
+        assert_eq!(t.cap_usd(), Some(0.0));
+        assert!(matches!(
+            t.record(&json!({"cost_usd": 0.01})),
+            BudgetVerdict::Exceeded { .. }
+        ));
+        let t = BudgetTracker::new(
+            Some(budget(
+                Some(f64::NAN),
+                Some(f64::INFINITY),
+                BudgetAction::Cancel,
+            )),
+            None,
+            None,
+        );
+        assert_eq!(t.cap_usd(), Some(0.0));
+        assert_eq!(t.soft_limit_usd(), Some(0.0));
     }
 
     #[test]

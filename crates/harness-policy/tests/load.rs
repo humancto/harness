@@ -327,3 +327,18 @@ fn tempdir() -> Tempdir {
     std::fs::create_dir_all(&dir).unwrap();
     Tempdir(dir)
 }
+
+#[test]
+fn t_nonfinite_execution_budget_rejected() {
+    // 5.8 (Codex P2 on #59): TOML parses nan/inf; a NaN cap silently
+    // disables the default budget. Load must reject it.
+    for bad in ["nan", "inf", "-1.0"] {
+        let toml = format!("[execution]\ndefault_plan_budget_usd = {bad}\n");
+        let r = harness_policy::load_from_str(&toml);
+        assert!(r.is_err(), "{bad} must be rejected");
+    }
+    let ok = harness_policy::load_from_str("[execution]\nplan_budget_ceiling_usd = 12.5\n")
+        .expect("valid");
+    assert!((ok.execution.plan_budget_ceiling_usd.expect("set") - 12.5).abs() < f64::EPSILON);
+    assert!((ok.execution.default_plan_budget_usd.expect("default") - 5.0).abs() < f64::EPSILON);
+}
