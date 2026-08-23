@@ -553,3 +553,274 @@ pub async fn cancel_handler(
         }
     }
 }
+
+/// Body of `POST /api/v1/tasks/{id}/resume` (5.12). All fields
+/// optional: a bare resume re-runs the plan under its original cap.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResumeRequest {
+    /// Raise (or lower) the plan's cap for the resumed run. Still
+    /// clamped by `[execution] plan_budget_ceiling_usd` at execute
+    /// time — the response reports what actually applies.
+    #[serde(default)]
+    pub max_cost_usd: Option<f64>,
+    /// Resume even when steps were in flight when the plan stopped.
+    /// Those steps were dispatched and their outcome was never
+    /// recorded, so resuming may run them a second time.
+    #[serde(default)]
+    pub allow_in_flight: bool,
+}
+
+/// The unfinished-step lists a stopped plan recorded (5.12).
+struct ResumePoint {
+    plan: JsonValue,
+    plan_id: harness_core::PlanId,
+    unscheduled: Vec<String>,
+    in_flight: Vec<String>,
+}
+
+/// Read a terminal `plan.execute` row's aggregate and the plan it ran.
+fn resume_point(
+    store: &harness_store::Store,
+    task_id: TaskId,
+) -> Result<ResumePoint, (StatusCode, &'static str)> {
+    let task = match store.load_task(task_id) {
+        Ok(Some(t)) => t,
+        Ok(None) => return Err((StatusCode::NOT_FOUND, "unknown_task")),
+        Err(err) => {
+            tracing::error!(target: "harness.api.tasks", ?err, "load task (resume)");
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "load_failed"));
+        }
+    };
+    if task.capability != "plan.execute" {
+        return Err((StatusCode::CONFLICT, "not_a_plan"));
+    }
+    let plan = task.input.get("plan").cloned().unwrap_or(JsonValue::Null);
+    if !plan.is_object() {
+        return Err((StatusCode::CONFLICT, "plan_missing"));
+    }
+    let aggregate = match store.load_task_result(task_id) {
+        Ok(Some(row)) => row.output.unwrap_or(JsonValue::Null),
+        // No result row: the plan never finished (a crash, or the boot
+        // sweep failed it). Everything the checkpoints do not cover
+        // re-runs, and there is no list to warn about.
+        Ok(None) => JsonValue::Null,
+        Err(err) => {
+            tracing::error!(target: "harness.api.tasks", ?err, "load result (resume)");
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "load_failed"));
+        }
+    };
+    let ids = |key: &str| -> Vec<String> {
+        aggregate
+            .get("resume")
+            .and_then(|r| r.get(key))
+            .and_then(JsonValue::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(ToString::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let Some(plan_id) = plan
+        .get("id")
+        .and_then(JsonValue::as_str)
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .map(harness_core::PlanId)
+    else {
+        return Err((StatusCode::CONFLICT, "plan_missing"));
+    };
+    Ok(ResumePoint {
+        plan,
+        plan_id,
+        unscheduled: ids("unscheduled"),
+        in_flight: ids("in_flight"),
+    })
+}
+
+/// The id of a non-terminal `plan.execute` row for this plan, if one
+/// exists (5.12) — resuming while a run is live would put two
+/// coordinators on one plan, both minting steps and side effects.
+fn live_plan_run(
+    store: &harness_store::Store,
+    plan_id: harness_core::PlanId,
+) -> Result<Option<TaskId>, (StatusCode, &'static str)> {
+    // `list_tasks_by_plan` yields (id, capability, state, parent).
+    match store.list_tasks_by_plan(plan_id) {
+        Ok(rows) => Ok(rows
+            .iter()
+            .find(|(_, capability, state, _)| {
+                capability == "plan.execute"
+                    && !matches!(
+                        state,
+                        harness_store::TaskState::Done
+                            | harness_store::TaskState::Failed
+                            | harness_store::TaskState::Cancelled
+                            | harness_store::TaskState::Expired
+                    )
+            })
+            .map(|(id, ..)| *id)),
+        Err(err) => {
+            tracing::error!(target: "harness.api.tasks", ?err, "list plan rows (resume)");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "load_failed"))
+        }
+    }
+}
+
+/// Replace a plan's cap for a resumed run, re-signing it with the
+/// local identity (5.12). The plan's signature is not verified at
+/// execute time, but a mutated plan should not carry a stale one.
+/// The raise is still clamped by `[execution] plan_budget_ceiling_usd`
+/// when the plan runs.
+fn raise_plan_cap(
+    state: &ApiState,
+    mut plan_value: JsonValue,
+    cap: f64,
+) -> Result<JsonValue, (StatusCode, &'static str)> {
+    if !cap.is_finite() || cap < 0.0 {
+        return Err((StatusCode::BAD_REQUEST, "bad_max_cost_usd"));
+    }
+    plan_value["budget"] = serde_json::json!({
+        "max_cost_usd": cap,
+        "soft_limit_usd": plan_value
+            .get("budget")
+            .and_then(|b| b.get("soft_limit_usd"))
+            .cloned()
+            .unwrap_or(JsonValue::Null),
+        "on_exceed": plan_value
+            .get("budget")
+            .and_then(|b| b.get("on_exceed"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("cancel")),
+    });
+    match serde_json::from_value::<harness_core::Plan>(plan_value.clone()) {
+        Ok(mut plan) => {
+            if let Err(err) = plan.sign(&state.identity) {
+                tracing::error!(target: "harness.api.tasks", ?err, "re-sign plan");
+            }
+            Ok(serde_json::to_value(&plan).unwrap_or(plan_value))
+        }
+        Err(err) => {
+            tracing::warn!(target: "harness.api.tasks", %err, "resume plan re-parse");
+            Err((StatusCode::CONFLICT, "plan_malformed"))
+        }
+    }
+}
+
+/// `POST /api/v1/tasks/{id}/resume` — re-run a stopped plan, replaying
+/// every step whose checkpoint still stands (5.12, ADR-0040).
+///
+/// Mints a NEW `plan.execute` row carrying the SAME plan id, which is
+/// what makes 5.11's checkpoints hit. It cannot re-dispatch the old
+/// row: a plan.execute that ran locally holds no lease, and the boot
+/// orphan sweep marks a crashed one `Failed` — a terminal state with
+/// no outgoing transition.
+pub async fn resume_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id_str): Path<String>,
+    body: Option<Json<ResumeRequest>>,
+) -> axum::response::Response {
+    if !is_authenticated(&state.auth, &headers) {
+        return unauthorized();
+    }
+    let Some(store) = state.store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "store_not_configured" })),
+        )
+            .into_response();
+    };
+    let Ok(task_id) = parse_task_id(&id_str) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "bad_task_id" })),
+        )
+            .into_response();
+    };
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+
+    let point = match resume_point(store, task_id) {
+        Ok(p) => p,
+        Err((code, err)) => {
+            return (code, Json(serde_json::json!({ "error": err }))).into_response()
+        }
+    };
+    let plan_id = point.plan_id;
+
+    // Idempotence: never a second coordinator for one plan.
+    match live_plan_run(store, plan_id) {
+        Ok(Some(live_id)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "already_running",
+                    "task_id": format!("{}", live_id.0.as_hyphenated()),
+                })),
+            )
+                .into_response()
+        }
+        Ok(None) => {}
+        Err((code, err)) => {
+            return (code, Json(serde_json::json!({ "error": err }))).into_response()
+        }
+    }
+
+    if !point.in_flight.is_empty() && !req.allow_in_flight {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "steps_in_flight",
+                "in_flight": point.in_flight,
+                "hint": "these steps were dispatched and never settled; \
+                         resuming may run them twice — pass allow_in_flight",
+            })),
+        )
+            .into_response();
+    }
+
+    let mut plan_value = point.plan;
+    if let Some(cap) = req.max_cost_usd {
+        match raise_plan_cap(&state, plan_value, cap) {
+            Ok(v) => plan_value = v,
+            Err((code, err)) => {
+                return (code, Json(serde_json::json!({ "error": err }))).into_response()
+            }
+        }
+    }
+
+    let replayable = store.checkpoint_count(plan_id).unwrap_or(0);
+    let mint = mint_task(
+        &state,
+        store,
+        SubmitRequest {
+            capability: "plan.execute".to_string(),
+            input: serde_json::json!({ "plan": plan_value }),
+            constraints: None,
+            execution: None,
+            tags: vec!["resume".to_string()],
+            resource_hints: None,
+        },
+    );
+    match mint {
+        Ok(new_id) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "task_id": format!("{}", new_id.0.as_hyphenated()),
+                "plan_id": format!("{}", plan_id.0.as_hyphenated()),
+                // How many steps can replay from checkpoints. Zero
+                // means the whole plan re-runs — checkpoints are local
+                // and expire, so this is honest, not a promise.
+                "replayable": replayable,
+                "unscheduled": point.unscheduled,
+                "in_flight": point.in_flight,
+            })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": err })),
+        )
+            .into_response(),
+    }
+}

@@ -135,6 +135,11 @@ pub struct PlanExecCapability {
     default_plan_budget_usd: Option<f64>,
     /// 5.8: hard ceiling over every plan when set.
     plan_budget_ceiling_usd: Option<f64>,
+    /// 5.12 (ADR-0040): checkpoint plans that do not ask for it
+    /// themselves. 5.11 made `Plan.checkpoint` real, but no planner
+    /// backend emits one — without this default, checkpointing never
+    /// runs outside hand-authored plans and a resume replays nothing.
+    checkpoint_by_default: bool,
     /// One plan per node: `try_acquire` and fail fast — never queue
     /// while holding an executor permit (plan review BLOCKER-1).
     inflight: Arc<tokio::sync::Semaphore>,
@@ -154,7 +159,16 @@ impl PlanExecCapability {
             inflight: Arc::new(tokio::sync::Semaphore::new(1)),
             default_plan_budget_usd: Some(5.0),
             plan_budget_ceiling_usd: None,
+            checkpoint_by_default: true,
         }
+    }
+
+    /// 5.12: opt every plan into checkpointing unless it says
+    /// otherwise (`[execution] checkpoint_plans`).
+    #[must_use]
+    pub fn with_checkpoint_default(mut self, on: bool) -> Self {
+        self.checkpoint_by_default = on;
+        self
     }
 
     /// Thread the mesh budget policy (5.8, ADR-0036): `default` caps
@@ -178,12 +192,14 @@ pub fn enrich_with_plan_exec(
     exec: Arc<dyn PlanExec>,
     default_plan_budget_usd: Option<f64>,
     plan_budget_ceiling_usd: Option<f64>,
+    checkpoint_plans: bool,
 ) {
     registry
-        .register(Arc::new(PlanExecCapability::new(exec).with_budget_policy(
-            default_plan_budget_usd,
-            plan_budget_ceiling_usd,
-        )))
+        .register(Arc::new(
+            PlanExecCapability::new(exec)
+                .with_budget_policy(default_plan_budget_usd, plan_budget_ceiling_usd)
+                .with_checkpoint_default(checkpoint_plans),
+        ))
         .expect("BUG: plan.execute registered twice");
 }
 
@@ -335,6 +351,7 @@ impl Capability for PlanExecCapability {
             timeout,
             fail_fast,
             budget,
+            checkpoint_by_default: self.checkpoint_by_default,
         })
         .await
     }
@@ -348,6 +365,9 @@ struct DriveArgs<'a> {
     timeout: Duration,
     fail_fast: bool,
     budget: harness_orchestrator::BudgetTracker,
+    /// 5.12: the policy default applied when the plan itself is
+    /// silent about checkpointing.
+    checkpoint_by_default: bool,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -360,6 +380,7 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
         timeout,
         fail_fast,
         mut budget,
+        checkpoint_by_default,
     } = args;
     let started = tokio::time::Instant::now();
     let mut scheduler = DagScheduler::new(&plan)
@@ -493,7 +514,20 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
     // a visible warning frame rather than pretending (the store is the
     // single-file property; a second on-disk format is not this PR).
     let mut checkpoint_hashes: HashMap<TaskId, [u8; 32]> = HashMap::new();
-    let checkpoint_hash_fn = match plan.checkpoint.as_ref() {
+    let default_checkpoint = harness_core::CheckpointConfig {
+        enabled: true,
+        interval_items: 1,
+        storage: harness_core::CheckpointStorage::Sqlite,
+        input_hash_fn: HashFn::Blake3,
+    };
+    // The plan's own config wins; a plan that says nothing (every
+    // planner backend emits `None`) takes the policy default, or 5.11
+    // never runs outside hand-authored plans (plan review BLOCKER-1).
+    let effective_checkpoint = plan
+        .checkpoint
+        .clone()
+        .or_else(|| checkpoint_by_default.then_some(default_checkpoint));
+    let checkpoint_hash_fn = match effective_checkpoint.as_ref() {
         Some(cfg) if cfg.enabled => match cfg.storage {
             harness_core::CheckpointStorage::Sqlite => Some(cfg.input_hash_fn),
             // `None` means "off" — no warning owed. `File` and any
@@ -795,6 +829,19 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
     // replayed steps were paid for in the earlier run. The count makes
     // that legible instead of surprising.
     let replayed = records.values().filter(|r| r.from_checkpoint).count();
+    // 5.12 (ADR-0040): tell the two kinds of unfinished step apart.
+    // A row was minted ⇒ the step really was dispatched and its
+    // outcome is unknown, so resuming it may run it twice. A step
+    // with no row never left the ready set — safe to resume. Keying
+    // on rows, not scheduler state, matters: a step is marked
+    // `InFlight` when it leaves the ready set, BEFORE the window
+    // pulls it, and the 5.8 Pause path deliberately leaves buffered
+    // steps unpulled — scheduler state would call almost every
+    // budget resume unsafe (plan review MAJOR-3).
+    let (in_flight, never_dispatched): (Vec<TaskId>, Vec<TaskId>) = {
+        let rows = row_ids.lock();
+        unscheduled.iter().partition(|id| rows.contains_key(*id))
+    };
     let mut aggregate = json!({
         "plan_id": plan.id.0.to_string(),
         "name": plan.name,
@@ -822,6 +869,19 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
                 .collect::<Vec<_>>());
         }
         aggregate["budget"] = b;
+    }
+    // The resume surface: what is left, and how safe it is to retry.
+    if !unscheduled.is_empty() {
+        aggregate["resume"] = json!({
+            "unscheduled": never_dispatched
+                .iter()
+                .map(|id| id.0.to_string())
+                .collect::<Vec<_>>(),
+            "in_flight": in_flight
+                .iter()
+                .map(|id| id.0.to_string())
+                .collect::<Vec<_>>(),
+        });
     }
     if let Some(sink) = &sink {
         let chunk = json!({ "plan_summary": {
@@ -2295,5 +2355,72 @@ mod tests {
             "a stopped replay must not wait out the deadline: {}",
             out["duration_ms"]
         );
+    }
+    #[tokio::test]
+    async fn e16_policy_default_turns_checkpointing_on() {
+        // 5.12 (plan review BLOCKER-1): no planner backend emits a
+        // CheckpointConfig, so without the policy default 5.11 never
+        // runs for a plan the product produces and every resume
+        // replays nothing.
+        let ids = sorted_ids(2);
+        let (a, b) = (ids[0], ids[1]);
+        let exec = FakePlanExec::new(2, 100);
+        let cap = PlanExecCapability::new(exec.clone());
+        // A plan that says NOTHING about checkpointing.
+        let input = json!({ "plan": plan_json(
+            vec![node_of(a, json!({})), node_of(b, json!({}))],
+            vec![(b, a)],
+        )});
+        cap.execute(&ctx(), input).await.expect("Ok aggregate");
+        assert_eq!(
+            exec.checkpoints.lock().len(),
+            2,
+            "the policy default checkpoints a silent plan"
+        );
+
+        // Opted out: nothing is recorded.
+        let exec2 = FakePlanExec::new(2, 100);
+        let cap2 = PlanExecCapability::new(exec2.clone()).with_checkpoint_default(false);
+        let ids = sorted_ids(1);
+        let input2 = json!({ "plan": plan_json(vec![node_of(ids[0], json!({}))], vec![]) });
+        cap2.execute(&ctx(), input2).await.expect("Ok aggregate");
+        assert!(exec2.checkpoints.lock().is_empty(), "opt-out honored");
+    }
+
+    #[tokio::test]
+    async fn e17_resume_lists_split_dispatched_from_never_started() {
+        // 5.12 (plan review MAJOR-3): a step that was dispatched and
+        // never settled may run twice on resume; a step that never
+        // left the ready set is safe. The split keys on whether a ROW
+        // was minted, not on scheduler state — a budget Pause leaves
+        // buffered steps marked InFlight by the scheduler while no row
+        // exists for them.
+        let ids = sorted_ids(3);
+        let (a, b, c_id) = (ids[0], ids[1], ids[2]);
+        let exec = FakePlanExec::new(1, 100);
+        exec.cancelled.store(true, Ordering::SeqCst);
+        let cap = PlanExecCapability::new(exec.clone());
+        let input = json!({ "plan": plan_json(
+            vec![node_of(a, json!({})), node_of(b, json!({})), node_of(c_id, json!({}))],
+            vec![(b, a), (c_id, b)],
+        )});
+        let out = cap.execute(&ctx(), input).await.expect("Ok aggregate");
+
+        assert_eq!(out["status"], "cancelled");
+        let resume = &out["resume"];
+        let unscheduled = resume["unscheduled"].as_array().expect("unscheduled");
+        let in_flight = resume["in_flight"].as_array().expect("in_flight");
+        assert_eq!(
+            unscheduled.len() + in_flight.len(),
+            2,
+            "both stranded steps are accounted for: {resume}"
+        );
+        // Neither b nor c was ever minted (the cancel broke the loop
+        // at the first completion), so both are safe to resume.
+        assert!(
+            in_flight.is_empty(),
+            "no row was minted for a stranded step: {resume}"
+        );
+        assert_eq!(unscheduled.len(), 2);
     }
 }

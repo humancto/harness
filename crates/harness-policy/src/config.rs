@@ -80,6 +80,15 @@ pub struct ExecutionBudgetPolicy {
     /// plan-carried waiver (`max_cost_usd: null`). Default: none.
     #[serde(default)]
     pub plan_budget_ceiling_usd: Option<f64>,
+
+    /// 5.12 (ADR-0040): checkpoint plan steps by default. 5.11 made
+    /// `Plan.checkpoint` real, but no planner backend emits one — so
+    /// without this every plan runs uncheckpointed and a resume
+    /// replays nothing. `false` restores the pre-5.12 behavior for
+    /// operators who would rather re-run a step than replay its
+    /// recorded output.
+    #[serde(default = "default_true")]
+    pub checkpoint_plans: bool,
 }
 
 impl Default for ExecutionBudgetPolicy {
@@ -87,6 +96,7 @@ impl Default for ExecutionBudgetPolicy {
         Self {
             default_plan_budget_usd: default_plan_budget_usd(),
             plan_budget_ceiling_usd: None,
+            checkpoint_plans: default_true(),
         }
     }
 }
@@ -94,6 +104,10 @@ impl Default for ExecutionBudgetPolicy {
 #[allow(clippy::unnecessary_wraps)]
 fn default_plan_budget_usd() -> Option<f64> {
     Some(5.0)
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

@@ -429,6 +429,7 @@ impl DaemonOrchestrator {
                 mesh_exec,
                 exec_policy_snapshot.execution.default_plan_budget_usd,
                 exec_policy_snapshot.execution.plan_budget_ceiling_usd,
+                exec_policy_snapshot.execution.checkpoint_plans,
             );
         }
 

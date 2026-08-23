@@ -51,6 +51,7 @@ pub fn api_router(state: ApiState) -> Router {
         // partials API test.
         .route("/tasks/:id", get(tasks::get_handler))
         .route("/tasks/:id/cancel", post(tasks::cancel_handler))
+        .route("/tasks/:id/resume", post(tasks::resume_handler))
         .route("/runs/:id", get(runs::ws_run))
         .fallback(api_not_found)
         .with_state(state)
