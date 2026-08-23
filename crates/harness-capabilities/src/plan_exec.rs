@@ -2388,6 +2388,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn e16b_a_plan_can_opt_out_under_a_default_on_mesh() {
+        // 5.12 (diff review MINOR-5): the plan's own config always
+        // wins. A plan that says "do not checkpoint me" is exactly
+        // what an operator relies on when the mesh default is on.
+        for storage in [
+            harness_core::CheckpointStorage::Sqlite,
+            harness_core::CheckpointStorage::None,
+        ] {
+            let disabled_by_flag = matches!(storage, harness_core::CheckpointStorage::Sqlite);
+            let ids = sorted_ids(1);
+            let exec = FakePlanExec::new(1, 100);
+            let cap = PlanExecCapability::new(exec.clone());
+            let plan_id = PlanId::new_v7();
+            let mut plan_value =
+                checkpointed_plan_json(plan_id, vec![node_of(ids[0], json!({}))], vec![], storage);
+            if disabled_by_flag {
+                // Sqlite storage but explicitly disabled.
+                plan_value["checkpoint"]["enabled"] = json!(false);
+            }
+            cap.execute(&ctx(), json!({ "plan": plan_value }))
+                .await
+                .expect("Ok aggregate");
+            assert!(
+                exec.checkpoints.lock().is_empty(),
+                "the plan's own config wins over the mesh default"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn e17_resume_lists_split_dispatched_from_never_started() {
         // 5.12 (plan review MAJOR-3): a step that was dispatched and
         // never settled may run twice on resume; a step that never

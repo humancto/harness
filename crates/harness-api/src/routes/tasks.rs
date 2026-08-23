@@ -609,6 +609,11 @@ pub struct ResumeRequest {
 
 /// The unfinished-step lists a stopped plan recorded (5.12).
 struct ResumePoint {
+    /// The original submission, so a resume keeps the caller's
+    /// timeout, failure mode, execution policy, constraints and tags
+    /// (diff review MAJOR-2) instead of silently falling back to
+    /// defaults that fail-fast at 30s.
+    original: Box<Task>,
     plan: JsonValue,
     plan_id: harness_core::PlanId,
     /// The plan ran to completion with nothing left: resuming it would
@@ -649,6 +654,14 @@ fn resume_point(
             return Err((StatusCode::INTERNAL_SERVER_ERROR, "load_failed"));
         }
     };
+    // The aggregate is only ONE source, and not the reliable one
+    // (diff review BLOCKER-1): `drive_plan` returns Err — so the
+    // executor persists an error string and NO aggregate — on exactly
+    // the paths that strand dispatched steps: fail-fast abort,
+    // deadline expiry, "no step succeeded", and a coordinator crash
+    // (no result row at all). The authoritative in-flight source is
+    // the plan's own STEP ROWS: a row exists iff the step was really
+    // dispatched, and a non-terminal one never settled.
     let ids = |key: &str| -> Vec<String> {
         aggregate
             .get("resume")
@@ -669,20 +682,136 @@ fn resume_point(
     else {
         return Err((StatusCode::CONFLICT, "plan_missing"));
     };
-    let complete = {
-        let zero = |key: &str| aggregate.get(key).and_then(JsonValue::as_u64) == Some(0);
-        aggregate.get("status").and_then(JsonValue::as_str) == Some("done")
-            && zero("failed")
-            && zero("timed_out")
-            && zero("skipped")
-    };
+    // The SAME predicate the checkpoint sweep uses (diff review
+    // MINOR-7): the endpoint refuses to resume exactly the plans whose
+    // checkpoints the sweep deletes, so the two must not drift.
+    let complete = harness_store::aggregate_is_complete(&aggregate);
+    let mut in_flight = ids("in_flight");
+    match store.list_tasks_by_plan(plan_id) {
+        Ok(rows) => {
+            for (row_id, capability, state, _) in rows {
+                if capability == "plan.execute" {
+                    continue;
+                }
+                if matches!(
+                    state,
+                    harness_store::TaskState::Done
+                        | harness_store::TaskState::Failed
+                        | harness_store::TaskState::Cancelled
+                        | harness_store::TaskState::Expired
+                ) {
+                    continue;
+                }
+                let id = format!("{}", row_id.0.as_hyphenated());
+                if !in_flight.contains(&id) {
+                    in_flight.push(id);
+                }
+            }
+        }
+        Err(err) => {
+            tracing::error!(target: "harness.api.tasks", ?err, "list step rows (resume)");
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "load_failed"));
+        }
+    }
+
     Ok(ResumePoint {
+        original: Box::new(task),
         plan,
         plan_id,
         complete,
         unscheduled: ids("unscheduled"),
-        in_flight: ids("in_flight"),
+        in_flight,
     })
+}
+
+/// Mint the resumed run. Everything but the plan comes from the
+/// ORIGINAL submission (diff review MAJOR-2): `input.timeout_ms` /
+/// `on_failure`, the execution policy, constraints and tags all shape
+/// how a plan runs, and rebuilding a bare request silently downgrades
+/// a 10-minute keep-going run into a 2-minute fail-fast one.
+fn mint_resumed_plan(
+    state: &ApiState,
+    store: &harness_store::Store,
+    point: &ResumePoint,
+    plan_value: JsonValue,
+    replayable: usize,
+) -> axum::response::Response {
+    let mut resumed_input = point.original.input.clone();
+    resumed_input["plan"] = plan_value;
+    let mut tags = point.original.tags.clone();
+    if !tags.iter().any(|t| t == "resume") {
+        tags.push("resume".to_string());
+    }
+    let mint = mint_task_guarded(
+        state,
+        store,
+        SubmitRequest {
+            capability: "plan.execute".to_string(),
+            input: resumed_input,
+            constraints: Some(point.original.constraints.clone()),
+            execution: Some(point.original.execution),
+            tags,
+            resource_hints: Some(point.original.resource_hints.clone()),
+        },
+        // 5.12: the live-run check shares the insert's transaction.
+        Some(point.plan_id),
+    );
+    match mint {
+        Ok(MintOutcome::PlanAlreadyRunning(live_id)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "already_running",
+                "task_id": format!("{}", live_id.0.as_hyphenated()),
+            })),
+        )
+            .into_response(),
+        Ok(MintOutcome::Minted(new_id)) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "task_id": format!("{}", new_id.0.as_hyphenated()),
+                "plan_id": format!("{}", point.plan_id.0.as_hyphenated()),
+                // Checkpoints live on the node that RAN the plan, and a
+                // resumed plan.execute is placed by the scheduler
+                // (Cardinality::Anyone, no pin) — so this counts what
+                // THIS node holds, which may not be where the resumed
+                // run lands (diff review MINOR-4).
+                "replayable_local": replayable,
+                "unscheduled": point.unscheduled,
+                "in_flight": point.in_flight,
+            })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": err })),
+        )
+            .into_response(),
+    }
+}
+
+/// A resume body: absent means "resume as-is", malformed is a 400.
+///
+/// `Option<Json<T>>` cannot express that — in axum 0.7 it turns EVERY
+/// rejection into `None` (diff review MAJOR-1), so a typo'd field
+/// under `deny_unknown_fields` would silently resume at the old cap
+/// and report success.
+fn resume_body(
+    body: Result<Json<ResumeRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<ResumeRequest, axum::response::Response> {
+    match body {
+        Ok(Json(req)) => Ok(req),
+        Err(axum::extract::rejection::JsonRejection::MissingJsonContentType(_)) => {
+            Ok(ResumeRequest::default())
+        }
+        Err(rejection) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "bad_request_body",
+                "detail": rejection.body_text(),
+            })),
+        )
+            .into_response()),
+    }
 }
 
 /// The reasons a resume is refused before anything is minted (5.12).
@@ -773,6 +902,9 @@ fn raise_plan_cap(
     });
     match serde_json::from_value::<harness_core::Plan>(plan_value.clone()) {
         Ok(mut plan) => {
+            // Stamp the signer too, or the artifact verifies against
+            // nobody (diff review MINOR-3).
+            plan.issued_by = state.local_node_id;
             if let Err(err) = plan.sign(&state.identity) {
                 tracing::error!(target: "harness.api.tasks", ?err, "re-sign plan");
             }
@@ -797,7 +929,7 @@ pub async fn resume_handler(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Path(id_str): Path<String>,
-    body: Option<Json<ResumeRequest>>,
+    body: Result<Json<ResumeRequest>, axum::extract::rejection::JsonRejection>,
 ) -> axum::response::Response {
     if !is_authenticated(&state.auth, &headers) {
         return unauthorized();
@@ -816,7 +948,21 @@ pub async fn resume_handler(
         )
             .into_response();
     };
-    let req = body.map(|Json(b)| b).unwrap_or_default();
+    // `Option<Json<T>>` turns EVERY rejection into None (axum 0.7), so
+    // a typo'd or malformed body would silently resume at the old cap
+    // and report success (diff review MAJOR-1). Only a genuinely
+    // absent body defaults.
+    let req = match resume_body(body) {
+        Ok(r) => r,
+        Err(refusal) => return refusal,
+    };
+
+    // 4.7 (ADR-0029): a resume is an authenticated top-level mint, not
+    // a window-bounded internal sub-task — the backlog cap applies
+    // (diff review MINOR-1).
+    if let Some(refusal) = check_admission(store) {
+        return refusal;
+    }
 
     let point = match resume_point(store, task_id) {
         Ok(p) => p,
@@ -851,7 +997,7 @@ pub async fn resume_handler(
         return refusal;
     }
 
-    let mut plan_value = point.plan;
+    let mut plan_value = point.plan.clone();
     if let Some(cap) = req.max_cost_usd {
         match raise_plan_cap(&state, plan_value, cap) {
             Ok(v) => plan_value = v,
@@ -862,47 +1008,5 @@ pub async fn resume_handler(
     }
 
     let replayable = store.checkpoint_count(plan_id).unwrap_or(0);
-    let mint = mint_task_guarded(
-        &state,
-        store,
-        SubmitRequest {
-            capability: "plan.execute".to_string(),
-            input: serde_json::json!({ "plan": plan_value }),
-            constraints: None,
-            execution: None,
-            tags: vec!["resume".to_string()],
-            resource_hints: None,
-        },
-        // 5.12: the live-run check shares the insert's transaction.
-        Some(plan_id),
-    );
-    match mint {
-        Ok(MintOutcome::PlanAlreadyRunning(live_id)) => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "already_running",
-                "task_id": format!("{}", live_id.0.as_hyphenated()),
-            })),
-        )
-            .into_response(),
-        Ok(MintOutcome::Minted(new_id)) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "task_id": format!("{}", new_id.0.as_hyphenated()),
-                "plan_id": format!("{}", plan_id.0.as_hyphenated()),
-                // How many steps can replay from checkpoints. Zero
-                // means the whole plan re-runs — checkpoints are local
-                // and expire, so this is honest, not a promise.
-                "replayable": replayable,
-                "unscheduled": point.unscheduled,
-                "in_flight": point.in_flight,
-            })),
-        )
-            .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": err })),
-        )
-            .into_response(),
-    }
+    mint_resumed_plan(&state, store, &point, plan_value, replayable)
 }

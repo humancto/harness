@@ -212,7 +212,7 @@ async fn resume_matrix_and_mint() {
     assert_eq!(body["plan_id"], plan_id.to_string());
     assert_eq!(body["unscheduled"][0], parked.as_str());
     assert_eq!(
-        body["replayable"], 0,
+        body["replayable_local"], 0,
         "no checkpoints recorded in this test"
     );
 
@@ -381,4 +381,198 @@ async fn concurrent_resumes_mint_exactly_one_coordinator() {
         })
         .count();
     assert_eq!(live, 1, "no second coordinator was minted");
+}
+
+/// Seed a non-terminal STEP row for `plan_id` — what a coordinator
+/// leaves behind when it dies, deadlines, or fail-fast aborts.
+fn seed_stranded_step(store: &Store, plan_id: uuid::Uuid) -> TaskId {
+    let me = Identity::generate();
+    let mut task = harness_core::Task {
+        id: TaskId::new_v7(),
+        parent: None,
+        plan_id: Some(harness_core::PlanId(plan_id)),
+        capability: "shell.exec".into(),
+        input: serde_json::json!({}),
+        constraints: harness_core::Constraints::default(),
+        retry: harness_core::RetryPolicy::default(),
+        execution: harness_core::ExecutionPolicy::default(),
+        resource_hints: harness_core::ResourceHints {
+            cpu_class: harness_core::protocol::CpuClass::Light,
+            memory_mb: None,
+            gpu_required: false,
+            gpu_memory_mb: None,
+            network_class: harness_core::protocol::NetworkClass::None,
+            disk_io_class: harness_core::protocol::DiskIoClass::None,
+            estimated_duration_ms: None,
+        },
+        trace_ctx: harness_core::TraceContext::default(),
+        issued_by: me.node_id(),
+        issued_at: 1,
+        tags: vec![],
+        sig: harness_core::Signature::from_bytes([0u8; 64]),
+    };
+    harness_core::Signable::sign(&mut task, &me).expect("sign");
+    store.insert_task(&task).expect("insert step");
+    store
+        .try_dispatch_task(task.id, me.node_id())
+        .expect("dispatch step");
+    task.id
+}
+
+#[tokio::test]
+async fn stranded_steps_are_found_without_an_aggregate() {
+    // Diff review BLOCKER-1: `drive_plan` returns Err — so the
+    // executor persists an error and NO aggregate — on exactly the
+    // paths that strand dispatched steps (fail-fast abort, deadline,
+    // "no step succeeded"), and a crashed coordinator writes no result
+    // row at all. Reading only the aggregate would report
+    // `in_flight: []` and cheerfully re-run those steps. The step rows
+    // are the source that survives every one of those exits.
+    let (app, store, token) = app_and_token().await;
+    let plan_id = uuid::Uuid::now_v7();
+    let id = submit(
+        &app,
+        &token,
+        serde_json::json!({
+            "capability": "plan.execute",
+            "input": {"plan": plan_value(plan_id, 5.0)},
+        }),
+    )
+    .await;
+    let stranded = seed_stranded_step(&store, plan_id);
+
+    // The coordinator failed WITHOUT an aggregate — the crash shape.
+    for next in [
+        TaskState::Dispatched,
+        TaskState::Claimed,
+        TaskState::Running,
+    ] {
+        store.transition_task(id, next).expect("hop");
+    }
+    store
+        .try_transition_task(id, TaskState::Running, TaskState::Failed)
+        .expect("fail");
+    let id_str = format!("{}", id.0.as_hyphenated());
+
+    let resp = resume(&app, Some(&token), &id_str, None).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "a dispatched, unsettled step must not be silently re-run"
+    );
+    let body = body_json(resp).await;
+    assert_eq!(body["error"], "steps_in_flight");
+    assert_eq!(
+        body["in_flight"][0],
+        format!("{}", stranded.0.as_hyphenated()).as_str()
+    );
+
+    // Settling the step clears the warning: nothing is in flight now.
+    store
+        .try_transition_task(stranded, TaskState::Dispatched, TaskState::Cancelled)
+        .expect("settle");
+    let resp = resume(&app, Some(&token), &id_str, None).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = body_json(resp).await;
+    assert_eq!(body["in_flight"].as_array().expect("array").len(), 0);
+}
+
+#[tokio::test]
+async fn a_malformed_body_is_rejected_not_ignored() {
+    // Diff review MAJOR-1: `Option<Json<T>>` turns every rejection into
+    // None, so a typo'd field would resume at the OLD cap and report
+    // success. Only an absent body may default.
+    let (app, store, token) = app_and_token().await;
+    let plan_id = uuid::Uuid::now_v7();
+    let id = submit(
+        &app,
+        &token,
+        serde_json::json!({
+            "capability": "plan.execute",
+            "input": {"plan": plan_value(plan_id, 5.0)},
+        }),
+    )
+    .await;
+    settle_with_aggregate(
+        &store,
+        id,
+        &serde_json::json!({
+            "plan_id": plan_id.to_string(),
+            "status": "paused_budget",
+            "ok": 1, "failed": 0, "timed_out": 0, "skipped": 1,
+            "resume": {"unscheduled": [uuid::Uuid::now_v7().to_string()], "in_flight": []},
+        }),
+    );
+    let id_str = format!("{}", id.0.as_hyphenated());
+
+    // A typo'd field (deny_unknown_fields) must not silently no-op.
+    let resp = resume(
+        &app,
+        Some(&token),
+        &id_str,
+        Some(serde_json::json!({"max_cost": 20.0})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(resp).await["error"], "bad_request_body");
+
+    // An absent body still means "resume as-is".
+    let resp = resume(&app, Some(&token), &id_str, None).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn a_resume_keeps_the_original_submission_shape() {
+    // Diff review MAJOR-2: rebuilding a bare request downgraded a
+    // keep-going, 10-minute plan to a fail-fast 2-minute one and reset
+    // the execution policy to the 30s default.
+    let (app, store, token) = app_and_token().await;
+    let plan_id = uuid::Uuid::now_v7();
+    let id = submit(
+        &app,
+        &token,
+        serde_json::json!({
+            "capability": "plan.execute",
+            "input": {
+                "plan": plan_value(plan_id, 5.0),
+                "timeout_ms": 600_000,
+                "on_failure": "continue",
+            },
+            "execution": {"redundancy": 1, "timeout_ms": 600_000, "on_partial": "return_partial", "lease_ms": 660_000},
+            "tags": ["cli"],
+        }),
+    )
+    .await;
+    settle_with_aggregate(
+        &store,
+        id,
+        &serde_json::json!({
+            "plan_id": plan_id.to_string(),
+            "status": "paused_budget",
+            "ok": 1, "failed": 0, "timed_out": 0, "skipped": 1,
+            "resume": {"unscheduled": [uuid::Uuid::now_v7().to_string()], "in_flight": []},
+        }),
+    );
+
+    let resp = resume(
+        &app,
+        Some(&token),
+        &format!("{}", id.0.as_hyphenated()),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let new_id = TaskId(
+        body_json(resp).await["task_id"]
+            .as_str()
+            .expect("id")
+            .parse()
+            .expect("uuid"),
+    );
+    let minted = store.load_task(new_id).expect("load").expect("row");
+    assert_eq!(minted.input["timeout_ms"], 600_000);
+    assert_eq!(minted.input["on_failure"], "continue");
+    assert_eq!(minted.execution.timeout_ms, 600_000);
+    assert!(minted.tags.iter().any(|t| t == "cli"), "original tags kept");
+    assert!(minted.tags.iter().any(|t| t == "resume"));
 }

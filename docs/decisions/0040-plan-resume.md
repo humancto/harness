@@ -133,9 +133,27 @@ compatibility; it remains the union.)
   parked longer than that loses its prefix and re-runs. The
   completeness sweep is not a hazard here: a `paused_budget`
   aggregate never counts as complete.
-- **Steps the dead coordinator had in flight re-run.** Their rows and
-  leases lived only in its store; nobody else can settle them, and
-  their outputs were never checkpointed.
+- **Steps that were in flight when a plan stopped are reported, not
+  guessed.** The aggregate's `resume` lists are a fast path only:
+  `drive_plan` returns `Err` — so no aggregate is persisted at all —
+  on precisely the paths that strand dispatched steps (fail-fast
+  abort, deadline expiry, "no step succeeded"), and a crashed
+  coordinator writes no result row either. The authority is the
+  plan's own step rows: a row exists iff the step was really
+  dispatched, and a non-terminal row never settled. On a node that is
+  permanently gone those rows are gone with it, and the resumed plan
+  re-runs those steps.
+- **A restarted node is not a departed one.** After a restart the
+  store and dispatcher are back, so lease expiry keeps driving the
+  old step rows — which is why resume refuses while any of them is
+  non-terminal unless the caller passes `allow_in_flight`.
+- **Default-on checkpointing is a new storage draw.** Before 5.12
+  nothing in production wrote a checkpoint row. Now a plan that stops
+  short of complete retains up to `MAX_PLAN_STEPS` ×
+  `MAX_CHECKPOINT_OUTPUT_BYTES` (16 MiB) for the retention window,
+  with no global cap and no vacuum. A step whose output exceeds
+  256 KiB is not checkpointed at all and re-runs with full side
+  effects.
 - **Deferred, not cut:** placing a re-dispatched plan on the node that
   holds its checkpoints, as a genuine *soft preference* in
   `eligible_scored` (a scorer tie-break — never `pin_to_node`, which
