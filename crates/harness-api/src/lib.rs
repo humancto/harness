@@ -45,6 +45,10 @@ pub fn router(state: ApiState) -> Router {
             "/webhook/whatsapp",
             axum::routing::post(routes::webhook::whatsapp::whatsapp_handler),
         )
+        .route(
+            "/webhook/sms",
+            axum::routing::post(routes::webhook::sms::sms_handler),
+        )
         .with_state(state);
     Router::new()
         .nest("/api/v1", api)

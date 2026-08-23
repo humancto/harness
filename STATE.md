@@ -1,7 +1,7 @@
 # Harness Implementation State
 
 **Current phase:** 4 — Distribution patterns (Phase 3 COMPLETE as of #42)
-**Last updated:** 2026-08-23 (post-5.5 WhatsApp webhook adapter)
+**Last updated:** 2026-08-23 (post-5.6 SMS webhook adapter)
 
 ## Phase 3 summary (post-merge) — COMPLETE
 
@@ -128,6 +128,8 @@ These will land alongside their natural Phase 3 home, not as a "phase 2.10":
 
 | #50 | 4.7  | Backpressure (ADR-0029): the heartbeat `paused` field finally has a producer — `PauseState` (queue-depth hysteresis latch at `max_queue_depth`/release at 3/4, OR operator `POST /admin/pause\|resume` + `GET /status` surfacing) with coordination-permit RAII subtraction so `queue_depth` means WORK depth; `DaemonRuntimeConfig.max_queue_depth` is the §14.10 knob; submit admission (`429` + `Retry-After: 2` over 1024 `Submitted` rows, indexed COUNT, fail-open, internal mints exempt); pause-aware routing in every `eligible_scored` arm (live-paused pin ⇒ ResourceGated while dead pins stay fast-terminal; paused owners wait, never reroute; unpinned federated sets exclude paused into `DispatchPlan::Federated::excluded` → `Skipped` provenance rows, policy-exempt; self gated via the shared `PauseState` in `StoreLoadView`); sub-tasks + plan steps stamp `constraints.deadline = issued_at + timeout_ms` (the pre-dispatch wait is bounded — no posthumous runs); full/lag-condition tests for every shipped bound (peer_net QueueFull both arms, reply pump/bridge/WS Lagged recovery, `into_channel` producer-park, `MESH_EVENT_CAPACITY`/`TERMINAL_EVENT_CAPACITY` named); bounds hygiene (llm_batcher `MAX_SLOT_SENDERS=64` flush-on-full + `MAX_LIVE_FINGERPRINTS=256` bypass; partial_stream pending task cap 256 evict-oldest-warned; sweep covers `elig_failures` + Cancelled reply obligations; additive `partials_dropped` on `GET /tasks/:id` + types.ts; `CLI_FANOUT_WINDOW=16`). m09 money test: saturate→pause→pinned waits/Anyone reroutes/federated Skips→drain→resume→exactly-once. +32 tests |
 
+| #57 | 5.6  | SMS webhook (ADR-0034): channel-generic conversation core extracted from 5.5 (`webhook/conversation.rs`; `Channel` name = route = task tag = log field, threaded through the DRIVER so both `brain.plan` and `plan.execute` mints carry it — plan review MAJOR-1, pinned by tag assertions on both rows in BOTH suites); `POST /webhook/sms` with bare-E.164 senders (ONE allowlist, channel-native entry forms — channels are distinct authorization surfaces, `whatsapp:+X` never admits SMS `+X`, near-miss drop-log hint when the other form is listed); shared signature/dedup/admission/driver/reply machinery unchanged (5.5's 8 whatsapp rows keep passing verbatim + symmetric exec-tag assertion added); same 1600 cap (SMS UCS-2 segment economics recorded); STOP/HELP rests on Twilio platform handling. Zero new deps. +5 tests |
+
 | #56 | 5.5  | WhatsApp webhook (ADR-0033): root-path `POST /webhook/whatsapp` — fail-closed Twilio signature validation (`Base64(HMAC-SHA1(token, url+sorted params))`, vault token absent ⇒ 503, constant-time `verify_slice`, independent known-vector test; signed URL includes the query string; `HARNESS_WEBHOOK_BASE_URL` REQUIRED behind TLS termination); deny-all-by-default sender allowlist (BLOCKER-3: the signature authenticates TWILIO, not the sender — `HARNESS_WEBHOOK_ALLOW_FROM`, `*` opts into allow-all, WhatsApp senders match in full `whatsapp:+E164` form); the mint sequence extracted into ONE shared `mint_task` (clamp→build→sign→insert→replica-mirror; BLOCKER-1) used by submit handler + webhook; message Body → `brain.plan` (tags webhook+whatsapp, NO cloud_ok, constraint-smuggle pinned inert, 4.7 admission-subject) → TwiML ⏳ ack → detached store-polling driver (16 `OwnedSemaphorePermit`s, 600s deadline, CLI-parity envelopes) → `plan.execute` → Twilio Messages API reply (From=inbound To; missing SID ⇒ ack-only degraded mode). Tests ACT as the executor (BLOCKER-2: harness-api has no executor — legal state-chain walks + canned plan JSON + wiremock Twilio). MessageSid retry dedup (bounded 512 ring, same-ack) + result-row wait after terminal (the 5.3 executor gap) per Codex P1s; restart durability documented-deferred to 5.11. Deps: `hmac` is the only new lockfile entry (`sha1` already rides axum ws). +17 tests |
 
 | #55 | 5.4  | NL Submit UI: Submit page reworked into "Describe it" (default) + "Advanced" (pre-5.4 form, behavior preserved; cold-load capabilities double-fetch fixed in passing) tabs; `$lib/nlsubmit.ts` — CLI-parity request bodies INCLUDING the execution envelope (plan review BLOCKER-1: bare submits get the 30s `ExecutionPolicy` default, which would have killed the 210s planner chain; brain.plan rides 245s, plan.execute 125s), tolerant `parsePlanOutcome`, typed `pollTask` (401 ⇒ AuthGate flip mid-poll, other non-OK ⇒ fail-fast `http_error`, AbortSignal, budget = envelope + 2×slack), `inputPreview` (`truncate_chars` parity); NL state machine with generation guards + `$effect`-owned AbortController teardown (the 4.8 stale-callback lesson); DAG preview reuses `DagView` with an empty steps map + confidence bar/cost/duration/rationale strip + per-step input previews; confirm resubmits the plan VERBATIM to `plan.execute` (server re-validates — 5.3 ruleset) and navigates to the live `/runs/:id` page; planning failures render the 5.3 per-tier diagnostics verbatim. `fallback_plan` deliberately not rendered. +13 vitest (49 UI total) |
@@ -145,6 +147,14 @@ These will land alongside their natural Phase 3 home, not as a "phase 2.10":
 cloud/template) — deferred, not dropped: `brain.plan`'s input schema is
 `additionalProperties: false` with no tier-selection field; needs a schema extension
 (natural home: 5.x backlog alongside escalation knobs).**
+
+5.6 review round 1 (plan): REVISE, all adopted pre-implementation — MAJOR: the driver's
+second mint (plan.execute) had no channel-tag guard; a half-parameterized extraction
+would ship SMS exec tasks tagged `whatsapp` with every test green — `Channel` threads the
+driver and both suites assert tags on BOTH mints. MINORs: near-miss allowlist drop-log
+hint (other-channel form listed); short ADR-0034 over mutating Accepted ADR-0033; UCS-2
+segment-economics + Twilio-platform STOP/HELP sentences. NIT: cross-route dedup test
+re-signs per URL and allowlists the bare sender (allowlist precedes the ring).
 
 5.5 review round 2 (diff): APPROVE at head — mint extraction byte-preserving, signature
 soundness (constant-time verified in vendored digest source; independent Python vector),

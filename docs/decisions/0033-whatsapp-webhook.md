@@ -109,8 +109,9 @@ RustCrypto; the single-binary/no-broker property is untouched.
 - Meta-native WhatsApp signature variant (PRD lists Twilio/Meta —
   Twilio only here; the validation module is provider-shaped for the
   next adapter).
-- SMS (5.6, reuses `twilio.rs` verbatim), iOS Shortcuts (5.7),
-  Slack/Telegram/Email (backlog).
+- SMS: shipped as 5.6 (ADR-0034 — channel-generic core extracted
+  from this adapter). iOS Shortcuts (5.7), Slack/Telegram/Email
+  (backlog).
 - Per-sender budgets/rate limits beyond the global driver cap and
   admission gate.
 - Reply cost summary (5.9 cost tracking).
