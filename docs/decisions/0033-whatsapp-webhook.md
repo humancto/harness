@@ -62,6 +62,20 @@ operator work, never a blocker.
    / `❌ failed — <diagnostic>`, char-capped at WhatsApp's 1600
    (cost figures join when 5.9 lands).
 
+6. **Delivery dedup + known restart limitation (Codex review).**
+   Twilio retries deliveries when a response is lost; the handler
+   dedups on `MessageSid` (bounded 512-entry in-memory ring —
+   same-ack semantics for the retry, one task per message). The
+   driver reads result rows through a bounded poll because task
+   state flips terminal BEFORE the result row lands (the executor
+   gap the 5.3 money tests hit). KNOWN LIMITATION, deliberately
+   deferred: a daemon restart forgets both the dedup ring and any
+   in-flight conversations — the minted tasks persist and are
+   visible on the Runs page (the ack named the task id), but the
+   final WhatsApp reply for a conversation caught mid-restart is
+   never sent. Durable conversation state is 5.11 checkpoint-store
+   territory; recorded here rather than half-built now.
+
 ## Dependencies (stopping-condition record)
 
 `hmac` is the only NEW lockfile entry. `sha1` was already in the

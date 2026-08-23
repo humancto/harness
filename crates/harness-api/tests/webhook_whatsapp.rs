@@ -15,7 +15,7 @@ use axum::{
     http::{header, Request, StatusCode},
 };
 use harness_api::routes::webhook::twilio::compute_twilio_signature;
-use harness_api::routes::webhook::{AllowFrom, WebhookRuntime, MAX_WEBHOOK_DRIVERS};
+use harness_api::routes::webhook::{AllowFrom, SeenSids, WebhookRuntime, MAX_WEBHOOK_DRIVERS};
 use harness_api::{router, ApiStateBuilder};
 use harness_core::Identity;
 use harness_store::{Store, TaskState};
@@ -54,6 +54,7 @@ fn runtime(twilio_base: &str, drivers: usize) -> Arc<WebhookRuntime> {
         twilio_api_base: twilio_base.to_string(),
         drivers: Arc::new(tokio::sync::Semaphore::new(drivers)),
         http: reqwest::Client::new(),
+        seen_sids: parking_lot::Mutex::new(SeenSids::default()),
     })
 }
 
@@ -331,4 +332,35 @@ async fn t07_driver_cap_returns_busy() {
     let text = body_text(resp).await;
     assert!(text.contains("mesh busy"), "{text}");
     assert!(find_task(&store, "brain.plan").is_none(), "nothing minted");
+}
+
+#[tokio::test]
+async fn t08_provider_retry_is_deduplicated_on_message_sid() {
+    let secrets = secrets_with(&[("secret/twilio-auth-token", TOKEN)]);
+    let (app, store) = app_with(Some(secrets), runtime("http://unused", MAX_WEBHOOK_DRIVERS));
+    let (body, sig) = signed_form(&[
+        ("Body", "run: ls"),
+        ("From", SENDER),
+        ("To", BOT),
+        ("MessageSid", "SM_retry_1"),
+    ]);
+
+    let first = post_webhook(&app, body.clone(), Some(&sig)).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    assert!(body_text(first).await.contains("planning task"));
+
+    // Twilio replays the SAME signed request after a lost response —
+    // one task, same-ack semantics (Codex P1).
+    let retry = post_webhook(&app, body, Some(&sig)).await;
+    assert_eq!(retry.status(), StatusCode::OK);
+    let text = body_text(retry).await;
+    assert!(text.contains("already working"), "{text}");
+
+    let minted = store
+        .list_recent_tasks(50)
+        .expect("list")
+        .into_iter()
+        .filter(|t| t.capability == "brain.plan")
+        .count();
+    assert_eq!(minted, 1, "exactly one task for both deliveries");
 }

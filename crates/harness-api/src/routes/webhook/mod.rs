@@ -75,6 +75,44 @@ pub struct WebhookRuntime {
     pub drivers: Arc<tokio::sync::Semaphore>,
     /// Outbound HTTP client for the final reply.
     pub http: reqwest::Client,
+    /// Recently-seen provider message ids (Codex P1: Twilio RETRIES
+    /// deliveries — a lost response replays the same validly-signed
+    /// request, and re-minting would double-execute the goal).
+    /// Bounded in-memory ring; a daemon restart forgets it, which is
+    /// coherent with the driver also being in-memory (ADR-0033
+    /// restart-durability note).
+    pub seen_sids: parking_lot::Mutex<SeenSids>,
+}
+
+/// Bounded insert-order dedup set.
+#[derive(Debug, Default)]
+pub struct SeenSids {
+    order: std::collections::VecDeque<String>,
+    set: HashSet<String>,
+}
+
+/// Twilio's retry window is minutes; 512 recent ids is ample for a
+/// 16-driver adapter.
+const SEEN_SIDS_CAP: usize = 512;
+
+impl SeenSids {
+    /// Record `sid`; returns `false` if it was already present (a
+    /// provider retry — the caller must NOT mint again).
+    pub fn insert(&mut self, sid: &str) -> bool {
+        if sid.is_empty() {
+            return true; // no id to dedup on — accept
+        }
+        if !self.set.insert(sid.to_string()) {
+            return false;
+        }
+        self.order.push_back(sid.to_string());
+        while self.order.len() > SEEN_SIDS_CAP {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        true
+    }
 }
 
 impl std::fmt::Debug for WebhookRuntime {
@@ -102,6 +140,7 @@ impl WebhookRuntime {
             twilio_api_base: "https://api.twilio.com".to_string(),
             drivers: Arc::new(tokio::sync::Semaphore::new(MAX_WEBHOOK_DRIVERS)),
             http: reqwest::Client::new(),
+            seen_sids: parking_lot::Mutex::new(SeenSids::default()),
         }
     }
 }
@@ -110,6 +149,21 @@ impl WebhookRuntime {
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seen_sids_dedups_and_stays_bounded() {
+        let mut s = SeenSids::default();
+        assert!(s.insert("SM1"));
+        assert!(!s.insert("SM1"), "retry detected");
+        assert!(s.insert(""), "empty sid never dedups");
+        assert!(s.insert(""), "empty sid never dedups");
+        for i in 0..SEEN_SIDS_CAP {
+            assert!(s.insert(&format!("SMx{i}")));
+        }
+        // SM1 evicted by the ring bound — accepted again.
+        assert!(s.insert("SM1"));
+        assert!(s.set.len() <= SEEN_SIDS_CAP + 1);
+    }
 
     #[test]
     fn allow_from_is_deny_all_by_default() {

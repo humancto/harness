@@ -141,6 +141,19 @@ pub async fn whatsapp_handler(
         return twiml(Some("send a goal, e.g. \"run: uname -a\""));
     }
 
+    // Provider retry dedup (Codex P1): Twilio replays the same signed
+    // request when a response is lost; re-minting would double-run
+    // the goal. Same-ack semantics for the retry.
+    let message_sid = form_value(&pairs, "MessageSid").unwrap_or("");
+    if !state.webhook.seen_sids.lock().insert(message_sid) {
+        tracing::info!(
+            target: "harness.api.webhook",
+            sid = %message_sid,
+            "duplicate delivery; already working on it"
+        );
+        return twiml(Some("⏳ already working on that message"));
+    }
+
     let Some(store) = state.store.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -230,6 +243,32 @@ async fn wait_terminal(
     }
 }
 
+/// Poll for a terminal task's result row. Task state flips terminal
+/// BEFORE the result row is written on the executor (the same gap the
+/// 5.3 money tests hit — Codex P1 here): a one-shot load right after
+/// `wait_terminal` can see `None` for a row that lands milliseconds
+/// later. Bounded, never a behavioral wait.
+async fn wait_result_row(
+    state: &ApiState,
+    id: harness_core::TaskId,
+    deadline: tokio::time::Instant,
+) -> Option<harness_store::TaskResult> {
+    let store = state.store.as_ref()?;
+    let bound = std::cmp::min(
+        deadline,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+    );
+    loop {
+        if let Ok(Some(row)) = store.load_task_result(id) {
+            return Some(row);
+        }
+        if tokio::time::Instant::now() >= bound {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// The execute-and-reply driver. Strictly Result-free control flow
 /// (the release profile is panic=abort): every failure path becomes a
 /// reply string.
@@ -260,18 +299,14 @@ async fn run_conversation(
         return "⏳ timed out waiting for the planner — check the Runs page".to_string();
     };
     if plan_state != TaskState::Done {
-        let diag = store
-            .load_task_result(plan_id)
-            .ok()
-            .flatten()
+        let diag = wait_result_row(state, plan_id, deadline)
+            .await
             .and_then(|r| r.error)
             .unwrap_or_else(|| format!("planning {plan_state:?}"));
         return truncate_reply(&format!("❌ planning failed — {diag}"));
     }
-    let Some(plan_json) = store
-        .load_task_result(plan_id)
-        .ok()
-        .flatten()
+    let Some(plan_json) = wait_result_row(state, plan_id, deadline)
+        .await
         .and_then(|r| r.output)
         .and_then(|o| o.get("plan").cloned())
     else {
@@ -302,10 +337,8 @@ async fn run_conversation(
     if exec_state == TaskState::Done {
         format!("✅ done — {step_count} steps in {secs}s")
     } else {
-        let diag = store
-            .load_task_result(exec_id)
-            .ok()
-            .flatten()
+        let diag = wait_result_row(state, exec_id, deadline)
+            .await
             .and_then(|r| r.error)
             .unwrap_or_else(|| format!("execution {exec_state:?}"));
         truncate_reply(&format!("❌ failed after {secs}s — {diag}"))
