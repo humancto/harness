@@ -253,6 +253,22 @@ async fn t04_full_conversation_plans_executes_and_replies() {
     complete_task(&store, plan_row.id, &canned_plan());
     let exec_row = wait_for_task(&store, "plan.execute").await;
     assert!(exec_row.input["plan"]["tasks"].is_object());
+    // The DRIVER's mint carries the channel too (5.6 plan review
+    // MAJOR-1, symmetric to webhook_sms t04): an exec mint hardcoding
+    // the other channel must fail HERE — the SMS suite only catches
+    // the whatsapp-hardcoded direction.
+    assert!(exec_row.tags.contains(&"webhook".to_string()));
+    assert!(
+        exec_row.tags.contains(&"whatsapp".to_string()),
+        "{:?}",
+        exec_row.tags
+    );
+    assert!(
+        !exec_row.tags.contains(&"sms".to_string()),
+        "{:?}",
+        exec_row.tags
+    );
+    assert!(!exec_row.tags.contains(&"cloud_ok".to_string()));
     complete_task(&store, exec_row.id, &serde_json::json!({"state": "done"}));
 
     // The driver's reply lands on the mock Twilio API.

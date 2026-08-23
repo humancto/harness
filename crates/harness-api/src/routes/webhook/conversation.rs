@@ -83,6 +83,16 @@ fn twiml(message: Option<&str>) -> axum::response::Response {
         .into_response()
 }
 
+/// The same sender in the OTHER channel's allowlist entry form
+/// (`whatsapp:+E164` ⇄ bare `+E164`) — feeds only the near-miss
+/// drop-log hint, never an allow decision. Hardcodes the one prefixed
+/// Twilio channel that exists; a third prefixed channel would need
+/// this to become a `Channel` field.
+fn other_channel_form(from: &str) -> String {
+    from.strip_prefix("whatsapp:")
+        .map_or_else(|| format!("whatsapp:{from}"), str::to_string)
+}
+
 fn form_value<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
     pairs
         .iter()
@@ -162,10 +172,7 @@ pub fn handle(
         // Near-miss hint (5.6 plan review MINOR-2): entries are
         // channel-NATIVE (`whatsapp:+E164` vs bare `+E164`) — say so
         // when the operator listed this number in the other form.
-        let other_form = from
-            .strip_prefix("whatsapp:")
-            .map_or_else(|| format!("whatsapp:{from}"), str::to_string);
-        let near_miss = state.webhook.allow_from.permits(&other_form);
+        let near_miss = state.webhook.allow_from.permits(&other_channel_form(&from));
         tracing::warn!(
             target: "harness.api.webhook",
             channel = channel.name,
@@ -487,6 +494,18 @@ mod tests {
     fn twiml_escapes_message_content() {
         let r = twiml(Some("a<b>&c"));
         assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn other_channel_form_flips_the_whatsapp_prefix_both_ways() {
+        // Near-miss hint mapping (5.6 MINOR-2): bare E.164 ⇄
+        // whatsapp-prefixed, exact round trip, no other rewriting.
+        assert_eq!(other_channel_form("+15551234567"), "whatsapp:+15551234567");
+        assert_eq!(other_channel_form("whatsapp:+15551234567"), "+15551234567");
+        assert_eq!(
+            other_channel_form(&other_channel_form("+15551234567")),
+            "+15551234567"
+        );
     }
 
     #[test]

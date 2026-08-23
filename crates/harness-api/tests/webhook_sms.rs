@@ -292,30 +292,6 @@ async fn t04_full_sms_conversation_with_channel_tags_on_both_mints() {
 }
 
 #[tokio::test]
-async fn t06_opt_out_event_is_acked_without_minting() {
-    // Twilio delivers STOP/HELP inbounds tagged `OptOutType` while
-    // handling the compliance reply itself (Codex review on #57): a
-    // compliance keyword from an ALLOWLISTED sender must not become a
-    // brain.plan goal, and we must not queue a reply of our own.
-    let secrets = secrets_with(&[("secret/twilio-auth-token", TOKEN)]);
-    let (app, store) = app_with(secrets, runtime("http://unused", &[SENDER]));
-    let (body, sig) = signed_form_for(
-        "/webhook/sms",
-        &[
-            ("Body", "STOP"),
-            ("From", SENDER),
-            ("To", BOT),
-            ("MessageSid", "SM_optout"),
-            ("OptOutType", "STOP"),
-        ],
-    );
-    let resp = post_route(&app, "/webhook/sms", body, &sig).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert!(body_text(resp).await.contains("<Response/>"), "empty ack");
-    assert!(find_task(&store, "brain.plan").is_none(), "nothing minted");
-}
-
-#[tokio::test]
 async fn t05_dedup_ring_is_shared_across_the_sms_route() {
     let secrets = secrets_with(&[("secret/twilio-auth-token", TOKEN)]);
     let (app, store) = app_with(secrets, runtime("http://unused", &[SENDER]));
@@ -342,4 +318,28 @@ async fn t05_dedup_ring_is_shared_across_the_sms_route() {
         .filter(|t| t.capability == "brain.plan")
         .count();
     assert_eq!(minted, 1, "one task for both deliveries");
+}
+
+#[tokio::test]
+async fn t06_opt_out_event_is_acked_without_minting() {
+    // Twilio delivers STOP/HELP inbounds tagged `OptOutType` while
+    // handling the compliance reply itself (Codex review on #57): a
+    // compliance keyword from an ALLOWLISTED sender must not become a
+    // brain.plan goal, and we must not queue a reply of our own.
+    let secrets = secrets_with(&[("secret/twilio-auth-token", TOKEN)]);
+    let (app, store) = app_with(secrets, runtime("http://unused", &[SENDER]));
+    let (body, sig) = signed_form_for(
+        "/webhook/sms",
+        &[
+            ("Body", "STOP"),
+            ("From", SENDER),
+            ("To", BOT),
+            ("MessageSid", "SM_optout"),
+            ("OptOutType", "STOP"),
+        ],
+    );
+    let resp = post_route(&app, "/webhook/sms", body, &sig).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(body_text(resp).await.contains("<Response/>"), "empty ack");
+    assert!(find_task(&store, "brain.plan").is_none(), "nothing minted");
 }
