@@ -334,6 +334,22 @@ fn render_exec(output: &JsonValue) -> RunOutcome {
         .and_then(JsonValue::as_str)
         .unwrap_or("done");
     let mut out = String::new();
+    if status == "done"
+        && output
+            .get("budget")
+            .and_then(|b| b.get("triggered"))
+            .and_then(JsonValue::as_bool)
+            == Some(true)
+    {
+        let spent = output
+            .get("budget")
+            .and_then(|b| b.get("spent_usd"))
+            .and_then(JsonValue::as_f64)
+            .unwrap_or(0.0);
+        out.push_str(&format!(
+            "budget cap tripped on the final step: spent ${spent:.2} (nothing cut)\n"
+        ));
+    }
     if status != "done" {
         let spent = output
             .get("budget")

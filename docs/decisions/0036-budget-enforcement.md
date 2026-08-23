@@ -87,6 +87,10 @@ PRICING and per-plan/user/day aggregation are 5.9's `harness-cost`.
    comparison); a plan-carried nonsense limit sanitizes to the
    STRICTEST reading ($0), never "unlimited".
 
+8. **Precedence:** deadline expiry and fail-fast aborts WIN over a
+   budget stop (the settled plan decision) — a pause racing either
+   keeps the Err semantics; only a clean budget stop returns Ok.
+
 ## Recorded limitations
 
 - **Overshoot bound:** budget checks are per-completion, so
@@ -97,6 +101,10 @@ PRICING and per-plan/user/day aggregation are 5.9's `harness-cost`.
   string): a cost-then-fail cloud call undercounts, and a retry loop
   of expensive failures never trips the cap. Frozen by test; 5.9
   fixes it by costing the result row rather than worker JSON.
+- **`unscheduled` conflates two things on Cancel:** budget-parked
+  never-ran steps and dispatched-then-dropped in-flight steps (whose
+  rows orphan-complete, ADR-0022). 5.12 resume will need to split
+  them via the row-id presence in the step records.
 - **Trust-the-worker:** `cost_usd` comes from the step's own output
   — same trust model as every result. Notably `mcp.proxy` passes
   foreign tool results through top-level, so an external MCP server

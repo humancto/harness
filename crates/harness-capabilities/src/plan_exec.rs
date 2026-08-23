@@ -697,7 +697,11 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
     // review B2/M1). At least one Done step recorded the tripping
     // cost, so this never masks a total failure.
     let all_done = summary.done == summary.total;
-    if budget_stop.is_some() && summary.done > 0 {
+    // Precedence (diff review on #59, per the settled plan decision):
+    // deadline expiry and fail-fast aborts WIN over a budget stop — a
+    // pause that raced a deadline or a failing in-flight step keeps
+    // today's Err semantics; only a clean budget stop returns Ok.
+    if budget_stop.is_some() && !aborted && !deadline_hit && summary.done > 0 {
         return Ok(aggregate);
     }
     if all_done || (!aborted && !deadline_hit && summary.done > 0) {
@@ -1479,10 +1483,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn e02_pause_lets_in_flight_finish_then_settles_promptly() {
-        // Diamond: a → (b, c) → d. b and c run concurrently; the
-        // SECOND completion (order-independent: 0.6 + 0.6) blows the
-        // $1 cap → Pause. Both b and c count; d is never dispatched.
+    async fn e02_pause_parks_unfed_steps_and_settles_promptly() {
+        // Diamond: a → (b, c) → d. The SECOND of b/c
+        // (order-independent: 0.6 + 0.6) blows the $1 cap → Pause;
+        // both b and c count and d is never dispatched. (The instant
+        // fake settles steps immediately, so genuine mid-flight
+        // behavior — window completions cost-recording after pause —
+        // is pinned by e08, not here.)
         let ids = sorted_ids(4);
         let (a, b, c_id, d) = (ids[0], ids[1], ids[2], ids[3]);
         let exec = FakePlanExec::new(2, 100);

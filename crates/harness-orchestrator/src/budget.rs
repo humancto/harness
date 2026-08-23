@@ -160,6 +160,11 @@ impl BudgetTracker {
         if let Some(cap) = self.cap_usd {
             if !self.exceeded_fired && self.spent_usd > cap {
                 self.exceeded_fired = true;
+                // The hard cap subsumes the soft limit: a later record
+                // must never emit a "soft_limit" frame AFTER
+                // "exceeded" on the Progress stream (diff review on
+                // #59 — 5.10 reads these in order).
+                self.soft_fired = true;
                 return BudgetVerdict::Exceeded {
                     spent_usd: self.spent_usd,
                     cap_usd: cap,
@@ -278,6 +283,17 @@ mod tests {
         assert_eq!(t.record(&json!({"cost_usd": 5.0})), BudgetVerdict::Ok);
         assert!(t.triggered());
         assert!((t.spent_usd() - 6.2).abs() < 1e-9);
+        // And a soft limit never fires AFTER the cap did.
+        let mut t = BudgetTracker::new(
+            Some(budget(Some(1.0), Some(0.9), BudgetAction::Notify)),
+            None,
+            None,
+        );
+        assert!(matches!(
+            t.record(&json!({"cost_usd": 1.2})),
+            BudgetVerdict::Exceeded { .. }
+        ));
+        assert_eq!(t.record(&json!({"cost_usd": 0.1})), BudgetVerdict::Ok);
     }
 
     #[test]
