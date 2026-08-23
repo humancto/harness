@@ -65,6 +65,8 @@ struct Fixture {
     partials: Arc<harness_api::PartialBuffers>,
     addr: std::net::SocketAddr,
     server: harness_api::ServerHandle,
+    /// 4.8: the runs socket is session-gated; tests mint a token.
+    token: String,
 }
 
 async fn boot() -> Fixture {
@@ -74,6 +76,7 @@ async fn boot() -> Fixture {
     let auth = Arc::new(AuthProvider::new(Some(
         AdminFile::from_password("hunter2").expect("hash"),
     )));
+    let (token, _) = auth.sessions.issue();
     let state = ApiStateBuilder::new(identity.clone(), "runs-ws-test")
         .with_auth(auth)
         .with_store(store.clone())
@@ -89,15 +92,21 @@ async fn boot() -> Fixture {
         partials,
         addr,
         server,
+        token,
     }
 }
 
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-async fn connect(addr: std::net::SocketAddr, task_id: TaskId) -> Ws {
-    let url = format!("ws://{addr}/api/v1/runs/{}", task_id.0.as_hyphenated());
-    let (ws, _resp) = tokio_tungstenite::connect_async(url)
+async fn connect(f: &Fixture, task_id: TaskId) -> Ws {
+    let url = format!("ws://{}/api/v1/runs/{}", f.addr, task_id.0.as_hyphenated());
+    let mut req = url.as_str().into_client_request().expect("build req");
+    req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {}", f.token).parse().unwrap(),
+    );
+    let (ws, _resp) = tokio_tungstenite::connect_async(req)
         .await
         .expect("ws connect");
     ws
@@ -140,7 +149,7 @@ async fn expect_close(ws: &mut Ws) {
 async fn ws_streams_states_to_done_with_output_then_closes() {
     let f = boot().await;
     let id = insert_signed_task(&f.store, &f.identity);
-    let mut ws = connect(f.addr, id).await;
+    let mut ws = connect(&f, id).await;
 
     // Connect-time state arrives without waiting for a transition.
     let first = next_json(&mut ws).await;
@@ -199,7 +208,7 @@ async fn ws_pushes_mixed_partials_before_terminal_frame() {
     // the terminal frame; no seq is resent on the same socket.
     let f = boot().await;
     let id = insert_signed_task(&f.store, &f.identity);
-    let mut ws = connect(f.addr, id).await;
+    let mut ws = connect(&f, id).await;
     let first = next_json(&mut ws).await;
     assert_eq!(first["state"], "submitted");
 
@@ -265,7 +274,7 @@ async fn ws_failed_task_streams_error_then_closes() {
         .write_task_result_failed(id, "undispatchable: no eligible node", 42, node)
         .expect("result");
 
-    let mut ws = connect(f.addr, id).await;
+    let mut ws = connect(&f, id).await;
     let ev = next_json(&mut ws).await;
     assert_eq!(ev["state"], "failed");
     assert_eq!(ev["error"], "undispatchable: no eligible node");
@@ -282,7 +291,12 @@ async fn ws_unknown_task_rejected_before_upgrade() {
         f.addr,
         TaskId::new_v7().0.as_hyphenated()
     );
-    let result = tokio_tungstenite::connect_async(url).await;
+    let mut req = url.as_str().into_client_request().expect("build req");
+    req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {}", f.token).parse().unwrap(),
+    );
+    let result = tokio_tungstenite::connect_async(req).await;
     assert!(result.is_err(), "unknown task id must refuse the upgrade");
     f.server.shutdown().await;
 }
@@ -291,8 +305,25 @@ async fn ws_unknown_task_rejected_before_upgrade() {
 async fn ws_invalid_task_id_rejected() {
     let f = boot().await;
     let url = format!("ws://{}/api/v1/runs/not-a-uuid", f.addr);
-    let result = tokio_tungstenite::connect_async(url).await;
+    let mut req = url.as_str().into_client_request().expect("build req");
+    req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {}", f.token).parse().unwrap(),
+    );
+    let result = tokio_tungstenite::connect_async(req).await;
     assert!(result.is_err(), "malformed task id must refuse the upgrade");
+    f.server.shutdown().await;
+}
+
+/// 4.8: the runs socket serves task output — an upgrade without a
+/// session (no cookie, no bearer) is refused like GET /tasks/:id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_unauthenticated_upgrade_refused() {
+    let f = boot().await;
+    let id = insert_signed_task(&f.store, &f.identity);
+    let url = format!("ws://{}/api/v1/runs/{}", f.addr, id.0.as_hyphenated());
+    let result = tokio_tungstenite::connect_async(url).await;
+    assert!(result.is_err(), "sessionless upgrade must be refused");
     f.server.shutdown().await;
 }
 

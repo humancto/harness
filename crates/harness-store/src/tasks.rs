@@ -115,6 +115,10 @@ pub struct TaskRow {
     pub completed_by: Option<NodeId>,
     pub started_at: Option<u64>,
     pub finished_at: Option<u64>,
+    /// 4.8: sub-task linkage for UI grouping (federated/plan children).
+    pub parent: Option<TaskId>,
+    /// 4.8: plan-run linkage (`plan.execute` step rows).
+    pub plan_id: Option<harness_core::PlanId>,
 }
 
 impl Store {
@@ -386,7 +390,8 @@ impl Store {
         self.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT id, capability, state, issued_by, issued_at,
-                        completed_by, started_at, finished_at
+                        completed_by, started_at, finished_at,
+                        parent_id, plan_id
                    FROM tasks
                   WHERE state = ?1
                     AND ((?2 IS NULL AND assigned_node IS NULL)
@@ -505,11 +510,61 @@ impl Store {
         })
     }
 
+    /// Most-recent tasks across ALL states (4.8 runs listing), newest
+    /// first over `idx_tasks_by_issued_at`.
+    pub fn list_recent_tasks(&self, limit: usize) -> Result<Vec<TaskRow>, StoreError> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, capability, state, issued_by, issued_at,
+                        completed_by, started_at, finished_at,
+                        parent_id, plan_id
+                   FROM tasks
+               ORDER BY issued_at DESC
+                  LIMIT ?",
+            )?;
+            let rows = stmt
+                .query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
+                    Ok(row_to_task_row(r))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter().collect::<Result<Vec<_>, _>>()
+        })
+    }
+
+    /// Like [`Self::list_tasks_by_state`] with a row cap — the 4.8
+    /// API listing's `?state=` arm (one page, never a full-table dump;
+    /// terminal states accumulate forever).
+    pub fn list_tasks_by_state_limited(
+        &self,
+        state: TaskState,
+        limit: usize,
+    ) -> Result<Vec<TaskRow>, StoreError> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, capability, state, issued_by, issued_at,
+                        completed_by, started_at, finished_at,
+                        parent_id, plan_id
+                   FROM tasks
+                  WHERE state = ?1
+               ORDER BY issued_at DESC
+                  LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(
+                    params![state.as_str(), i64::try_from(limit).unwrap_or(i64::MAX)],
+                    |r| Ok(row_to_task_row(r)),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter().collect::<Result<Vec<_>, _>>()
+        })
+    }
+
     pub fn list_tasks_by_state(&self, state: TaskState) -> Result<Vec<TaskRow>, StoreError> {
         self.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT id, capability, state, issued_by, issued_at,
-                        completed_by, started_at, finished_at
+                        completed_by, started_at, finished_at,
+                        parent_id, plan_id
                    FROM tasks
                   WHERE state = ?
                ORDER BY issued_at DESC",
@@ -541,6 +596,22 @@ fn row_to_task_row(r: &rusqlite::Row<'_>) -> Result<TaskRow, StoreError> {
                 .map_err(|_| StoreError::Cbor("completed_by must be 16 bytes".into()))
         })
         .transpose()?;
+    let parent = r
+        .get::<_, Option<Vec<u8>>>(8)?
+        .map(|b| {
+            <[u8; 16]>::try_from(b.as_slice())
+                .map_err(|_| StoreError::Cbor("parent id must be 16 bytes".into()))
+        })
+        .transpose()?
+        .map(|arr| TaskId(uuid::Uuid::from_bytes(arr)));
+    let plan_id = r
+        .get::<_, Option<Vec<u8>>>(9)?
+        .map(|b| {
+            <[u8; 16]>::try_from(b.as_slice())
+                .map_err(|_| StoreError::Cbor("plan id must be 16 bytes".into()))
+        })
+        .transpose()?
+        .map(|arr| harness_core::PlanId(uuid::Uuid::from_bytes(arr)));
     Ok(TaskRow {
         id: TaskId(uuid::Uuid::from_bytes(id_arr)),
         capability: r.get(1)?,
@@ -548,6 +619,8 @@ fn row_to_task_row(r: &rusqlite::Row<'_>) -> Result<TaskRow, StoreError> {
         issued_by: NodeId::from_bytes(issued_arr),
         issued_at: u64::try_from(r.get::<_, i64>(4)?).unwrap_or(0),
         completed_by,
+        parent,
+        plan_id,
         started_at: r
             .get::<_, Option<i64>>(6)?
             .map(|v| u64::try_from(v).unwrap_or(0)),
@@ -607,6 +680,40 @@ mod tests {
         let loaded = s.load_task(task.id).expect("load").expect("present");
         assert_eq!(loaded, task);
         assert!(loaded.verify_signature(id.public_key()).is_ok());
+    }
+
+    /// 4.8: the runs listing — newest first across states, limit
+    /// honored, and `parent`/`plan_id` round-trip for UI grouping.
+    #[test]
+    fn list_recent_tasks_orders_limits_and_links() {
+        let s = Store::open_memory().expect("open");
+        let id = Identity::generate();
+        let mut older = signed_task(&id);
+        older.issued_at = 1_700_000_000_000;
+        older.sign(&id).expect("sign");
+        s.insert_task(&older).expect("insert");
+        s.transition_task(older.id, TaskState::Dispatched)
+            .expect("hop");
+
+        let plan_id = harness_core::PlanId(uuid::Uuid::now_v7());
+        let mut child = signed_task(&id);
+        child.issued_at = 1_700_000_000_500;
+        child.parent = Some(older.id);
+        child.plan_id = Some(plan_id);
+        child.sign(&id).expect("sign");
+        s.insert_task(&child).expect("insert");
+
+        let rows = s.list_recent_tasks(50).expect("list");
+        assert_eq!(rows.len(), 2, "all states listed");
+        assert_eq!(rows[0].id, child.id, "newest first");
+        assert_eq!(rows[0].parent, Some(older.id), "parent round-trips");
+        assert_eq!(rows[0].plan_id, Some(plan_id), "plan_id round-trips");
+        assert_eq!(rows[1].state, TaskState::Dispatched);
+        assert_eq!(rows[1].parent, None);
+
+        let limited = s.list_recent_tasks(1).expect("list");
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, child.id);
     }
 
     #[test]

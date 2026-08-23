@@ -58,7 +58,8 @@ pub enum Command {
     Admin(AdminArgs),
     /// Submit a task to the local daemon.
     Submit(SubmitArgs),
-    /// List submitted tasks.
+    /// List recent tasks across all states (newest first; the
+    /// pre-4.8 submitted-only view is `GET /tasks?state=submitted`).
     Tasks(TasksArgs),
     /// Run a shell command on this node (Phase 3.3a).
     /// `harness run -- uname -a`. `--all`/`--on <node>`/`--where` are

@@ -108,6 +108,77 @@ export interface PartialFrame {
   line: string;
 }
 
+// One row of GET /api/v1/tasks (4.8) — crates/harness-api/src/routes/
+// tasks.rs `TaskSummaryDto`. `parent`/`plan_id` are omitted for
+// top-level / non-plan tasks.
+export interface TaskSummaryDto {
+  id: string;
+  capability: string;
+  state: TaskState | string;
+  issued_at_ms: number;
+  parent?: string;
+  plan_id?: string;
+}
+
+// One `{"step": ...}` progress-frame chunk emitted by plan.execute —
+// crates/harness-capabilities/src/plan_exec.rs. `in_flight` frames
+// (4.8) fire at submit time and always carry `task_id`; settle frames
+// carry a terminal state; feed-time failures never get a `task_id`.
+export interface PlanStepFrame {
+  step: {
+    id: string;
+    capability: string;
+    state:
+      | "waiting"
+      | "in_flight"
+      | "done"
+      | "failed"
+      | "timed_out"
+      | "skipped"
+      | string;
+    task_id?: string;
+    error?: string;
+  };
+}
+
+// The terminal `{"plan_summary": ...}` chunk (plan_exec.rs).
+export interface PlanSummaryFrame {
+  plan_summary: {
+    ok: number;
+    failed: number;
+    timed_out: number;
+    skipped: number;
+    total: number;
+  };
+}
+
+// Federated coordinator stage chunks (crates/harness-daemon/
+// src/federated.rs): per-node streaming updates and the settle line.
+export interface FederatedProgressChunk {
+  federated: {
+    stage: "discovered" | "streaming" | "fanout_settled" | "merging" | string;
+    node?: string;
+    node_name?: string;
+    outcome?: string;
+    completed?: number;
+    total?: number;
+    ok?: number;
+    failed?: number;
+    timed_out?: number;
+  };
+}
+
+// The `plan` object inside a plan.execute task's input —
+// crates/harness-core/src/protocol/plan.rs `Plan`. Task keys are
+// uuid strings; `edges` entries are `[from, to]` = "from DEPENDS ON
+// to" (to must complete before from starts).
+export interface PlanInput {
+  id: string;
+  name: string;
+  tasks: Record<string, { capability: string; [k: string]: unknown }>;
+  edges: [string, string][];
+}
+
 // GET /api/v1/tasks/{id} — output/error/completed_at_ms are omitted
 // (not null) until the task is terminal. `partials` carries the live
 // frame ring (3.2-stream) including "progress" telemetry (4.2).

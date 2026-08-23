@@ -30,9 +30,13 @@
 //! layer. A store-side notification bus can replace the poll without
 //! changing the wire shape.
 //!
-//! Auth/origin discipline mirrors `WS /api/v1/events`: loopback-only
-//! `Origin` when the header is present (browser defense-in-depth);
-//! header-less non-browser clients are allowed.
+//! Auth/origin discipline: loopback-only `Origin` when the header is
+//! present (browser defense-in-depth, as `WS /api/v1/events`), PLUS —
+//! 4.8 — session auth before the upgrade: this socket serves task
+//! output and partials, the same data the bearer-gated `GET /tasks/:id`
+//! serves, so it demands the same session. Browsers authenticate via
+//! the `harness_session` cookie (sent on the upgrade request); CLI or
+//! test clients set `Authorization: Bearer` on the handshake.
 
 use std::time::Duration;
 
@@ -99,6 +103,11 @@ pub async fn ws_run(
             tracing::warn!(target: "harness.api.runs", ?origin, "ws origin rejected");
             return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
         }
+    }
+    // 4.8: same session gate as GET /tasks/:id (cookie or bearer on
+    // the upgrade request) — this socket serves task output.
+    if !crate::auth::is_authenticated(&state.auth, &headers) {
+        return crate::auth::unauthorized();
     }
     let Some(store) = state.store.clone() else {
         return (

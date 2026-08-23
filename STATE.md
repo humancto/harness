@@ -1,7 +1,7 @@
 # Harness Implementation State
 
 **Current phase:** 4 — Distribution patterns (Phase 3 COMPLETE as of #42)
-**Last updated:** 2026-08-23 (post-4.7 backpressure)
+**Last updated:** 2026-08-23 (post-4.8 UI DAG viz + live progress)
 
 ## Phase 3 summary (post-merge) — COMPLETE
 
@@ -127,6 +127,19 @@ These will land alongside their natural Phase 3 home, not as a "phase 2.10":
 
 
 | #50 | 4.7  | Backpressure (ADR-0029): the heartbeat `paused` field finally has a producer — `PauseState` (queue-depth hysteresis latch at `max_queue_depth`/release at 3/4, OR operator `POST /admin/pause\|resume` + `GET /status` surfacing) with coordination-permit RAII subtraction so `queue_depth` means WORK depth; `DaemonRuntimeConfig.max_queue_depth` is the §14.10 knob; submit admission (`429` + `Retry-After: 2` over 1024 `Submitted` rows, indexed COUNT, fail-open, internal mints exempt); pause-aware routing in every `eligible_scored` arm (live-paused pin ⇒ ResourceGated while dead pins stay fast-terminal; paused owners wait, never reroute; unpinned federated sets exclude paused into `DispatchPlan::Federated::excluded` → `Skipped` provenance rows, policy-exempt; self gated via the shared `PauseState` in `StoreLoadView`); sub-tasks + plan steps stamp `constraints.deadline = issued_at + timeout_ms` (the pre-dispatch wait is bounded — no posthumous runs); full/lag-condition tests for every shipped bound (peer_net QueueFull both arms, reply pump/bridge/WS Lagged recovery, `into_channel` producer-park, `MESH_EVENT_CAPACITY`/`TERMINAL_EVENT_CAPACITY` named); bounds hygiene (llm_batcher `MAX_SLOT_SENDERS=64` flush-on-full + `MAX_LIVE_FINGERPRINTS=256` bypass; partial_stream pending task cap 256 evict-oldest-warned; sweep covers `elig_failures` + Cancelled reply obligations; additive `partials_dropped` on `GET /tasks/:id` + types.ts; `CLI_FANOUT_WINDOW=16`). m09 money test: saturate→pause→pinned waits/Anyone reroutes/federated Skips→drain→resume→exactly-once. +32 tests |
+
+| #51 | 4.8  | UI DAG viz + live progress: `GET /tasks` lists recent tasks across ALL states (limit clamp, `?state=` exact filter preserves the pre-4.8 view, 400 on unknown; additive `parent`/`plan_id` via `TaskRow`+`list_recent_tasks` over `idx_tasks_by_issued_at`); `WS /runs/:id` session-gated before upgrade (it serves task output — cookie rides the browser handshake, tests/CLI use bearer); plan.execute emits additive `in_flight` step frames at submit (settle frames only ever carried terminal states — the live DAG had nothing to light); UI: runs list rework (grouping, live badges), `/runs/[id]` (prerender=false) with WS live view + close-code-aware poll fallback, progress bar reduced from plan/mesh/federated frame families, log tail, `partials_dropped` banner, provenance table incl. Skipped; `$lib/dag.ts` pure Kahn layout (no new deps, cycle-defensive) + DagView SVG, arrows dependency→dependent mirroring the Rust orientation lock. +5 Rust tests, +12 vitest (35 UI total) |
+
+4.8 review round 1 (plan): REVISE, all adopted pre-implementation — MAJOR-1: `ws_run` had
+NO session auth (only loopback-Origin); 4.8 gates it with `is_authenticated` pre-upgrade
+(deliberate contract change; headerless clients must present a session). MAJOR-2: step
+frames were settle-only (`InFlight` never emitted; t08 pinned 2 frames) — additive
+in_flight emit at submit_step makes the live DAG real. MAJOR-3: `/runs/[id]` needs
+`prerender = false` under the root prerender=true SPA shell or adapter-static fails the
+build. MINOR-4..7 + NIT-8 (query extractor is new code w/ 400s; progress vocab corrected
+to completed/total + FederatedProgressChunk; TaskSummaryDto added to types.ts; TaskRow
+ripple through both positional SELECTs; 1000-close never reconnects) adopted; money tests
+(parent linkage through the LIST endpoint, DAG arrow direction, three-family reducer).
 
 4.7 review round 1 (plan): REVISE, all adopted pre-implementation — BLOCKER-1: no
 `PauseAwareLiveSet` (liveness ≠ load); the gate lives inside `eligible_scored` via the

@@ -60,6 +60,13 @@ pub struct TaskSummaryDto {
     pub capability: String,
     pub state: String,
     pub issued_at_ms: u64,
+    /// 4.8: parent task id for sub-task grouping (federated/plan
+    /// children). Omitted for top-level tasks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// 4.8: plan-run linkage. Omitted for non-plan tasks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
 }
 
 /// 4.7 admission (ADR-0029): `Some(429)` when the submitted backlog is
@@ -204,12 +211,30 @@ pub async fn submit_handler(
         .into_response()
 }
 
-/// `GET /api/v1/tasks?state=<state>` — list tasks from the local store.
-/// Currently returns only `submitted` tasks; the full state filter set
-/// lands when the dispatcher writes through more transitions.
+/// Query surface of `GET /api/v1/tasks` (4.8).
+#[derive(Debug, Deserialize)]
+pub struct ListQuery {
+    /// Exact per-state filter (the pre-4.8 Submitted-only view is
+    /// `?state=submitted`). Unknown states → 400.
+    pub state: Option<String>,
+    /// Row cap for the default recent-across-states listing
+    /// (default 50, clamped to [1, 200]).
+    pub limit: Option<usize>,
+}
+
+/// Default limit for the recent listing.
+const LIST_DEFAULT_LIMIT: usize = 50;
+/// Hard cap — one indexed page, never a full-table dump.
+const LIST_MAX_LIMIT: usize = 200;
+
+/// `GET /api/v1/tasks` — recent tasks across ALL states, newest first
+/// (4.8; the pre-4.8 behavior returned Submitted rows only — that view
+/// is `?state=submitted`). `parent`/`plan_id` ride along for sub-task
+/// grouping in the UI.
 pub async fn list_handler(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<ListQuery>,
 ) -> axum::response::Response {
     if !is_authenticated(&state.auth, &headers) {
         return unauthorized();
@@ -221,7 +246,28 @@ pub async fn list_handler(
         )
             .into_response();
     };
-    match store.list_tasks_by_state(harness_store::TaskState::Submitted) {
+    let limit = query
+        .limit
+        .unwrap_or(LIST_DEFAULT_LIMIT)
+        .clamp(1, LIST_MAX_LIMIT);
+    let rows = if let Some(wanted) = &query.state {
+        match wanted.parse::<harness_store::TaskState>() {
+            // The clamp applies to BOTH arms (diff review MINOR-6):
+            // terminal states accumulate forever, so `?state=done`
+            // must page exactly like the default listing.
+            Ok(task_state) => store.list_tasks_by_state_limited(task_state, limit),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "unknown_state" })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        store.list_recent_tasks(limit)
+    };
+    match rows {
         Ok(rows) => {
             let dto: Vec<TaskSummaryDto> = rows
                 .into_iter()
@@ -230,6 +276,8 @@ pub async fn list_handler(
                     capability: r.capability,
                     state: r.state.as_str().into(),
                     issued_at_ms: r.issued_at,
+                    parent: r.parent.map(|p| format!("{}", p.0.as_hyphenated())),
+                    plan_id: r.plan_id.map(|p| format!("{}", p.0.as_hyphenated())),
                 })
                 .collect();
             (StatusCode::OK, Json(dto)).into_response()

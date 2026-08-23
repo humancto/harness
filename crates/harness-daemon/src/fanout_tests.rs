@@ -528,7 +528,8 @@ async fn m05_plan_execute_chains_steps_with_output_threading() {
         .collect();
     assert_eq!(row_ids.len(), 2);
 
-    // Progress frames: 2 step frames + 1 plan summary in the ring.
+    // Progress frames: per step one in_flight (4.8) + one settle
+    // frame, plus 1 plan summary in the ring.
     let frames: Vec<serde_json::Value> = a
         .partials
         .frames(id)
@@ -537,11 +538,19 @@ async fn m05_plan_execute_chains_steps_with_output_threading() {
         .map(|f| serde_json::from_str(&f.line).expect("json"))
         .collect();
     let step_frames = frames.iter().filter(|c| !c["step"].is_null()).count();
+    let in_flight = frames
+        .iter()
+        .filter(|c| c["step"]["state"] == "in_flight")
+        .count();
     let summaries = frames
         .iter()
         .filter(|c| !c["plan_summary"].is_null())
         .count();
-    assert_eq!((step_frames, summaries), (2, 1), "{frames:#?}");
+    assert_eq!(
+        (step_frames, in_flight, summaries),
+        (4, 2, 1),
+        "{frames:#?}"
+    );
 
     a.stop().await;
 }
