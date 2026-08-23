@@ -90,6 +90,21 @@ provider in the middle: the phone talks straight to the mesh, so the
   ledger (in-memory, like the Twilio drivers) — same deferral to
   5.11 recorded in ADR-0033 §6.
 
+## Post-open review hardening (#58 Codex + diff review)
+
+- **Atomic dedup:** duplicate lookup → admission → mint → ledger
+  reservation run under ONE ledger lock (sync `admit_goal`), so
+  concurrent retries with the same `request_id` serialize — exactly
+  one mints. A remembered id whose outcome aged out of the ledger is
+  an **expired duplicate** (410 + original task id), never a
+  re-mint.
+- **Bounded in bytes, not just entries:** `request_id` ≤ 128
+  printable ASCII, `goal` ≤ 4096 chars — an authorized client cannot
+  pin megabyte strings into the ledger or the store.
+- **Clock failure fails closed** (503): expiry is never evaluated
+  against a zeroed clock. `Bearer` scheme matching is
+  case-insensitive per RFC 7235.
+
 ## Production cutover
 
 No external account exists for this adapter — the tests exercise the

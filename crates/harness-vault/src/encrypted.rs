@@ -267,10 +267,16 @@ impl EncryptedStore {
             .unwrap_or("secrets.enc");
         let tmp = path.with_file_name(format!("{file_name}.tmp"));
         write_encrypted(&tmp, key, &raw)?;
-        std::fs::rename(&tmp, path).map_err(|e| SecretsError::Io {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            // Best-effort cleanup: the tmp is encrypted (no plaintext
+            // exposure) but stale key material under a predictable
+            // name should not linger (diff review MINOR-3).
+            let _ = std::fs::remove_file(&tmp);
+            return Err(SecretsError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            });
+        }
         self.map.insert(
             tag.to_string(),
             SecretValue::from_bytes(value.as_bytes().to_vec()),

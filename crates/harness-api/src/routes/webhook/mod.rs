@@ -156,8 +156,12 @@ impl ShortcutsLedger {
             }
         }
         if let Some(rid) = request_id.filter(|r| !r.is_empty()) {
-            self.requests.insert(rid.to_string(), task);
-            self.request_order.push_back(rid.to_string());
+            // A re-admitted id (its outcome aged out but the mapping
+            // had not) must not appear twice in the FIFO — that would
+            // skew eviction accounting (diff review NIT-9).
+            if self.requests.insert(rid.to_string(), task).is_none() {
+                self.request_order.push_back(rid.to_string());
+            }
             while self.request_order.len() > SHORTCUT_REQUESTS_CAP {
                 if let Some(old) = self.request_order.pop_front() {
                     self.requests.remove(&old);

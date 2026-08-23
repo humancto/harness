@@ -45,6 +45,23 @@ const DEFAULT_WAIT_MS: u64 = 55_000;
 const MIN_WAIT_MS: u64 = 1_000;
 const MAX_WAIT_MS: u64 = 120_000;
 
+/// `request_id` bound (Codex P2 on #58): every distinct value is
+/// cloned into two ledger structures, so a near-body-sized id from a
+/// valid-token client could pin hundreds of large strings. A UUID is
+/// 36 chars; 128 printable ASCII is generous and also keeps the
+/// logged value injection-free.
+const MAX_REQUEST_ID_LEN: usize = 128;
+
+/// Goal cap (diff review MAJOR-1 second half): axum's default body
+/// limit is ~2 MB; an authorized client must not push megabyte goals
+/// into the store per mint. 4096 chars is far beyond any spoken or
+/// typed Shortcut input.
+const MAX_GOAL_LEN: usize = 4096;
+
+fn request_id_ok(rid: &str) -> bool {
+    rid.len() <= MAX_REQUEST_ID_LEN && rid.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
 /// Request body. `deny_unknown_fields` on purpose: a `constraints`
 /// or `tags` field is a smuggling attempt and gets a 400, not a
 /// silent drop (5.7 plan review NIT-14).
@@ -63,10 +80,14 @@ fn err_json(status: StatusCode, body: serde_json::Value) -> Response {
     (status, Json(body)).into_response()
 }
 
-fn unix_now() -> u64 {
+/// `None` on a broken clock — the ONE security check in this adapter
+/// (token expiry) must fail closed, not open at `now = 0` (diff
+/// review MINOR-2).
+fn unix_now() -> Option<u64> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 /// Bearer auth shared by POST and GET. `Err` is the ready-to-return
@@ -94,12 +115,22 @@ fn authorize(state: &ApiState, headers: &HeaderMap) -> Result<String, Response> 
             json!({ "error": "adapter_unconfigured", "missing": SHORTCUTS_KEY_TAG }),
         ));
     };
+    let Some(now) = unix_now() else {
+        return Err(err_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "error": "clock_unavailable" }),
+        ));
+    };
+    // RFC 7235: the auth scheme is case-insensitive (diff review
+    // NIT-6 — a hand-typed "bearer" in the Shortcuts header field
+    // must not 401 mysteriously).
     let token = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .unwrap_or("");
-    match verify_token(&key, token, unix_now()) {
+        .and_then(|h| h.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+        .map_or("", |(_, t)| t.trim());
+    match verify_token(&key, token, now) {
         Ok(payload) => Ok(payload.sub),
         Err(class) => {
             tracing::warn!(
@@ -145,20 +176,91 @@ fn outcome_response(
 
 /// A remembered `request_id` answers with the ORIGINAL task's current
 /// state — crucially including the `task_id` the timed-out client
-/// never saw (plan review MAJOR-5).
-fn duplicate_response(state: &ApiState, request_id: Option<&str>, sub: &str) -> Option<Response> {
+/// never saw (plan review MAJOR-5). Takes the CALLER-HELD ledger so
+/// lookup and reservation are one atomic critical section (Codex P1
+/// on #58: two concurrent same-id retries must not both mint).
+/// A remembered id whose outcome was evicted is an EXPIRED duplicate
+/// (410), never a fresh request (Codex P2: the two FIFO caps differ,
+/// so the mapping can outlive the outcome).
+fn duplicate_response(
+    ledger: &super::ShortcutsLedger,
+    request_id: Option<&str>,
+    sub: &str,
+) -> Option<Response> {
     let rid = request_id.filter(|r| !r.is_empty())?;
-    let ledger = state.webhook.shortcuts.lock();
     let task = ledger.lookup_request(rid)?;
-    let o = ledger.get(task)?;
+    let id = format!("{}", task.0.as_hyphenated());
     tracing::info!(
         target: "harness.api.webhook",
         channel = "shortcuts",
         %sub,
         request_id = %rid,
+        task = %id,
         "duplicate request_id; returning original task state"
     );
-    Some(outcome_response(task, o.done, o.ok, o.reply.as_deref()))
+    match ledger.get(task) {
+        Some(o) => Some(outcome_response(task, o.done, o.ok, o.reply.as_deref())),
+        None => Some(err_json(
+            StatusCode::GONE,
+            json!({
+                "error": "result_expired",
+                "task_id": id,
+                "reply": "result expired — resubmit with a new request_id",
+            }),
+        )),
+    }
+}
+
+/// The SYNC critical section: duplicate lookup → admission gate →
+/// permit → mint → ledger reservation, all under ONE ledger lock
+/// (Codex P1 on #58: concurrent retries with the same `request_id`
+/// serialize here, so exactly one mints and the rest see the
+/// reservation). Being a sync fn, the `parking_lot` guard structurally
+/// cannot be held across an await. A refusal on any path returns
+/// BEFORE the reservation, so the `request_id` stays retryable.
+fn admit_goal(
+    state: &ApiState,
+    goal: &str,
+    request_id: Option<&str>,
+    sub: &str,
+) -> Result<(harness_core::TaskId, tokio::sync::OwnedSemaphorePermit), Response> {
+    let mut ledger = state.webhook.shortcuts.lock();
+    if let Some(dup) = duplicate_response(&ledger, request_id, sub) {
+        return Err(dup);
+    }
+    let Some(store) = state.store.as_ref() else {
+        return Err(err_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "error": "store_not_configured" }),
+        ));
+    };
+    // Root-level external input rides the 4.7 admission gate; the
+    // driver semaphore bounds concurrent conversations (shared with
+    // the Twilio channels on purpose — one global conversation cap).
+    if check_admission(store).is_some() {
+        return Err(err_json(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({ "error": "mesh_busy" }),
+        ));
+    }
+    let Ok(permit) = Arc::clone(&state.webhook.drivers).try_acquire_owned() else {
+        return Err(err_json(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({ "error": "mesh_busy" }),
+        ));
+    };
+    let plan_req = SubmitRequest {
+        capability: "brain.plan".to_string(),
+        input: json!({ "goal": goal }),
+        constraints: None,
+        execution: Some(exec_policy(PLAN_TIMEOUT_MS + SLACK_MS)),
+        tags: vec!["webhook".to_string(), SHORTCUTS.name.to_string()],
+        resource_hints: None,
+    };
+    let plan_id = mint_task(state, store, plan_req)
+        .map_err(|code| err_json(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": code })))?;
+    ledger.admit(plan_id, request_id);
+    Ok((plan_id, permit))
 }
 
 pub async fn shortcuts_handler(
@@ -177,52 +279,23 @@ pub async fn shortcuts_handler(
     if goal.is_empty() {
         return err_json(StatusCode::BAD_REQUEST, json!({ "error": "empty_goal" }));
     }
-
-    if let Some(dup) = duplicate_response(&state, req.request_id.as_deref(), &sub) {
-        return dup;
+    if goal.chars().count() > MAX_GOAL_LEN {
+        return err_json(StatusCode::BAD_REQUEST, json!({ "error": "goal_too_long" }));
     }
 
-    let Some(store) = state.store.as_ref() else {
-        return err_json(
-            StatusCode::SERVICE_UNAVAILABLE,
-            json!({ "error": "store_not_configured" }),
-        );
-    };
-    // Root-level external input rides the 4.7 admission gate; the
-    // driver semaphore bounds concurrent conversations (shared with
-    // the Twilio channels on purpose — one global conversation cap).
-    if check_admission(store).is_some() {
-        return err_json(
-            StatusCode::TOO_MANY_REQUESTS,
-            json!({ "error": "mesh_busy" }),
-        );
-    }
-    let Ok(permit) = Arc::clone(&state.webhook.drivers).try_acquire_owned() else {
-        return err_json(
-            StatusCode::TOO_MANY_REQUESTS,
-            json!({ "error": "mesh_busy" }),
-        );
-    };
-
-    let plan_req = SubmitRequest {
-        capability: "brain.plan".to_string(),
-        input: json!({ "goal": goal }),
-        constraints: None,
-        execution: Some(exec_policy(PLAN_TIMEOUT_MS + SLACK_MS)),
-        tags: vec!["webhook".to_string(), SHORTCUTS.name.to_string()],
-        resource_hints: None,
-    };
-    let plan_id = match mint_task(&state, store, plan_req) {
-        Ok(id) => id,
-        Err(code) => {
-            return err_json(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": code }));
+    if let Some(rid) = req.request_id.as_deref() {
+        if !request_id_ok(rid) {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": "invalid_request_id" }),
+            );
         }
+    }
+
+    let (plan_id, permit) = match admit_goal(&state, &goal, req.request_id.as_deref(), &sub) {
+        Ok(admitted) => admitted,
+        Err(refusal) => return refusal,
     };
-    state
-        .webhook
-        .shortcuts
-        .lock()
-        .admit(plan_id, req.request_id.as_deref());
     tracing::info!(
         target: "harness.api.webhook",
         channel = "shortcuts",

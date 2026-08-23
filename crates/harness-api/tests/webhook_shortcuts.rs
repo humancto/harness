@@ -421,3 +421,76 @@ async fn t07_driver_cap_is_429_busy() {
     assert_eq!(body["error"], "mesh_busy");
     assert!(find_task(&store, "brain.plan").is_none(), "nothing minted");
 }
+
+#[tokio::test]
+async fn t08_oversized_request_id_is_400() {
+    let (app, store) = app_with(key_secrets(), runtime(MAX_WEBHOOK_DRIVERS));
+    let resp = post_goal(
+        &app,
+        Some(&token()),
+        serde_json::json!({"goal": "run: ls", "request_id": "r".repeat(4000)}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp = post_goal(
+        &app,
+        Some(&token()),
+        serde_json::json!({"goal": "run: ls", "request_id": "has\nnewline"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(find_task(&store, "brain.plan").is_none(), "nothing minted");
+}
+
+#[tokio::test]
+async fn t09_remembered_request_id_with_evicted_outcome_is_410_not_a_remint() {
+    // Codex P2 on #58: the request map (512) outlives the outcome map
+    // (256), so a remembered id can point at an evicted outcome. That
+    // retry must NOT mint a second task — it gets 410 result_expired
+    // with the original task_id.
+    let rt = runtime(MAX_WEBHOOK_DRIVERS);
+    let original = harness_core::TaskId::new_v7();
+    {
+        let mut ledger = rt.shortcuts.lock();
+        ledger.admit(original, Some("r-old"));
+        for _ in 0..300 {
+            ledger.admit(harness_core::TaskId::new_v7(), None);
+        }
+        assert!(ledger.get(original).is_none(), "outcome evicted");
+        assert_eq!(
+            ledger.lookup_request("r-old"),
+            Some(original),
+            "mapping kept"
+        );
+    }
+    let (app, store) = app_with(key_secrets(), rt);
+    let resp = post_goal(
+        &app,
+        Some(&token()),
+        serde_json::json!({"goal": "run: ls", "request_id": "r-old"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::GONE);
+    let body = body_json(resp).await;
+    assert_eq!(body["error"], "result_expired");
+    assert_eq!(
+        body["task_id"].as_str().expect("id"),
+        format!("{}", original.0.as_hyphenated())
+    );
+    assert!(find_task(&store, "brain.plan").is_none(), "no second mint");
+}
+
+#[tokio::test]
+async fn t10_oversized_goal_is_400() {
+    let (app, store) = app_with(key_secrets(), runtime(MAX_WEBHOOK_DRIVERS));
+    let resp = post_goal(
+        &app,
+        Some(&token()),
+        serde_json::json!({"goal": "g".repeat(5000)}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["error"], "goal_too_long");
+    assert!(find_task(&store, "brain.plan").is_none(), "nothing minted");
+}

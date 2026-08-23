@@ -459,16 +459,20 @@ fn cmd_admin_issue_shortcut_token(args: &IssueShortcutTokenArgs) -> Result<Strin
     // Reuse an existing key (env override included — same precedence
     // the daemon reads with); generate + persist only when absent
     // everywhere.
+    // Key material stays behind Zeroizing while it exists as a hex
+    // String in this process (diff review NIT-7).
     let (key_hex, generated) = if let Some(v) = vault.get(SHORTCUTS_KEY_TAG) {
         (
-            String::from_utf8(v.as_bytes().to_vec())
-                .map_err(|_| anyhow::anyhow!("value at {SHORTCUTS_KEY_TAG} is not UTF-8"))?,
+            zeroize::Zeroizing::new(
+                String::from_utf8(v.as_bytes().to_vec())
+                    .map_err(|_| anyhow::anyhow!("value at {SHORTCUTS_KEY_TAG} is not UTF-8"))?,
+            ),
             false,
         )
     } else {
-        let mut key_bytes = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key_bytes);
-        let hex = hex::encode(key_bytes);
+        let mut key_bytes = zeroize::Zeroizing::new([0u8; 32]);
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *key_bytes);
+        let hex = zeroize::Zeroizing::new(hex::encode(*key_bytes));
         vault
             .upsert(&enc_path, &vault_key, SHORTCUTS_KEY_TAG, &hex)
             .context("persist generated signing key")?;
@@ -483,7 +487,7 @@ fn cmd_admin_issue_shortcut_token(args: &IssueShortcutTokenArgs) -> Result<Strin
     let exp = if args.no_expiry {
         None
     } else {
-        Some(now + args.ttl_days.saturating_mul(86_400))
+        Some(now.saturating_add(args.ttl_days.saturating_mul(86_400)))
     };
     let token =
         mint_token(&key, &args.sub, now, exp).map_err(|e| anyhow::anyhow!("mint token: {e}"))?;
