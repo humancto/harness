@@ -38,6 +38,11 @@ fn shell_index() -> CapabilitySchemaIndex {
     CapabilitySchemaIndex::from_pairs(vec![("shell.exec".into(), shell_schema())])
 }
 
+/// 5.3: the common case — no cloud capabilities registered locally.
+fn no_cloud() -> std::collections::HashSet<String> {
+    std::collections::HashSet::new()
+}
+
 fn empty_hints() -> ResourceHints {
     ResourceHints {
         cpu_class: CpuClass::Light,
@@ -84,6 +89,7 @@ fn t06_schema_match_passes_for_shell_exec() {
         &PlanConstraints::default(),
         &shell_index(),
         &shell_only(),
+        &no_cloud(),
     );
     assert!(r.is_ok(), "got {r:?}");
 }
@@ -97,6 +103,7 @@ fn t07_schema_match_fails_when_cmd_is_integer() {
         &PlanConstraints::default(),
         &shell_index(),
         &shell_only(),
+        &no_cloud(),
     );
     let Err(PlanValidationError::SchemaViolation { errors, cap, .. }) = r else {
         panic!("expected SchemaViolation; got {r:?}");
@@ -115,7 +122,14 @@ fn t08_cost_exceeded_fails() {
         max_cost_usd: Some(0.50),
         ..PlanConstraints::default()
     };
-    let r = validate_plan(&p, 1.00, &constraints, &shell_index(), &shell_only());
+    let r = validate_plan(
+        &p,
+        1.00,
+        &constraints,
+        &shell_index(),
+        &shell_only(),
+        &no_cloud(),
+    );
     let Err(PlanValidationError::CostExceeded {
         estimated_usd,
         max_usd,
@@ -135,7 +149,14 @@ fn t09_cost_at_cap_passes() {
         max_cost_usd: Some(1.00),
         ..PlanConstraints::default()
     };
-    let r = validate_plan(&p, 1.00, &constraints, &shell_index(), &shell_only());
+    let r = validate_plan(
+        &p,
+        1.00,
+        &constraints,
+        &shell_index(),
+        &shell_only(),
+        &no_cloud(),
+    );
     assert!(r.is_ok(), "got {r:?}");
 }
 
@@ -147,7 +168,14 @@ fn t10_cost_none_skips_check() {
         ..PlanConstraints::default()
     };
     // Even an absurd cost passes because the cap is unset.
-    let r = validate_plan(&p, 1_000_000.0, &constraints, &shell_index(), &shell_only());
+    let r = validate_plan(
+        &p,
+        1_000_000.0,
+        &constraints,
+        &shell_index(),
+        &shell_only(),
+        &no_cloud(),
+    );
     assert!(r.is_ok(), "got {r:?}");
 }
 
@@ -160,6 +188,7 @@ fn t11_unknown_capability_fails() {
         &PlanConstraints::default(),
         &shell_index(),
         &shell_only(),
+        &no_cloud(),
     );
     assert!(matches!(
         r,
@@ -183,6 +212,7 @@ fn t11b_unknown_schema_for_foreign_cap() {
         &PlanConstraints::default(),
         &shell_index(),     // shell.exec only; foreign.cap absent
         &foreign_available, // foreign.cap appears here so well-formed passes
+        &no_cloud(),
     );
     let Err(PlanValidationError::UnknownSchema { cap, .. }) = r else {
         panic!("expected UnknownSchema; got {r:?}");
@@ -203,6 +233,7 @@ fn t31_well_formed_3_8_shape_still_passes() {
         &PlanConstraints::default(),
         &shell_index(),
         &shell_only(),
+        &no_cloud(),
     );
     assert!(r.is_ok(), "got {r:?}");
 }
@@ -279,6 +310,7 @@ fn t20_ref_to_declared_dependency_defers_schema_and_passes() {
         &PlanConstraints::default(),
         &shell_index(),
         &shell_only(),
+        &no_cloud(),
     );
     assert!(r.is_ok(), "{r:?} — edge ({b2:?},{a2:?}) declared");
 }
@@ -293,6 +325,7 @@ fn t21_ref_without_declared_edge_rejected() {
         &PlanConstraints::default(),
         &shell_index(),
         &shell_only(),
+        &no_cloud(),
     );
     assert!(matches!(
         r,
@@ -311,6 +344,7 @@ fn t22_malformed_ref_rejected() {
         &PlanConstraints::default(),
         &shell_index(),
         &shell_only(),
+        &no_cloud(),
     );
     assert!(matches!(
         r,
@@ -328,6 +362,7 @@ fn t23_node_id_mismatch_rejected() {
         &PlanConstraints::default(),
         &shell_index(),
         &shell_only(),
+        &no_cloud(),
     );
     assert!(matches!(
         r,
@@ -345,9 +380,79 @@ fn t24_ref_free_nodes_keep_full_schema_validation() {
         &PlanConstraints::default(),
         &shell_index(),
         &shell_only(),
+        &no_cloud(),
     );
     assert!(matches!(
         r,
         Err(PlanValidationError::SchemaViolation { .. })
     ));
+}
+
+// ───────────────────────────────────────── 5.3 locality conflict (§15.4 rule 4)
+
+#[test]
+fn t33_must_be_local_with_cloud_cap_is_locality_conflict() {
+    let mut cloud = no_cloud();
+    cloud.insert("llm.cloud.claude".to_string());
+    let avail = vec![CapabilityRef {
+        id: "llm.cloud.claude".to_string(),
+        version_major: 0,
+    }];
+    let p = one_node_plan("llm.cloud.claude", json!({}));
+    let constraints = PlanConstraints {
+        must_be_local: true,
+        ..PlanConstraints::default()
+    };
+    // Schema deliberately unknown for the cloud cap: the locality rule
+    // must fire FIRST (clearest repair diagnostic).
+    let r = validate_plan(
+        &p,
+        0.0,
+        &constraints,
+        &CapabilitySchemaIndex::default(),
+        &avail,
+        &cloud,
+    );
+    assert!(
+        matches!(r, Err(PlanValidationError::LocalityConflict { ref cap, .. }) if cap == "llm.cloud.claude"),
+        "got {r:?}"
+    );
+
+    // Same plan without must_be_local → the rule does not fire (falls
+    // through to UnknownSchema, proving locality was the only gate).
+    let relaxed = PlanConstraints::default();
+    let r = validate_plan(
+        &p,
+        0.0,
+        &relaxed,
+        &CapabilitySchemaIndex::default(),
+        &avail,
+        &cloud,
+    );
+    assert!(
+        matches!(r, Err(PlanValidationError::UnknownSchema { .. })),
+        "got {r:?}"
+    );
+}
+
+#[test]
+fn t34_must_be_local_without_cloud_caps_passes() {
+    // must_be_local against purely local capabilities: fine. Foreign
+    // caps (input-override path) are never in the local cloud set —
+    // same shape as this test — and are deliberately not flagged
+    // (§10.4 backstop, ADR-0032).
+    let p = one_node_plan("shell.exec", json!({"cmd": "ls"}));
+    let constraints = PlanConstraints {
+        must_be_local: true,
+        ..PlanConstraints::default()
+    };
+    let r = validate_plan(
+        &p,
+        0.0,
+        &constraints,
+        &shell_index(),
+        &shell_only(),
+        &no_cloud(),
+    );
+    assert!(r.is_ok(), "got {r:?}");
 }

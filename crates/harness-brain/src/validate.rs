@@ -11,8 +11,15 @@
 //!   capability's `input_schema` (via [`crate::CapabilitySchemaIndex`])
 //! - estimated cost ≤ `constraints.max_cost_usd` (when set)
 //!
-//! Still NOT enforced in 3.9 (deferred to dispatcher / 3.6-encrypted):
-//! - `must_be_local` / `cloud_ok` consistency
+//! 5.3 (ADR-0032) adds §15.4 rule 4:
+//! - `must_be_local` × cloud-capability conflict: a plan that names a
+//!   cloud-tier capability (per the snapshot's `cloud_caps` set) while
+//!   `constraints.must_be_local` is set fails with `LocalityConflict`.
+//!   Foreign caps (input-override path) are not in the local set and
+//!   are not flagged — the executing node's policy is the §10.4
+//!   backstop.
+//!
+//! Still NOT enforced (deferred):
 //! - `version_major` of capabilities (`PlanNode` has no version field today;
 //!   ADR-0013 §10 documents the gap, ADR-0014 §11 carries it forward).
 
@@ -57,6 +64,10 @@ pub fn validate_plan_well_formed(
 ///    (an edge `(node, referenced)` exists) — data dependencies must be
 ///    a subset of control dependencies.
 ///
+/// 8. (5.3, §15.4 rule 4) when `constraints.must_be_local` is set, no
+///    node may reference a capability in `cloud_caps` (the snapshot's
+///    set of locally-registered cloud-tier capability ids).
+///
 /// `confidence_threshold` is NOT checked here — that lives at the
 /// brain.plan executor so a low-confidence `Confident(_)` becomes an
 /// escalation diagnostic, not a hard validation failure.
@@ -66,8 +77,22 @@ pub fn validate_plan(
     constraints: &PlanConstraints,
     schemas: &CapabilitySchemaIndex,
     available: &[CapabilityRef],
+    cloud_caps: &HashSet<String>,
 ) -> Result<(), PlanValidationError> {
     well_formed(plan, available)?;
+
+    // 8. Locality conflict (5.3, ADR-0032). Checked early — it is the
+    // cheapest rule and the clearest diagnostic for a repair prompt.
+    if constraints.must_be_local {
+        for (task_id, node) in &plan.tasks {
+            if cloud_caps.contains(node.capability.as_str()) {
+                return Err(PlanValidationError::LocalityConflict {
+                    task: *task_id,
+                    cap: node.capability.clone(),
+                });
+            }
+        }
+    }
 
     // 7. Key ↔ node-id agreement, and output-reference legality.
     let mut declared: HashMap<TaskId, HashSet<TaskId>> = HashMap::new();

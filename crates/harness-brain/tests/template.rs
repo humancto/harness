@@ -38,6 +38,7 @@ fn req(goal: &str, available: Vec<CapabilityRef>) -> PlanRequest {
         constraints: PlanConstraints::default(),
         context: None,
         issuing_node: NodeId::from_bytes([7; 16]),
+        repair: None,
     }
 }
 
