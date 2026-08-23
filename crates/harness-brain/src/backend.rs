@@ -22,7 +22,7 @@ use crate::schema::CapabilitySchemaIndex;
 #[async_trait]
 pub trait PlannerBackend: Send + Sync + std::fmt::Debug {
     /// Stable identifier for diagnostics. Examples: `"template"`,
-    /// `"llm:llama3.1:8b"`.
+    /// `"localfast:llama3.1:8b"`.
     fn id(&self) -> &str;
 
     /// Try to produce a plan. The four-state outcome is intentional:
