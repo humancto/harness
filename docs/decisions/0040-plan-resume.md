@@ -50,7 +50,19 @@ one — leaves a terminal row that only a new row can follow.
 
 Safety comes from an idempotence check instead: resume refuses with
 `409 already_running` while any non-terminal `plan.execute` row exists
-for that plan id. Never two coordinators on one plan.
+for that plan id. Never two coordinators on one plan — and that has to
+mean *never*, so the check shares ONE transaction with the insert
+(`Store::insert_task_unless_plan_live`). A check-then-insert sequence
+lets two concurrent resumes both observe "nothing live" and both mint
+a coordinator; SQLite serializes the statements, not the sequence.
+The handler still checks up front, but only to answer quickly — the
+guarantee lives in the store.
+
+A plan that finished every step is also refused (`nothing_to_resume`):
+it has no leftover work, its checkpoints are eligible for deletion,
+and resuming it would silently re-run the whole DAG. A plan with no
+result row at all is NOT refused — that is the crashed-coordinator
+case resume exists for.
 
 ## Decision 3 — the honest scope: "brain handover" is a misnomer here
 

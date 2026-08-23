@@ -283,3 +283,102 @@ async fn in_flight_steps_require_an_explicit_opt_in() {
     assert_eq!(resp.status(), StatusCode::CREATED);
     assert_eq!(body_json(resp).await["in_flight"][0], dispatched.as_str());
 }
+
+#[tokio::test]
+async fn a_completed_plan_is_not_resumable() {
+    // Codex P2 on #63: a plan that finished every step has no resume
+    // work, and its checkpoints are eligible for deletion — resuming
+    // it would silently re-run the whole DAG and its side effects.
+    let (app, store, token) = app_and_token().await;
+    let plan_id = uuid::Uuid::now_v7();
+    let id = submit(
+        &app,
+        &token,
+        serde_json::json!({
+            "capability": "plan.execute",
+            "input": {"plan": plan_value(plan_id, 5.0)},
+        }),
+    )
+    .await;
+    settle_with_aggregate(
+        &store,
+        id,
+        &serde_json::json!({
+            "plan_id": plan_id.to_string(),
+            "status": "done",
+            "ok": 3, "failed": 0, "timed_out": 0, "skipped": 0,
+        }),
+    );
+
+    let resp = resume(
+        &app,
+        Some(&token),
+        &format!("{}", id.0.as_hyphenated()),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(body_json(resp).await["error"], "nothing_to_resume");
+}
+
+#[tokio::test]
+async fn concurrent_resumes_mint_exactly_one_coordinator() {
+    // Codex P1 on #63: the live-run check must share the insert's
+    // transaction. Checking first and inserting after lets two
+    // resumes both see "nothing live" and both mint a coordinator —
+    // one plan, two runs, duplicated side effects.
+    let (app, store, token) = app_and_token().await;
+    let plan_id = uuid::Uuid::now_v7();
+    let parked = uuid::Uuid::now_v7().to_string();
+    let id = submit(
+        &app,
+        &token,
+        serde_json::json!({
+            "capability": "plan.execute",
+            "input": {"plan": plan_value(plan_id, 5.0)},
+        }),
+    )
+    .await;
+    settle_with_aggregate(
+        &store,
+        id,
+        &serde_json::json!({
+            "plan_id": plan_id.to_string(),
+            "status": "paused_budget",
+            "ok": 1, "failed": 0, "timed_out": 0, "skipped": 1,
+            "resume": {"unscheduled": [parked], "in_flight": []},
+        }),
+    );
+    let id_str = format!("{}", id.0.as_hyphenated());
+
+    // Fire several at once through the same store.
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..4 {
+        let app = app.clone();
+        let token = token.clone();
+        let id_str = id_str.clone();
+        set.spawn(async move { resume(&app, Some(&token), &id_str, None).await.status() });
+    }
+    let mut created = 0;
+    let mut conflicts = 0;
+    while let Some(res) = set.join_next().await {
+        match res.expect("join") {
+            StatusCode::CREATED => created += 1,
+            StatusCode::CONFLICT => conflicts += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert_eq!(created, 1, "exactly one resume wins");
+    assert_eq!(conflicts, 3);
+
+    // And the store agrees: one live plan.execute for this plan.
+    let live = store
+        .list_tasks_by_plan(harness_core::PlanId(plan_id))
+        .expect("list")
+        .into_iter()
+        .filter(|(_, capability, state, _)| {
+            capability == "plan.execute" && *state == TaskState::Submitted
+        })
+        .count();
+    assert_eq!(live, 1, "no second coordinator was minted");
+}

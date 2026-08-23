@@ -130,6 +130,30 @@ pub(crate) fn mint_task(
     store: &harness_store::Store,
     req: SubmitRequest,
 ) -> Result<TaskId, &'static str> {
+    // Unguarded: `PlanAlreadyRunning` cannot occur, and carrying the
+    // id out is harmless if it somehow did.
+    mint_task_guarded(state, store, req, None).map(|outcome| match outcome {
+        MintOutcome::Minted(id) | MintOutcome::PlanAlreadyRunning(id) => id,
+    })
+}
+
+/// What [`mint_task_guarded`] did.
+pub(crate) enum MintOutcome {
+    Minted(TaskId),
+    /// 5.12: refused — a non-terminal run of this plan already exists.
+    PlanAlreadyRunning(TaskId),
+}
+
+/// The mint path, optionally guarded on "no live run of this plan"
+/// (5.12, Codex P1 on #63). The guard shares ONE transaction with the
+/// insert: checking first and inserting after lets two concurrent
+/// resumes both mint a coordinator and run the DAG twice.
+pub(crate) fn mint_task_guarded(
+    state: &ApiState,
+    store: &harness_store::Store,
+    req: SubmitRequest,
+    guard_plan: Option<harness_core::PlanId>,
+) -> Result<MintOutcome, &'static str> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -180,9 +204,21 @@ pub(crate) fn mint_task(
         return Err("sign_failed");
     }
 
-    if let Err(err) = store.insert_task(&task) {
-        tracing::error!(target: "harness.api.tasks", ?err, "insert task");
-        return Err("store_insert_failed");
+    match guard_plan {
+        Some(plan_id) => match store.insert_task_unless_plan_live(&task, plan_id) {
+            Ok(Some(live)) => return Ok(MintOutcome::PlanAlreadyRunning(live)),
+            Ok(None) => {}
+            Err(err) => {
+                tracing::error!(target: "harness.api.tasks", ?err, "insert task (guarded)");
+                return Err("store_insert_failed");
+            }
+        },
+        None => {
+            if let Err(err) = store.insert_task(&task) {
+                tracing::error!(target: "harness.api.tasks", ?err, "insert task");
+                return Err("store_insert_failed");
+            }
+        }
     }
 
     // Mirror the initial state into the replica map so any peer
@@ -199,7 +235,7 @@ pub(crate) fn mint_task(
         tracing::warn!(target: "harness.api.tasks", ?err, "replica_apply_local");
     }
 
-    Ok(task.id)
+    Ok(MintOutcome::Minted(task.id))
 }
 
 /// `POST /api/v1/tasks` — sign with the local Identity, persist via Store,
@@ -575,6 +611,9 @@ pub struct ResumeRequest {
 struct ResumePoint {
     plan: JsonValue,
     plan_id: harness_core::PlanId,
+    /// The plan ran to completion with nothing left: resuming it would
+    /// re-execute every step and its side effects (Codex P2 on #63).
+    complete: bool,
     unscheduled: Vec<String>,
     in_flight: Vec<String>,
 }
@@ -630,12 +669,51 @@ fn resume_point(
     else {
         return Err((StatusCode::CONFLICT, "plan_missing"));
     };
+    let complete = {
+        let zero = |key: &str| aggregate.get(key).and_then(JsonValue::as_u64) == Some(0);
+        aggregate.get("status").and_then(JsonValue::as_str) == Some("done")
+            && zero("failed")
+            && zero("timed_out")
+            && zero("skipped")
+    };
     Ok(ResumePoint {
         plan,
         plan_id,
+        complete,
         unscheduled: ids("unscheduled"),
         in_flight: ids("in_flight"),
     })
+}
+
+/// The reasons a resume is refused before anything is minted (5.12).
+fn resume_refusal(point: &ResumePoint, req: &ResumeRequest) -> Option<axum::response::Response> {
+    if point.complete {
+        return Some(
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "nothing_to_resume",
+                    "hint": "this plan finished every step; resuming would re-run all of them",
+                })),
+            )
+                .into_response(),
+        );
+    }
+    if !point.in_flight.is_empty() && !req.allow_in_flight {
+        return Some(
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "steps_in_flight",
+                    "in_flight": point.in_flight,
+                    "hint": "these steps were dispatched and never settled; \
+                             resuming may run them twice — pass allow_in_flight",
+                })),
+            )
+                .into_response(),
+        );
+    }
+    None
 }
 
 /// The id of a non-terminal `plan.execute` row for this plan, if one
@@ -748,7 +826,10 @@ pub async fn resume_handler(
     };
     let plan_id = point.plan_id;
 
-    // Idempotence: never a second coordinator for one plan.
+    // Fast path only: this answers before doing any work, but it is
+    // NOT the guarantee — two concurrent resumes can both pass it.
+    // The authority is the guarded insert below, which checks and
+    // inserts in one transaction (Codex P1 on #63).
     match live_plan_run(store, plan_id) {
         Ok(Some(live_id)) => {
             return (
@@ -766,17 +847,8 @@ pub async fn resume_handler(
         }
     }
 
-    if !point.in_flight.is_empty() && !req.allow_in_flight {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "steps_in_flight",
-                "in_flight": point.in_flight,
-                "hint": "these steps were dispatched and never settled; \
-                         resuming may run them twice — pass allow_in_flight",
-            })),
-        )
-            .into_response();
+    if let Some(refusal) = resume_refusal(&point, &req) {
+        return refusal;
     }
 
     let mut plan_value = point.plan;
@@ -790,7 +862,7 @@ pub async fn resume_handler(
     }
 
     let replayable = store.checkpoint_count(plan_id).unwrap_or(0);
-    let mint = mint_task(
+    let mint = mint_task_guarded(
         &state,
         store,
         SubmitRequest {
@@ -801,9 +873,19 @@ pub async fn resume_handler(
             tags: vec!["resume".to_string()],
             resource_hints: None,
         },
+        // 5.12: the live-run check shares the insert's transaction.
+        Some(plan_id),
     );
     match mint {
-        Ok(new_id) => (
+        Ok(MintOutcome::PlanAlreadyRunning(live_id)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "already_running",
+                "task_id": format!("{}", live_id.0.as_hyphenated()),
+            })),
+        )
+            .into_response(),
+        Ok(MintOutcome::Minted(new_id)) => (
             StatusCode::CREATED,
             Json(serde_json::json!({
                 "task_id": format!("{}", new_id.0.as_hyphenated()),

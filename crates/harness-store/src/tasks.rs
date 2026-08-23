@@ -2,7 +2,7 @@
 
 use std::str::FromStr;
 
-use harness_core::{NodeId, Signable, Signature, Task, TaskId};
+use harness_core::{NodeId, PlanId, Signable, Signature, Task, TaskId};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -158,6 +158,66 @@ impl Store {
                 ],
             )?;
             Ok(())
+        })
+    }
+
+    /// 5.12 (Codex P1 on #63): insert a `plan.execute` row ONLY if no
+    /// non-terminal run of `plan_id` exists — the check and the insert
+    /// in one transaction.
+    ///
+    /// Checking first and inserting after is not enough: two resume
+    /// requests for the same stopped plan can both see "nothing live"
+    /// and both mint a coordinator, and then the DAG runs twice with
+    /// its side effects. Returns the live run's id when it refuses.
+    ///
+    /// # Errors
+    /// Underlying sqlite errors, or a task that cannot be encoded.
+    pub fn insert_task_unless_plan_live(
+        &self,
+        task: &Task,
+        plan_id: PlanId,
+    ) -> Result<Option<TaskId>, StoreError> {
+        let bytes = task
+            .canonical_bytes()
+            .map_err(|e| StoreError::Cbor(e.to_string()))?;
+        let sig = task.sig_field().to_bytes();
+        self.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            let live: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT id FROM tasks
+                      WHERE plan_id = ?1
+                        AND capability = 'plan.execute'
+                        AND state NOT IN ('done', 'failed', 'cancelled', 'expired')
+                      LIMIT 1",
+                    params![plan_id.0.as_bytes()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(raw) = live {
+                let id = <[u8; 16]>::try_from(raw.as_slice())
+                    .map(|b| TaskId(uuid::Uuid::from_bytes(b)))
+                    .unwrap_or(task.id);
+                return Ok(Some(id));
+            }
+            tx.execute(
+                "INSERT INTO tasks (
+                    id, parent_id, plan_id, capability, state,
+                    issued_by, issued_at, canonical_cbor, signature
+                ) VALUES (?, ?, ?, ?, 'submitted', ?, ?, ?, ?)",
+                params![
+                    task.id.0.as_bytes(),
+                    task.parent.map(|p| p.0.as_bytes().to_vec()),
+                    task.plan_id.map(|p| p.0.as_bytes().to_vec()),
+                    task.capability,
+                    task.issued_by.as_bytes(),
+                    i64::try_from(task.issued_at).unwrap_or(i64::MAX),
+                    bytes,
+                    sig.as_slice(),
+                ],
+            )?;
+            tx.commit()?;
+            Ok(None)
         })
     }
 
