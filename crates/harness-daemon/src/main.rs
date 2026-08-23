@@ -123,6 +123,20 @@ where
     Ok(())
 }
 
+/// Parse `HARNESS_MAX_QUEUE_DEPTH`: a positive u16 (0 would latch the
+/// auto-pause permanently — refused, not clamped).
+fn parse_max_queue_depth(s: &str) -> Result<u16> {
+    let depth: u16 = s
+        .trim()
+        .parse()
+        .with_context(|| format!("HARNESS_MAX_QUEUE_DEPTH={s:?} is not a u16"))?;
+    anyhow::ensure!(
+        depth > 0,
+        "HARNESS_MAX_QUEUE_DEPTH must be >= 1 (0 would pause the node permanently)"
+    );
+    Ok(depth)
+}
+
 fn run_daemon(args: DaemonArgs) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -182,6 +196,13 @@ async fn daemon_main(args: DaemonArgs) -> Result<()> {
             .parse()
             .with_context(|| format!("HARNESS_MESH_BIND={bind:?} is not a valid SocketAddr"))?;
     }
+    // 4.7 (ADR-0029): the operator backpressure knob — auto-pause
+    // latches at this WORK depth (resume at 3/4). Strict parsing, same
+    // posture as HARNESS_STATIC_PEERS: a typo must not boot a node
+    // with a silently-default bound.
+    if let Ok(depth) = std::env::var("HARNESS_MAX_QUEUE_DEPTH") {
+        config.max_queue_depth = parse_max_queue_depth(&depth)?;
+    }
 
     let orchestrator = DaemonOrchestrator::build(identity.clone(), trust, config)
         .await
@@ -201,4 +222,23 @@ async fn daemon_main(args: DaemonArgs) -> Result<()> {
     }
 
     orchestrator.run_until_signal().await
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::parse_max_queue_depth;
+
+    #[test]
+    fn max_queue_depth_env_parses_strictly() {
+        assert_eq!(parse_max_queue_depth("64").unwrap(), 64);
+        assert_eq!(parse_max_queue_depth(" 4 ").unwrap(), 4);
+        assert!(
+            parse_max_queue_depth("0").is_err(),
+            "permanent pause refused"
+        );
+        assert!(parse_max_queue_depth("-1").is_err());
+        assert!(parse_max_queue_depth("70000").is_err(), "u16 overflow");
+        assert!(parse_max_queue_depth("lots").is_err());
+    }
 }
