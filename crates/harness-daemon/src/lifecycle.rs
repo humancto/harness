@@ -380,9 +380,6 @@ impl DaemonOrchestrator {
                 identity.clone(),
                 capabilities.downgrade(),
                 heartbeat.peers(),
-                // 4.2: per-target progress frames ride the same partial
-                // pipeline as shell line frames (ADR-0024).
-                Some(partial_streamer.sink()),
             );
             harness_capabilities::enrich_with_mesh_meta(&capabilities, mesh_exec.clone());
             // 4.3: plan.execute — the DAG executor driver shares the
@@ -463,12 +460,16 @@ impl DaemonOrchestrator {
         // the queue, walks the lifecycle ladder, invokes the capability,
         // writes results.
         let local_node_name: Arc<str> = Arc::from(config.node_name.as_str());
+        // 4.6: the executor stamps the partial-stream sink into every
+        // ExecutionContext (ADR-0024's FrameSink promotion) — wrappers
+        // read ctx.frame_sink instead of per-trait plumbing.
         let executor = crate::executor::LocalExecutor::with_default_concurrency(
             store.clone(),
             capabilities.clone(),
             identity.node_id(),
             local_node_name.clone(),
-        );
+        )
+        .with_frame_sink(partial_streamer.sink());
 
         // Phase 3.3-fanout (PR-A1): the per-peer connection registry +
         // channel router. Announces our signed manifest on every adopted

@@ -28,9 +28,6 @@ pub(crate) struct StoreMeshExec {
     registry: WeakCapabilityRegistry,
     peers: PeerTable,
     local_id: NodeId,
-    /// 4.2 (ADR-0024): sink for per-target progress frames — the
-    /// partial-stream pipeline's entry point.
-    progress: Option<harness_capabilities::FrameSink>,
 }
 
 impl StoreMeshExec {
@@ -39,7 +36,6 @@ impl StoreMeshExec {
         identity: Arc<Identity>,
         registry: WeakCapabilityRegistry,
         peers: PeerTable,
-        progress: Option<harness_capabilities::FrameSink>,
     ) -> Arc<Self> {
         let local_id = identity.node_id();
         Arc::new(Self {
@@ -48,7 +44,6 @@ impl StoreMeshExec {
             registry,
             peers,
             local_id,
-            progress,
         })
     }
 }
@@ -125,10 +120,6 @@ impl MeshExec for StoreMeshExec {
             .insert_task(&task)
             .map_err(|e| CapabilityError::Failed(format!("insert sub-task: {e}")))?;
         Ok(task.id)
-    }
-
-    fn progress_sink(&self) -> Option<harness_capabilities::FrameSink> {
-        self.progress.clone()
     }
 
     async fn await_terminal(&self, id: TaskId, deadline: Duration) -> SubTaskOutcome {
@@ -223,10 +214,6 @@ impl harness_capabilities::PlanExec for StoreMeshExec {
             }
         }
         out
-    }
-
-    fn progress_sink(&self) -> Option<harness_capabilities::FrameSink> {
-        self.progress.clone()
     }
 }
 
@@ -334,7 +321,6 @@ mod tests {
             me,
             harness_capabilities::CapabilityRegistry::new().downgrade(),
             peers,
-            None,
         );
         let ids: Vec<String> = exec
             .known_capabilities()

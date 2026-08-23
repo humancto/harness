@@ -95,13 +95,6 @@ pub trait MeshExec: Send + Sync + 'static {
 
     /// Await the sub-task's terminal result, up to `deadline`.
     async fn await_terminal(&self, id: TaskId, deadline: Duration) -> SubTaskOutcome;
-
-    /// Sink for per-target progress frames (4.2, ADR-0024). `None`
-    /// (the default) disables emission — pure unit-test fakes stay
-    /// silent, and the daemon wires the partial-stream sink in.
-    fn progress_sink(&self) -> Option<crate::traits::FrameSink> {
-        None
-    }
 }
 
 fn clamp_timeout(input: &JsonValue) -> u64 {
@@ -155,7 +148,9 @@ async fn fan_out(
     // controller will attempt. `total` here is post-truncation.
     let total = u64::try_from(local_pairs.len() + remote_pairs.len()).unwrap_or(u64::MAX);
     let counters = Arc::new(ProgressCounters::new(total));
-    let sink = exec.progress_sink();
+    // 4.6: the sink rides ExecutionContext (executor-stamped) —
+    // ADR-0024's promotion, closing the per-trait plumbing.
+    let sink = ctx.frame_sink.clone();
     let items_key = if sub_capability == "fs.search" {
         "hits"
     } else {
@@ -796,10 +791,24 @@ mod tests {
             issued_by_name: Arc::from("self"),
             task_id: TaskId::new_v7(),
             tags: Arc::from(Vec::<String>::new()),
+            frame_sink: None,
         }
     }
 
     type CapturedFrames = Arc<Mutex<Vec<(TaskId, LogFrame)>>>;
+
+    /// 4.6: the sink rides `ExecutionContext` — tests capture frames by
+    /// stamping a recording closure into the ctx (the executor's role
+    /// in production).
+    fn ctx_with_sink() -> (ExecutionContext, CapturedFrames) {
+        let frames: CapturedFrames = Arc::new(Mutex::new(vec![]));
+        let sink_frames = frames.clone();
+        let mut c = ctx();
+        c.frame_sink = Some(Arc::new(move |task_id: TaskId, frame: LogFrame| {
+            sink_frames.lock().push((task_id, frame));
+        }));
+        (c, frames)
+    }
 
     struct FakeExec {
         targets: Vec<MeshTarget>,
@@ -808,8 +817,6 @@ mod tests {
         remote_calls: Mutex<Vec<(String, NodeId, JsonValue)>>,
         remote_outcome: SubTaskOutcome,
         local_fails: bool,
-        /// 4.2: captured progress frames when a sink is installed.
-        frames: Option<CapturedFrames>,
     }
 
     impl FakeExec {
@@ -820,24 +827,7 @@ mod tests {
                 remote_calls: Mutex::new(vec![]),
                 remote_outcome,
                 local_fails: false,
-                frames: None,
             })
-        }
-
-        fn with_sink(
-            targets: Vec<MeshTarget>,
-            remote_outcome: SubTaskOutcome,
-        ) -> (Arc<Self>, CapturedFrames) {
-            let frames = Arc::new(Mutex::new(vec![]));
-            let exec = Arc::new(Self {
-                targets,
-                local_calls: Mutex::new(vec![]),
-                remote_calls: Mutex::new(vec![]),
-                remote_outcome,
-                local_fails: false,
-                frames: Some(frames.clone()),
-            });
-            (exec, frames)
         }
     }
 
@@ -879,14 +869,6 @@ mod tests {
         }
         async fn await_terminal(&self, _id: TaskId, _deadline: Duration) -> SubTaskOutcome {
             self.remote_outcome.clone()
-        }
-        fn progress_sink(&self) -> Option<crate::traits::FrameSink> {
-            self.frames.as_ref().map(|frames| {
-                let frames = frames.clone();
-                Arc::new(move |task_id: TaskId, frame: LogFrame| {
-                    frames.lock().push((task_id, frame));
-                }) as crate::traits::FrameSink
-            })
         }
     }
 
@@ -1218,7 +1200,7 @@ mod tests {
 
     #[tokio::test]
     async fn t12_progress_frames_per_target_plus_one_summary() {
-        let (exec, frames) = FakeExec::with_sink(
+        let exec = FakeExec::new(
             vec![
                 target(1, "self", true, &["docs"], &["fs.grep"]),
                 target(2, "peer", false, &["notes"], &["fs.grep"]),
@@ -1226,7 +1208,7 @@ mod tests {
             SubTaskOutcome::Done(json!({ "matches": [{ "path": "r.md", "line": 7 }] })),
         );
         let cap = MeshGrepCapability::new(exec);
-        let c = ctx();
+        let (c, frames) = ctx_with_sink();
         let task_id = c.task_id;
         cap.execute(&c, json!({ "pattern": "x" }))
             .await
@@ -1269,7 +1251,7 @@ mod tests {
 
     #[tokio::test]
     async fn t13_progress_failure_frame_carries_error_and_summary_counts() {
-        let (exec, frames) = FakeExec::with_sink(
+        let exec = FakeExec::new(
             vec![
                 target(1, "self", true, &["docs"], &["fs.grep"]),
                 target(2, "peer", false, &["notes"], &["fs.grep"]),
@@ -1277,7 +1259,8 @@ mod tests {
             SubTaskOutcome::Failed("worker exploded".into()),
         );
         let cap = MeshGrepCapability::new(exec);
-        cap.execute(&ctx(), json!({ "pattern": "x" }))
+        let (c, frames) = ctx_with_sink();
+        cap.execute(&c, json!({ "pattern": "x" }))
             .await
             .expect("execute");
         let chunks: Vec<JsonValue> = frames
@@ -1305,13 +1288,12 @@ mod tests {
 
     #[tokio::test]
     async fn t14_sinkless_exec_emits_nothing_and_output_is_unchanged() {
-        // The default progress_sink (None) keeps every existing test
-        // green; this pins that the sink is genuinely optional.
+        // A ctx without frame_sink keeps every existing test green;
+        // this pins that the sink is genuinely optional.
         let exec = FakeExec::new(
             vec![target(1, "self", true, &["docs"], &["fs.grep"])],
             SubTaskOutcome::Done(json!({ "matches": [] })),
         );
-        assert!(exec.frames.is_none());
         let cap = MeshGrepCapability::new(exec);
         let out = cap
             .execute(&ctx(), json!({ "pattern": "x" }))

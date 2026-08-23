@@ -50,6 +50,10 @@ pub(crate) struct LocalExecutor {
     /// self node's rate stays pinned at the optimistic prior while
     /// remote failures accrue (review MAJOR-2).
     success: Option<Arc<harness_orchestrator::SuccessTracker>>,
+    /// 4.6 (ADR-0028): the daemon's partial-stream sink, stamped into
+    /// every `ExecutionContext` so capabilities emit Progress frames
+    /// without per-trait plumbing. None in bare test fixtures.
+    frame_sink: Option<harness_capabilities::FrameSink>,
 }
 
 impl std::fmt::Debug for LocalExecutor {
@@ -80,7 +84,15 @@ impl LocalExecutor {
             coord_sem: Arc::new(tokio::sync::Semaphore::new(COORD_PERMITS)),
             terminal_tx,
             success: None,
+            frame_sink: None,
         }
+    }
+
+    /// Attach the partial-stream sink stamped into every
+    /// `ExecutionContext` (4.6, ADR-0028).
+    pub(crate) fn with_frame_sink(mut self, sink: harness_capabilities::FrameSink) -> Self {
+        self.frame_sink = Some(sink);
+        self
     }
 
     /// Test-only: shrink the coordination pool to exercise skip paths.
@@ -247,6 +259,7 @@ impl LocalExecutor {
         let success = self.success.clone();
         let local_node_name = self.local_node_name.clone();
         let terminal_tx = self.terminal_tx.clone();
+        let frame_sink = self.frame_sink.clone();
 
         // 3.3-fanout issuer-name plumbing (ADR-0009): a remote issuer's
         // display name comes from its announced manifest; fall back to
@@ -274,6 +287,7 @@ impl LocalExecutor {
                 issued_by_name,
                 task_id: id,
                 tags,
+                frame_sink,
             };
 
             // S2: panic boundary. A panicking capability cannot wedge
@@ -597,6 +611,77 @@ mod tests {
             Some(serde_json::json!({"echoed": {"msg": "hi"}}))
         );
         assert!(result.error.is_none());
+    }
+
+    /// 4.6 (ADR-0028): the executor stamps its frame sink into every
+    /// `ExecutionContext` — a capability emitting through ctx.frame_sink
+    /// needs no bespoke plumbing.
+    #[tokio::test]
+    async fn t16_executor_stamps_frame_sink_into_ctx() {
+        struct SinkCap;
+        #[async_trait]
+        impl Capability for SinkCap {
+            fn id(&self) -> &str {
+                "sink.probe"
+            }
+            fn manifest(&self) -> ManifestEntry {
+                manifest_for("sink.probe")
+            }
+            async fn execute(
+                &self,
+                ctx: &ExecutionContext,
+                _: JsonValue,
+            ) -> Result<JsonValue, CapabilityError> {
+                if let Some(sink) = &ctx.frame_sink {
+                    sink(
+                        ctx.task_id,
+                        harness_capabilities::LogFrame {
+                            stream: harness_capabilities::StreamKind::Progress,
+                            line: "{\"probe\":true}".into(),
+                        },
+                    );
+                }
+                Ok(serde_json::json!({"ok": true}))
+            }
+        }
+
+        let store = fresh_store();
+        let frames: Arc<parking_lot::Mutex<Vec<(TaskId, harness_capabilities::LogFrame)>>> =
+            Arc::new(parking_lot::Mutex::new(vec![]));
+        let sink_frames = frames.clone();
+        let sink: harness_capabilities::FrameSink = Arc::new(move |task_id, frame| {
+            sink_frames.lock().push((task_id, frame));
+        });
+        let exec = LocalExecutor::new(
+            store.clone(),
+            registry_with(Arc::new(SinkCap)),
+            local_node(),
+            Arc::from("self"),
+            1,
+        )
+        .with_frame_sink(sink);
+
+        let id = TaskId::new_v7();
+        store
+            .insert_task(&dummy_task(
+                id,
+                "sink.probe",
+                serde_json::json!({}),
+                local_node(),
+            ))
+            .expect("insert");
+        assert!(store
+            .try_dispatch_task(id, local_node())
+            .expect("seed dispatch"));
+        exec.poll_once().await;
+        assert_eq!(wait_terminal(&store, id).await, TaskState::Done);
+        let captured = frames.lock();
+        assert_eq!(captured.len(), 1, "one frame through the stamped sink");
+        assert_eq!(captured[0].0, id);
+        assert_eq!(
+            captured[0].1.stream,
+            harness_capabilities::StreamKind::Progress
+        );
     }
 
     // t08 — unknown capability: Failed with descriptive error.
