@@ -1,7 +1,7 @@
 # Harness Implementation State
 
 **Current phase:** 4 — Distribution patterns (Phase 3 COMPLETE as of #42)
-**Last updated:** 2026-08-23 (post-5.6 SMS webhook adapter)
+**Last updated:** 2026-08-23 (post-5.7 iOS Shortcuts adapter)
 
 ## Phase 3 summary (post-merge) — COMPLETE
 
@@ -129,6 +129,7 @@ These will land alongside their natural Phase 3 home, not as a "phase 2.10":
 | #50 | 4.7  | Backpressure (ADR-0029): the heartbeat `paused` field finally has a producer — `PauseState` (queue-depth hysteresis latch at `max_queue_depth`/release at 3/4, OR operator `POST /admin/pause\|resume` + `GET /status` surfacing) with coordination-permit RAII subtraction so `queue_depth` means WORK depth; `DaemonRuntimeConfig.max_queue_depth` is the §14.10 knob; submit admission (`429` + `Retry-After: 2` over 1024 `Submitted` rows, indexed COUNT, fail-open, internal mints exempt); pause-aware routing in every `eligible_scored` arm (live-paused pin ⇒ ResourceGated while dead pins stay fast-terminal; paused owners wait, never reroute; unpinned federated sets exclude paused into `DispatchPlan::Federated::excluded` → `Skipped` provenance rows, policy-exempt; self gated via the shared `PauseState` in `StoreLoadView`); sub-tasks + plan steps stamp `constraints.deadline = issued_at + timeout_ms` (the pre-dispatch wait is bounded — no posthumous runs); full/lag-condition tests for every shipped bound (peer_net QueueFull both arms, reply pump/bridge/WS Lagged recovery, `into_channel` producer-park, `MESH_EVENT_CAPACITY`/`TERMINAL_EVENT_CAPACITY` named); bounds hygiene (llm_batcher `MAX_SLOT_SENDERS=64` flush-on-full + `MAX_LIVE_FINGERPRINTS=256` bypass; partial_stream pending task cap 256 evict-oldest-warned; sweep covers `elig_failures` + Cancelled reply obligations; additive `partials_dropped` on `GET /tasks/:id` + types.ts; `CLI_FANOUT_WINDOW=16`). m09 money test: saturate→pause→pinned waits/Anyone reroutes/federated Skips→drain→resume→exactly-once. +32 tests |
 
 | #57 | 5.6  | SMS webhook (ADR-0034): channel-generic conversation core extracted from 5.5 (`webhook/conversation.rs`; `Channel` name = route = task tag = log field, threaded through the DRIVER so both `brain.plan` and `plan.execute` mints carry it — plan review MAJOR-1, pinned by tag assertions on both rows in BOTH suites); `POST /webhook/sms` with bare-E.164 senders (ONE allowlist, channel-native entry forms — channels are distinct authorization surfaces, `whatsapp:+X` never admits SMS `+X`, near-miss drop-log hint when the other form is listed); shared signature/dedup/admission/driver/reply machinery unchanged (5.5's 8 whatsapp rows keep passing verbatim + symmetric exec-tag assertion added); same 1600 cap (SMS UCS-2 segment economics recorded); STOP/HELP: inbounds tagged `OptOutType` (Twilio's own opt-out handling fired) are acked empty and never minted — a compliance keyword is not a goal (Codex P2 on #57). Zero new deps. +7 tests |
+| #58 | 5.7  | iOS Shortcuts adapter (ADR-0035): signed JSON token — `harness_vault::shortcuts_token` (`base64url(payload).base64url(blake3_keyed_mac)`, not-JWT by design, constant-time compare, strict URL_SAFE_NO_PAD, 4KiB token cap, `sub` 1..=64 printable ASCII at mint AND verify); `POST /webhook/shortcuts` (Bearer header only, JSON body `deny_unknown_fields` — `constraints` smuggle = 400; fail-closed 503 on missing/malformed key; admission + shared 16-permit semaphore = 429) with synchronous wait (default 55s, clamp 1–120s) → `{task_id, status, reply}`, 202 running on timeout; bounded `ShortcutsLedger` (256 outcomes / 512 request ids, FIFO) is late-result store + `request_id` retry dedup (duplicate returns the ORIGINAL task_id + state) + authorization scope for `GET /webhook/shortcuts/result/:id` (non-ledger ids 404 — a shortcut token cannot probe other adapters' tasks); permit rides the spawned driver (client disconnect ≠ lost work); `run_conversation` extracted to return `(reply, ok)` with channel threading intact (Twilio suites unchanged); `harness admin issue-shortcut-token --sub [--ttl-days 90|--no-expiry]` reuses-or-generates the signing key via new atomic `EncryptedStore::upsert` (tmp+fsync+rename, file-values-only) and prints the restart-the-daemon note (startup vault snapshot staleness documented). Post-open Codex round (1 P1 + 2 P2, all verified real and fixed): atomic dedup+reserve under one ledger lock via sync `admit_goal` (concurrent same-request_id retries serialize — exactly one mints), `request_id` capped 128 printable ASCII + `goal` capped 4096 chars (bounded-in-bytes, not just entries), mapped-but-evicted request_id = 410 `result_expired` with the original task_id (never a re-mint); diff-review extras: clock failure = 503 fail-closed (expiry never checks against now=0), case-insensitive Bearer scheme, upsert tmp cleanup on rename failure, saturating expiry arithmetic, Zeroizing key hex in CLI, no duplicate rids in the FIFO. Zero new external deps. +23 tests |
 
 | #56 | 5.5  | WhatsApp webhook (ADR-0033): root-path `POST /webhook/whatsapp` — fail-closed Twilio signature validation (`Base64(HMAC-SHA1(token, url+sorted params))`, vault token absent ⇒ 503, constant-time `verify_slice`, independent known-vector test; signed URL includes the query string; `HARNESS_WEBHOOK_BASE_URL` REQUIRED behind TLS termination); deny-all-by-default sender allowlist (BLOCKER-3: the signature authenticates TWILIO, not the sender — `HARNESS_WEBHOOK_ALLOW_FROM`, `*` opts into allow-all, WhatsApp senders match in full `whatsapp:+E164` form); the mint sequence extracted into ONE shared `mint_task` (clamp→build→sign→insert→replica-mirror; BLOCKER-1) used by submit handler + webhook; message Body → `brain.plan` (tags webhook+whatsapp, NO cloud_ok, constraint-smuggle pinned inert, 4.7 admission-subject) → TwiML ⏳ ack → detached store-polling driver (16 `OwnedSemaphorePermit`s, 600s deadline, CLI-parity envelopes) → `plan.execute` → Twilio Messages API reply (From=inbound To; missing SID ⇒ ack-only degraded mode). Tests ACT as the executor (BLOCKER-2: harness-api has no executor — legal state-chain walks + canned plan JSON + wiremock Twilio). MessageSid retry dedup (bounded 512 ring, same-ack) + result-row wait after terminal (the 5.3 executor gap) per Codex P1s; restart durability documented-deferred to 5.11. Deps: `hmac` is the only new lockfile entry (`sha1` already rides axum ws). +17 tests |
 
@@ -147,6 +148,25 @@ These will land alongside their natural Phase 3 home, not as a "phase 2.10":
 cloud/template) — deferred, not dropped: `brain.plan`'s input schema is
 `additionalProperties: false` with no tier-selection field; needs a schema extension
 (natural home: 5.x backlog alongside escalation knobs).**
+
+5.7 review round 1 (plan): REVISE, all adopted pre-implementation — BLOCKER: the
+late-result GET as planned read the store, but `mint_task` writes no plan→exec linkage
+and the reply string is driver-local (never persisted) — its own t04 could not pass;
+replaced with the bounded in-memory `ShortcutsLedger`, which simultaneously fixed
+MAJOR-4 (any valid token could probe ANY task's outcome — ledger membership is now the
+authz boundary, non-ledger ids 404), MAJOR-5 (the dedup duplicate-response was a dead
+end for the timed-out client — it now carries the original task_id), and MINOR-6
+(shortcuts traffic sharing `SeenSids` could evict Twilio SIDs mid-retry-window).
+MAJOR-2: `EncryptedStore` had NO write API (`write_encrypted` is pub(crate),
+truncate-in-place) — added public atomic `upsert` (tmp+fsync+rename, file-values-only so
+env overrides never bake into the file). MAJOR-3: daemon holds a startup vault snapshot —
+first-use key generation now prints the restart-the-daemon note (env-var escape hatch
+documented). MINORs: extraction signature carries channel+started (5.6 MAJOR-1 lesson),
+permit-in-driver disconnect semantics spelled out, 90-day default TTL with explicit
+--no-expiry, malformed vault key = 503 never panic, matrix additions (driver-cap busy row, GET
+400/404, dedup-carries-task_id, standard-alphabet rejection). NITs: vault gains
+base64+serde_json dep edges (recorded), sub length/charset caps, deny_unknown_fields=400,
+TLS posture stated stricter than ADR-0033 (static bearer vs per-request signature).
 
 5.6 review round 1 (plan): REVISE, all adopted pre-implementation — MAJOR: the driver's
 second mint (plan.execute) had no channel-tag guard; a half-parameterized extraction

@@ -228,6 +228,61 @@ impl EncryptedStore {
         }
         Ok(Self { map })
     }
+
+    /// Insert or replace one FILE-backed value and persist atomically:
+    /// the new envelope is written to a `.tmp` sibling (fsynced, mode
+    /// 0600) and renamed over `path`, so a crash mid-write never
+    /// corrupts `secrets.enc`. Env overrides are read-time only —
+    /// `self.map` holds file-origin values by construction, so they
+    /// can never be baked into the file by this call. (5.7, ADR-0035:
+    /// CLI shortcut-token key issuance.)
+    ///
+    /// # Errors
+    /// Invalid tag grammar, a stored value that is not UTF-8, or any
+    /// underlying encrypt/serialize/IO failure.
+    pub fn upsert(
+        &mut self,
+        path: &Path,
+        key: &[u8; 32],
+        tag: &str,
+        value: &str,
+    ) -> Result<(), SecretsError> {
+        if tag_to_env_var(tag).is_none() {
+            return Err(SecretsError::InvalidTag {
+                tag: tag.to_string(),
+            });
+        }
+        let mut raw = BTreeMap::new();
+        for (t, v) in &self.map {
+            let s = std::str::from_utf8(v.as_bytes()).map_err(|_| SecretsError::BadFormat {
+                path: path.to_path_buf(),
+                reason: format!("stored value for tag {t} is not UTF-8"),
+            })?;
+            raw.insert(t.clone(), s.to_string());
+        }
+        raw.insert(tag.to_string(), value.to_string());
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("secrets.enc");
+        let tmp = path.with_file_name(format!("{file_name}.tmp"));
+        write_encrypted(&tmp, key, &raw)?;
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            // Best-effort cleanup: the tmp is encrypted (no plaintext
+            // exposure) but stale key material under a predictable
+            // name should not linger (diff review MINOR-3).
+            let _ = std::fs::remove_file(&tmp);
+            return Err(SecretsError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            });
+        }
+        self.map.insert(
+            tag.to_string(),
+            SecretValue::from_bytes(value.as_bytes().to_vec()),
+        );
+        Ok(())
+    }
 }
 
 impl SecretsStore for EncryptedStore {
@@ -588,5 +643,35 @@ mod unit_tests {
             toml::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
         assert_ne!(e1.nonce, e2.nonce, "nonce must be random per write");
         assert_ne!(e1.ciphertext, e2.ciphertext);
+    }
+
+    #[test]
+    fn t14_upsert_persists_atomically_and_preserves_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("secrets.enc");
+        let mut raw = BTreeMap::new();
+        raw.insert("secret/a".to_string(), "one".to_string());
+        write_encrypted(&path, &key_a(), &raw).expect("seed");
+        let mut store = EncryptedStore::load_from_path(&path, &key_a()).expect("load");
+
+        store
+            .upsert(&path, &key_a(), "secret/shortcuts-signing-key", "aabb")
+            .expect("upsert");
+        // In-memory view updated, persisted view reloads with BOTH
+        // entries, and no tmp sibling is left behind.
+        assert!(store.map.contains_key("secret/shortcuts-signing-key"));
+        let re = EncryptedStore::load_from_path(&path, &key_a()).expect("reload");
+        assert!(re.map.contains_key("secret/a"));
+        assert!(re.map.contains_key("secret/shortcuts-signing-key"));
+        assert!(!dir.path().join("secrets.enc.tmp").exists());
+
+        // Replace-in-place works and invalid tag grammar is refused.
+        store
+            .upsert(&path, &key_a(), "secret/a", "two")
+            .expect("replace");
+        let re = EncryptedStore::load_from_path(&path, &key_a()).expect("reload 2");
+        let v = re.map.get("secret/a").expect("value");
+        assert_eq!(v.as_bytes(), b"two");
+        assert!(store.upsert(&path, &key_a(), "bad tag!", "x").is_err());
     }
 }

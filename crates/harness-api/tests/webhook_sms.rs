@@ -13,7 +13,9 @@ use axum::{
     http::{header, Request, StatusCode},
 };
 use harness_api::routes::webhook::twilio::compute_twilio_signature;
-use harness_api::routes::webhook::{AllowFrom, SeenSids, WebhookRuntime, MAX_WEBHOOK_DRIVERS};
+use harness_api::routes::webhook::{
+    AllowFrom, SeenSids, ShortcutsLedger, WebhookRuntime, MAX_WEBHOOK_DRIVERS,
+};
 use harness_api::{router, ApiStateBuilder};
 use harness_core::Identity;
 use harness_store::{Store, TaskState};
@@ -52,6 +54,7 @@ fn runtime(twilio_base: &str, allow: &[&str]) -> Arc<WebhookRuntime> {
         drivers: Arc::new(tokio::sync::Semaphore::new(MAX_WEBHOOK_DRIVERS)),
         http: reqwest::Client::new(),
         seen_sids: parking_lot::Mutex::new(SeenSids::default()),
+        shortcuts: parking_lot::Mutex::new(ShortcutsLedger::default()),
     })
 }
 

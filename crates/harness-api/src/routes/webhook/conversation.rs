@@ -50,15 +50,19 @@ pub struct Channel {
 
 pub const WHATSAPP: Channel = Channel { name: "whatsapp" };
 pub const SMS: Channel = Channel { name: "sms" };
+/// 5.7 (ADR-0035): the Shortcuts adapter reuses this driver core —
+/// same tags-on-both-mints rule, but the reply returns over HTTP via
+/// the ledger instead of the Twilio Messages API.
+pub const SHORTCUTS: Channel = Channel { name: "shortcuts" };
 
 /// CLI-parity input envelopes (crates/harness-cli/src/plan.rs).
-const PLAN_TIMEOUT_MS: u64 = 240_000;
+pub(super) const PLAN_TIMEOUT_MS: u64 = 240_000;
 const EXEC_TIMEOUT_MS: u64 = 120_000;
-const SLACK_MS: u64 = 5_000;
+pub(super) const SLACK_MS: u64 = 5_000;
 /// Overall driver deadline — `MAX_EXEC_TIMEOUT_MS`. A wedged mesh
 /// must release the driver permit, not brick the adapter at 16
 /// stuck conversations.
-const DRIVER_DEADLINE_MS: u64 = 600_000;
+pub(super) const DRIVER_DEADLINE_MS: u64 = 600_000;
 const POLL_INTERVAL_MS: u64 = 500;
 /// Twilio Message-resource body cap — same for `WhatsApp` and SMS
 /// (Twilio segments SMS; ADR-0034 records the UCS-2 economics).
@@ -276,7 +280,7 @@ pub fn handle(
     )))
 }
 
-fn exec_policy(timeout_ms: u64) -> harness_core::ExecutionPolicy {
+pub(super) fn exec_policy(timeout_ms: u64) -> harness_core::ExecutionPolicy {
     harness_core::ExecutionPolicy {
         redundancy: 1,
         timeout_ms: u32::try_from(timeout_ms).unwrap_or(u32::MAX),
@@ -353,37 +357,49 @@ async fn drive_conversation(
     let started = tokio::time::Instant::now();
     let deadline = started + Duration::from_millis(DRIVER_DEADLINE_MS);
 
-    let reply = run_conversation(channel, &state, plan_id, deadline, started).await;
+    let (reply, _ok) = run_conversation(channel, &state, plan_id, deadline, started).await;
     send_reply(&state, &inbound_from, &inbound_to, &reply).await;
 }
 
-async fn run_conversation(
+/// The channel-agnostic middle of every webhook conversation: wait
+/// for the plan, mint `plan.execute` (channel-tagged — 5.6 MAJOR-1),
+/// wait for execution, format the human reply. Returns the reply and
+/// whether execution completed successfully (5.7: the Shortcuts
+/// adapter surfaces `ok` as its `status` field; Twilio callers send
+/// the text either way).
+pub(super) async fn run_conversation(
     channel: Channel,
     state: &ApiState,
     plan_id: harness_core::TaskId,
     deadline: tokio::time::Instant,
     started: tokio::time::Instant,
-) -> String {
+) -> (String, bool) {
     let Some(store) = state.store.as_ref() else {
-        return "❌ internal error: no store".to_string();
+        return ("❌ internal error: no store".to_string(), false);
     };
 
     let Some(plan_state) = wait_terminal(state, plan_id, deadline).await else {
-        return "⏳ timed out waiting for the planner — check the Runs page".to_string();
+        return (
+            "⏳ timed out waiting for the planner — check the Runs page".to_string(),
+            false,
+        );
     };
     if plan_state != TaskState::Done {
         let diag = wait_result_row(state, plan_id, deadline)
             .await
             .and_then(|r| r.error)
             .unwrap_or_else(|| format!("planning {plan_state:?}"));
-        return truncate_reply(&format!("❌ planning failed — {diag}"));
+        return (
+            truncate_reply(&format!("❌ planning failed — {diag}")),
+            false,
+        );
     }
     let Some(plan_json) = wait_result_row(state, plan_id, deadline)
         .await
         .and_then(|r| r.output)
         .and_then(|o| o.get("plan").cloned())
     else {
-        return "❌ planner returned no plan".to_string();
+        return ("❌ planner returned no plan".to_string(), false);
     };
     let step_count = plan_json
         .get("tasks")
@@ -400,21 +416,27 @@ async fn run_conversation(
     };
     let exec_id = match mint_task(state, store, exec_req) {
         Ok(id) => id,
-        Err(code) => return format!("❌ could not start execution ({code})"),
+        Err(code) => return (format!("❌ could not start execution ({code})"), false),
     };
 
     let Some(exec_state) = wait_terminal(state, exec_id, deadline).await else {
-        return "⏳ execution timed out — check the Runs page".to_string();
+        return (
+            "⏳ execution timed out — check the Runs page".to_string(),
+            false,
+        );
     };
     let secs = started.elapsed().as_secs();
     if exec_state == TaskState::Done {
-        format!("✅ done — {step_count} steps in {secs}s")
+        (format!("✅ done — {step_count} steps in {secs}s"), true)
     } else {
         let diag = wait_result_row(state, exec_id, deadline)
             .await
             .and_then(|r| r.error)
             .unwrap_or_else(|| format!("execution {exec_state:?}"));
-        truncate_reply(&format!("❌ failed after {secs}s — {diag}"))
+        (
+            truncate_reply(&format!("❌ failed after {secs}s — {diag}")),
+            false,
+        )
     }
 }
 

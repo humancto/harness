@@ -6,6 +6,7 @@
 //! submission via the shared mint path in `routes::tasks`.
 
 pub mod conversation;
+pub mod shortcuts;
 pub mod sms;
 pub mod twilio;
 pub mod whatsapp;
@@ -84,6 +85,100 @@ pub struct WebhookRuntime {
     /// coherent with the driver also being in-memory (ADR-0033
     /// restart-durability note).
     pub seen_sids: parking_lot::Mutex<SeenSids>,
+    /// 5.7 (ADR-0035): outcome ledger for the SYNCHRONOUS Shortcuts
+    /// adapter. Deliberately separate from `seen_sids` — a looping
+    /// authorized Shortcut must not churn Twilio SIDs out of their
+    /// retry-dedup ring (plan review MINOR-6).
+    pub shortcuts: parking_lot::Mutex<ShortcutsLedger>,
+}
+
+/// Bounded in-memory ledger backing the Shortcuts adapter's
+/// late-result GET, its `request_id` retry dedup, and — by
+/// construction — its authorization scope: the GET serves ONLY task
+/// ids present here (i.e. shortcuts-minted), so a shortcut token can
+/// never probe tasks minted by admins, plans, or other adapters
+/// (plan review BLOCKER-1 + MAJOR-4 + MAJOR-5). Restart forgets it,
+/// coherent with the in-memory driver (ADR-0033 durability note).
+#[derive(Debug, Default)]
+pub struct ShortcutsLedger {
+    outcomes: std::collections::HashMap<harness_core::TaskId, ShortcutOutcome>,
+    outcome_order: std::collections::VecDeque<harness_core::TaskId>,
+    requests: std::collections::HashMap<String, harness_core::TaskId>,
+    request_order: std::collections::VecDeque<String>,
+}
+
+/// What the ledger knows about one shortcuts-minted conversation.
+#[derive(Debug, Clone)]
+pub struct ShortcutOutcome {
+    /// `true` once the driver finished (either way); the reply is
+    /// then present.
+    pub done: bool,
+    /// `false` until done; then: did the plan execute successfully?
+    pub ok: bool,
+    /// The human reply text, present once done.
+    pub reply: Option<String>,
+}
+
+/// FIFO caps (bounded-everything): outcomes cover the poll window,
+/// request ids cover the client-retry window.
+const SHORTCUT_OUTCOMES_CAP: usize = 256;
+const SHORTCUT_REQUESTS_CAP: usize = 512;
+
+impl ShortcutsLedger {
+    /// A prior mint for this client `request_id`, if remembered.
+    #[must_use]
+    pub fn lookup_request(&self, request_id: &str) -> Option<harness_core::TaskId> {
+        self.requests.get(request_id).copied()
+    }
+
+    /// The recorded outcome for a shortcuts-minted plan task. `None`
+    /// means unknown to this adapter: never minted here, or evicted.
+    #[must_use]
+    pub fn get(&self, task: harness_core::TaskId) -> Option<ShortcutOutcome> {
+        self.outcomes.get(&task).cloned()
+    }
+
+    /// Record a fresh mint (running, no reply yet). Called AFTER the
+    /// mint succeeds — a refused request must stay retryable.
+    pub fn admit(&mut self, task: harness_core::TaskId, request_id: Option<&str>) {
+        self.outcomes.insert(
+            task,
+            ShortcutOutcome {
+                done: false,
+                ok: false,
+                reply: None,
+            },
+        );
+        self.outcome_order.push_back(task);
+        while self.outcome_order.len() > SHORTCUT_OUTCOMES_CAP {
+            if let Some(old) = self.outcome_order.pop_front() {
+                self.outcomes.remove(&old);
+            }
+        }
+        if let Some(rid) = request_id.filter(|r| !r.is_empty()) {
+            // A re-admitted id (its outcome aged out but the mapping
+            // had not) must not appear twice in the FIFO — that would
+            // skew eviction accounting (diff review NIT-9).
+            if self.requests.insert(rid.to_string(), task).is_none() {
+                self.request_order.push_back(rid.to_string());
+            }
+            while self.request_order.len() > SHORTCUT_REQUESTS_CAP {
+                if let Some(old) = self.request_order.pop_front() {
+                    self.requests.remove(&old);
+                }
+            }
+        }
+    }
+
+    /// Record the driver's final outcome. A ledger entry evicted
+    /// mid-flight is silently dropped (the GET reports it expired).
+    pub fn complete(&mut self, task: harness_core::TaskId, ok: bool, reply: String) {
+        if let Some(entry) = self.outcomes.get_mut(&task) {
+            entry.done = true;
+            entry.ok = ok;
+            entry.reply = Some(reply);
+        }
+    }
 }
 
 /// Bounded insert-order dedup set.
@@ -152,6 +247,7 @@ impl WebhookRuntime {
             drivers: Arc::new(tokio::sync::Semaphore::new(MAX_WEBHOOK_DRIVERS)),
             http: reqwest::Client::new(),
             seen_sids: parking_lot::Mutex::new(SeenSids::default()),
+            shortcuts: parking_lot::Mutex::new(ShortcutsLedger::default()),
         }
     }
 }
@@ -174,6 +270,33 @@ mod tests {
         // SM1 evicted by the ring bound — accepted again.
         assert!(s.insert("SM1"));
         assert!(s.set.len() <= SEEN_SIDS_CAP + 1);
+    }
+
+    #[test]
+    fn shortcuts_ledger_bounds_and_scopes() {
+        let mut l = ShortcutsLedger::default();
+        let t1 = harness_core::TaskId::new_v7();
+        l.admit(t1, Some("req-1"));
+        assert_eq!(l.lookup_request("req-1"), Some(t1));
+        assert!(!l.get(t1).expect("admitted").done);
+        // Unknown task ids stay unknown — the GET's authz boundary.
+        assert!(l.get(harness_core::TaskId::new_v7()).is_none());
+
+        l.complete(t1, true, "✅ done".to_string());
+        let o = l.get(t1).expect("entry");
+        assert!(o.done && o.ok);
+        assert_eq!(o.reply.as_deref(), Some("✅ done"));
+
+        // FIFO eviction over the cap; completing an evicted id is a
+        // no-op, and the evicted entry reads as unknown.
+        for i in 0..SHORTCUT_OUTCOMES_CAP {
+            l.admit(harness_core::TaskId::new_v7(), Some(&format!("r{i}")));
+        }
+        assert!(l.get(t1).is_none(), "t1 evicted");
+        l.complete(t1, false, "late".to_string());
+        assert!(l.get(t1).is_none());
+        assert!(l.outcomes.len() <= SHORTCUT_OUTCOMES_CAP);
+        assert!(l.requests.len() <= SHORTCUT_REQUESTS_CAP);
     }
 
     #[test]

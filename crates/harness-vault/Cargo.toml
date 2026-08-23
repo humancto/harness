@@ -22,6 +22,10 @@ blake3           = { workspace = true }
 chacha20poly1305 = { workspace = true }
 hex              = { workspace = true }
 rand             = { workspace = true }
+# 5.7 (ADR-0035): signed-JSON shortcut tokens (payload JSON + base64url
+# transport; MAC is keyed BLAKE3 — no new crypto deps).
+base64     = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile     = { workspace = true }
