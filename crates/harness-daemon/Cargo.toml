@@ -41,7 +41,7 @@ harness-policy       = { workspace = true }
 harness-orchestrator = { workspace = true }
 harness-merge        = { workspace = true }
 harness-vault        = { workspace = true }
-harness-brain        = { workspace = true, features = ["localfast"] }
+harness-brain        = { workspace = true, features = ["localfast", "cloud"] }
 reqwest             = { workspace = true }
 url                 = { workspace = true }
 async-trait         = "0.1"

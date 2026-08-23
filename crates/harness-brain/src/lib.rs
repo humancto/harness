@@ -14,7 +14,11 @@
 #![forbid(unsafe_code)]
 
 pub mod backend;
+#[cfg(feature = "cloud")]
+pub mod cloud;
 pub mod error;
+#[cfg(any(feature = "localfast", feature = "cloud"))]
+mod llm_common;
 #[cfg(feature = "localfast")]
 pub mod local_fast;
 pub mod schema;
@@ -33,3 +37,9 @@ pub use validate::{validate_plan, validate_plan_well_formed};
 
 #[cfg(feature = "localfast")]
 pub use local_fast::{LocalFastBackend, LocalStrongBackend};
+
+#[cfg(feature = "cloud")]
+pub use cloud::{CloudBackend, CloudKeyProvider};
+
+#[cfg(any(feature = "localfast", feature = "cloud"))]
+pub use llm_common::extract_json_object;

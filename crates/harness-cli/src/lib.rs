@@ -84,14 +84,21 @@ pub struct PlanArgs {
     /// Natural-language goal for the planner.
     pub goal: String,
     /// Timeout in milliseconds. Governs the planning call (default
-    /// 180000 — must cover the LocalFast→LocalStrong→Template chain)
-    /// and, for `exec`, the whole-plan execution (default 120000).
+    /// 240000 — must cover the LocalFast→LocalStrong→Cloud→Template
+    /// chain) and, for `exec`, the whole-plan execution (default
+    /// 120000).
     #[arg(long)]
     pub timeout_ms: Option<u64>,
     /// Keep executing independent branches past a step failure
     /// (default aborts on the first failure).
     #[arg(long)]
     pub keep_going: bool,
+    /// Opt this request in to cloud planner escalation (5.2,
+    /// ADR-0031). Sets `constraints.allow_cloud: true` — the
+    /// per-task half of the double gate; the mesh policy must still
+    /// approve via `allow_cloud_escalation` or this flag is inert.
+    #[arg(long)]
+    pub cloud: bool,
     #[arg(long)]
     pub root: Option<std::path::PathBuf>,
     /// Daemon API base URL.

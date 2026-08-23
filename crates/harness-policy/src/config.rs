@@ -144,6 +144,16 @@ pub struct PlanningPolicy {
     /// — a conservative starting point; operators raise per their tier.
     #[serde(default = "default_max_cost_usd")]
     pub default_max_cost_usd: Option<f64>,
+
+    /// 5.2 (ADR-0031) — Anthropic model the tier-3 Cloud planner
+    /// backend uses. Only consulted when `allow_cloud_escalation` is
+    /// true (the cloud tier is not even registered otherwise). Empty
+    /// string disables the cloud tier without flipping the policy
+    /// bit. The PRD's `[mesh.planning.cloud] default_model` example
+    /// names a model id that does not exist in the Anthropic API;
+    /// this default tracks the current mid-tier model instead.
+    #[serde(default = "default_cloud_planner_model")]
+    pub cloud_planner_model: String,
 }
 
 fn default_confidence_threshold() -> f64 {
@@ -152,6 +162,9 @@ fn default_confidence_threshold() -> f64 {
 #[allow(clippy::unnecessary_wraps)]
 fn default_max_cost_usd() -> Option<f64> {
     Some(1.0)
+}
+fn default_cloud_planner_model() -> String {
+    "claude-sonnet-5".to_string()
 }
 
 impl Default for PlanningPolicy {
@@ -162,6 +175,7 @@ impl Default for PlanningPolicy {
             confidence_threshold: default_confidence_threshold(),
             prefer_local_models: Vec::new(),
             default_max_cost_usd: default_max_cost_usd(),
+            cloud_planner_model: default_cloud_planner_model(),
         }
     }
 }

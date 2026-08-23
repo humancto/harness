@@ -15,6 +15,9 @@ default   = []
 # 3.9 LocalFast backend pulls in reqwest + url. Behind a feature so a
 # Template-only build (no Ollama) doesn't compile a network stack.
 localfast = ["dep:reqwest", "dep:url"]
+# 5.2 Cloud backend (tier 3, Anthropic Messages API). Same optional
+# deps; independent of `localfast` so a cloud-only build works.
+cloud     = ["dep:reqwest", "dep:url"]
 
 [dependencies]
 harness-core = { workspace = true }
