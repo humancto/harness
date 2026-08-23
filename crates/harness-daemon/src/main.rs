@@ -2,6 +2,7 @@
 //! surface into a real `harness` binary.
 #![forbid(unsafe_code)]
 
+mod cost_gate;
 mod dispatch;
 mod executor;
 #[cfg(test)]

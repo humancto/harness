@@ -144,6 +144,32 @@ async fn t12_happy_path_via_wiremock() {
     assert_eq!(out["model"], json!("claude-3-5-sonnet-20241022"));
     assert_eq!(out["prompt_tokens"], json!(7));
     assert_eq!(out["completion_tokens"], json!(3));
+    // 5.9: priced from usage — 7×$3/1M + 3×$15/1M.
+    let cost = out["cost_usd"].as_f64().expect("priced");
+    assert!((cost - (7.0 * 3.0 + 3.0 * 15.0) / 1_000_000.0).abs() < 1e-12);
+}
+
+#[tokio::test]
+async fn t12b_unknown_model_is_unpriced_not_guessed() {
+    let mock = MockServer::start().await;
+    let mut body = ok_body();
+    body["model"] = json!("claude-experimental-x");
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let secrets: Arc<dyn SecretsStore> = Arc::new(TestStore::with_claude_key("sk-ant-test"));
+    let cap = cap_with(secrets, &mock);
+    let out = cap
+        .execute(
+            &ctx(),
+            json!({"model": "claude-experimental-x", "prompt": "hi"}),
+        )
+        .await
+        .expect("call succeeds");
+    assert!(out["cost_usd"].is_null(), "unknown model must be unpriced");
 }
 
 #[tokio::test]

@@ -163,6 +163,7 @@ impl Capability for LlmCloudClaudeCapability {
                     "duration_ms":       { "type": "integer" },
                     "prompt_tokens":     { "type": ["integer", "null"] },
                     "completion_tokens": { "type": ["integer", "null"] },
+                    "cost_usd":          { "type": ["number", "null"] },
                 },
             }),
             cost_hint: CostHint::CloudPaid,
@@ -389,12 +390,21 @@ async fn dispatch_claude(
         .collect();
 
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    // 5.9 (ADR-0037): price the call from provider-reported usage.
+    // Unknown model or absent usage → null, never a guess.
+    let pt = r.usage.as_ref().and_then(|u| u.input_tokens);
+    let ct = r.usage.as_ref().and_then(|u| u.output_tokens);
+    let cost_usd = match (pt, ct) {
+        (Some(p), Some(c)) => harness_cost::price_usd(&input.model, p, c),
+        _ => None,
+    };
     Ok(json!({
         "text":              text,
         "model":             input.model,
         "duration_ms":       duration_ms,
-        "prompt_tokens":     r.usage.as_ref().and_then(|u| u.input_tokens),
-        "completion_tokens": r.usage.as_ref().and_then(|u| u.output_tokens),
+        "prompt_tokens":     pt,
+        "completion_tokens": ct,
+        "cost_usd":          cost_usd,
     }))
 }
 

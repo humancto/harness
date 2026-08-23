@@ -35,6 +35,11 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "result_provenance",
         include_str!("../migrations/V0006__result_provenance.sql"),
     ),
+    (
+        7,
+        "result_cost",
+        include_str!("../migrations/V0007__result_cost.sql"),
+    ),
 ];
 
 pub(crate) fn run(conn: &Connection) -> Result<(), StoreError> {

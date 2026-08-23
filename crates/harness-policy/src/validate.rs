@@ -52,6 +52,21 @@ pub(crate) fn validate(policy: &Policy) -> Result<(), PolicyError> {
         &mut errors,
     );
 
+    // 5.9: pricing overrides — non-empty prefixes, finite non-negative
+    // rates (same nan/negative hygiene as the budget knobs).
+    for (prefix, rates) in &policy.cost.model_prices {
+        if prefix.trim().is_empty() {
+            errors.push("cost.model_prices has an empty model prefix".to_string());
+        }
+        for (i, r) in rates.iter().enumerate() {
+            if !r.is_finite() || *r < 0.0 {
+                errors.push(format!(
+                    "cost.model_prices[{prefix:?}][{i}] must be a finite, non-negative rate (got {r})"
+                ));
+            }
+        }
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {

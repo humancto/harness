@@ -270,6 +270,7 @@ impl LocalExecutor {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn spawn_execute(
         &self,
         id: TaskId,
@@ -332,6 +333,9 @@ impl LocalExecutor {
             }
         };
 
+        // 5.9: capture the manifest hint before `cap` moves into the
+        // task — the cost gate needs it at result-write time.
+        let cost_hint = cap.manifest().cost_hint;
         tokio::spawn(async move {
             let _permit = permit;
             // Held for the coordination-depth RAII window (4.7). The
@@ -373,6 +377,12 @@ impl LocalExecutor {
                     let _ = store.try_transition_task(id, TaskState::Running, TaskState::Done);
                     if let Err(e) = store.write_task_result_done(id, &output, now, local_node) {
                         tracing::warn!(target: "harness.executor", ?e, "write_task_result_done");
+                    }
+                    // 5.9 (ADR-0037): persist actual dollars, gated on
+                    // the LOCAL manifest being CloudPaid.
+                    if let Some(usd) = crate::cost_gate::gated_cost(cost_hint, &output, &capability)
+                    {
+                        let _ = store.write_result_cost(id, usd);
                     }
                     let _ = store.replica_apply_local(&done_replica(id, now, local_node, &output));
                 }

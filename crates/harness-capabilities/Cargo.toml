@@ -28,6 +28,7 @@ fs   = ["dep:cap-std", "dep:base64", "dep:toml", "dep:dirs", "dep:rusqlite", "de
 mcp  = ["dep:rmcp", "dep:toml"]
 
 [dependencies]
+harness-cost = { workspace = true }
 harness-core         = { workspace = true }
 harness-policy       = { workspace = true }
 harness-orchestrator = { workspace = true }

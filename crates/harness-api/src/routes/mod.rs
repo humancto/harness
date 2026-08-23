@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod capabilities;
+pub mod costs;
 pub mod events;
 pub mod health;
 pub mod peers;
@@ -32,6 +33,7 @@ pub fn api_router(state: ApiState) -> Router {
         .route("/status", get(status::get_status))
         .route("/peers", get(peers::get_peers))
         .route("/capabilities", get(capabilities::get_capabilities))
+        .route("/costs", get(costs::get_costs))
         .route("/events", get(events::ws_events))
         .route("/admin/pause", post(admin::pause_handler))
         .route("/admin/resume", post(admin::resume_handler))

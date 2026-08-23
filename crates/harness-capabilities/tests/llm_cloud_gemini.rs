@@ -141,6 +141,9 @@ async fn t01_happy_path_via_wiremock() {
     assert_eq!(out["model"], json!("gemini-2.0-flash"));
     assert_eq!(out["prompt_tokens"], json!(7));
     assert_eq!(out["completion_tokens"], json!(3));
+    // 5.9: priced from usage — 7×$0.10/1M + 3×$0.40/1M.
+    let cost = out["cost_usd"].as_f64().expect("priced");
+    assert!((cost - (7.0 * 0.1 + 3.0 * 0.4) / 1_000_000.0).abs() < 1e-12);
 }
 
 #[tokio::test]

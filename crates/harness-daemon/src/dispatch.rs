@@ -296,6 +296,24 @@ pub(crate) struct DispatchRuntime {
 }
 
 impl DispatchRuntime {
+    /// 5.9 (ADR-0037): issuer-side cost gate — judged against the
+    /// ISSUER'S OWN local manifest (same binary, same first-party
+    /// hints), never the worker's gossiped announcement. This row is
+    /// the one the coordinator's ledger reads.
+    fn persist_ingested_cost(&self, task_id: TaskId, output: &serde_json::Value) {
+        if let Ok(Some(task)) = self.store.load_task(task_id) {
+            if let Some(cap) = self.registry.get(&task.capability) {
+                if let Some(usd) =
+                    crate::cost_gate::gated_cost(cap.manifest().cost_hint, output, &task.capability)
+                {
+                    if let Err(e) = self.store.write_result_cost(task_id, usd) {
+                        tracing::warn!(target: "harness.cost", ?e, "write_result_cost (ingest)");
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) fn new(
         store: Store,
         identity: Arc<Identity>,
@@ -1290,6 +1308,7 @@ impl TaskChannelHandlers for DispatchRuntime {
                 {
                     tracing::warn!(target: "harness.dispatch", ?e, "write remote result");
                 }
+                self.persist_ingested_cost(task_id, &msg.result.output);
                 let preview = serde_json::to_vec(&msg.result.output)
                     .ok()
                     .map(|v| v.into_iter().take(256).collect());
@@ -1792,6 +1811,103 @@ mod tests {
                 .state,
             harness_store::LeaseState::Completed
         );
+    }
+
+    /// 5.9 (ADR-0037): the issuer-side ingest applies the cost gate
+    /// against the ISSUER'S OWN local manifest — a CloudPaid result's
+    /// claimed cost_usd persists on the coordinator's row (the one
+    /// the ledger reads), a LocalFast claim does not.
+    #[tokio::test]
+    async fn t01b_remote_result_ingest_gates_cost_on_local_manifest() {
+        struct PaidEcho;
+        #[async_trait::async_trait]
+        impl harness_capabilities::Capability for PaidEcho {
+            fn id(&self) -> &'static str {
+                "paid.echo"
+            }
+            fn manifest(&self) -> harness_core::Capability {
+                let mut m = harness_capabilities::Capability::manifest(
+                    &harness_capabilities::MeshInfoCapability::new(),
+                );
+                m.id = "paid.echo".into();
+                m.cost_hint = harness_core::protocol::CostHint::CloudPaid;
+                m
+            }
+            async fn execute(
+                &self,
+                _ctx: &harness_capabilities::ExecutionContext,
+                _input: serde_json::Value,
+            ) -> Result<serde_json::Value, harness_capabilities::CapabilityError> {
+                Ok(serde_json::json!({}))
+            }
+        }
+
+        let f = fixture();
+        f.runtime
+            .registry
+            .register(Arc::new(PaidEcho))
+            .expect("register paid.echo");
+
+        // CloudPaid task: claimed cost persists on the issuer's row.
+        let task = signed_task_for(&f.local, "paid.echo");
+        f.store.insert_task(&task).expect("insert");
+        assert!(f
+            .store
+            .try_dispatch_task(task.id, f.remote.node_id())
+            .expect("dispatch"));
+        let lease = f
+            .store
+            .create_lease(task.id, f.remote.node_id(), 60_000, 1)
+            .expect("lease");
+        let mut result = signed_result(&f.remote, task.id, true);
+        result.output = serde_json::json!({"text": "x", "cost_usd": 0.25});
+        result.sign(&f.remote).expect("re-sign");
+        f.runtime.on_result(
+            f.remote.node_id(),
+            TaskResultMsg {
+                seq: 0,
+                lease_id: lease.lease_id,
+                result,
+                sig: Signature::from_bytes([0u8; 64]),
+            },
+        );
+        let row = f
+            .store
+            .load_task_result(task.id)
+            .expect("load")
+            .expect("row");
+        assert_eq!(row.cost_usd, Some(0.25), "CloudPaid claim persists");
+
+        // LocalFast task ("echo" is not even registered here — an
+        // unknown local manifest also refuses): claim ignored.
+        let task2 = signed_task_for(&f.local, "echo");
+        f.store.insert_task(&task2).expect("insert");
+        assert!(f
+            .store
+            .try_dispatch_task(task2.id, f.remote.node_id())
+            .expect("dispatch"));
+        let lease2 = f
+            .store
+            .create_lease(task2.id, f.remote.node_id(), 60_000, 1)
+            .expect("lease");
+        let mut result2 = signed_result(&f.remote, task2.id, true);
+        result2.output = serde_json::json!({"echoed": "hi", "cost_usd": 1e9});
+        result2.sign(&f.remote).expect("re-sign");
+        f.runtime.on_result(
+            f.remote.node_id(),
+            TaskResultMsg {
+                seq: 0,
+                lease_id: lease2.lease_id,
+                result: result2,
+                sig: Signature::from_bytes([0u8; 64]),
+            },
+        );
+        let row2 = f
+            .store
+            .load_task_result(task2.id)
+            .expect("load")
+            .expect("row");
+        assert_eq!(row2.cost_usd, None, "unbacked claim never persists");
     }
 
     #[tokio::test]
