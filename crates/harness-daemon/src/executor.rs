@@ -374,7 +374,22 @@ impl LocalExecutor {
             }
             match outcome {
                 Ok(Ok(output)) => {
-                    let _ = store.try_transition_task(id, TaskState::Running, TaskState::Done);
+                    // 5.10 (ADR-0038): the terminal CAS gates the
+                    // writes — a row cancelled mid-flight must not get
+                    // a Done result or Done gossip over Cancelled.
+                    let won = matches!(
+                        store.try_transition_task(id, TaskState::Running, TaskState::Done),
+                        Ok(true)
+                    );
+                    if !won {
+                        tracing::info!(
+                            target: "harness.executor",
+                            task_id = ?id,
+                            "terminal CAS lost (row left Running, e.g. cancelled); result dropped"
+                        );
+                        let _ = terminal_tx.send(id);
+                        return;
+                    }
                     if let Err(e) = store.write_task_result_done(id, &output, now, local_node) {
                         tracing::warn!(target: "harness.executor", ?e, "write_task_result_done");
                     }
@@ -388,7 +403,19 @@ impl LocalExecutor {
                 }
                 Ok(Err(e)) => {
                     let msg = e.to_string();
-                    let _ = store.try_transition_task(id, TaskState::Running, TaskState::Failed);
+                    let won = matches!(
+                        store.try_transition_task(id, TaskState::Running, TaskState::Failed),
+                        Ok(true)
+                    );
+                    if !won {
+                        tracing::info!(
+                            target: "harness.executor",
+                            task_id = ?id,
+                            "terminal CAS lost; failure result dropped"
+                        );
+                        let _ = terminal_tx.send(id);
+                        return;
+                    }
                     if let Err(we) = store.write_task_result_failed(id, &msg, now, local_node) {
                         tracing::warn!(target: "harness.executor", ?we, "write_task_result_failed");
                     }
@@ -396,7 +423,19 @@ impl LocalExecutor {
                 }
                 Err(payload) => {
                     let msg = format!("capability panicked: {}", describe_panic(payload.as_ref()));
-                    let _ = store.try_transition_task(id, TaskState::Running, TaskState::Failed);
+                    let won = matches!(
+                        store.try_transition_task(id, TaskState::Running, TaskState::Failed),
+                        Ok(true)
+                    );
+                    if !won {
+                        tracing::info!(
+                            target: "harness.executor",
+                            task_id = ?id,
+                            "terminal CAS lost; panic result dropped"
+                        );
+                        let _ = terminal_tx.send(id);
+                        return;
+                    }
                     if let Err(we) = store.write_task_result_failed(id, &msg, now, local_node) {
                         tracing::warn!(target: "harness.executor", ?we, "write_task_result_failed (panic)");
                     }

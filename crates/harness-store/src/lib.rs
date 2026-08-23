@@ -24,4 +24,4 @@ pub use crate::leases::{Lease, LeaseId, LeaseState};
 pub use crate::open::{Store, StoreConfig};
 pub use crate::replica::StoreReplicaApplier;
 pub use crate::results::TaskResult;
-pub use crate::tasks::{TaskRow, TaskState};
+pub use crate::tasks::{CancelOutcome, TaskRow, TaskState};

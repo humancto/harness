@@ -66,7 +66,13 @@ impl TaskState {
                 TaskState::Claimed | TaskState::Cancelled | TaskState::Expired
             ) | (
                 TaskState::Claimed,
-                TaskState::Running | TaskState::Failed | TaskState::Expired
+                TaskState::Running
+                    | TaskState::Failed
+                    | TaskState::Expired
+                    // 5.10 (ADR-0038): operator cancel reaches claimed
+                    // rows too — the stop button must not race-lose to
+                    // a worker claim.
+                    | TaskState::Cancelled
             ) | (
                 TaskState::Running,
                 TaskState::Done | TaskState::Failed | TaskState::Cancelled | TaskState::Expired
@@ -798,5 +804,52 @@ mod tests {
         let missing = TaskId::new_v7();
         let err = s.transition_task(missing, TaskState::Done).unwrap_err();
         assert!(matches!(err, StoreError::NotFound));
+    }
+}
+
+/// 5.10 (ADR-0038): outcome of an operator cancel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// The row was non-terminal and is now `Cancelled`.
+    Cancelled,
+    /// No such task.
+    Unknown,
+    /// Already terminal — nothing changed; the state is named.
+    AlreadyTerminal(TaskState),
+}
+
+impl Store {
+    /// Atomically cancel a NON-terminal task (5.10, ADR-0038): one
+    /// transaction reads the state and flips it to `cancelled`, so a
+    /// concurrent dispatch/claim cannot slip between read and write.
+    /// Callers also release the task's live leases (the API handler
+    /// does) so late worker results drop at the terminal-lease guard.
+    ///
+    /// # Errors
+    /// Underlying sqlite errors.
+    pub fn cancel_task(&self, id: TaskId) -> Result<CancelOutcome, StoreError> {
+        self.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            let state: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM tasks WHERE id = ?1",
+                    params![id.0.as_bytes()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(raw) = state else {
+                return Ok(CancelOutcome::Unknown);
+            };
+            let current: TaskState = raw.parse()?;
+            if !current.can_transition_to(TaskState::Cancelled) {
+                return Ok(CancelOutcome::AlreadyTerminal(current));
+            }
+            tx.execute(
+                "UPDATE tasks SET state = 'cancelled' WHERE id = ?1",
+                params![id.0.as_bytes()],
+            )?;
+            tx.commit()?;
+            Ok(CancelOutcome::Cancelled)
+        })
     }
 }

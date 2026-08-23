@@ -188,6 +188,13 @@ impl harness_capabilities::PlanExec for StoreMeshExec {
         self.await_terminal_impl(id, deadline).await
     }
 
+    fn own_cancelled(&self, id: harness_core::TaskId) -> bool {
+        matches!(
+            self.store.task_state(id),
+            Ok(Some(harness_store::TaskState::Cancelled))
+        )
+    }
+
     fn live_workers(&self) -> usize {
         self.peers.live_snapshot(PEER_TIMEOUT).len() + 1
     }

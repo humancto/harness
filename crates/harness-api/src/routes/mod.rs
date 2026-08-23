@@ -50,6 +50,7 @@ pub fn api_router(state: ApiState) -> Router {
         // 3.2-stream; regression-tested in runs_websocket.rs and the
         // partials API test.
         .route("/tasks/:id", get(tasks::get_handler))
+        .route("/tasks/:id/cancel", post(tasks::cancel_handler))
         .route("/runs/:id", get(runs::ws_run))
         .fallback(api_not_found)
         .with_state(state)
