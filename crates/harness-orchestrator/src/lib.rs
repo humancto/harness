@@ -21,7 +21,7 @@ pub use dag::{
     DagError, DagScheduler, DagSummary, Progress, StepOutcome, StepState, MAX_PLAN_STEPS,
 };
 pub use dispatcher::{
-    effective_hints, fit_score, DispatchPlan, Dispatcher, LiveSet, LoadView, NodeSnapshot,
+    effective_hints, fit_score, Breaker, DispatchPlan, Dispatcher, LiveSet, LoadView, NodeSnapshot,
     RoundRobin, StaticLiveSet, StaticLoadView, SuccessTracker,
 };
 pub use error::DispatchError;

@@ -39,8 +39,8 @@ use harness_core::{
 use harness_mesh::heartbeat::{PeerTable, PEER_TIMEOUT};
 use harness_mesh::TrustStore;
 use harness_orchestrator::{
-    effective_hints, DispatchError, DispatchPlan, Dispatcher, LiveSet, LoadView, NodeSnapshot,
-    RoundRobin, SuccessTracker,
+    effective_hints, Breaker, DispatchError, DispatchPlan, Dispatcher, LiveSet, LoadView,
+    NodeSnapshot, RoundRobin, SuccessTracker,
 };
 use harness_store::{Store, TaskState};
 use parking_lot::Mutex as ParkingMutex;
@@ -111,6 +111,35 @@ impl LiveSet for SecretAwareLiveSet<'_> {
             && self
                 .runtime
                 .node_has_required_secrets(*node, self.capability)
+    }
+}
+
+/// 4.6 (ADR-0028): bench-aware layer over the liveness ∩ secrets set.
+/// `breaker: None` = passthrough (pinned tasks and Federated fan-outs
+/// bypass the bench — operator intent and availability-first
+/// respectively). Counts filtered nodes so the caller can distinguish
+/// "no eligible nodes at all" from "eligible nodes exist but every one
+/// is benched" — the latter is ≤60 s transient and must WAIT, not burn
+/// the terminal eligibility window (plan review MAJOR-8).
+struct BreakerAwareLiveSet<'a> {
+    inner: SecretAwareLiveSet<'a>,
+    breaker: Option<&'a Breaker>,
+    filtered: std::sync::atomic::AtomicUsize,
+}
+
+impl LiveSet for BreakerAwareLiveSet<'_> {
+    fn is_live(&self, node: &NodeId) -> bool {
+        if !self.inner.is_live(node) {
+            return false;
+        }
+        if let Some(breaker) = self.breaker {
+            if breaker.is_benched(node) {
+                self.filtered
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -245,6 +274,12 @@ pub(crate) struct DispatchRuntime {
     /// loop. Backing-off tasks also sit in `gated` so they batch in
     /// the WAITING class.
     backoff: ParkingMutex<HashMap<TaskId, tokio::time::Instant>>,
+    /// 4.6 (ADR-0028, PRD §14.5): per-node circuit breaker — 5
+    /// consecutive NODE-HEALTH failures (lease expiry, send failure;
+    /// never task-level result statuses) bench a node for 60 s from
+    /// `Anyone`/`Owner` candidate sets. Self is never benched; pinned
+    /// tasks and Federated fan-outs bypass the bench.
+    breaker: Arc<Breaker>,
 }
 
 impl DispatchRuntime {
@@ -279,7 +314,30 @@ impl DispatchRuntime {
             success: Arc::new(SuccessTracker::new()),
             gated: ParkingMutex::new(std::collections::HashSet::new()),
             backoff: ParkingMutex::new(HashMap::new()),
+            breaker: Arc::new(Breaker::new()),
         })
+    }
+
+    /// 4.6: node-health failure feed (lease expiry / send failure).
+    /// Self is never benched — a single-node install must not gate its
+    /// whole queue on its own task outcomes.
+    fn record_node_failure(&self, node: NodeId) {
+        if node != self.local_id {
+            self.breaker.record_failure(node);
+        }
+    }
+
+    /// Test introspection: the circuit breaker.
+    #[cfg(test)]
+    pub(crate) fn breaker(&self) -> &Breaker {
+        &self.breaker
+    }
+
+    /// Test introspection: is the task inside the terminal eligibility
+    /// window?
+    #[cfg(test)]
+    pub(crate) fn has_elig_failure(&self, id: TaskId) -> bool {
+        self.elig_failures.lock().contains_key(&id)
     }
 
     /// The shared success tracker — the local executor records its own
@@ -439,10 +497,23 @@ impl DispatchRuntime {
             // tag the capability requires are not candidates. When that
             // empties the set the existing eligibility-failure window →
             // terminal `undispatchable` path applies unchanged.
-            let live = SecretAwareLiveSet {
-                inner: self.live_set(),
-                runtime: self,
-                capability: &task.capability,
+            let live = BreakerAwareLiveSet {
+                inner: SecretAwareLiveSet {
+                    inner: self.live_set(),
+                    runtime: self,
+                    capability: &task.capability,
+                },
+                // Pinned tasks (operator intent) and Federated fan-outs
+                // (availability-first; a benched node just shows up
+                // non-Ok in provenance) bypass the bench.
+                breaker: if task.constraints.pin_to_node.is_some()
+                    || matches!(cardinality, Cardinality::Federated { .. })
+                {
+                    None
+                } else {
+                    Some(&self.breaker)
+                },
+                filtered: std::sync::atomic::AtomicUsize::new(0),
             };
             match self.dispatcher.eligible_scored(
                 &task,
@@ -502,7 +573,11 @@ impl DispatchRuntime {
                     // a routing bug, not a task failure.
                     tracing::error!(target: "harness.dispatch", task = %task.id.0, "unknown dispatch plan");
                 }
-                Err(err) => self.eligibility_failure(&task, &err),
+                Err(err) => {
+                    let bench_filtered =
+                        live.filtered.load(std::sync::atomic::Ordering::Relaxed) > 0;
+                    self.eligibility_failure(&task, &err, bench_filtered);
+                }
             }
         }
     }
@@ -648,6 +723,7 @@ impl DispatchRuntime {
                 %err,
                 "assign enqueue failed; resetting for re-dispatch"
             );
+            self.record_node_failure(node);
             if let Ok(true) = self.store.expire_and_reset_task(lease.lease_id) {
                 // 4.6 (risk 9): back off before re-routing so a dead
                 // pin isn't hammered every 100 ms poll.
@@ -656,12 +732,23 @@ impl DispatchRuntime {
         }
     }
 
-    fn eligibility_failure(&self, task: &Task, err: &DispatchError) {
+    fn eligibility_failure(&self, task: &Task, err: &DispatchError, bench_filtered: bool) {
         // 4.4 (ADR-0026 / review BLOCKER-1): a load-gated task is a
         // QUEUED task, not an undispatchable one — never start the
         // terminal window for it. It waits bounded only by its own
         // deadline, exactly like work queued behind a busy executor.
-        if matches!(err, DispatchError::ResourceGated { .. }) {
+        //
+        // 4.6 (ADR-0028): "every candidate is benched" is the same
+        // shape — a ≤60 s transient. When the breaker filtered anyone,
+        // NoEligibleNodes and Owner-empty errors join the waiting arm
+        // instead of burning the terminal window (the sole-benched-
+        // owner case included; plan review MAJOR-8).
+        let bench_gated = bench_filtered
+            && matches!(
+                err,
+                DispatchError::NoEligibleNodes { .. } | DispatchError::Owner { .. }
+            );
+        if bench_gated || matches!(err, DispatchError::ResourceGated { .. }) {
             self.elig_failures.lock().remove(&task.id);
             self.gated.lock().insert(task.id);
             let deadline_expired = task
@@ -763,6 +850,7 @@ impl DispatchRuntime {
                 }
                 if let Some(worker) = lease.worker_id {
                     self.success.record(worker, false);
+                    self.record_node_failure(worker);
                 }
                 let msg = format!("lease expired after {} attempts", lease.attempt);
                 tracing::warn!(target: "harness.dispatch", task = %lease.task_id.0, %msg, "task expired terminally");
@@ -790,6 +878,7 @@ impl DispatchRuntime {
                 // lease and didn't finish (review MINOR-6).
                 if let Some(worker) = lease.worker_id {
                     self.success.record(worker, false);
+                    self.record_node_failure(worker);
                 }
                 // Guarded on expires_at < now: a LeaseExtend landing
                 // after find_expired's snapshot makes this reset lose
@@ -1115,6 +1204,10 @@ impl TaskChannelHandlers for DispatchRuntime {
         // Feed the tracker only after the CAS accepted the result —
         // duplicate frames never double-count (review MINOR-6).
         self.success.record(from, msg.result.status == Status::Ok);
+        // 4.6: ANY accepted result proves node liveness — even a Failed
+        // one clears the breaker streak (task-level outcomes are not
+        // node-health signals).
+        self.breaker.record_ok(from);
         let task_id = msg.result.task_id;
         let now = msg.result.finished_at;
         if msg.result.status == Status::Ok {
@@ -1217,6 +1310,7 @@ impl TaskChannelHandlers for DispatchRuntime {
     fn on_assign_send_failed(&self, node: NodeId, lease_id: LeaseId) {
         tracing::warn!(target: "harness.dispatch", %node, "assign send failed; resetting lease");
         self.success.record(node, false);
+        self.record_node_failure(node);
         // 4.6 (risk 9, plan review MAJOR-6): the ASYNC send-failure
         // path — a half-dead peer accepts the enqueue and fails in the
         // sender task — must back off too, or the retry loop hammers
@@ -2380,6 +2474,131 @@ mod tests {
         assert!(
             !f.runtime.is_gated(task.id),
             "cancelled task pruned from waiting sets"
+        );
+    }
+
+    // ---- 4.6 (ADR-0028): circuit breaker -------------------------------
+
+    fn bench(f: &Fixture, node: NodeId) {
+        for _ in 0..harness_orchestrator::dispatcher::BENCH_THRESHOLD {
+            f.runtime.breaker().record_failure(node);
+        }
+        assert!(f.runtime.breaker().is_benched(&node));
+    }
+
+    /// A benched node is excluded from Anyone routing; a healthy peer
+    /// takes every dispatch.
+    #[tokio::test]
+    async fn t24_benched_node_excluded_from_candidates() {
+        let f = fixture();
+        let benched = Identity::generate();
+        let healthy = Identity::generate();
+        add_live_candidate(&f, &benched, vec![SECRET_TAG.to_string()]);
+        add_live_candidate(&f, &healthy, vec![SECRET_TAG.to_string()]);
+        bench(&f, benched.node_id());
+
+        for _ in 0..3 {
+            let t = signed_task_for(&f.local, SECRET_CAP);
+            f.store.insert_task(&t).expect("insert");
+            f.runtime.poll_submitted_once();
+            assert_eq!(
+                f.store.last_dispatched(SECRET_CAP).expect("cursor"),
+                Some(healthy.node_id()),
+                "benched node must never be routed to"
+            );
+        }
+    }
+
+    /// All candidates benched ⇒ the task WAITS in the gated class (a
+    /// ≤60 s transient), never entering the terminal eligibility
+    /// window; a liveness proof un-benches and it dispatches.
+    #[tokio::test]
+    async fn t25_all_benched_waits_gated_not_terminal() {
+        let f = fixture();
+        let only = Identity::generate();
+        add_live_candidate(&f, &only, vec![SECRET_TAG.to_string()]);
+        bench(&f, only.node_id());
+
+        let t = signed_task_for(&f.local, SECRET_CAP);
+        f.store.insert_task(&t).expect("insert");
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.task_state(t.id).unwrap(),
+            Some(TaskState::Submitted)
+        );
+        assert!(f.runtime.is_gated(t.id), "all-benched waits in gated class");
+        assert!(
+            !f.runtime.has_elig_failure(t.id),
+            "the terminal window must never start for a bench-gated task"
+        );
+
+        // Liveness proof clears the bench; the task dispatches.
+        f.runtime.breaker().record_ok(only.node_id());
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.list_leases_for_task(t.id).expect("leases").len(),
+            1,
+            "dispatched once the bench clears"
+        );
+    }
+
+    /// Pinned tasks bypass the bench — operator intent wins.
+    #[tokio::test]
+    async fn t26_pin_bypasses_bench() {
+        let f = fixture();
+        let benched = Identity::generate();
+        add_live_candidate(&f, &benched, vec![SECRET_TAG.to_string()]);
+        bench(&f, benched.node_id());
+
+        let mut t = signed_task_for(&f.local, SECRET_CAP);
+        t.constraints.pin_to_node = Some(benched.node_id());
+        t.sign(&f.local).expect("re-sign");
+        f.store.insert_task(&t).expect("insert");
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.list_leases_for_task(t.id).expect("leases").len(),
+            1,
+            "pinned dispatch proceeds to the benched node"
+        );
+    }
+
+    /// Self is never benched: a burst of local failures must not gate
+    /// a single-node install's queue.
+    #[tokio::test]
+    async fn t27_self_is_never_benched() {
+        let f = fixture();
+        for _ in 0..20 {
+            // Through the guarded feed, not the raw breaker.
+            f.runtime
+                .on_assign_send_failed(f.local.node_id(), harness_core::LeaseId::new_v7());
+        }
+        assert!(!f.runtime.breaker().is_benched(&f.local.node_id()));
+    }
+
+    /// The node-health feed benches through the real failure path:
+    /// five failed sends to the same peer.
+    #[tokio::test]
+    async fn t28_send_failures_feed_the_breaker() {
+        let f = fixture();
+        let peer = Identity::generate();
+        add_live_candidate(&f, &peer, vec![SECRET_TAG.to_string()]);
+        for _ in 0..harness_orchestrator::dispatcher::BENCH_THRESHOLD {
+            let t = signed_task_for(&f.local, SECRET_CAP);
+            f.store.insert_task(&t).expect("insert");
+            assert!(f
+                .store
+                .try_dispatch_task(t.id, peer.node_id())
+                .expect("cas"));
+            let lease = f
+                .store
+                .create_lease(t.id, peer.node_id(), 5_000, 1)
+                .expect("lease");
+            f.runtime
+                .on_assign_send_failed(peer.node_id(), lease.lease_id);
+        }
+        assert!(
+            f.runtime.breaker().is_benched(&peer.node_id()),
+            "five consecutive send failures bench the peer"
         );
     }
 

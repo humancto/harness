@@ -238,6 +238,87 @@ impl SuccessTracker {
     }
 }
 
+/// 4.6 (ADR-0028, PRD §14.5): per-node circuit breaker — after
+/// [`BENCH_THRESHOLD`] CONSECUTIVE node-health failures (lease expiry,
+/// send failure — never task-level result statuses), the node is
+/// benched for [`BENCH_MS`] and excluded from `Anyone`/`Owner`
+/// candidate sets. ANY accepted result from the node (even a Failed
+/// one — it proves liveness) resets the streak and clears the bench.
+/// Issuer-local and in-memory, like [`SuccessTracker`]; the daemon
+/// never benches self, pinned tasks, or Federated fan-outs.
+#[derive(Debug, Default)]
+pub struct Breaker {
+    inner: parking_lot::Mutex<HashMap<NodeId, BreakerEntry>>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BreakerEntry {
+    consecutive_fails: u32,
+    benched_until: Option<std::time::Instant>,
+}
+
+/// Consecutive node-health failures that bench a node (PRD §14.5).
+pub const BENCH_THRESHOLD: u32 = 5;
+/// Bench duration (PRD §14.5: "60s bench").
+pub const BENCH_MS: u64 = 60_000;
+
+impl Breaker {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// One node-health failure. Benches the node once the streak
+    /// reaches [`BENCH_THRESHOLD`] (and re-benches while it persists).
+    pub fn record_failure(&self, node: NodeId) {
+        self.record_failure_at(node, std::time::Instant::now());
+    }
+
+    /// Deterministic seam for tests.
+    pub fn record_failure_at(&self, node: NodeId, now: std::time::Instant) {
+        let mut inner = self.inner.lock();
+        let e = inner.entry(node).or_default();
+        e.consecutive_fails = e.consecutive_fails.saturating_add(1);
+        if e.consecutive_fails >= BENCH_THRESHOLD {
+            e.benched_until = Some(now + std::time::Duration::from_millis(BENCH_MS));
+        }
+    }
+
+    /// Proof of liveness: clears the streak and any bench.
+    pub fn record_ok(&self, node: NodeId) {
+        let mut inner = self.inner.lock();
+        if let Some(e) = inner.get_mut(&node) {
+            e.consecutive_fails = 0;
+            e.benched_until = None;
+        }
+    }
+
+    #[must_use]
+    pub fn is_benched(&self, node: &NodeId) -> bool {
+        self.is_benched_at(node, std::time::Instant::now())
+    }
+
+    /// Deterministic seam for tests. Expiry auto-clears.
+    #[must_use]
+    pub fn is_benched_at(&self, node: &NodeId, now: std::time::Instant) -> bool {
+        let mut inner = self.inner.lock();
+        let Some(e) = inner.get_mut(node) else {
+            return false;
+        };
+        match e.benched_until {
+            Some(until) if now < until => true,
+            Some(_) => {
+                // Bench served: the node gets a fresh chance (streak
+                // resets so one more failure doesn't instantly re-bench).
+                e.benched_until = None;
+                e.consecutive_fails = 0;
+                false
+            }
+            None => false,
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -247,6 +328,51 @@ impl SuccessTracker {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn breaker_threshold_reset_and_expiry() {
+        let b = Breaker::new();
+        let node = NodeId::from_bytes([1; 16]);
+        let t0 = std::time::Instant::now();
+        for _ in 0..BENCH_THRESHOLD - 1 {
+            b.record_failure_at(node, t0);
+        }
+        assert!(!b.is_benched_at(&node, t0), "under threshold: not benched");
+        b.record_failure_at(node, t0);
+        assert!(
+            b.is_benched_at(&node, t0),
+            "5th consecutive failure benches"
+        );
+        // Liveness proof clears everything.
+        b.record_ok(node);
+        assert!(!b.is_benched_at(&node, t0));
+        // Re-bench and serve the full bench: auto-clears with a fresh
+        // streak.
+        for _ in 0..BENCH_THRESHOLD {
+            b.record_failure_at(node, t0);
+        }
+        assert!(b.is_benched_at(&node, t0));
+        let after = t0 + std::time::Duration::from_millis(BENCH_MS + 1);
+        assert!(!b.is_benched_at(&node, after), "bench expires");
+        b.record_failure_at(node, after);
+        assert!(
+            !b.is_benched_at(&node, after),
+            "streak reset after a served bench — one failure must not re-bench"
+        );
+    }
+
+    #[test]
+    fn breaker_ok_interleaved_never_benches() {
+        let b = Breaker::new();
+        let node = NodeId::from_bytes([2; 16]);
+        let t0 = std::time::Instant::now();
+        for _ in 0..20 {
+            b.record_failure_at(node, t0);
+            b.record_failure_at(node, t0);
+            b.record_ok(node); // consecutive requirement
+        }
+        assert!(!b.is_benched_at(&node, t0));
+    }
     use harness_core::protocol::{CpuClass, DiskIoClass, NetworkClass};
 
     fn hints() -> ResourceHints {
