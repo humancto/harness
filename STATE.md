@@ -1,7 +1,7 @@
 # Harness Implementation State
 
 **Current phase:** 4 — Distribution patterns (Phase 3 COMPLETE as of #42)
-**Last updated:** 2026-08-23 (post-5.4 NL Submit UI)
+**Last updated:** 2026-08-23 (post-5.5 WhatsApp webhook adapter)
 
 ## Phase 3 summary (post-merge) — COMPLETE
 
@@ -128,6 +128,8 @@ These will land alongside their natural Phase 3 home, not as a "phase 2.10":
 
 | #50 | 4.7  | Backpressure (ADR-0029): the heartbeat `paused` field finally has a producer — `PauseState` (queue-depth hysteresis latch at `max_queue_depth`/release at 3/4, OR operator `POST /admin/pause\|resume` + `GET /status` surfacing) with coordination-permit RAII subtraction so `queue_depth` means WORK depth; `DaemonRuntimeConfig.max_queue_depth` is the §14.10 knob; submit admission (`429` + `Retry-After: 2` over 1024 `Submitted` rows, indexed COUNT, fail-open, internal mints exempt); pause-aware routing in every `eligible_scored` arm (live-paused pin ⇒ ResourceGated while dead pins stay fast-terminal; paused owners wait, never reroute; unpinned federated sets exclude paused into `DispatchPlan::Federated::excluded` → `Skipped` provenance rows, policy-exempt; self gated via the shared `PauseState` in `StoreLoadView`); sub-tasks + plan steps stamp `constraints.deadline = issued_at + timeout_ms` (the pre-dispatch wait is bounded — no posthumous runs); full/lag-condition tests for every shipped bound (peer_net QueueFull both arms, reply pump/bridge/WS Lagged recovery, `into_channel` producer-park, `MESH_EVENT_CAPACITY`/`TERMINAL_EVENT_CAPACITY` named); bounds hygiene (llm_batcher `MAX_SLOT_SENDERS=64` flush-on-full + `MAX_LIVE_FINGERPRINTS=256` bypass; partial_stream pending task cap 256 evict-oldest-warned; sweep covers `elig_failures` + Cancelled reply obligations; additive `partials_dropped` on `GET /tasks/:id` + types.ts; `CLI_FANOUT_WINDOW=16`). m09 money test: saturate→pause→pinned waits/Anyone reroutes/federated Skips→drain→resume→exactly-once. +32 tests |
 
+| #56 | 5.5  | WhatsApp webhook (ADR-0033): root-path `POST /webhook/whatsapp` — fail-closed Twilio signature validation (`Base64(HMAC-SHA1(token, url+sorted params))`, vault token absent ⇒ 503, constant-time `verify_slice`, independent known-vector test; signed URL includes the query string; `HARNESS_WEBHOOK_BASE_URL` REQUIRED behind TLS termination); deny-all-by-default sender allowlist (BLOCKER-3: the signature authenticates TWILIO, not the sender — `HARNESS_WEBHOOK_ALLOW_FROM`, `*` opts into allow-all, WhatsApp senders match in full `whatsapp:+E164` form); the mint sequence extracted into ONE shared `mint_task` (clamp→build→sign→insert→replica-mirror; BLOCKER-1) used by submit handler + webhook; message Body → `brain.plan` (tags webhook+whatsapp, NO cloud_ok, constraint-smuggle pinned inert, 4.7 admission-subject) → TwiML ⏳ ack → detached store-polling driver (16 `OwnedSemaphorePermit`s, 600s deadline, CLI-parity envelopes) → `plan.execute` → Twilio Messages API reply (From=inbound To; missing SID ⇒ ack-only degraded mode). Tests ACT as the executor (BLOCKER-2: harness-api has no executor — legal state-chain walks + canned plan JSON + wiremock Twilio). MessageSid retry dedup (bounded 512 ring, same-ack) + result-row wait after terminal (the 5.3 executor gap) per Codex P1s; restart durability documented-deferred to 5.11. Deps: `hmac` is the only new lockfile entry (`sha1` already rides axum ws). +17 tests |
+
 | #55 | 5.4  | NL Submit UI: Submit page reworked into "Describe it" (default) + "Advanced" (pre-5.4 form, behavior preserved; cold-load capabilities double-fetch fixed in passing) tabs; `$lib/nlsubmit.ts` — CLI-parity request bodies INCLUDING the execution envelope (plan review BLOCKER-1: bare submits get the 30s `ExecutionPolicy` default, which would have killed the 210s planner chain; brain.plan rides 245s, plan.execute 125s), tolerant `parsePlanOutcome`, typed `pollTask` (401 ⇒ AuthGate flip mid-poll, other non-OK ⇒ fail-fast `http_error`, AbortSignal, budget = envelope + 2×slack), `inputPreview` (`truncate_chars` parity); NL state machine with generation guards + `$effect`-owned AbortController teardown (the 4.8 stale-callback lesson); DAG preview reuses `DagView` with an empty steps map + confidence bar/cost/duration/rationale strip + per-step input previews; confirm resubmits the plan VERBATIM to `plan.execute` (server re-validates — 5.3 ruleset) and navigates to the live `/runs/:id` page; planning failures render the 5.3 per-tier diagnostics verbatim. `fallback_plan` deliberately not rendered. +13 vitest (49 UI total) |
 
 | #54 | 5.3  | Validation ruleset + escalation triggers (ADR-0032): §15.4 rule 4 finally enforced — `validate_plan` gains `cloud_caps` (snapshot detects `CostHint::CloudPaid` / `"cloud"`-tagged caps) and rejects `must_be_local` plans naming one (`LocalityConflict`, checked first; foreign caps deferred to §10.4, `plan.execute` passes the empty set); typed `CloudTrigger` policy knob `escalate_to_cloud_if` (typos fail policy load; default ALL FOUR triggers — production local tiers only emit Confident/Err, so the PRD's two-string example would lock cloud out of every real failure mode and regress 5.2 reachability); executor rewrite (`walk_lineup`): per-tier attempt loops with validation-repair retries (`PlanRequest.repair` → 1KiB-capped repair prompt block; `max_replanning_attempts` default 2, cloud capped at 1 paid retry; low-confidence/NoMatch never retried), trigger-gated cloud (NoMatch deliberately NOT a trigger; cloud-as-baseline when no local LLM tier exists — nothing to escalate FROM), chain planning budget `Some(210_000)` from the daemon (attempts neither start past nor run beyond it via `tokio::time::timeout`; Template exempt — the §15.2 floor is now real, resolving the 5.1/5.2 carried risk). +14 tests |
@@ -143,6 +145,28 @@ These will land alongside their natural Phase 3 home, not as a "phase 2.10":
 cloud/template) — deferred, not dropped: `brain.plan`'s input schema is
 `additionalProperties: false` with no tier-selection field; needs a schema extension
 (natural home: 5.x backlog alongside escalation knobs).**
+
+5.5 review round 2 (diff): APPROVE at head — mint extraction byte-preserving, signature
+soundness (constant-time verified in vendored digest source; independent Python vector),
+no secret leakage (reqwest basic_auth sets the header sensitive — verified in vendored
+source), canned-plan fixture EMPIRICALLY deserialized against the real `Plan` serde,
+env coupling harmless, docs exact. Adopted follow-ups: sid recorded only AFTER a
+successful mint (a refused delivery stays retryable); t04 asserts the outbound basic-auth
+header; NIT doc-comments (redaction-wall crossing; Twilio's separator-less HMAC concat
+attacked and found unexploitable — ADR'd).
+
+5.5 review round 1 (plan): REVISE, all adopted pre-implementation — BLOCKER-1: no
+reusable mint path existed (submit_handler inlines auth+clamp+sign+insert+replica) —
+extracted `mint_task`; BLOCKER-2: harness-api has no executor, so the planned
+"stub lineup" driver test would hang — tests act as the executor via legal store
+transitions; BLOCKER-3: default-allow senders made a valid Twilio signature a remote
+NL-command surface (the signature authenticates Twilio, not the sender) — deny-all
+default with an explicit `*` escape. MAJORs: store-polling driver (HTTP-to-self cannot
+authenticate); outbound reply addresses = echoed inbound pair. MINORs: query string in
+the signed URL + TLS-termination note; dep claim precision (sha1 already in the lock,
+hmac the only new entry, reqwest a new edge); ApiState.secrets already existed;
+webhook mints are admission-subject; semaphore permits ride the drivers with a 600s
+deadline. NITs: pinned reply format; forwarded-to-brain equivalence recorded.
 
 5.3 review round 2 (diff): APPROVE — every attacked invariant verified clean (retry
 bounds, fresh repair threading, budget arithmetic, cloud-cap detection sweep across all

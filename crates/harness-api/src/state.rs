@@ -90,6 +90,10 @@ pub struct ApiState {
     /// 4.7 (ADR-0029): pause switch. `None` in bare test fixtures —
     /// status reports `paused: false` and the admin endpoints 503.
     pub pause: Option<Arc<dyn PauseControl>>,
+    /// 5.5 (ADR-0033): webhook adapter runtime (sender allowlist,
+    /// public-URL override, driver semaphore, outbound Twilio base).
+    /// Built from the environment by default; tests inject their own.
+    pub webhook: Arc<crate::routes::webhook::WebhookRuntime>,
 }
 
 impl std::fmt::Debug for ApiState {
@@ -143,6 +147,7 @@ pub struct ApiStateBuilder {
     secrets: Option<Arc<dyn SecretsStore>>,
     partials: Option<Arc<crate::partials::PartialBuffers>>,
     pause: Option<Arc<dyn PauseControl>>,
+    webhook: Option<Arc<crate::routes::webhook::WebhookRuntime>>,
 }
 
 impl ApiStateBuilder {
@@ -161,6 +166,7 @@ impl ApiStateBuilder {
             secrets: None,
             partials: None,
             pause: None,
+            webhook: None,
         }
     }
 
@@ -228,6 +234,17 @@ impl ApiStateBuilder {
         self
     }
 
+    /// 5.5: inject a webhook runtime (tests point the Twilio base at
+    /// wiremock and set an explicit allowlist). Default: from env.
+    #[must_use]
+    pub fn with_webhook_runtime(
+        mut self,
+        webhook: Arc<crate::routes::webhook::WebhookRuntime>,
+    ) -> Self {
+        self.webhook = Some(webhook);
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> ApiState {
         let local_node_id = self.identity.public_key().node_id();
@@ -254,6 +271,9 @@ impl ApiStateBuilder {
         let partials = self
             .partials
             .unwrap_or_else(|| Arc::new(crate::partials::PartialBuffers::new()));
+        let webhook = self
+            .webhook
+            .unwrap_or_else(|| Arc::new(crate::routes::webhook::WebhookRuntime::from_env()));
         ApiState {
             identity: self.identity,
             local_node_id,
@@ -266,6 +286,7 @@ impl ApiStateBuilder {
             secrets,
             partials,
             pause: self.pause,
+            webhook,
         }
     }
 }

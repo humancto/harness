@@ -31,6 +31,14 @@ thiserror     = { workspace = true }
 hex           = { workspace = true }
 futures       = { workspace = true }
 rand          = { workspace = true }
+# 5.5 webhook adapters (ADR-0033): Twilio signature (HMAC-SHA1 is
+# Twilio's contract; sha1 already in the lock via axum ws) + outbound
+# reply client.
+hmac             = { workspace = true }
+sha1             = { workspace = true }
+base64           = { workspace = true }
+serde_urlencoded = { workspace = true }
+reqwest          = { workspace = true }
 
 [dev-dependencies]
 tokio-tungstenite = { workspace = true }
@@ -39,4 +47,5 @@ tempfile          = { workspace = true }
 ed25519-dalek     = { workspace = true }
 rand              = { workspace = true }
 http-body-util    = "0.1"
+wiremock          = { workspace = true }
 tower             = { workspace = true, features = ["util"] }

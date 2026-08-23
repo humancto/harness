@@ -1226,6 +1226,7 @@ name = "harness-api"
 version = "0.0.0"
 dependencies = [
  "axum",
+ "base64",
  "ed25519-dalek",
  "futures",
  "harness-core",
@@ -1235,12 +1236,16 @@ dependencies = [
  "harness-ui",
  "harness-vault",
  "hex",
+ "hmac",
  "http-body-util",
  "insta",
  "parking_lot",
  "rand 0.8.6",
+ "reqwest",
  "serde",
  "serde_json",
+ "serde_urlencoded",
+ "sha1",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -1249,6 +1254,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -1544,6 +1550,15 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
 
 [[package]]
 name = "hostname"

@@ -36,11 +36,19 @@ pub use state::{
 
 use axum::Router;
 
-/// Build the daemon's combined `Router`: API at `/api/v1/*`, UI at `/`.
+/// Build the daemon's combined `Router`: API at `/api/v1/*`, webhook
+/// adapters at `/webhook/*` (PRD §20.2 path shape, 5.5), UI at `/`.
 pub fn router(state: ApiState) -> Router {
-    let api = routes::api_router(state);
+    let api = routes::api_router(state.clone());
+    let webhooks = Router::new()
+        .route(
+            "/webhook/whatsapp",
+            axum::routing::post(routes::webhook::whatsapp::whatsapp_handler),
+        )
+        .with_state(state);
     Router::new()
         .nest("/api/v1", api)
+        .merge(webhooks)
         .fallback_service(harness_ui::router())
 }
 
