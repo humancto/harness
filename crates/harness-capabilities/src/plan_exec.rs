@@ -312,6 +312,7 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
         let run_exec = exec.clone();
         let lw_exec = exec.clone();
         let row_ids = row_ids.clone();
+        let run_sink = sink.clone();
         let parent = ctx.task_id;
         let plan_id = plan.id;
         FanoutSpec {
@@ -319,6 +320,7 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
             run: Box::new(move |_index, step: ReadyStep| {
                 let exec = run_exec.clone();
                 let row_ids = row_ids.clone();
+                let sink = run_sink.clone();
                 // Remaining plan budget at pull time (4.1 MAJOR-1 rule),
                 // further clamped by the step's own timeout.
                 let budget = timeout
@@ -340,6 +342,25 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
                     ) {
                         Ok(row) => {
                             row_ids.lock().insert(step.node_id, row);
+                            // 4.8 (plan review MAJOR-2): announce the
+                            // dispatch so the live DAG can light the
+                            // node before settle — the settle-time
+                            // frames only ever carry terminal states.
+                            if let Some(sink) = sink.as_ref() {
+                                let chunk = json!({ "step": {
+                                    "id": step.node_id.0.to_string(),
+                                    "capability": step.capability,
+                                    "state": harness_orchestrator::StepState::InFlight.as_str(),
+                                    "task_id": row.0.to_string(),
+                                }});
+                                sink(
+                                    parent,
+                                    LogFrame {
+                                        stream: StreamKind::Progress,
+                                        line: chunk.to_string(),
+                                    },
+                                );
+                            }
                             match exec.await_terminal(row, budget).await {
                                 SubTaskOutcome::Done(v) => ItemOutcome::Ok(v),
                                 SubTaskOutcome::Failed(e) => ItemOutcome::Failed(e),
@@ -1085,8 +1106,25 @@ mod tests {
             .map(|(_, f)| serde_json::from_str(&f.line).expect("json"))
             .collect();
         let step_frames: Vec<&JsonValue> = chunks.iter().filter(|c| !c["step"].is_null()).collect();
-        assert_eq!(step_frames.len(), 2);
-        assert!(step_frames.iter().all(|f| f["step"]["state"] == "done"));
+        // 4.8: each dispatched step emits an in_flight frame at submit
+        // time (with task_id) and a settle frame — 2 steps → 4 frames.
+        assert_eq!(step_frames.len(), 4);
+        let in_flight: Vec<_> = step_frames
+            .iter()
+            .filter(|f| f["step"]["state"] == "in_flight")
+            .collect();
+        assert_eq!(in_flight.len(), 2);
+        assert!(
+            in_flight.iter().all(|f| f["step"]["task_id"].is_string()),
+            "in_flight frames carry the row id for drill-down"
+        );
+        assert_eq!(
+            step_frames
+                .iter()
+                .filter(|f| f["step"]["state"] == "done")
+                .count(),
+            2
+        );
         let summary = chunks
             .iter()
             .find(|c| !c["plan_summary"].is_null())

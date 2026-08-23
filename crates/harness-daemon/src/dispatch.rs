@@ -2969,6 +2969,8 @@ mod tests {
             completed_by: None,
             started_at: None,
             finished_at: None,
+            parent: None,
+            plan_id: None,
         };
         let rows: Vec<_> = (0..6).map(mk).collect();
         let failing: std::collections::HashSet<TaskId> =
