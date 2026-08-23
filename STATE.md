@@ -1,7 +1,7 @@
 # Harness Implementation State
 
 **Current phase:** 4 — Distribution patterns (Phase 3 COMPLETE as of #42)
-**Last updated:** 2026-08-23 (post-4.6 lease extension/retry backoff)
+**Last updated:** 2026-08-23 (post-4.7 backpressure)
 
 ## Phase 3 summary (post-merge) — COMPLETE
 
@@ -126,6 +126,23 @@ These will land alongside their natural Phase 3 home, not as a "phase 2.10":
 | #49 | 4.6  | Lease extension + retry backoff (ADR-0028): `LeaseExtend` on the additive `harness.task.lease` channel (worker extender per remote task, aborted on settle, live-lease lookup per tick; issuer CAS-sets rolling `now+30s` horizon UNCONDITIONALLY — first extension shrinks a long lease so dead workers are caught in seconds — hard-capped by `issued_at + original TTL` so wedged/malicious extenders gain nothing; expiry CASes require `expires_at < now` so extensions beat racing expiry); backoff finally reads `RetryPolicy` (expiry + both send-failure paths, waiting-class pacing, deadline enforced in the skip path, in-memory + pruned); circuit breaker (5 consecutive node-health fails ⇒ 60s bench; results — even Failed — prove liveness; self/pin/Federated exempt; all-benched waits in the gated arm, sole-benched-owner included); boot orphan sweep (local⇒Failed with reason, remote⇒Dispatched(self) re-execution — no retry-budget poisoning); FrameSink promoted into ExecutionContext (`progress_sink` trait methods deleted); RR cursor skipped for pinned routes. m08 money test: live worker's 60s lease shrinks over real QUIC and completes exactly once; killed worker detected in seconds. +30 tests |
 
 
+| #50 | 4.7  | Backpressure (ADR-0029): the heartbeat `paused` field finally has a producer — `PauseState` (queue-depth hysteresis latch at `max_queue_depth`/release at 3/4, OR operator `POST /admin/pause\|resume` + `GET /status` surfacing) with coordination-permit RAII subtraction so `queue_depth` means WORK depth; `DaemonRuntimeConfig.max_queue_depth` is the §14.10 knob; submit admission (`429` + `Retry-After: 2` over 1024 `Submitted` rows, indexed COUNT, fail-open, internal mints exempt); pause-aware routing in every `eligible_scored` arm (live-paused pin ⇒ ResourceGated while dead pins stay fast-terminal; paused owners wait, never reroute; unpinned federated sets exclude paused into `DispatchPlan::Federated::excluded` → `Skipped` provenance rows, policy-exempt; self gated via the shared `PauseState` in `StoreLoadView`); sub-tasks + plan steps stamp `constraints.deadline = issued_at + timeout_ms` (the pre-dispatch wait is bounded — no posthumous runs); full/lag-condition tests for every shipped bound (peer_net QueueFull both arms, reply pump/bridge/WS Lagged recovery, `into_channel` producer-park, `MESH_EVENT_CAPACITY`/`TERMINAL_EVENT_CAPACITY` named); bounds hygiene (llm_batcher `MAX_SLOT_SENDERS=64` flush-on-full + `MAX_LIVE_FINGERPRINTS=256` bypass; partial_stream pending task cap 256 evict-oldest-warned; sweep covers `elig_failures` + Cancelled reply obligations; additive `partials_dropped` on `GET /tasks/:id` + types.ts; `CLI_FANOUT_WINDOW=16`). m09 money test: saturate→pause→pinned waits/Anyone reroutes/federated Skips→drain→resume→exactly-once. +32 tests |
+
+4.7 review round 1 (plan): REVISE, all adopted pre-implementation — BLOCKER-1: no
+`PauseAwareLiveSet` (liveness ≠ load); the gate lives inside `eligible_scored` via the
+LoadView, non-Anyone arms stop delegating to the LoadView-less `eligible()`; BLOCKER-2:
+sub-task/plan-step deadlines bound the new pre-dispatch waiting phase (ADR-0022 extended
+to pre-lease); MAJOR-3 shared self-view (paused node stops dispatching to itself);
+MAJOR-4 coordination subtraction (8+16 phantom rows vs default 64); MAJOR-5 Skipped
+provenance for excluded federated nodes + the wrappers-wait asymmetry recorded; MAJOR-6
+honest coverage (Anyone pins were already 4.4-gated; new ground is Federated pins,
+unpinned sets, Owner); MAJOR-7 config knob not cfg(test); MINOR-8..13 + NIT-14 adopted
+(indexed COUNT + TOCTOU note, two QueueFull arms, flush-on-full via atomic remove,
+replica-gossip cancel recovery correction, wire-`dropped` accumulation, refill-gate
+equivalence note for ADR-0023).
+**Carried (ADR-0029): operator-pause persistence (in-memory by design; §25.2 revisits);
+federated-parent leases → Phase 5 (ADR-0028 carry); shell.exec ctor sink → Phase 6.**
+
 4.6 review round 1 (plan): REVISE, all adopted pre-implementation — BLOCKER-1: the
 extension CAS is an unconditional `min(now+horizon, budget)` set (the drafted `max()` was
 dead code and "first-extension" detection unnecessary); BLOCKER-2: issuer-side budget cap
@@ -182,8 +199,9 @@ consumers (WS, CLI) don't suppress reborn frames under >256 concurrent tasks.
 
 Spine is sequential: ~~4.1~~ → ~~4.2~~ → ~~4.3~~ → ~~4.4~~ → ~~4.5~~ → ~~4.6 lease
 extension/retry backoff~~ (risks 9/10 CLOSED; orphan sweep + FrameSink promotion landed)
-→ **4.7 backpressure tests** (owes the federated-scoring note from ADR-0026/0028) → 4.8
-UI DAG viz (provenance + federated-stage types shipped in 4.5). Phase-4-owned obligations from below: risks 2 (drop-guard), 9
+→ ~~4.7 backpressure~~ (federated-scoring debt from ADR-0026/0028 RESOLVED: score-blind
+by design, pressure-aware via exclusion) → **4.8 UI DAG viz** (provenance +
+federated-stage types shipped in 4.5; `partials_dropped` shipped in 4.7). Phase-4-owned obligations from below: risks 2 (drop-guard), 9
 (send-failure backoff → 4.6), 10 (dispatch head-of-line → 4.4), 11 (unknown-capability
 fast-fail), 12 (`SubmitRequest.execution` clamps → 4.4).
 

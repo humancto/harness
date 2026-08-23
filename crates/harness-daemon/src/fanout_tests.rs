@@ -43,6 +43,17 @@ impl TestDaemon {
 /// Generate two identities + cross-trusted roots, then boot daemons.
 /// `b` dials `a` via a static peer hint.
 pub(crate) async fn boot_pair(policy_toml: Option<&str>) -> (TestDaemon, TestDaemon) {
+    boot_pair_with_depths(policy_toml, 64, 64).await
+}
+
+/// Like [`boot_pair`] with per-node `max_queue_depth` (4.7 m09: a tiny
+/// depth on the worker makes auto-pause reachable with a handful of
+/// pinned sleeps).
+pub(crate) async fn boot_pair_with_depths(
+    policy_toml: Option<&str>,
+    depth_a: u16,
+    depth_b: u16,
+) -> (TestDaemon, TestDaemon) {
     let root_a = tempfile::tempdir().expect("root a");
     let root_b = tempfile::tempdir().expect("root b");
     let id_a = Arc::new(harness_mesh::identity::init_or_load(root_a.path()).expect("id a"));
@@ -58,8 +69,8 @@ pub(crate) async fn boot_pair(policy_toml: Option<&str>) -> (TestDaemon, TestDae
         std::fs::write(root_b.path().join("policy.toml"), policy).expect("policy b");
     }
 
-    let a = boot_one(root_a, id_a, trust_a, "node-a", vec![]).await;
-    let b = boot_one(root_b, id_b, trust_b, "node-b", vec![a.mesh_addr]).await;
+    let a = boot_one(root_a, id_a, trust_a, "node-a", vec![], depth_a).await;
+    let b = boot_one(root_b, id_b, trust_b, "node-b", vec![a.mesh_addr], depth_b).await;
     (a, b)
 }
 
@@ -80,6 +91,7 @@ async fn boot_one(
     trust: TrustStore,
     node_name: &str,
     static_peers: Vec<SocketAddr>,
+    max_queue_depth: u16,
 ) -> TestDaemon {
     let cfg = DaemonRuntimeConfig {
         mesh_name: "fanout-test".into(),
@@ -89,7 +101,7 @@ async fn boot_one(
         mdns_enabled: false,
         static_peers,
         harness_root: root.path().to_path_buf(),
-        max_queue_depth: 64,
+        max_queue_depth,
     };
     let orch = DaemonOrchestrator::build(identity.clone(), trust, cfg)
         .await
@@ -357,8 +369,8 @@ async fn m04_mesh_grep_federates_across_both_nodes() {
     let trust_b = TrustStore::open(root_b.path(), id_b.node_id()).expect("trust b");
     trust_a.add(peer_of(&id_b, "node-b")).expect("a trusts b");
     trust_b.add(peer_of(&id_a, "node-a")).expect("b trusts a");
-    let a = boot_one(root_a, id_a, trust_a, "node-a", vec![]).await;
-    let b = boot_one(root_b, id_b, trust_b, "node-b", vec![a.mesh_addr]).await;
+    let a = boot_one(root_a, id_a, trust_a, "node-a", vec![], 64).await;
+    let b = boot_one(root_b, id_b, trust_b, "node-b", vec![a.mesh_addr], 64).await;
     wait_for_mesh(&a, &b).await;
 
     let id = submit_task(
@@ -443,7 +455,7 @@ async fn m05_plan_execute_chains_steps_with_output_threading() {
     let root = tempfile::tempdir().expect("root");
     let identity = Arc::new(harness_mesh::identity::init_or_load(root.path()).expect("id"));
     let trust = TrustStore::open(root.path(), identity.node_id()).expect("trust");
-    let a = boot_one(root, identity, trust, "solo", vec![]).await;
+    let a = boot_one(root, identity, trust, "solo", vec![], 64).await;
 
     let step_a = TaskId::new_v7();
     let step_b = TaskId::new_v7();
@@ -807,4 +819,163 @@ allow = [{ cmd = "sleep", any_args = true }]
     );
 
     a.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // five sequential legs of one story
+async fn m09_saturated_worker_pauses_waits_pinned_work_and_resumes() {
+    // 4.7 (ADR-0029) money test: worker B (max_queue_depth 4, resume 3)
+    // saturates → advertises `paused` → pinned work WAITS (no lease),
+    // Anyone work routes around it, federated work marks it Skipped —
+    // then B drains, un-pauses, and the waiting work completes
+    // exactly once.
+    let policy = r#"
+[shell]
+allow = [{ cmd = "sh", any_args = true }]
+"#;
+    let (a, b) = boot_pair_with_depths(Some(policy), 64, 4).await;
+    wait_for_mesh(&a, &b).await;
+
+    // 1. Saturate B: five pinned 8 s sleeps. Depth (assigned,
+    // non-terminal) ≥ 4 latches the hysteresis on B's next snapshot.
+    let mut sleepers = Vec::new();
+    for _ in 0..5 {
+        sleepers.push(submit_task(
+            &a,
+            "shell.exec",
+            serde_json::json!({"cmd": "sh", "args": ["-c", "sleep 8"], "timeout_ms": 30_000}),
+            Some(b.node_id()),
+            30_000,
+        ));
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if a.peers
+            .get(&b.node_id())
+            .is_some_and(|e| e.heartbeat.paused)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "B never advertised paused = true at A"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // 2. A further pinned task WAITS: stays Submitted, no lease minted
+    // (several dispatch passes' worth of observation).
+    let waiting = submit_task(
+        &a,
+        "shell.exec",
+        serde_json::json!({"cmd": "sh", "args": ["-c", "echo waited"], "timeout_ms": 30_000}),
+        Some(b.node_id()),
+        30_000,
+    );
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        a.store.task_state(waiting).expect("state"),
+        Some(TaskState::Submitted),
+        "pinned task must WAIT behind the paused worker"
+    );
+    assert!(
+        a.store
+            .list_leases_for_task(waiting)
+            .expect("leases")
+            .is_empty(),
+        "no lease is minted toward a paused pin"
+    );
+
+    // 3. Anyone-cardinality work routes AROUND the paused node: it
+    // completes on A itself — self-execution mints no lease, so an
+    // empty lease list proves it never went to B.
+    let anyone = submit_task(
+        &a,
+        "shell.exec",
+        serde_json::json!({"cmd": "sh", "args": ["-c", "echo hi"], "timeout_ms": 10_000}),
+        None,
+        10_000,
+    );
+    let state = wait_for_state(
+        &a.store,
+        anyone,
+        &[TaskState::Done],
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(state, TaskState::Done);
+    assert!(
+        a.store
+            .list_leases_for_task(anyone)
+            .expect("leases")
+            .is_empty(),
+        "Anyone work executed locally on A while B was paused"
+    );
+
+    // 4. Federated work EXCLUDES the paused node — visibly: B lands in
+    // provenance as Skipped (item_count 0), A contributes normally.
+    let fed = submit_task(&a, "mesh.info", serde_json::json!({}), None, 20_000);
+    let state = wait_for_state(&a.store, fed, &[TaskState::Done], Duration::from_secs(20)).await;
+    assert_eq!(state, TaskState::Done);
+    let row = a.store.load_task_result(fed).expect("load").expect("row");
+    let output = row.output.expect("output");
+    let items = output["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "only A contributed: {output:#}");
+    assert_eq!(items[0]["node_name"], "node-a");
+    let provenance = row.provenance.expect("provenance");
+    assert_eq!(provenance.len(), 2, "excluded node still visible");
+    let b_row = provenance
+        .iter()
+        .find(|c| c.node_id == b.node_id())
+        .expect("B in provenance");
+    assert_eq!(
+        b_row.status,
+        harness_core::protocol::NodeStatus::Skipped,
+        "paused node marked Skipped: {provenance:?}"
+    );
+    assert_eq!(b_row.item_count, 0);
+    let a_row = provenance
+        .iter()
+        .find(|c| c.node_id == a.node_id())
+        .expect("A in provenance");
+    assert_eq!(a_row.status, harness_core::protocol::NodeStatus::Ok);
+
+    // 5. Drain: the sleeps finish, depth falls to ≤ 3, the latch
+    // releases, and the waiting pinned task dispatches and completes —
+    // exactly once (one lease, ever).
+    let state = wait_for_state(
+        &a.store,
+        waiting,
+        &[TaskState::Done],
+        Duration::from_secs(60),
+    )
+    .await;
+    assert_eq!(state, TaskState::Done);
+    assert_eq!(
+        a.store.list_leases_for_task(waiting).expect("leases").len(),
+        1,
+        "dispatched exactly once, after the un-pause"
+    );
+    for id in sleepers {
+        let state = wait_for_state(&a.store, id, &[TaskState::Done], Duration::from_secs(60)).await;
+        assert_eq!(state, TaskState::Done, "every saturating sleep completed");
+    }
+    // And A's view of B eventually clears.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if a.peers
+            .get(&b.node_id())
+            .is_some_and(|e| !e.heartbeat.paused)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "B never advertised paused = false after draining"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    a.stop().await;
+    b.stop().await;
 }
