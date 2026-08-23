@@ -84,6 +84,20 @@ async fn connect(args: &PlanArgs) -> Result<(reqwest::Client, String, String)> {
     Ok((client, api_base, token))
 }
 
+/// Build the `brain.plan` input. `--cloud` is the CLI's per-task
+/// cloud opt-in (5.2, ADR-0031): without an explicit
+/// `constraints.allow_cloud: true` (or a `cloud_ok` task tag) the
+/// brain.plan executor narrows `allow_cloud` to false, so the cloud
+/// tier would be unreachable from the CLI even on a policy-approved
+/// mesh (Codex review P1).
+fn plan_input(goal: &str, cloud: bool) -> JsonValue {
+    if cloud {
+        json!({ "goal": goal, "constraints": { "allow_cloud": true } })
+    } else {
+        json!({ "goal": goal })
+    }
+}
+
 /// Run `brain.plan` for the goal and extract the plan JSON.
 async fn obtain_plan(
     client: &reqwest::Client,
@@ -97,12 +111,13 @@ async fn obtain_plan(
         .timeout_ms
         .unwrap_or(DEFAULT_PLAN_TIMEOUT_MS)
         .clamp(1_000, MAX_EXEC_TIMEOUT_MS);
+    let input = plan_input(&args.goal, args.cloud);
     let envelope = submit_and_poll(
         client,
         api_base,
         token,
         "brain.plan",
-        json!({ "goal": args.goal }),
+        input,
         plan_timeout_ms,
         false,
     )
@@ -378,6 +393,20 @@ fn render_exec(output: &JsonValue) -> RunOutcome {
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_input_carries_cloud_opt_in_only_when_flagged() {
+        // Codex review P1: without an explicit constraint the
+        // executor's cloud_ok gate narrows allow_cloud to false, so
+        // the flag must translate into the constraint verbatim.
+        let default = plan_input("run: ls", false);
+        assert_eq!(default, json!({ "goal": "run: ls" }));
+        let opted_in = plan_input("run: ls", true);
+        assert_eq!(
+            opted_in,
+            json!({ "goal": "run: ls", "constraints": { "allow_cloud": true } })
+        );
+    }
 
     #[test]
     fn plan_listing_is_topological_with_deps() {

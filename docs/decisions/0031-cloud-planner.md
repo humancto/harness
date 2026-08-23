@@ -32,7 +32,9 @@
      constraint is the programmatic equivalent of the tag — both are
      issuer-controlled, so treating them as interchangeable opt-ins
      adds no authority. Narrowing only: a false `allow_cloud` stays
-     false.
+     false. `harness plan|exec --cloud` is the CLI surface for the
+     explicit constraint (Codex review P1: without it the cloud tier
+     was unreachable from the primary CLI flows).
    - *In-backend gate:* `!allow_cloud || must_be_local` →
      `NoMatch` before any I/O, whatever lineup it sits in.
 
