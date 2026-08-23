@@ -11,6 +11,7 @@
 //! fail-closed handling (no token configured ⇒ nothing validates) and
 //! constant-time comparison (`Mac::verify_slice`).
 
+use base64::Engine as _;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 
@@ -38,7 +39,6 @@ pub fn compute_twilio_signature(
         mac.update(k.as_bytes());
         mac.update(v.as_bytes());
     }
-    use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
 }
 
@@ -51,7 +51,6 @@ pub fn validate_twilio_signature(
     params: &[(String, String)],
     header_b64: &str,
 ) -> bool {
-    use base64::Engine as _;
     let Ok(expected_tag) = base64::engine::general_purpose::STANDARD.decode(header_b64.trim())
     else {
         return false;

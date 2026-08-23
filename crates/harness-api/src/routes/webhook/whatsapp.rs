@@ -3,7 +3,7 @@
 //!
 //! Flow: validate the Twilio signature (fail-closed) → sender
 //! allowlist (deny-all by default) → admission gate → mint a
-//! `brain.plan` task from the message body → reply TwiML `⏳` ack
+//! `brain.plan` task from the message body → reply `TwiML` ack
 //! in-channel (zero outbound API calls) → detached driver polls the
 //! STORE, mints `plan.execute` from the planned JSON, and sends the
 //! final reply through the Twilio Messages API when an account SID is
@@ -45,7 +45,7 @@ const SLACK_MS: u64 = 5_000;
 /// stuck conversations.
 const DRIVER_DEADLINE_MS: u64 = 600_000;
 const POLL_INTERVAL_MS: u64 = 500;
-/// WhatsApp message body cap.
+/// `WhatsApp` message body cap.
 const REPLY_CHAR_CAP: usize = 1600;
 
 fn twiml(message: Option<&str>) -> axum::response::Response {
@@ -105,7 +105,7 @@ pub async fn whatsapp_handler(
     let path_and_query = uri
         .path_and_query()
         .map_or_else(|| uri.path().to_string(), ToString::to_string);
-    let url = public_url(
+    let signed_url = public_url(
         state.webhook.base_url_override.as_deref(),
         host,
         &path_and_query,
@@ -116,9 +116,9 @@ pub async fn whatsapp_handler(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
     if signature.is_empty()
-        || !validate_twilio_signature(auth_token.as_bytes(), &url, &pairs, signature)
+        || !validate_twilio_signature(auth_token.as_bytes(), &signed_url, &pairs, signature)
     {
-        tracing::warn!(target: "harness.api.webhook", %url, "twilio signature rejected");
+        tracing::warn!(target: "harness.api.webhook", %signed_url, "twilio signature rejected");
         return (StatusCode::FORBIDDEN, "signature mismatch").into_response();
     }
 
@@ -322,9 +322,9 @@ fn truncate_reply(s: &str) -> String {
 }
 
 /// Send the final reply through the Twilio Messages API. Outbound
-/// `From` = the inbound `To` (our Twilio WhatsApp sender), outbound
+/// `From` = the inbound `To` (our Twilio `WhatsApp` sender), outbound
 /// `To` = the inbound `From` — no extra configuration. Missing account
-/// SID degrades gracefully: the work already ran, the TwiML ack
+/// SID degrades gracefully: the work already ran, the `TwiML` ack
 /// already named the task id; we log and skip.
 async fn send_reply(state: &ApiState, inbound_from: &str, inbound_to: &str, body: &str) {
     let Some(sid) = state.secrets.get(ACCOUNT_SID_TAG) else {

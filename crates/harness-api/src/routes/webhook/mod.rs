@@ -25,15 +25,15 @@ pub const MAX_WEBHOOK_DRIVERS: usize = 16;
 pub enum AllowFrom {
     /// Explicit `HARNESS_WEBHOOK_ALLOW_FROM="*"`.
     All,
-    /// Exact-match senders. WhatsApp numbers arrive PREFIXED
+    /// Exact-match senders. `WhatsApp` numbers arrive PREFIXED
     /// (`whatsapp:+15551234567`) and are matched in that full form;
     /// SMS (5.6) uses bare E.164.
     Senders(HashSet<String>),
 }
 
 impl AllowFrom {
-    fn from_env_value(raw: Option<String>) -> Self {
-        match raw.as_deref().map(str::trim) {
+    fn from_env_value(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
             Some("*") => Self::All,
             Some(list) if !list.is_empty() => Self::Senders(
                 list.split(',')
@@ -96,7 +96,9 @@ impl WebhookRuntime {
                 .ok()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
-            allow_from: AllowFrom::from_env_value(std::env::var("HARNESS_WEBHOOK_ALLOW_FROM").ok()),
+            allow_from: AllowFrom::from_env_value(
+                std::env::var("HARNESS_WEBHOOK_ALLOW_FROM").ok().as_deref(),
+            ),
             twilio_api_base: "https://api.twilio.com".to_string(),
             drivers: Arc::new(tokio::sync::Semaphore::new(MAX_WEBHOOK_DRIVERS)),
             http: reqwest::Client::new(),
@@ -111,15 +113,14 @@ mod tests {
 
     #[test]
     fn allow_from_is_deny_all_by_default() {
-        for raw in [None, Some(String::new()), Some("  ".to_string())] {
+        for raw in [None, Some(""), Some("  ")] {
             let a = AllowFrom::from_env_value(raw);
             assert!(!a.permits("whatsapp:+15551234567"), "default must deny");
         }
-        let star = AllowFrom::from_env_value(Some("*".to_string()));
+        let star = AllowFrom::from_env_value(Some("*"));
         assert!(star.permits("whatsapp:+15551234567"));
-        let list = AllowFrom::from_env_value(Some(
-            "whatsapp:+15551234567, whatsapp:+4915112345678".to_string(),
-        ));
+        let list =
+            AllowFrom::from_env_value(Some("whatsapp:+15551234567, whatsapp:+4915112345678"));
         assert!(list.permits("whatsapp:+15551234567"));
         assert!(list.permits("whatsapp:+4915112345678"));
         assert!(!list.permits("whatsapp:+19998887777"));
