@@ -152,8 +152,13 @@ impl harness_capabilities::PlanExec for StoreMeshExec {
             input,
             // UNPINNED — the dispatch runtime places it by cardinality
             // over the live mesh (self included); policy is evaluated
-            // on the executing node (rule 10).
-            constraints: Constraints::default(),
+            // on the executing node (rule 10). Deadline (4.7, plan
+            // review BLOCKER-2): the step's pre-dispatch wait is
+            // bounded by the plan's await budget — no posthumous runs.
+            constraints: Constraints {
+                deadline: Some(now_ms.saturating_add(u64::from(timeout_ms))),
+                ..Constraints::default()
+            },
             retry: RetryPolicy {
                 // Same posthumous-work rule as mesh sub-tasks
                 // (ADR-0022): lease TTL outlives the plan's await.

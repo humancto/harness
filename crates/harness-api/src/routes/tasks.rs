@@ -15,6 +15,17 @@ use serde_json::Value as JsonValue;
 use crate::auth::{is_authenticated, unauthorized};
 use crate::state::ApiState;
 
+/// 4.7 (ADR-0029): submitted-backlog admission cap. `POST /tasks` is
+/// refused with `429 Too Many Requests` while at least this many rows
+/// sit at `Submitted` — the `SQLite` queue is otherwise unbounded and a
+/// runaway submitter grows it (and every dispatch-pass scan) without
+/// limit. Sub-tasks minted internally (fanout / plans / federated) do
+/// not pass through this gate; they are bounded by their windows.
+pub const MAX_SUBMITTED_BACKLOG: u64 = 1024;
+
+/// `Retry-After` seconds suggested on 429 — one dispatch-pass cadence.
+const RETRY_AFTER_SECS: u64 = 2;
+
 /// Request body for `POST /api/v1/tasks`.
 #[derive(Debug, Deserialize)]
 pub struct SubmitRequest {
@@ -51,6 +62,38 @@ pub struct TaskSummaryDto {
     pub issued_at_ms: u64,
 }
 
+/// 4.7 admission (ADR-0029): `Some(429)` when the submitted backlog is
+/// at the cap. Check-then-insert is deliberately non-transactional:
+/// concurrent submits can overshoot the cap by the number of in-flight
+/// requests. The cap protects against unbounded growth, not an exact
+/// ceiling — an exact one would serialize every submit through a write
+/// transaction. A count ERROR fails open: admission is protective, and
+/// the insert below surfaces a genuinely broken store as a 500.
+fn check_admission(store: &harness_store::Store) -> Option<axum::response::Response> {
+    match store.count_tasks_by_state(harness_store::TaskState::Submitted) {
+        Ok(backlog) if backlog >= MAX_SUBMITTED_BACKLOG => Some(
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(
+                    axum::http::header::RETRY_AFTER,
+                    RETRY_AFTER_SECS.to_string(),
+                )],
+                Json(serde_json::json!({
+                    "error": "submitted_backlog_full",
+                    "submitted_backlog": backlog,
+                    "max_submitted_backlog": MAX_SUBMITTED_BACKLOG,
+                })),
+            )
+                .into_response(),
+        ),
+        Ok(_) => None,
+        Err(err) => {
+            tracing::warn!(target: "harness.api.tasks", ?err, "backlog count failed; admitting");
+            None
+        }
+    }
+}
+
 /// `POST /api/v1/tasks` — sign with the local Identity, persist via Store,
 /// return the new task id. The actual dispatch (assigning to a worker
 /// across QUIC) lands when the QUIC envelope channels wire in a follow-up.
@@ -69,6 +112,10 @@ pub async fn submit_handler(
         )
             .into_response();
     };
+
+    if let Some(refusal) = check_admission(store) {
+        return refusal;
+    }
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -291,6 +338,13 @@ pub async fn get_handler(
     let frames = state.partials.frames(task_id);
     if !frames.is_empty() {
         body["partials"] = serde_json::json!(frames);
+    }
+    // 4.7 (ADR-0029): additive lossiness flag — frames lost to ring
+    // eviction locally plus the worker's wire-reported queue drops.
+    // OMITTED when nothing was lost (the common case).
+    let partials_dropped = state.partials.dropped(task_id);
+    if partials_dropped > 0 {
+        body["partials_dropped"] = serde_json::json!(partials_dropped);
     }
     if let Some(r) = result {
         body["completed_at_ms"] = serde_json::json!(r.completed_at_ms);

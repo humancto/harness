@@ -115,7 +115,10 @@ impl Dispatcher {
                     return Ok(DispatchPlan::Single { node: pin });
                 }
                 candidates.sort();
-                Ok(DispatchPlan::Federated { nodes: candidates })
+                Ok(DispatchPlan::Federated {
+                    nodes: candidates,
+                    excluded: vec![],
+                })
             }
             // `Cardinality` is `#[non_exhaustive]`; future variants should
             // be a hard failure here so we never silently mis-route.
@@ -180,14 +183,26 @@ impl Dispatcher {
     /// are uniform (equal-capacity fleets with today's unpopulated
     /// heartbeats).
     ///
-    /// `Owner` / `Federated` are unchanged (ownership dominates; 4.5
-    /// owns federated scoring).
+    /// `Owner` / `Federated` (4.7, ADR-0029): no longer delegated to the
+    /// `LoadView`-less [`Self::eligible`] — every arm now consults
+    /// `loads` so a live-but-`paused` node WAITS work instead of
+    /// receiving it:
+    /// - a live-but-paused **pin** ⇒ `ResourceGated` (a DEAD pin stays
+    ///   `PinnedNodeNotLive` — dead ≠ paused; the pause gate consults
+    ///   only live nodes, so the fast-terminal path is untouched);
+    /// - a paused **owner** is dropped from the intersected owner set;
+    ///   all owners paused ⇒ `ResourceGated` (owners wait, never
+    ///   silently reroute outside the owner set);
+    /// - unpinned **Federated** sets exclude paused candidates into
+    ///   `DispatchPlan::Federated::excluded` (Skipped in provenance —
+    ///   federated stays score-BLIND but is no longer pressure-DEAF);
+    ///   all paused ⇒ `ResourceGated`.
     ///
     /// # Errors
     /// [`DispatchError::ResourceGated`] when candidates exist but every
-    /// one is hard-gated — a transient condition the caller must treat
-    /// as "wait", never as terminal (plan review BLOCKER-1). Otherwise
-    /// the same set as [`Self::eligible`].
+    /// one is hard-gated or paused — a transient condition the caller
+    /// must treat as "wait", never as terminal (plan review BLOCKER-1).
+    /// Otherwise the same set as [`Self::eligible`].
     pub fn eligible_scored<L: LiveSet, V: crate::dispatcher::score::LoadView>(
         &self,
         task: &Task,
@@ -197,9 +212,6 @@ impl Dispatcher {
         loads: &V,
         rr: &RoundRobin,
     ) -> Result<DispatchPlan, DispatchError> {
-        if !matches!(cardinality, Cardinality::Anyone) {
-            return self.eligible(task, cardinality, live);
-        }
         // Owner input validation runs BEFORE any live-set consultation
         // (4.6, PR #49 review): a missing/non-string scope field is a
         // PERMANENT input error and must never be observable as
@@ -218,38 +230,100 @@ impl Dispatcher {
             });
         }
         candidates.sort();
-        let scored: Vec<(NodeId, f64)> = candidates
-            .iter()
-            .map(|n| {
-                (
-                    *n,
-                    crate::dispatcher::score::fit_score(
-                        hints,
-                        &loads.snapshot(n),
-                        loads.success_rate(n),
-                    ),
-                )
-            })
-            .filter(|(_, s)| *s > 0.0)
-            .collect();
-        if scored.is_empty() {
-            return Err(DispatchError::ResourceGated {
-                capability: task.capability.clone(),
-            });
+        match cardinality {
+            Cardinality::Anyone => {
+                // Anyone (pins included) gates paused inside fit_score —
+                // a paused node scores 0 and drops here.
+                let scored: Vec<(NodeId, f64)> = candidates
+                    .iter()
+                    .map(|n| {
+                        (
+                            *n,
+                            crate::dispatcher::score::fit_score(
+                                hints,
+                                &loads.snapshot(n),
+                                loads.success_rate(n),
+                            ),
+                        )
+                    })
+                    .filter(|(_, s)| *s > 0.0)
+                    .collect();
+                if scored.is_empty() {
+                    return Err(DispatchError::ResourceGated {
+                        capability: task.capability.clone(),
+                    });
+                }
+                let best = scored
+                    .iter()
+                    .map(|(_, s)| *s)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let tied: Vec<NodeId> = scored
+                    .iter()
+                    .filter(|(_, s)| *s >= best * (1.0 - Self::TIE_EPSILON))
+                    .map(|(n, _)| *n)
+                    .collect();
+                // `tied` inherits the sorted candidate order; uniform
+                // scores → tied == candidates → identical RR sequence
+                // to eligible_with_rr.
+                let chosen = rr.next(&task.capability, &tied)?;
+                Ok(DispatchPlan::Single { node: chosen })
+            }
+            Cardinality::Owner { scope_field } => {
+                let scope_id = read_scope_field(task, scope_field)?;
+                let owners = self.scopes.owners(&scope_id);
+                let owners = live.live_subset(&owners);
+                let mut intersected: Vec<NodeId> = owners
+                    .into_iter()
+                    .filter(|n| candidates.contains(n))
+                    .collect();
+                if intersected.is_empty() {
+                    return Err(DispatchError::Owner {
+                        reason: format!(
+                            "no live owner of scope {scope_id:?} advertises {:?}",
+                            task.capability
+                        ),
+                    });
+                }
+                intersected.sort();
+                intersected.retain(|n| !loads.snapshot(n).paused);
+                if intersected.is_empty() {
+                    return Err(DispatchError::ResourceGated {
+                        capability: task.capability.clone(),
+                    });
+                }
+                Ok(DispatchPlan::Single {
+                    node: intersected[0],
+                })
+            }
+            Cardinality::Federated { .. } => {
+                // 4.5 (ADR-0027): a pinned federated task is a federated
+                // SUB-task (or an operator pin) — it must EXECUTE on the
+                // pin, not re-coordinate. `apply_constraints` already
+                // narrowed candidates to the (live) pin.
+                if let Some(pin) = task.constraints.pin_to_node {
+                    if loads.snapshot(&pin).paused {
+                        return Err(DispatchError::ResourceGated {
+                            capability: task.capability.clone(),
+                        });
+                    }
+                    return Ok(DispatchPlan::Single { node: pin });
+                }
+                let (nodes, excluded): (Vec<NodeId>, Vec<NodeId>) = candidates
+                    .into_iter()
+                    .partition(|n| !loads.snapshot(n).paused);
+                if nodes.is_empty() {
+                    return Err(DispatchError::ResourceGated {
+                        capability: task.capability.clone(),
+                    });
+                }
+                Ok(DispatchPlan::Federated { nodes, excluded })
+            }
+            // `Cardinality` is `#[non_exhaustive]`; future variants are
+            // a hard failure so we never silently mis-route.
+            other => Err(DispatchError::Owner {
+                reason: format!("unsupported cardinality variant: {other:?}"),
+            }),
         }
-        let best = scored
-            .iter()
-            .map(|(_, s)| *s)
-            .fold(f64::NEG_INFINITY, f64::max);
-        let tied: Vec<NodeId> = scored
-            .iter()
-            .filter(|(_, s)| *s >= best * (1.0 - Self::TIE_EPSILON))
-            .map(|(n, _)| *n)
-            .collect();
-        // `tied` inherits the sorted candidate order; uniform scores →
-        // tied == candidates → identical RR sequence to eligible_with_rr.
-        let chosen = rr.next(&task.capability, &tied)?;
-        Ok(DispatchPlan::Single { node: chosen })
     }
 
     /// Scores within this relative band of the best are ties, resolved
@@ -549,7 +623,7 @@ mod tests {
         ]);
         let t = task("mesh.search", serde_json::json!({"q": "x"}));
         match d.eligible(&t, &federated(), &live).unwrap() {
-            DispatchPlan::Federated { nodes } => assert_eq!(
+            DispatchPlan::Federated { nodes, .. } => assert_eq!(
                 nodes,
                 vec![
                     NodeId::from_bytes([1; 16]),
@@ -655,7 +729,7 @@ mod tests_support {
         }
     }
 
-    fn echo_cap() -> Capability {
+    pub(super) fn echo_cap() -> Capability {
         Capability {
             id: "echo".into(),
             version: SemVer {
@@ -733,6 +807,7 @@ mod tests_support {
 mod scored_tests {
     use super::tests_support::*;
     use super::*;
+    use crate::dispatcher::live_set::StaticLiveSet;
     use crate::dispatcher::score::{NodeSnapshot, StaticLoadView};
     use crate::dispatcher::RoundRobin;
     use harness_core::Cardinality;
@@ -984,7 +1059,7 @@ mod scored_tests {
         // Unpinned federated still fans out to all.
         let t = task_for("echo");
         match d.eligible(&t, &fed, &live).unwrap() {
-            DispatchPlan::Federated { nodes } => assert_eq!(nodes.len(), 3),
+            DispatchPlan::Federated { nodes, .. } => assert_eq!(nodes.len(), 3),
             other => panic!("must be Federated: {other:?}"),
         }
         // Anyone + pin is untouched (regression).
@@ -997,5 +1072,224 @@ mod scored_tests {
             DispatchPlan::Single { node } => assert_eq!(node, pin),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    // ---------- 4.7 (ADR-0029): pause gates in every arm ----------
+
+    fn fed() -> Cardinality {
+        Cardinality::Federated {
+            merge: harness_core::protocol::MergeStrategy::Concat,
+            on_node_failure: harness_core::PartialPolicy::ReturnPartial,
+        }
+    }
+
+    fn paused_view(paused: &[u8]) -> StaticLoadView {
+        let mut loads = StaticLoadView::default();
+        for n in paused {
+            loads.snapshots.insert(
+                node(*n),
+                NodeSnapshot {
+                    paused: true,
+                    ..NodeSnapshot::default()
+                },
+            );
+        }
+        loads
+    }
+
+    /// Three live `echo` nodes; nodes 1 and 2 own scope `"nas"`.
+    fn build3_nas_owners() -> (Dispatcher, StaticLiveSet) {
+        let (d, live) = build3();
+        for n in [1u8, 2] {
+            let id = harness_core::Identity::generate();
+            let m = harness_core::NodeManifest {
+                node_id: node(n),
+                hostname: "h".into(),
+                pubkey: *id.public_key(),
+                capabilities: vec![echo_cap()],
+                scopes: vec![harness_core::Scope {
+                    kind: "directory".into(),
+                    id: "nas".into(),
+                    label: "nas".into(),
+                    indexed: false,
+                    last_indexed: None,
+                }],
+                secret_tags: vec![],
+                resources: harness_core::Resources {
+                    cpu_cores: 0,
+                    ram_total_mb: 0,
+                    gpu: None,
+                    os: "test".into(),
+                    arch: "test".into(),
+                },
+                online_since: 0,
+                version: harness_core::SemVer {
+                    major: 0,
+                    minor: 1,
+                    patch: 0,
+                },
+                sig: harness_core::Signature::from_bytes([0; 64]),
+            };
+            d.scope_index().upsert_node(&m);
+        }
+        (d, live)
+    }
+
+    #[test]
+    fn s08_paused_federated_pin_waits_dead_pin_stays_terminal() {
+        let (d, live) = build3();
+        let rr = RoundRobin::new();
+        let mut t = task_for("echo");
+        t.constraints.pin_to_node = Some(node(2));
+
+        // Live-but-paused pin ⇒ ResourceGated (wait, never fail).
+        let err = d
+            .eligible_scored(
+                &t,
+                &empty_hints_pub(),
+                &fed(),
+                &live,
+                &paused_view(&[2]),
+                &rr,
+            )
+            .unwrap_err();
+        assert!(matches!(err, DispatchError::ResourceGated { .. }));
+
+        // DEAD pin stays PinnedNodeNotLive — dead ≠ paused (m08's
+        // fast-terminal path untouched).
+        t.constraints.pin_to_node = Some(node(9));
+        let err = d
+            .eligible_scored(
+                &t,
+                &empty_hints_pub(),
+                &fed(),
+                &live,
+                &paused_view(&[]),
+                &rr,
+            )
+            .unwrap_err();
+        assert!(matches!(err, DispatchError::PinnedNodeNotLive { .. }));
+
+        // Unpaused live pin executes (regression).
+        t.constraints.pin_to_node = Some(node(2));
+        match d
+            .eligible_scored(
+                &t,
+                &empty_hints_pub(),
+                &fed(),
+                &live,
+                &paused_view(&[]),
+                &rr,
+            )
+            .unwrap()
+        {
+            DispatchPlan::Single { node: n } => assert_eq!(n, node(2)),
+            other => panic!("must be Single: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn s09_federated_set_excludes_paused_all_paused_waits() {
+        let (d, live) = build3();
+        let rr = RoundRobin::new();
+        let t = task_for("echo");
+
+        match d
+            .eligible_scored(
+                &t,
+                &empty_hints_pub(),
+                &fed(),
+                &live,
+                &paused_view(&[2]),
+                &rr,
+            )
+            .unwrap()
+        {
+            DispatchPlan::Federated { nodes, excluded } => {
+                assert_eq!(nodes, vec![node(1), node(3)]);
+                assert_eq!(excluded, vec![node(2)], "paused node visible, not fanned");
+            }
+            other => panic!("must be Federated: {other:?}"),
+        }
+
+        let err = d
+            .eligible_scored(
+                &t,
+                &empty_hints_pub(),
+                &fed(),
+                &live,
+                &paused_view(&[1, 2, 3]),
+                &rr,
+            )
+            .unwrap_err();
+        assert!(matches!(err, DispatchError::ResourceGated { .. }));
+    }
+
+    #[test]
+    fn s10_paused_owners_wait_never_reroute() {
+        let (d, live) = build3_nas_owners();
+        let rr = RoundRobin::new();
+        let mut t = task_for("echo");
+        t.input = serde_json::json!({"path": "nas"});
+        let card = Cardinality::Owner {
+            scope_field: "path".into(),
+        };
+
+        // Lowest owner paused → the OTHER owner serves (still an owner).
+        match d
+            .eligible_scored(
+                &t,
+                &empty_hints_pub(),
+                &card,
+                &live,
+                &paused_view(&[1]),
+                &rr,
+            )
+            .unwrap()
+        {
+            DispatchPlan::Single { node: n } => assert_eq!(n, node(2)),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // ALL owners paused ⇒ ResourceGated — wait, never reroute to a
+        // non-owner (node 3 advertises echo but does not own "nas").
+        let err = d
+            .eligible_scored(
+                &t,
+                &empty_hints_pub(),
+                &card,
+                &live,
+                &paused_view(&[1, 2]),
+                &rr,
+            )
+            .unwrap_err();
+        assert!(matches!(err, DispatchError::ResourceGated { .. }));
+    }
+
+    #[test]
+    fn s11_unpaused_owner_and_federated_match_eligible_exactly() {
+        // Regression lock: with no pause anywhere, the scored non-Anyone
+        // arms decide identically to the LoadView-less eligible().
+        let (d, live) = build3_nas_owners();
+        let rr = RoundRobin::new();
+        let loads = StaticLoadView::default();
+
+        let mut t = task_for("echo");
+        t.input = serde_json::json!({"path": "nas"});
+        let card = Cardinality::Owner {
+            scope_field: "path".into(),
+        };
+        assert_eq!(
+            d.eligible_scored(&t, &empty_hints_pub(), &card, &live, &loads, &rr)
+                .unwrap(),
+            d.eligible(&t, &card, &live).unwrap()
+        );
+
+        let t = task_for("echo");
+        assert_eq!(
+            d.eligible_scored(&t, &empty_hints_pub(), &fed(), &live, &loads, &rr)
+                .unwrap(),
+            d.eligible(&t, &fed(), &live).unwrap()
+        );
     }
 }

@@ -216,6 +216,14 @@ impl LoadView for StoreLoadView<'_> {
             snap.paused = hb.paused;
             snap.on_battery = hb.on_battery;
         }
+        // 4.7 (ADR-0029): self has no PeerTable entry — read the local
+        // pause switch directly so a paused node gates dispatch-to-self
+        // exactly like peers gate dispatch-to-it (plan review MAJOR-3).
+        if *node == self.runtime.local_id {
+            if let Some(pause) = self.runtime.pause.get() {
+                snap.paused = pause.effective();
+            }
+        }
         snap.assigned_inflight = self.inflight.get(node).copied().unwrap_or(0);
         self.base.lock().insert(*node, snap);
         let reserved = self.reserved.lock().get(node).copied().unwrap_or(0);
@@ -274,6 +282,11 @@ pub(crate) struct DispatchRuntime {
     /// loop. Backing-off tasks also sit in `gated` so they batch in
     /// the WAITING class.
     backoff: ParkingMutex<HashMap<TaskId, tokio::time::Instant>>,
+    /// 4.7 (ADR-0029): the node's own pause switch. The `PeerTable` has
+    /// no self entry, so without this the LOCAL dispatch view would be
+    /// pause-blind and a paused node would keep dispatching to itself
+    /// (plan review MAJOR-3). Set once from lifecycle.
+    pause: OnceLock<Arc<crate::pause::PauseState>>,
     /// 4.6 (ADR-0028, PRD §14.5): per-node circuit breaker — 5
     /// consecutive NODE-HEALTH failures (lease expiry, send failure;
     /// never task-level result statuses) bench a node for 60 s from
@@ -315,7 +328,14 @@ impl DispatchRuntime {
             gated: ParkingMutex::new(std::collections::HashSet::new()),
             backoff: ParkingMutex::new(HashMap::new()),
             breaker: Arc::new(Breaker::new()),
+            pause: OnceLock::new(),
         })
+    }
+
+    /// Wire the shared pause switch (4.7, lifecycle).
+    pub(crate) fn attach_pause(&self, pause: Arc<crate::pause::PauseState>) {
+        self.federated.attach_pause(pause.clone());
+        let _ = self.pause.set(pause);
     }
 
     /// 4.6: node-health failure feed (lease expiry / send failure).
@@ -481,7 +501,7 @@ impl DispatchRuntime {
             // 4.6 (ADR-0028): a backing-off task waits out its delay
             // in the gated class (deadline enforced inside — plan
             // review MAJOR-7).
-            if self.waits_in_backoff(&task) {
+            if self.waits_in_backoff(&task) || self.gated_deadline_expired(&task) {
                 continue;
             }
             let cardinality = self.cardinality_for(&task.capability);
@@ -528,7 +548,7 @@ impl DispatchRuntime {
                     loads.note_assigned(node);
                     self.dispatch_to(&task, node);
                 }
-                Ok(DispatchPlan::Federated { nodes }) => {
+                Ok(DispatchPlan::Federated { nodes, excluded }) => {
                     // 4.5 (ADR-0027): hand the parent to the federated
                     // coordinator. It claims atomically (submitted →
                     // running(self)) and a detached driver fans out /
@@ -555,7 +575,7 @@ impl DispatchRuntime {
                     };
                     if self
                         .federated
-                        .try_start(&task, nodes, merge, on_node_failure)
+                        .try_start(&task, nodes, excluded, merge, on_node_failure)
                     {
                         self.gated.lock().remove(&task.id);
                     } else {
@@ -734,6 +754,27 @@ impl DispatchRuntime {
                 self.schedule_backoff(task.id, &task.retry, attempt);
             }
         }
+    }
+
+    /// 4.7 (diff review MINOR-1): a task WAITING in the gated class
+    /// whose deadline elapsed terminalizes even when the gate opens in
+    /// the same poll gap (a paused pin un-pausing, an all-benched set
+    /// clearing) — the success-path dispatch must never run it
+    /// posthumously. Scoped to the gated set so plain user tasks keep
+    /// their semantics (deadline otherwise enforced on failure paths).
+    /// Returns `true` when the task was terminalized.
+    fn gated_deadline_expired(&self, task: &Task) -> bool {
+        if self.gated.lock().contains(&task.id)
+            && task
+                .constraints
+                .deadline
+                .is_some_and(|d| now_unix_ms() >= d)
+        {
+            self.gated.lock().remove(&task.id);
+            self.fail_undispatchable(task, "deadline exceeded while resource-gated");
+            return true;
+        }
+        false
     }
 
     fn eligibility_failure(&self, task: &Task, err: &DispatchError, bench_filtered: bool) {
@@ -962,12 +1003,29 @@ impl DispatchRuntime {
         let mut ids: std::collections::HashSet<TaskId> =
             self.backoff.lock().keys().copied().collect();
         ids.extend(self.gated.lock().iter().copied());
+        // 4.7 (ADR-0029, plan risk #13): eligibility-window entries are
+        // bounded by the same rule — a task that left `Submitted`
+        // sideways (cancel, remote completion) must not hold its
+        // first-failure instant forever.
+        ids.extend(self.elig_failures.lock().keys().copied());
         for id in ids {
             let still_submitted =
                 matches!(self.store.task_state(id), Ok(Some(TaskState::Submitted)));
             if !still_submitted {
                 self.backoff.lock().remove(&id);
                 self.gated.lock().remove(&id);
+                self.elig_failures.lock().remove(&id);
+            }
+        }
+        // Worker-side reply obligations for CANCELLED tasks are
+        // immortal without this sweep: a cancelled task never fires the
+        // terminal pump, so `try_reply` never consumes the entry. The
+        // issuer learns the outcome via replica gossip (ADR-0019), not
+        // a result reply — dropping the obligation loses nothing.
+        let owed: Vec<TaskId> = self.reply.lock().keys().copied().collect();
+        for id in owed {
+            if matches!(self.store.task_state(id), Ok(Some(TaskState::Cancelled))) {
+                self.reply.lock().remove(&id);
             }
         }
     }
@@ -1316,6 +1374,16 @@ impl TaskChannelHandlers for DispatchRuntime {
             {
                 buffers.append(msg.task_id, stream, line.to_string());
             }
+        }
+        // 4.7 (ADR-0029): the worker reports frames its pending queue
+        // overflowed before this batch — fold them into the task's
+        // lossiness flag (`partials_dropped`).
+        if let Some(dropped) = msg
+            .output_chunk
+            .get("dropped")
+            .and_then(serde_json::Value::as_u64)
+        {
+            buffers.add_dropped(msg.task_id, dropped);
         }
     }
 
@@ -3053,5 +3121,285 @@ mod tests {
             Some(b.node_id()),
             "unreliable node must lose ranking"
         );
+    }
+
+    /// 4.7 (ADR-0029, plan review MAJOR-3): a paused node stops
+    /// dispatching to ITSELF — the self snapshot reads the local
+    /// `PauseState` (there is no `PeerTable` self entry). Resume
+    /// dispatches; already-`Dispatched` rows keep draining (executor).
+    #[tokio::test]
+    async fn t29_self_pause_gates_dispatch_to_self_until_resume() {
+        let f = fixture();
+        let pause = crate::pause::PauseState::new();
+        f.runtime.attach_pause(pause.clone());
+        let m = signed_peer_manifest(&f.local, vec![]);
+        f.runtime.dispatcher.capability_index().upsert_node(&m);
+        f.store.upsert_manifest(&m).expect("upsert");
+
+        let mut task = signed_task_for(&f.local, SECRET_CAP);
+        task.constraints.pin_to_node = Some(f.local.node_id());
+        task.sign(&f.local).expect("re-sign");
+        f.store.insert_task(&task).expect("insert");
+
+        pause.set_operator(true);
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.task_state(task.id).unwrap(),
+            Some(TaskState::Submitted),
+            "paused self never receives new work"
+        );
+        assert!(f.runtime.is_gated(task.id), "waits in the gated class");
+
+        pause.set_operator(false);
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.task_state(task.id).unwrap(),
+            Some(TaskState::Dispatched),
+            "resume dispatches to self"
+        );
+        assert!(!f.runtime.is_gated(task.id));
+    }
+
+    /// 4.7: a live peer advertising `paused` in its heartbeat WAITS
+    /// pinned work (no lease minted), and the route resumes on the
+    /// first unpaused heartbeat. Dead pins keep their fast-terminal
+    /// path (s08 unit + m08).
+    #[tokio::test]
+    async fn t30_paused_peer_heartbeat_gates_pinned_dispatch() {
+        let f = fixture();
+        let peer = Identity::generate();
+        add_live_candidate(&f, &peer, vec![SECRET_TAG.to_string()]);
+        let mut hb = live_heartbeat(peer.node_id());
+        hb.seq = 2;
+        hb.paused = true;
+        f.peers.record(hb);
+
+        let mut task = signed_task_for(&f.local, SECRET_CAP);
+        task.constraints.pin_to_node = Some(peer.node_id());
+        task.sign(&f.local).expect("re-sign");
+        f.store.insert_task(&task).expect("insert");
+
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.task_state(task.id).unwrap(),
+            Some(TaskState::Submitted)
+        );
+        assert_eq!(
+            f.store.list_leases_for_task(task.id).unwrap().len(),
+            0,
+            "no lease minted toward a paused pin"
+        );
+        assert!(f.runtime.is_gated(task.id));
+
+        let mut hb = live_heartbeat(peer.node_id());
+        hb.seq = 3;
+        f.peers.record(hb);
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.list_leases_for_task(task.id).unwrap().len(),
+            1,
+            "unpaused heartbeat resumes the route (lease minted; the \
+             no-net send failure afterwards is t17's territory)"
+        );
+    }
+
+    /// 4.7 (plan review BLOCKER-2): a sub-task parked behind a paused
+    /// pin terminalizes once its deadline passes — and can never run
+    /// posthumously after an un-pause.
+    #[tokio::test]
+    async fn t31_paused_pin_deadline_elapse_terminal_never_posthumous() {
+        let f = fixture();
+        let pause = crate::pause::PauseState::new();
+        f.runtime.attach_pause(pause.clone());
+        let m = signed_peer_manifest(&f.local, vec![]);
+        f.runtime.dispatcher.capability_index().upsert_node(&m);
+        f.store.upsert_manifest(&m).expect("upsert");
+
+        let mut task = signed_task_for(&f.local, SECRET_CAP);
+        task.constraints.pin_to_node = Some(f.local.node_id());
+        task.constraints.deadline = Some(1); // long since elapsed
+        task.sign(&f.local).expect("re-sign");
+        f.store.insert_task(&task).expect("insert");
+
+        pause.set_operator(true);
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.task_state(task.id).unwrap(),
+            Some(TaskState::Failed),
+            "deadline-elapsed paused-pin terminalizes"
+        );
+        let row = f
+            .store
+            .load_task_result(task.id)
+            .expect("load")
+            .expect("row");
+        assert!(row
+            .error
+            .expect("error")
+            .contains("deadline exceeded while"));
+
+        pause.set_operator(false);
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.task_state(task.id).unwrap(),
+            Some(TaskState::Failed),
+            "never dispatched after un-pause"
+        );
+        assert_eq!(f.store.list_leases_for_task(task.id).unwrap().len(), 0);
+    }
+
+    /// 4.7 (ADR-0029): the reply pump survives `Lagged` on the
+    /// terminal broadcast — it logs, skips (the issuer recovers those
+    /// via lease expiry + assign-time terminal-resend, ADR-0017), and
+    /// KEEPS processing later terminals. Capacity-1 channel makes the
+    /// lag deterministic (current-thread runtime: the burst outruns
+    /// the pump's first poll).
+    #[tokio::test(flavor = "current_thread")]
+    async fn t32_reply_pump_survives_lag_and_processes_later_terminals() {
+        let f = fixture();
+        let ids: Vec<TaskId> = (0..3).map(|_| TaskId::new_v7()).collect();
+        for id in &ids {
+            f.runtime.reply.lock().insert(
+                *id,
+                ReplyObligation {
+                    issuer: f.remote.node_id(),
+                    lease_id: harness_core::LeaseId::new_v7(),
+                },
+            );
+        }
+        let (terminal_tx, terminal_rx) = tokio::sync::broadcast::channel(1);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let pump = tokio::spawn(f.runtime.clone().run_reply_pump(terminal_rx, shutdown_rx));
+        for id in &ids {
+            let _ = terminal_tx.send(*id);
+        }
+        for _ in 0..200 {
+            if !f.runtime.reply.lock().contains_key(&ids[2]) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !f.runtime.reply.lock().contains_key(&ids[2]),
+            "the post-lag terminal was processed — the pump did not exit"
+        );
+        assert!(
+            f.runtime.reply.lock().contains_key(&ids[0])
+                && f.runtime.reply.lock().contains_key(&ids[1]),
+            "lagged obligations remain for the assign-time resend to cover"
+        );
+        shutdown_tx.send(true).expect("shutdown");
+        pump.await.expect("pump join");
+    }
+
+    /// 4.7 (ADR-0029, plan risk #13): the prune sweep also bounds the
+    /// eligibility-failure window map and worker-side reply obligations
+    /// for cancelled tasks — neither entry class is immortal.
+    #[tokio::test]
+    async fn t33_prune_covers_elig_failures_and_cancelled_reply_obligations() {
+        let f = fixture();
+        // No candidates for this capability → eligibility failure entry.
+        let task = signed_task_for(&f.local, "no.such.capability");
+        f.store.insert_task(&task).expect("insert");
+        f.runtime.poll_submitted_once();
+        assert!(
+            f.runtime.elig_failures.lock().contains_key(&task.id),
+            "failure window opened"
+        );
+        // Cancelled out from under the window: the entry must not
+        // survive the next prune pass.
+        f.store
+            .transition_task(task.id, TaskState::Cancelled)
+            .expect("cancel");
+        f.runtime.expire_pass();
+        assert!(
+            !f.runtime.elig_failures.lock().contains_key(&task.id),
+            "elig_failures pruned"
+        );
+
+        // Worker side: an obligation for a CANCELLED task never fires
+        // the terminal pump — the sweep is its only exit.
+        let cancelled = signed_task_for(&f.remote, SECRET_CAP);
+        f.store.insert_task(&cancelled).expect("insert");
+        f.store
+            .transition_task(cancelled.id, TaskState::Cancelled)
+            .expect("cancel");
+        f.runtime.reply.lock().insert(
+            cancelled.id,
+            ReplyObligation {
+                issuer: f.remote.node_id(),
+                lease_id: harness_core::LeaseId::new_v7(),
+            },
+        );
+        // A live obligation (Submitted task) survives the same pass.
+        let live = signed_task_for(&f.remote, SECRET_CAP);
+        f.store.insert_task(&live).expect("insert");
+        f.runtime.reply.lock().insert(
+            live.id,
+            ReplyObligation {
+                issuer: f.remote.node_id(),
+                lease_id: harness_core::LeaseId::new_v7(),
+            },
+        );
+        f.runtime.expire_pass();
+        assert!(
+            !f.runtime.reply.lock().contains_key(&cancelled.id),
+            "cancelled obligation swept"
+        );
+        assert!(
+            f.runtime.reply.lock().contains_key(&live.id),
+            "live obligation untouched"
+        );
+    }
+
+    /// 4.7 (diff review MINOR-1): the gate opening and the deadline
+    /// elapsing inside the SAME poll gap must still terminalize — the
+    /// success-path dispatch never runs a gated task posthumously.
+    #[tokio::test]
+    async fn t34_gate_opening_and_deadline_racing_still_terminal() {
+        let f = fixture();
+        let pause = crate::pause::PauseState::new();
+        f.runtime.attach_pause(pause.clone());
+        let m = signed_peer_manifest(&f.local, vec![]);
+        f.runtime.dispatcher.capability_index().upsert_node(&m);
+        f.store.upsert_manifest(&m).expect("upsert");
+
+        let mut task = signed_task_for(&f.local, SECRET_CAP);
+        task.constraints.pin_to_node = Some(f.local.node_id());
+        // Deadline in the near future: alive at poll 1, elapsed by
+        // poll 2 (wall clock — the deadline checks read now_unix_ms).
+        task.constraints.deadline = Some(now_unix_ms() + 50);
+        task.sign(&f.local).expect("re-sign");
+        f.store.insert_task(&task).expect("insert");
+
+        pause.set_operator(true);
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.task_state(task.id).unwrap(),
+            Some(TaskState::Submitted),
+            "poll 1: gated behind the pause, deadline still alive"
+        );
+        assert!(f.runtime.is_gated(task.id));
+
+        // The gap: deadline elapses AND the gate opens before the next
+        // poll ever observes the (paused ∧ expired) combination.
+        std::thread::sleep(Duration::from_millis(60));
+        pause.set_operator(false);
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.task_state(task.id).unwrap(),
+            Some(TaskState::Failed),
+            "poll 2 must terminalize, never dispatch posthumously"
+        );
+        let row = f
+            .store
+            .load_task_result(task.id)
+            .expect("load")
+            .expect("row");
+        assert!(row
+            .error
+            .expect("error")
+            .contains("deadline exceeded while resource-gated"));
+        assert!(!f.runtime.is_gated(task.id));
     }
 }

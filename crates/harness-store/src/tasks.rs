@@ -491,6 +491,20 @@ impl Store {
         })
     }
 
+    /// Indexed `COUNT(*)` over `idx_tasks_by_state` — the 4.7
+    /// (ADR-0029) submit-admission check, which must not pay
+    /// `list_tasks_by_state`'s row materialization on every `POST`.
+    pub fn count_tasks_by_state(&self, state: TaskState) -> Result<u64, StoreError> {
+        self.with_conn(|c| {
+            let n: i64 = c.query_row(
+                "SELECT COUNT(*) FROM tasks WHERE state = ?",
+                params![state.as_str()],
+                |r| r.get(0),
+            )?;
+            Ok(u64::try_from(n).unwrap_or(0))
+        })
+    }
+
     pub fn list_tasks_by_state(&self, state: TaskState) -> Result<Vec<TaskRow>, StoreError> {
         self.with_conn(|c| {
             let mut stmt = c.prepare(

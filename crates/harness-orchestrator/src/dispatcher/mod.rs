@@ -29,5 +29,13 @@ pub enum DispatchPlan {
     /// task; results are merged per `MergeStrategy` by the brain.
     /// Order is deterministic — nodes sorted by `NodeId` for stable
     /// re-dispatch and reproducible tests.
-    Federated { nodes: Vec<NodeId> },
+    ///
+    /// `excluded` (4.7, ADR-0029): live candidates dropped at plan time
+    /// because they advertised `paused` — the coordinator records them
+    /// as `Skipped` in provenance so exclusion is never silent. Empty
+    /// from the `LoadView`-less [`Dispatcher::eligible`] path.
+    Federated {
+        nodes: Vec<NodeId>,
+        excluded: Vec<NodeId>,
+    },
 }

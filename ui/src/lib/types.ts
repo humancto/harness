@@ -121,6 +121,9 @@ export interface TaskDetailDto {
   output?: unknown;
   error?: string;
   partials?: PartialFrame[];
+  // 4.7 (ADR-0029): frames lost for this task (ring evictions +
+  // worker-reported queue drops). Omitted when nothing was lost.
+  partials_dropped?: number;
   // 4.5 (ADR-0027): per-node contributions of a Federated result —
   // omitted for single-node results.
   provenance?: NodeContribution[];

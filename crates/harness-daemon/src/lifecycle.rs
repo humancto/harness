@@ -60,6 +60,11 @@ pub(crate) struct DaemonOrchestrator {
     /// Frame router + wire coalescer for streaming partial output.
     /// Phase 3.2-stream (ADR-0020).
     partial_streamer: Arc<crate::partial_stream::PartialStreamer>,
+    /// 4.7 (ADR-0029): shared backpressure switch (auto latch +
+    /// operator flag + coordination counter).
+    pause: Arc<crate::pause::PauseState>,
+    /// 4.7: configured auto-pause bound (PRD §14.10 default 64).
+    max_queue_depth: u16,
     /// Coordinated shutdown — flipped to `true` on ctrl-c. The executor
     /// loop watches this; future loops can subscribe too.
     shutdown_tx: watch::Sender<bool>,
@@ -96,6 +101,10 @@ pub(crate) struct DaemonRuntimeConfig {
     /// `~/.harness/` (or `--root` override). The store, identity, and
     /// admin.toml all live under here.
     pub harness_root: std::path::PathBuf,
+    /// 4.7 (ADR-0029, PRD §14.10): WORK-queue depth at which this node
+    /// auto-pauses (broadcasts `paused = true`; resumes at 3/4 of
+    /// this). Default 64 per the PRD.
+    pub max_queue_depth: u16,
 }
 
 impl Default for DaemonRuntimeConfig {
@@ -108,6 +117,7 @@ impl Default for DaemonRuntimeConfig {
             mdns_enabled: true,
             static_peers: Vec::new(),
             harness_root: std::path::PathBuf::from("/tmp/harness"),
+            max_queue_depth: 64,
         }
     }
 }
@@ -163,6 +173,11 @@ impl DaemonOrchestrator {
         // BEFORE any loop spawns — at this point every such row
         // assigned to self is provably debris from a previous process.
         crate::executor::sweep_boot_orphans(&store, identity.node_id());
+
+        // 4.7 (ADR-0029): the shared backpressure switch — heartbeat
+        // producer, API surface, and local dispatch view all consult
+        // this one instance.
+        let pause = crate::pause::PauseState::new();
 
         // Load the admin file if present; absence means the operator
         // hasn't run `harness admin set-password` yet, and mutating
@@ -526,6 +541,7 @@ impl DaemonOrchestrator {
         let extender_runtime = dispatch_runtime.clone();
         let executor = executor
             .with_success_tracker(dispatch_runtime.success_tracker())
+            .with_pause(pause.clone())
             .with_lease_extender(std::sync::Arc::new(move |task_id| {
                 extender_runtime.send_lease_extend(task_id);
             }));
@@ -537,6 +553,9 @@ impl DaemonOrchestrator {
         // 4.5: the federated coordinator's stage/streaming frames ride
         // the same partial pipeline (ADR-0027).
         dispatch_runtime.attach_federated_sink(partial_streamer.sink());
+        // 4.7: a paused node gates dispatch-to-self too; coordination
+        // guards keep the published depth honest.
+        dispatch_runtime.attach_pause(pause.clone());
 
         // Phase 3.3-gossip: LWW replica sync over `harness.gossip.state`
         // + heartbeat replica_head anti-entropy (ADR-0019).
@@ -554,6 +573,7 @@ impl DaemonOrchestrator {
                 .with_policy(policy_engine)
                 .with_secrets(secrets.clone())
                 .with_partials(partial_buffers)
+                .with_pause(pause.clone())
                 .build();
         let api_handle = harness_api::serve(config.api_bind, api_state.clone())
             .await
@@ -574,6 +594,8 @@ impl DaemonOrchestrator {
             dispatch: dispatch_runtime,
             gossip,
             partial_streamer,
+            pause,
+            max_queue_depth: config.max_queue_depth,
             shutdown_tx,
             tasks: ParkingMutex::new(Vec::new()),
             listeners: Arc::new(ParkingMutex::new(Vec::new())),
@@ -647,6 +669,13 @@ impl DaemonOrchestrator {
         let snapshot_state = self.api_state.clone();
         let snapshot_store = self.api_state.store.clone();
         let local_id = self.transport.node_id();
+        // 4.7 (ADR-0029): the pause producer — hysteresis bounds from
+        // config (max, resume at 3/4) and the shared state the API +
+        // dispatch view also consult.
+        let snapshot_pause = self.pause.clone();
+        let pause_max_depth = self.max_queue_depth.max(1);
+        let pause_resume_depth =
+            u16::try_from(u32::from(pause_max_depth) * 3 / 4).unwrap_or(u16::MAX);
         let snapshot_fn: harness_mesh::heartbeat::SnapshotFn = Box::new(move || {
             // 3.3-gossip: advertise the replica head per tick so peers
             // can detect divergence (ADR-0019). All-zero = "no replica
@@ -660,11 +689,19 @@ impl DaemonOrchestrator {
             // assigned to self and not yet terminal — so other issuers'
             // fit_score sees real cross-issuer load. cpu/ram/gpu
             // sampling stays a Phase 6 hardening item.
-            let queue_depth = snapshot_store
+            // 4.7 (ADR-0029): the published depth is the WORK depth —
+            // active coordinations (federated slots + coordination
+            // permits) are subtracted so a coordinator-heavy brain
+            // doesn't pause on bookkeeping (plan review MAJOR-4) —
+            // and it drives the auto-pause hysteresis latch
+            // (PRD §14.10: bound 64, resume at 3/4).
+            let raw_depth = snapshot_store
                 .as_ref()
                 .and_then(|s| s.count_inflight_by_node().ok())
                 .and_then(|m| m.get(&local_id).copied())
                 .map_or(0, |n| u16::try_from(n).unwrap_or(u16::MAX));
+            let queue_depth = snapshot_pause.work_depth(raw_depth);
+            snapshot_pause.update_auto(queue_depth, pause_max_depth, pause_resume_depth);
             let s = snapshot_state.local_status.read();
             let cfg = HeartbeatPublisherConfig {
                 version: harness_core::SemVer {
@@ -674,6 +711,7 @@ impl DaemonOrchestrator {
                 },
                 replica_head,
                 queue_depth,
+                paused: snapshot_pause.effective(),
                 ..HeartbeatPublisherConfig::default()
             };
             let leader = s.leader_belief.unwrap_or(local_id);
@@ -1060,6 +1098,7 @@ mod tests {
             mdns_enabled: false,
             static_peers: vec![],
             harness_root: tmp.path().to_path_buf(),
+            max_queue_depth: 64,
         };
 
         let orch = DaemonOrchestrator::build(identity, trust, cfg)

@@ -215,6 +215,35 @@ mod tests {
         assert!(MeshEvent::from_table_event(&event, "lan", &peers).is_none());
     }
 
+    /// 4.7 (ADR-0029): a bridge that falls behind its capacity-bounded
+    /// source logs the `Lagged` and KEEPS TRANSLATING — it never exits,
+    /// never blocks the publisher.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bridge_survives_lag_and_keeps_translating() {
+        let (table_tx, table_rx) = broadcast::channel::<TableEvent>(1);
+        let (sink_tx, mut sink_rx) = broadcast::channel::<MeshEvent>(16);
+        let peers = PeerTable::new();
+        peers.record(sample_hb(1));
+        let bridge = TableEventBridge::spawn(table_rx, sink_tx, peers, "lan".into());
+
+        let event = TableEvent::Recorded {
+            node_id: NodeId::from_bytes([0x33; 16]),
+            was_new: false,
+        };
+        // Burst past the capacity-1 source before the bridge task first
+        // polls (current-thread runtime: no await between sends), so
+        // its first recv() observes Lagged.
+        for _ in 0..3 {
+            let _ = table_tx.send(event.clone());
+        }
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), sink_rx.recv())
+            .await
+            .expect("bridge kept running after the lag")
+            .expect("translated event");
+        assert!(matches!(got, MeshEvent::PeerUpdated { .. }));
+        bridge.shutdown().await;
+    }
+
     #[test]
     fn each_variant_round_trips_json() {
         let cases = vec![

@@ -43,6 +43,22 @@ impl LocalStatus {
     }
 }
 
+/// 4.7 (ADR-0029): the daemon's pause switch, seen through a narrow
+/// trait so the API crate stays daemon-agnostic. `paused()` is the
+/// effective (operator OR auto) flag surfaced on `GET /status`;
+/// `set_operator` backs `POST /admin/pause|resume`.
+pub trait PauseControl: Send + Sync + std::fmt::Debug {
+    fn paused(&self) -> bool;
+    fn operator_paused(&self) -> bool;
+    fn set_operator(&self, paused: bool);
+}
+
+/// Capacity of the mesh-event broadcast feeding `WS /events`. A slow
+/// WebSocket consumer that lags past this is closed with 1011
+/// ("lagged") and reconnects to resync from a fresh snapshot — the
+/// documented lag-recovery story (4.7 names the former bare literal).
+pub const MESH_EVENT_CAPACITY: usize = 1024;
+
 /// State shared by every API route. Cheaply cloneable (`Arc` internally).
 #[derive(Clone)]
 pub struct ApiState {
@@ -71,6 +87,9 @@ pub struct ApiState {
     /// The daemon shares one instance between its dispatch runtime /
     /// local sink (writers) and `GET /tasks/{id}` (reader).
     pub partials: Arc<crate::partials::PartialBuffers>,
+    /// 4.7 (ADR-0029): pause switch. `None` in bare test fixtures —
+    /// status reports `paused: false` and the admin endpoints 503.
+    pub pause: Option<Arc<dyn PauseControl>>,
 }
 
 impl std::fmt::Debug for ApiState {
@@ -123,6 +142,7 @@ pub struct ApiStateBuilder {
     policy: Option<Arc<PolicyEngine>>,
     secrets: Option<Arc<dyn SecretsStore>>,
     partials: Option<Arc<crate::partials::PartialBuffers>>,
+    pause: Option<Arc<dyn PauseControl>>,
 }
 
 impl ApiStateBuilder {
@@ -140,6 +160,7 @@ impl ApiStateBuilder {
             policy: None,
             secrets: None,
             partials: None,
+            pause: None,
         }
     }
 
@@ -200,6 +221,13 @@ impl ApiStateBuilder {
         self
     }
 
+    /// Wire the daemon's pause switch (4.7, ADR-0029).
+    #[must_use]
+    pub fn with_pause(mut self, pause: Arc<dyn PauseControl>) -> Self {
+        self.pause = Some(pause);
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> ApiState {
         let local_node_id = self.identity.public_key().node_id();
@@ -208,7 +236,7 @@ impl ApiStateBuilder {
         status.capabilities = self.capabilities;
         let events = self
             .events
-            .unwrap_or_else(|| broadcast::channel::<MeshEvent>(1024).0);
+            .unwrap_or_else(|| broadcast::channel::<MeshEvent>(MESH_EVENT_CAPACITY).0);
         let auth = self
             .auth
             .unwrap_or_else(|| Arc::new(crate::auth::AuthProvider::new(None)));
@@ -237,6 +265,7 @@ impl ApiStateBuilder {
             policy,
             secrets,
             partials,
+            pause: self.pause,
         }
     }
 }

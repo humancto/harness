@@ -72,6 +72,9 @@ pub(crate) struct FederatedCoordinator {
     /// issued, so frames land straight in the `PartialBuffers` ring
     /// (4.2 pipe). Unset in bare unit fixtures: frames are dropped.
     sink: OnceLock<FrameSink>,
+    /// 4.7 (ADR-0029): coordination guards keep the published queue
+    /// depth counting WORK, not parents awaiting sub-results.
+    pause: OnceLock<Arc<crate::pause::PauseState>>,
     slots: Arc<Semaphore>,
 }
 
@@ -83,6 +86,7 @@ impl FederatedCoordinator {
             identity,
             local_id,
             sink: OnceLock::new(),
+            pause: OnceLock::new(),
             slots: Arc::new(Semaphore::new(MAX_FEDERATED_COORDINATORS)),
         })
     }
@@ -90,6 +94,11 @@ impl FederatedCoordinator {
     /// Wire the partial-stream sink (lifecycle, after streamer build).
     pub(crate) fn attach_sink(&self, sink: FrameSink) {
         let _ = self.sink.set(sink);
+    }
+
+    /// Wire the shared pause switch (4.7, ADR-0029).
+    pub(crate) fn attach_pause(&self, pause: Arc<crate::pause::PauseState>) {
+        let _ = self.pause.set(pause);
     }
 
     /// Test ctor: a custom coordination-slot count.
@@ -101,6 +110,7 @@ impl FederatedCoordinator {
             identity,
             local_id,
             sink: OnceLock::new(),
+            pause: OnceLock::new(),
             slots: Arc::new(Semaphore::new(slots)),
         })
     }
@@ -111,10 +121,14 @@ impl FederatedCoordinator {
     /// has either been claimed (`submitted → running(self)` CAS) with a
     /// detached driver owning it to a terminal state, or the CAS was
     /// lost to a concurrent claimant (nothing to do).
+    /// `excluded` (4.7, ADR-0029): live candidates the dispatcher
+    /// dropped for advertising `paused` — recorded as `Skipped` in
+    /// provenance, never fanned to.
     pub(crate) fn try_start(
         self: &Arc<Self>,
         task: &Task,
         nodes: Vec<NodeId>,
+        excluded: Vec<NodeId>,
         merge: MergeStrategy,
         on_node_failure: PartialPolicy,
     ) -> bool {
@@ -148,11 +162,20 @@ impl FederatedCoordinator {
             task: task.clone(),
             merge,
             on_node_failure,
+            paused_excluded: excluded,
         };
         let store = self.store.clone();
         let task_id = task.id;
         let local_id = self.local_id;
+        let coord_guard = self
+            .pause
+            .get()
+            .map(crate::pause::PauseState::coordination_guard);
         tokio::spawn(async move {
+            // Held for the coordination-depth RAII window (4.7). The
+            // `Option<_>` wrapper hides the guard's Drop from clippy.
+            #[allow(clippy::no_effect_underscore_binding)]
+            let _coord_guard = coord_guard;
             // Panic boundary (diff review MAJOR-1): without it a panic
             // anywhere in the driver (sink closure, merge, terminal
             // writes) unwinds the task, releases the slot, and strands
@@ -203,6 +226,12 @@ struct Driver {
     task: Task,
     merge: MergeStrategy,
     on_node_failure: PartialPolicy,
+    /// 4.7 (ADR-0029): candidates the dispatcher excluded at plan time
+    /// for advertising `paused`. Never fanned to; surfaced in
+    /// provenance as `Skipped` (`item_count` 0) so exclusion is visible.
+    /// NOT counted by the failure policy — an excluded-at-start node
+    /// simply isn't a target.
+    paused_excluded: Vec<NodeId>,
 }
 
 impl Driver {
@@ -218,6 +247,7 @@ impl Driver {
             "stage": "discovered",
             "nodes": n,
             "truncated_nodes": truncated_nodes,
+            "paused_excluded": self.paused_excluded.len(),
         }}));
 
         // Global budget: the parent's own timeout, floored at 1 s.
@@ -315,7 +345,7 @@ impl Driver {
         // what each Ok node did contribute (PR #48 review): identical
         // by construction to `Merged::item_counts` (the merge engine
         // counts `extract_items` on each input).
-        let provenance: Vec<NodeContribution> = nodes
+        let mut provenance: Vec<NodeContribution> = nodes
             .iter()
             .zip(&settled)
             .map(|(node, s)| NodeContribution {
@@ -331,6 +361,15 @@ impl Driver {
                 },
             })
             .collect();
+        // 4.7 (ADR-0029): paused-at-plan-time exclusions are visible in
+        // provenance (Skipped, item_count 0) but excluded from the
+        // failure-policy math above — they were never targets.
+        provenance.extend(self.paused_excluded.iter().map(|node| NodeContribution {
+            node_id: *node,
+            status: NodeStatus::Skipped,
+            duration_ms: 0,
+            item_count: 0,
+        }));
 
         let all_ok = ok_count == n;
         let must_fail = match self.on_node_failure {
@@ -950,6 +989,7 @@ mod tests {
         assert!(coordinator.try_start(
             &task,
             nodes.clone(),
+            vec![],
             MergeStrategy::Concat,
             PartialPolicy::ReturnPartial,
         ));
@@ -1015,6 +1055,7 @@ mod tests {
         assert!(coordinator.try_start(
             &task,
             nodes.clone(),
+            vec![],
             MergeStrategy::Concat,
             PartialPolicy::ReturnPartial,
         ));
@@ -1066,6 +1107,7 @@ mod tests {
         assert!(coordinator.try_start(
             &task,
             nodes.clone(),
+            vec![],
             MergeStrategy::Concat,
             PartialPolicy::Wait,
         ));
@@ -1121,6 +1163,7 @@ mod tests {
         assert!(coordinator.try_start(
             &task,
             nodes.clone(),
+            vec![],
             MergeStrategy::Concat,
             PartialPolicy::FailFast,
         ));
@@ -1161,6 +1204,7 @@ mod tests {
         assert!(coordinator.try_start(
             &task,
             nodes.clone(),
+            vec![],
             MergeStrategy::Concat,
             PartialPolicy::ReturnPartial,
         ));
@@ -1209,6 +1253,7 @@ mod tests {
         assert!(coordinator.try_start(
             &hog,
             vec![node],
+            vec![],
             MergeStrategy::Concat,
             PartialPolicy::ReturnPartial,
         ));
@@ -1220,6 +1265,7 @@ mod tests {
         assert!(!coordinator.try_start(
             &queued,
             vec![node],
+            vec![],
             MergeStrategy::Concat,
             PartialPolicy::ReturnPartial,
         ));
@@ -1255,6 +1301,7 @@ mod tests {
             if coordinator.try_start(
                 &queued,
                 vec![node],
+                vec![],
                 MergeStrategy::Concat,
                 PartialPolicy::ReturnPartial,
             ) {
@@ -1283,6 +1330,7 @@ mod tests {
         assert!(coordinator.try_start(
             &task,
             vec![NodeId::from_bytes([1; 16])],
+            vec![],
             MergeStrategy::Concat,
             PartialPolicy::ReturnPartial,
         ));
@@ -1311,6 +1359,7 @@ mod tests {
             if coordinator.try_start(
                 &task2,
                 vec![NodeId::from_bytes([1; 16])],
+                vec![],
                 MergeStrategy::Concat,
                 PartialPolicy::ReturnPartial,
             ) {
@@ -1349,10 +1398,22 @@ mod tests {
         let n2 = nodes.clone();
         let (a, b) = tokio::join!(
             tokio::spawn(async move {
-                c1.try_start(&t1, n1, MergeStrategy::Concat, PartialPolicy::ReturnPartial)
+                c1.try_start(
+                    &t1,
+                    n1,
+                    vec![],
+                    MergeStrategy::Concat,
+                    PartialPolicy::ReturnPartial,
+                )
             }),
             tokio::spawn(async move {
-                c2.try_start(&t2, n2, MergeStrategy::Concat, PartialPolicy::ReturnPartial)
+                c2.try_start(
+                    &t2,
+                    n2,
+                    vec![],
+                    MergeStrategy::Concat,
+                    PartialPolicy::ReturnPartial,
+                )
             }),
         );
         // Both report handled (slot was free) — but only one won the CAS.
