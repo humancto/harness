@@ -90,7 +90,7 @@ When an item lands, flip its checkbox **in the same PR** as `STATE.md` is update
 **Demo:** WhatsApp message → mesh executes multi-step plan → text reply with cost summary. Crash brain mid-plan; new brain resumes from checkpoint.
 
 - [x] **5.1** `brain.plan` LocalStrong backend (tier 2, 32B–70B class). Shared Ollama core with tier knobs (id/timeout 120s/prompt cap 16KiB), verbatim-tag model-class detection (≥20B effective incl. MoE/quantized/decimal forms), `[fast, strong, template]` lineup partition from one `prefer_local_models` list, CLI planning budget raised to 180s + `--timeout-ms` wired through. ADR-0030.
-- [ ] **5.2** `brain.plan` Cloud backend (tier 3) with policy-driven escalation rules.
+- [x] **5.2** `brain.plan` Cloud backend (tier 3) with policy-driven escalation rules. `harness-brain::CloudBackend` (feature `cloud`, Anthropic Messages API, temperature 0.0, 60s/16KiB; shared `llm_common` pipeline extracted from `local_fast`); double gate: policy cap at registration (`allow_cloud_escalation` + new `cloud_planner_model` knob) AND per-task `cloud_ok` opt-in (tag or explicit `allow_cloud: true`) at the executor; `local_only_for_tags` first enforcement (forces `must_be_local` planning); vault-free key-provider closure returning a sensitive `HeaderValue`; CLI plan budget 240s. ADR-0031.
 - [ ] **5.3** Full plan validation ruleset (`plan_validation_failed` / `tool_not_found` escalation triggers).
 - [ ] **5.4** Natural-language Submit mode in UI (textarea → planner → DAG preview → confirm).
 - [ ] **5.5** WhatsApp webhook adapter (Twilio signature validation).

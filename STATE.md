@@ -1,7 +1,7 @@
 # Harness Implementation State
 
 **Current phase:** 4 — Distribution patterns (Phase 3 COMPLETE as of #42)
-**Last updated:** 2026-08-23 (post-5.1 LocalStrong planner — Phase 4 COMPLETE, Phase 5 begun)
+**Last updated:** 2026-08-23 (post-5.2 Cloud planner — full four-tier §15.2 lineup live)
 
 ## Phase 3 summary (post-merge) — COMPLETE
 
@@ -130,7 +130,21 @@ These will land alongside their natural Phase 3 home, not as a "phase 2.10":
 
 | #52 | 5.1  | LocalStrong planner (ADR-0030): `LocalFastBackend`+`LocalStrongBackend` as newtypes over one `LocalLlmCore` (tier knobs only: `localfast:`/`localstrong:` ids, 30s/120s timeouts, 8/16KiB prompt caps; 3.9 wiremock suite covers the shared core unchanged); `classify_local_model` over VERBATIM Ollama tags (`:`+`-` tokenization, `<n>x<m>b` MoE multiply, decimals, quantized suffixes; ≥20B effective ⇒ Strong; sizeless ⇒ Fast); `resolve_local_models` partitions one `prefer_local_models` list into `[fast?, strong?, template]` (mixed-list behavior change documented: 3.9 bound the 70B to tier 1); CLI `--timeout-ms` wired through planning + default 180s (the 60s hardcode would have starved Template behind a 120s tier 2 — plan review MAJOR-2). Zero executor changes (three-tier walk test t29). +4 tests |
 
+| #53 | 5.2  | Cloud planner (ADR-0031): `harness-brain::CloudBackend` (feature `cloud`) — Anthropic Messages API over the SAME planner pipeline as the local tiers (`llm_common.rs` pure-move extraction; temperature 0.0, 60s, 16KiB, `max_tokens` 4096, id `cloud:<model>`); double-gated escalation — policy cap at registration (`allow_cloud_escalation` default-false + new `cloud_planner_model` knob, empty disables; requests can never resurrect an unregistered tier) AND per-task `cloud_ok` opt-in at the executor (tag or explicit `constraints.allow_cloud: true`; narrowing only) — plus the in-backend `!allow_cloud \|\| must_be_local ⇒ NoMatch` gate before any I/O; `local_only_for_tags` FIRST enforcement (§10.4, parsed since Phase 2 — tagged tasks plan `must_be_local`, force-to-true only); vault-free key handling (daemon closure → sensitive `HeaderValue` from borrowed bytes; missing key ⇒ `Internal` diagnostic naming the tag, chain degrades to Template); CLI plan budget 180s→240s (30+120+60+Template). Cloud cost enforcement stays nominal until 5.9 (self-reported `estimated_cost_usd`) — recorded in ADR. +13 tests |
+
 | #51 | 4.8  | UI DAG viz + live progress: `GET /tasks` lists recent tasks across ALL states (limit clamp, `?state=` exact filter preserves the pre-4.8 view, 400 on unknown; additive `parent`/`plan_id` via `TaskRow`+`list_recent_tasks` over `idx_tasks_by_issued_at`); `WS /runs/:id` session-gated before upgrade (it serves task output — cookie rides the browser handshake, tests/CLI use bearer); plan.execute emits additive `in_flight` step frames at submit (settle frames only ever carried terminal states — the live DAG had nothing to light); UI: runs list rework (grouping, live badges), `/runs/[id]` (prerender=false) with WS live view + close-code-aware poll fallback, progress bar reduced from plan/mesh/federated frame families, log tail, `partials_dropped` banner, provenance table incl. Skipped; `$lib/dag.ts` pure Kahn layout (no new deps, cycle-defensive) + DagView SVG, arrows dependency→dependent mirroring the Rust orientation lock. +5 Rust tests, +12 vitest (35 UI total) |
+
+5.2 review round 1 (plan): REVISE, all adopted pre-implementation — MAJOR-1: the plan
+implemented only the policy half of PRD §15.2's "Cloud (if `cloud_ok`-tagged)" (once
+`allow_cloud_escalation = true`, every request would have defaulted to cloud); the
+executor now requires the per-task opt-in (tag or explicit constraint) on top of policy
+approval. MINOR-2: `PlannerBackend: Debug` vs non-Debug closure → manual redacting impl.
+MINOR-3: `local_only_for_tags` arrives via a `with_local_only_tags` builder (the 3-arg
+`new` keeps its 10 test call sites). MINOR-4: the key provider returns a ready
+`set_sensitive` `HeaderValue` instead of raw `Vec<u8>` — no unzeroized owned key crosses
+crates. MINOR-5 + NIT-6/7: ADR names the unimplemented §15.2 planning-mode enum, the
+truncation warn string went tier-neutral, and nominal cloud cost enforcement (until 5.9)
+is recorded.
 
 4.8 review round 1 (plan): REVISE, all adopted pre-implementation — MAJOR-1: `ws_run` had
 NO session auth (only loopback-Origin); 4.8 gates it with `is_authenticated` pre-upgrade

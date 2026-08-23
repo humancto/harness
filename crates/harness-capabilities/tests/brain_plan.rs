@@ -810,3 +810,125 @@ async fn t27_brain_plan_capability_dropped_when_registry_dropped() {
         "brain.plan capability must drop with its registry"
     );
 }
+
+// ───────────────────────────────────────── 5.2 policy-driven gating
+
+/// Spy that records the constraints it was invoked with, then defers.
+#[derive(Debug)]
+struct ConstraintRecorder {
+    seen: Arc<std::sync::Mutex<Option<PlanConstraints>>>,
+}
+
+#[async_trait]
+impl PlannerBackend for ConstraintRecorder {
+    fn id(&self) -> &str {
+        "recorder"
+    }
+    async fn plan(&self, req: &PlanRequest) -> Result<PlanOutcome, PlannerError> {
+        *self.seen.lock().expect("lock") = Some(req.constraints);
+        Ok(PlanOutcome::NoMatch)
+    }
+}
+
+fn recording_cap(
+    default_constraints: PlanConstraints,
+    local_only_tags: &[&str],
+) -> (
+    BrainPlanCapability,
+    Arc<std::sync::Mutex<Option<PlanConstraints>>>,
+) {
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let recorder: Arc<dyn PlannerBackend> = Arc::new(ConstraintRecorder {
+        seen: Arc::clone(&seen),
+    });
+    let template: Arc<dyn PlannerBackend> =
+        Arc::new(TemplateBackend::new(NodeId::from_bytes([1; 16])));
+    let provider: Arc<dyn Fn() -> CapabilitySnapshot + Send + Sync> = Arc::new(snapshot_with_shell);
+    let cap = BrainPlanCapability::new(vec![recorder, template], provider, default_constraints)
+        .with_local_only_tags(local_only_tags.iter().map(|s| (*s).to_string()).collect());
+    (cap, seen)
+}
+
+fn ctx_with_tags(tags: &[&str]) -> ExecutionContext {
+    ExecutionContext {
+        local_node: NodeId::from_bytes([1; 16]),
+        local_node_name: Arc::from("self"),
+        issued_by: NodeId::from_bytes([2; 16]),
+        issued_by_name: Arc::from("issuer"),
+        task_id: TaskId::new_v7(),
+        tags: Arc::from(tags.iter().map(|s| (*s).to_string()).collect::<Vec<_>>()),
+        frame_sink: None,
+    }
+}
+
+#[tokio::test]
+async fn t31_local_only_for_tags_forces_must_be_local() {
+    let (cap, seen) = recording_cap(PlanConstraints::default(), &["medical", "legal"]);
+
+    // Tagged task → must_be_local forced true.
+    let _ = cap
+        .execute(&ctx_with_tags(&["medical"]), json!({"goal": "run: ls"}))
+        .await
+        .expect("template still covers");
+    let c = seen.lock().expect("lock").take().expect("recorded");
+    assert!(c.must_be_local, "medical tag must force local planning");
+
+    // Untagged task → default (false) preserved.
+    let _ = cap
+        .execute(&ctx_with_tags(&[]), json!({"goal": "run: ls"}))
+        .await
+        .expect("ok");
+    let c = seen.lock().expect("lock").take().expect("recorded");
+    assert!(!c.must_be_local, "no tag → no forcing");
+}
+
+#[tokio::test]
+async fn t32_cloud_needs_policy_approval_and_per_task_opt_in() {
+    // Policy approves cloud (allow_cloud_escalation=true → default
+    // allow_cloud=true), but PRD §15.2 gates the tier on a per-task
+    // cloud_ok opt-in.
+    let cloud_ok_defaults = PlanConstraints {
+        allow_cloud: true,
+        ..PlanConstraints::default()
+    };
+
+    // Arm 1: approval without opt-in → allow_cloud narrowed to false.
+    let (cap, seen) = recording_cap(cloud_ok_defaults, &[]);
+    let _ = cap
+        .execute(&ctx_with_tags(&[]), json!({"goal": "run: ls"}))
+        .await
+        .expect("ok");
+    let c = seen.lock().expect("lock").take().expect("recorded");
+    assert!(!c.allow_cloud, "no cloud_ok tag and no explicit opt-in");
+
+    // Arm 2: cloud_ok tag opts in.
+    let _ = cap
+        .execute(&ctx_with_tags(&["cloud_ok"]), json!({"goal": "run: ls"}))
+        .await
+        .expect("ok");
+    let c = seen.lock().expect("lock").take().expect("recorded");
+    assert!(c.allow_cloud, "cloud_ok tag + policy approval → cloud on");
+
+    // Arm 3: explicit request constraint is the programmatic opt-in.
+    let _ = cap
+        .execute(
+            &ctx_with_tags(&[]),
+            json!({"goal": "run: ls", "constraints": {"allow_cloud": true}}),
+        )
+        .await
+        .expect("ok");
+    let c = seen.lock().expect("lock").take().expect("recorded");
+    assert!(c.allow_cloud, "explicit allow_cloud: true opts in");
+
+    // Arm 4: without policy approval the opt-ins are inert.
+    let (cap, seen) = recording_cap(PlanConstraints::default(), &[]);
+    let _ = cap
+        .execute(&ctx_with_tags(&["cloud_ok"]), json!({"goal": "run: ls"}))
+        .await
+        .expect("ok");
+    let c = seen.lock().expect("lock").take().expect("recorded");
+    assert!(
+        !c.allow_cloud,
+        "cloud_ok tag alone cannot resurrect cloud when policy denies it"
+    );
+}

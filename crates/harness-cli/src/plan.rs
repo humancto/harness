@@ -21,11 +21,11 @@ const CLI_SLACK_MS: u64 = 5_000;
 /// critical path.
 const DEFAULT_EXEC_TIMEOUT_MS: u64 = 120_000;
 const MAX_EXEC_TIMEOUT_MS: u64 = 600_000;
-/// 5.1 (ADR-0030): the planning budget must cover the full escalation
-/// chain — `LocalFast` (30 s) + `LocalStrong` (120 s) + Template — with
-/// slack, or a slow tier-2 model starves the Template fallback. The
-/// user's `--timeout-ms` overrides it.
-const DEFAULT_PLAN_TIMEOUT_MS: u64 = 180_000;
+/// 5.1/5.2 (ADR-0030/0031): the planning budget must cover the full
+/// escalation chain — `LocalFast` (30 s) + `LocalStrong` (120 s) +
+/// Cloud (60 s) + Template — with slack, or a slow tier starves the
+/// Template fallback. The user's `--timeout-ms` overrides it.
+const DEFAULT_PLAN_TIMEOUT_MS: u64 = 240_000;
 
 /// `harness plan "<goal>"` — plan only, render the DAG.
 pub async fn run_plan(args: PlanArgs) -> Result<RunOutcome> {

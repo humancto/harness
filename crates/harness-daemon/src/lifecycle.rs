@@ -492,6 +492,56 @@ impl DaemonOrchestrator {
                 }
             }
 
+            // 5.2 (ADR-0031): tier-3 Cloud planner — registered only
+            // when policy approves escalation AND a model is
+            // configured; needs no Ollama, hence outside the `llm`
+            // cfg. Per-request gating (the `cloud_ok` opt-in and
+            // `must_be_local`) happens in the brain.plan executor +
+            // backend; an unregistered tier cannot be resurrected by
+            // request constraints (requests narrow policy, never
+            // widen it).
+            if let Some(model) = cloud_planner_model_if_allowed(planning) {
+                #[allow(clippy::expect_used)]
+                let base =
+                    url::Url::parse(harness_capabilities::llm_cloud_claude::DEFAULT_BASE_URL)
+                        .expect("DEFAULT_BASE_URL parses");
+                let secrets_for_planner = secrets.clone();
+                let key_provider: harness_brain::CloudKeyProvider =
+                    std::sync::Arc::new(move || {
+                        let key = secrets_for_planner
+                            .get(harness_capabilities::llm_cloud_claude::SECRET_TAG)?;
+                        // Build the sensitive header inside the
+                        // closure so no owned key bytes ever leave
+                        // the vault layer (ADR-0031).
+                        let mut value =
+                            harness_brain::cloud::HeaderValue::from_bytes(key.as_bytes()).ok()?;
+                        value.set_sensitive(true);
+                        Some(value)
+                    });
+                match harness_brain::CloudBackend::new(
+                    base,
+                    model.to_string(),
+                    identity.node_id(),
+                    key_provider,
+                ) {
+                    Ok(b) => {
+                        tracing::info!(
+                            target: "harness.brain",
+                            cloud_planner_model = %model,
+                            "registered Cloud planner backend (escalation tier)"
+                        );
+                        backends.push(std::sync::Arc::new(b));
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "harness.brain",
+                            ?err,
+                            "failed to construct CloudBackend; tier skipped"
+                        );
+                    }
+                }
+            }
+
             backends.push(std::sync::Arc::new(harness_brain::TemplateBackend::new(
                 identity.node_id(),
             )));
@@ -504,6 +554,10 @@ impl DaemonOrchestrator {
                     plan_max_nodes: None,
                     confidence_threshold: Some(planning.confidence_threshold),
                 },
+                // 5.2: §10.4 local_only_for_tags — enforced at plan
+                // time by the brain.plan executor (force must_be_local
+                // for tagged tasks; gates the cloud tier).
+                local_only_for_tags: planning.local_only_for_tags.clone(),
             };
             harness_capabilities::enrich_with_brain_plan(&capabilities, backends, brain_config)
                 .await;
@@ -953,6 +1007,23 @@ fn resolve_local_models(
     lineup
 }
 
+/// 5.2 (ADR-0031): the tier-3 Cloud planner registers only when
+/// policy approves escalation AND a model is configured. An empty
+/// `cloud_planner_model` disables the tier without flipping the
+/// policy bit. Requests can never resurrect an unregistered tier.
+#[cfg_attr(not(feature = "brain"), allow(dead_code))]
+fn cloud_planner_model_if_allowed(planning: &harness_policy::PlanningPolicy) -> Option<&str> {
+    if !planning.allow_cloud_escalation {
+        return None;
+    }
+    let model = planning.cloud_planner_model.trim();
+    if model.is_empty() {
+        None
+    } else {
+        Some(model)
+    }
+}
+
 fn spawn_election_pump(
     peers: harness_mesh::heartbeat::PeerTable,
     election: Arc<Election>,
@@ -1301,5 +1372,34 @@ mod tests {
         // Nothing registered → template-only lineup upstream.
         let lineup = resolve_local_models(&registry_with(&[]), &prefer);
         assert_eq!(lineup, LocalPlannerLineup::default());
+    }
+
+    #[test]
+    fn cloud_planner_registration_is_policy_capped() {
+        // Policy default (allow_cloud_escalation = false) → no tier,
+        // whatever the model knob says.
+        let denied = harness_policy::PlanningPolicy::default();
+        assert!(!denied.allow_cloud_escalation, "PRD default is off");
+        assert_eq!(cloud_planner_model_if_allowed(&denied), None);
+
+        // Policy approves → configured model registers.
+        let allowed = harness_policy::PlanningPolicy {
+            allow_cloud_escalation: true,
+            ..harness_policy::PlanningPolicy::default()
+        };
+        assert_eq!(
+            cloud_planner_model_if_allowed(&allowed),
+            Some("claude-sonnet-5"),
+            "default model knob flows through"
+        );
+
+        // Empty model disables the tier without flipping the policy
+        // bit (whitespace counts as empty).
+        let no_model = harness_policy::PlanningPolicy {
+            allow_cloud_escalation: true,
+            cloud_planner_model: "  ".into(),
+            ..harness_policy::PlanningPolicy::default()
+        };
+        assert_eq!(cloud_planner_model_if_allowed(&no_model), None);
     }
 }

@@ -23,6 +23,7 @@
 //!   `harness-policy::PlanningPolicy.confidence_threshold` (PRD §15.2
 //!   default 0.7) via [`BrainPlanConfig::default_constraints`].
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -52,6 +53,13 @@ pub struct BrainPlanConfig {
     /// builds this from `harness-policy::PlanningPolicy`
     /// (`confidence_threshold`, `default_max_cost_usd`).
     pub default_constraints: PlanConstraints,
+
+    /// 5.2 (ADR-0031) — PRD §10.4 `[planning] local_only_for_tags`:
+    /// a task carrying any of these tags plans as `must_be_local`,
+    /// whatever the merged constraints say (force-to-true only; an
+    /// explicit `must_be_local: true` is never loosened). Gates the
+    /// cloud tier for tagged tasks.
+    pub local_only_for_tags: HashSet<String>,
 }
 
 /// `brain.plan` capability — wraps an ordered list of backends.
@@ -67,6 +75,10 @@ pub struct BrainPlanCapability {
     /// sub-field. Set by [`enrich_with_brain_plan`] from
     /// [`BrainPlanConfig::default_constraints`].
     default_constraints: PlanConstraints,
+    /// Tags that force `must_be_local` planning (5.2, PRD §10.4).
+    /// Empty by default (and in `new`); set via
+    /// [`BrainPlanCapability::with_local_only_tags`].
+    local_only_for_tags: HashSet<String>,
 }
 
 impl std::fmt::Debug for BrainPlanCapability {
@@ -92,7 +104,60 @@ impl BrainPlanCapability {
             backends,
             snapshot_provider,
             default_constraints,
+            local_only_for_tags: HashSet::new(),
         }
+    }
+
+    /// 5.2: install the `local_only_for_tags` set (PRD §10.4).
+    #[must_use]
+    pub fn with_local_only_tags(mut self, tags: HashSet<String>) -> Self {
+        self.local_only_for_tags = tags;
+        self
+    }
+
+    /// Merge request overrides onto the daemon defaults, then apply
+    /// the 5.2 policy-driven narrowing rules (ADR-0031):
+    ///
+    /// - PRD §10.4 `local_only_for_tags`: tagged tasks plan
+    ///   local-only. Force-to-true only — an explicit
+    ///   `must_be_local: true` is never loosened by an absent tag.
+    /// - PRD §15.2 "Cloud (if `cloud_ok`-tagged)": cloud escalation
+    ///   needs policy approval AND a per-task opt-in — the
+    ///   `cloud_ok` tag, or an explicit `allow_cloud: true` in the
+    ///   request (the programmatic equivalent; both are
+    ///   issuer-controlled). Narrowing only: a false `allow_cloud`
+    ///   stays false.
+    fn effective_constraints(
+        &self,
+        ctx: &ExecutionContext,
+        input_constraints: Option<PlanConstraintsInput>,
+    ) -> PlanConstraints {
+        // Captured before the merge erases the distinction between
+        // "the request explicitly asked for cloud" and "the policy
+        // default happens to allow it".
+        let explicit_cloud_opt_in = matches!(
+            input_constraints.as_ref().and_then(|c| c.allow_cloud),
+            Some(true)
+        );
+        let mut constraints = input_constraints
+            .unwrap_or_default()
+            .merge_over(self.default_constraints);
+
+        if ctx
+            .tags
+            .iter()
+            .any(|t| self.local_only_for_tags.contains(t.as_str()))
+        {
+            constraints.must_be_local = true;
+        }
+
+        if constraints.allow_cloud
+            && !explicit_cloud_opt_in
+            && !ctx.tags.iter().any(|t| t == "cloud_ok")
+        {
+            constraints.allow_cloud = false;
+        }
+        constraints
     }
 }
 
@@ -248,10 +313,7 @@ impl Capability for BrainPlanCapability {
             .unwrap_or_else(|| snapshot.refs.clone());
         let schemas: CapabilitySchemaIndex = snapshot.schemas;
 
-        let constraints = input
-            .constraints
-            .unwrap_or_default()
-            .merge_over(self.default_constraints);
+        let constraints = self.effective_constraints(ctx, input.constraints);
 
         let req = PlanRequest {
             goal: input.goal,
@@ -358,7 +420,8 @@ pub async fn enrich_with_brain_plan(
     let weak = registry.downgrade();
     let snapshot_provider: Arc<dyn Fn() -> CapabilitySnapshot + Send + Sync> =
         Arc::new(move || weak.snapshot());
-    let cap = BrainPlanCapability::new(backends, snapshot_provider, config.default_constraints);
+    let cap = BrainPlanCapability::new(backends, snapshot_provider, config.default_constraints)
+        .with_local_only_tags(config.local_only_for_tags);
     #[allow(clippy::expect_used)]
     registry
         .register(Arc::new(cap))
