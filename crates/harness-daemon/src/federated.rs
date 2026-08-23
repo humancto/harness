@@ -72,6 +72,9 @@ pub(crate) struct FederatedCoordinator {
     /// issued, so frames land straight in the `PartialBuffers` ring
     /// (4.2 pipe). Unset in bare unit fixtures: frames are dropped.
     sink: OnceLock<FrameSink>,
+    /// 4.7 (ADR-0029): coordination guards keep the published queue
+    /// depth counting WORK, not parents awaiting sub-results.
+    pause: OnceLock<Arc<crate::pause::PauseState>>,
     slots: Arc<Semaphore>,
 }
 
@@ -83,6 +86,7 @@ impl FederatedCoordinator {
             identity,
             local_id,
             sink: OnceLock::new(),
+            pause: OnceLock::new(),
             slots: Arc::new(Semaphore::new(MAX_FEDERATED_COORDINATORS)),
         })
     }
@@ -90,6 +94,11 @@ impl FederatedCoordinator {
     /// Wire the partial-stream sink (lifecycle, after streamer build).
     pub(crate) fn attach_sink(&self, sink: FrameSink) {
         let _ = self.sink.set(sink);
+    }
+
+    /// Wire the shared pause switch (4.7, ADR-0029).
+    pub(crate) fn attach_pause(&self, pause: Arc<crate::pause::PauseState>) {
+        let _ = self.pause.set(pause);
     }
 
     /// Test ctor: a custom coordination-slot count.
@@ -101,6 +110,7 @@ impl FederatedCoordinator {
             identity,
             local_id,
             sink: OnceLock::new(),
+            pause: OnceLock::new(),
             slots: Arc::new(Semaphore::new(slots)),
         })
     }
@@ -152,7 +162,15 @@ impl FederatedCoordinator {
         let store = self.store.clone();
         let task_id = task.id;
         let local_id = self.local_id;
+        let coord_guard = self
+            .pause
+            .get()
+            .map(crate::pause::PauseState::coordination_guard);
         tokio::spawn(async move {
+            // Held for the coordination-depth RAII window (4.7). The
+            // `Option<_>` wrapper hides the guard's Drop from clippy.
+            #[allow(clippy::no_effect_underscore_binding)]
+            let _coord_guard = coord_guard;
             // Panic boundary (diff review MAJOR-1): without it a panic
             // anywhere in the driver (sink closure, merge, terminal
             // writes) unwinds the task, releases the slot, and strands

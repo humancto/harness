@@ -67,6 +67,10 @@ pub(crate) struct LocalExecutor {
     /// re-delivered assign's fresh lease is picked up automatically).
     /// None in bare fixtures and for issuerless installs.
     lease_extender: Option<Arc<dyn Fn(TaskId) + Send + Sync>>,
+    /// 4.7 (ADR-0029): pause switch — coordination-permit holders
+    /// register a guard so the published queue depth counts WORK, not
+    /// awaiting-coordination bookkeeping (plan review MAJOR-4).
+    pause: Option<Arc<crate::pause::PauseState>>,
 }
 
 impl std::fmt::Debug for LocalExecutor {
@@ -99,7 +103,14 @@ impl LocalExecutor {
             success: None,
             frame_sink: None,
             lease_extender: None,
+            pause: None,
         }
+    }
+
+    /// Attach the shared pause switch (4.7, ADR-0029).
+    pub(crate) fn with_pause(mut self, pause: Arc<crate::pause::PauseState>) -> Self {
+        self.pause = Some(pause);
+        self
     }
 
     /// Attach the worker-side lease-extension hook (4.6, ADR-0028).
@@ -207,7 +218,14 @@ impl LocalExecutor {
                 }) {
                 harness_capabilities::ExecutionClass::Coordination => {
                     match self.coord_sem.clone().try_acquire_owned() {
-                        Ok(p) => Some(p),
+                        // The guard rides with the permit: this row is
+                        // awaiting-coordination, not work (4.7).
+                        Ok(p) => Some((
+                            p,
+                            self.pause
+                                .as_ref()
+                                .map(crate::pause::PauseState::coordination_guard),
+                        )),
                         Err(_) => continue, // pool full: natural queueing
                     }
                 }
@@ -250,7 +268,10 @@ impl LocalExecutor {
         &self,
         id: TaskId,
         capability: String,
-        coord_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        coord_permit: Option<(
+            tokio::sync::OwnedSemaphorePermit,
+            Option<crate::pause::CoordinationGuard>,
+        )>,
     ) {
         let Some(cap) = self.registry.get(&capability) else {
             self.fail_now_sync(id, &format!("capability not found: {capability}"));
@@ -267,14 +288,16 @@ impl LocalExecutor {
                 return;
             }
         };
-        let permit = if let Some(p) = coord_permit {
-            p // Coordination: pre-acquired from the dedicated pool.
+        let (permit, coord_guard) = if let Some((p, guard)) = coord_permit {
+            // Coordination: pre-acquired from the dedicated pool; the
+            // guard keeps the published queue depth honest (4.7).
+            (p, guard)
         } else {
             let Ok(p) = self.sem.clone().acquire_owned().await else {
                 tracing::error!(target: "harness.executor", "semaphore closed");
                 return;
             };
-            p
+            (p, None)
         };
 
         let store = self.store.clone();
@@ -305,6 +328,10 @@ impl LocalExecutor {
 
         tokio::spawn(async move {
             let _permit = permit;
+            // Held for the coordination-depth RAII window (4.7). The
+            // `Option<_>` wrapper hides the guard's Drop from clippy.
+            #[allow(clippy::no_effect_underscore_binding)]
+            let _coord_guard = coord_guard;
 
             // task.tags is already an owned Vec; clone-into-Arc<[String]>
             // is one allocation. Read from the loaded task envelope so

@@ -216,6 +216,14 @@ impl LoadView for StoreLoadView<'_> {
             snap.paused = hb.paused;
             snap.on_battery = hb.on_battery;
         }
+        // 4.7 (ADR-0029): self has no PeerTable entry — read the local
+        // pause switch directly so a paused node gates dispatch-to-self
+        // exactly like peers gate dispatch-to-it (plan review MAJOR-3).
+        if *node == self.runtime.local_id {
+            if let Some(pause) = self.runtime.pause.get() {
+                snap.paused = pause.effective();
+            }
+        }
         snap.assigned_inflight = self.inflight.get(node).copied().unwrap_or(0);
         self.base.lock().insert(*node, snap);
         let reserved = self.reserved.lock().get(node).copied().unwrap_or(0);
@@ -274,6 +282,11 @@ pub(crate) struct DispatchRuntime {
     /// loop. Backing-off tasks also sit in `gated` so they batch in
     /// the WAITING class.
     backoff: ParkingMutex<HashMap<TaskId, tokio::time::Instant>>,
+    /// 4.7 (ADR-0029): the node's own pause switch. The `PeerTable` has
+    /// no self entry, so without this the LOCAL dispatch view would be
+    /// pause-blind and a paused node would keep dispatching to itself
+    /// (plan review MAJOR-3). Set once from lifecycle.
+    pause: OnceLock<Arc<crate::pause::PauseState>>,
     /// 4.6 (ADR-0028, PRD §14.5): per-node circuit breaker — 5
     /// consecutive NODE-HEALTH failures (lease expiry, send failure;
     /// never task-level result statuses) bench a node for 60 s from
@@ -315,7 +328,14 @@ impl DispatchRuntime {
             gated: ParkingMutex::new(std::collections::HashSet::new()),
             backoff: ParkingMutex::new(HashMap::new()),
             breaker: Arc::new(Breaker::new()),
+            pause: OnceLock::new(),
         })
+    }
+
+    /// Wire the shared pause switch (4.7, lifecycle).
+    pub(crate) fn attach_pause(&self, pause: Arc<crate::pause::PauseState>) {
+        self.federated.attach_pause(pause.clone());
+        let _ = self.pause.set(pause);
     }
 
     /// 4.6: node-health failure feed (lease expiry / send failure).

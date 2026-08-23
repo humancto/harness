@@ -217,6 +217,10 @@ pub struct StatusDto {
     pub leader_belief: Option<String>,
     pub started_at_ms: u64,
     pub ui_version: String,
+    /// 4.7 (ADR-0029): the node's effective backpressure state
+    /// (operator OR auto). Additive; `false` on old daemons.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 /// Convert a `SystemTime` into Unix-epoch milliseconds. Returns `0` if

@@ -1,5 +1,6 @@
 //! HTTP and WebSocket route handlers.
 
+pub mod admin;
 pub mod capabilities;
 pub mod events;
 pub mod health;
@@ -31,6 +32,8 @@ pub fn api_router(state: ApiState) -> Router {
         .route("/peers", get(peers::get_peers))
         .route("/capabilities", get(capabilities::get_capabilities))
         .route("/events", get(events::ws_events))
+        .route("/admin/pause", post(admin::pause_handler))
+        .route("/admin/resume", post(admin::resume_handler))
         .route("/auth/login", post(auth::login_handler))
         .route("/auth/logout", post(auth::logout_handler))
         .route(

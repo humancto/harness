@@ -13,6 +13,7 @@ mod gossip_tests;
 mod lifecycle;
 mod mesh_exec;
 mod partial_stream;
+mod pause;
 mod peer_net;
 mod subtask;
 

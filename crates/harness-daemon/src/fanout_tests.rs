@@ -89,6 +89,7 @@ async fn boot_one(
         mdns_enabled: false,
         static_peers,
         harness_root: root.path().to_path_buf(),
+        max_queue_depth: 64,
     };
     let orch = DaemonOrchestrator::build(identity.clone(), trust, cfg)
         .await

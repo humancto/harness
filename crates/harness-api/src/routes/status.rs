@@ -17,5 +17,6 @@ pub async fn get_status(State(state): State<ApiState>) -> Json<StatusDto> {
         leader_belief: status.leader_belief.map(|id| format!("{id}")),
         started_at_ms: system_time_to_ms(status.started_at),
         ui_version: env!("CARGO_PKG_VERSION").to_owned(),
+        paused: state.pause.as_ref().is_some_and(|p| p.paused()),
     })
 }
