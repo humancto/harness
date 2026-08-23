@@ -700,3 +700,106 @@ async fn m07_mesh_info_node_death_returns_partial_with_failed_provenance() {
 
     a.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m08_lease_extension_shrinks_lease_and_detects_dead_worker_fast() {
+    // 4.6 (ADR-0028): worker-side LeaseExtend over QUIC. Phase 1: a
+    // live worker's extensions SHRINK a 60 s lease to the rolling
+    // 2 s (test) horizon and the task still completes exactly once.
+    // Phase 2: a killed worker's task fails FAST (~horizon + expire
+    // tick), not after the full 60 s timeout bound.
+    let policy = r#"
+[shell]
+allow = [{ cmd = "sleep", any_args = true }]
+"#;
+    let (a, b) = boot_pair(Some(policy)).await;
+    wait_for_mesh(&a, &b).await;
+
+    // ---- Phase 1: live worker, long budget, short real runtime.
+    let id = submit_task(
+        &a,
+        "shell.exec",
+        serde_json::json!({"cmd": "sleep", "args": ["2"], "timeout_ms": 60_000}),
+        Some(b.node_id()),
+        60_000,
+    );
+    // Original lease ≈ now + 60.7 s. Wait for the first extension to
+    // shrink it below now + 10 s (test horizon 2 s + margins).
+    let lease = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let leases = a.store.list_leases_for_task(id).expect("leases");
+            if let Some(lease) = leases.first() {
+                if lease.expires_at < now_ms() + 10_000 {
+                    break lease.clone();
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "lease never shrank: {leases:?}",
+                leases = a.store.list_leases_for_task(id).expect("leases")
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    assert_eq!(lease.attempt, 1, "still the first attempt");
+    // The rolling horizon keeps the live worker alive to completion.
+    let state = wait_for_state(&a.store, id, &[TaskState::Done], Duration::from_secs(20)).await;
+    assert_eq!(state, TaskState::Done, "extensions kept the lease alive");
+    assert_eq!(
+        a.store.list_leases_for_task(id).expect("leases").len(),
+        1,
+        "exactly one attempt — extensions never triggered a re-dispatch"
+    );
+
+    // ---- Phase 2: dead worker on a long-budget task.
+    let id2 = submit_task(
+        &a,
+        "shell.exec",
+        serde_json::json!({"cmd": "sleep", "args": ["50"], "timeout_ms": 60_000}),
+        Some(b.node_id()),
+        60_000,
+    );
+    // Wait until the extensions have taken over the lease horizon —
+    // the kill must land AFTER the first shrink (plan review NIT-15).
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let leases = a.store.list_leases_for_task(id2).expect("leases");
+            if leases
+                .first()
+                .is_some_and(|l| l.expires_at < now_ms() + 10_000)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "second lease never shrank"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    let killed_at = tokio::time::Instant::now();
+    b.stop().await;
+
+    // Dead-worker detection: the shrunken lease expires within ~2 s,
+    // the reset task backs off briefly, the pinned node goes un-live,
+    // and the eligibility window (2 s test) terminalizes. All of that
+    // is bounded FAR below the 60 s budget the old TTL would have
+    // waited out.
+    let state = wait_for_state(&a.store, id2, &[TaskState::Failed], Duration::from_secs(25)).await;
+    assert_eq!(state, TaskState::Failed);
+    let elapsed = killed_at.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(25),
+        "fast detection: took {elapsed:?}, budget was 60 s"
+    );
+    let row = a.store.load_task_result(id2).expect("load").expect("row");
+    let err = row.error.expect("error");
+    assert!(
+        err.contains("undispatchable") || err.contains("expired"),
+        "actionable reason: {err}"
+    );
+
+    a.stop().await;
+}

@@ -62,6 +62,16 @@ const LEASE_SLACK_MS: u64 = 15_000;
 const LEASE_SLACK_MS: u64 = 700;
 /// A task with no eligible node keeps retrying for this long (or until
 /// `constraints.deadline`), then fails terminally.
+/// 4.6 (ADR-0028): rolling lease horizon granted per accepted
+/// `LeaseExtend` — receipt time + this, hard-capped by the lease's
+/// ORIGINAL budget (`issued_at + lease TTL`). Once a worker proves it
+/// extends, its death is detected within ~one horizon instead of the
+/// full task timeout.
+#[cfg(not(test))]
+const EXTEND_HORIZON_MS: u64 = 30_000;
+#[cfg(test)]
+const EXTEND_HORIZON_MS: u64 = 2_000;
+
 #[cfg(not(test))]
 const ELIGIBILITY_WINDOW_MS: u64 = 30_000;
 #[cfg(test)]
@@ -724,7 +734,7 @@ impl DispatchRuntime {
                 // means a result completed the lease between
                 // `find_expired`'s snapshot and now — that result owns
                 // the terminal state; write nothing.
-                match self.store.try_expire_lease(lease.lease_id) {
+                match self.store.try_expire_lease(lease.lease_id, now) {
                     Ok(true) => {}
                     Ok(false) => {
                         tracing::debug!(
@@ -781,7 +791,13 @@ impl DispatchRuntime {
                 if let Some(worker) = lease.worker_id {
                     self.success.record(worker, false);
                 }
-                if let Ok(true) = self.store.expire_and_reset_task(lease.lease_id) {
+                // Guarded on expires_at < now: a LeaseExtend landing
+                // after find_expired's snapshot makes this reset lose
+                // (plan review MAJOR-3 — the worker is provably alive).
+                if let Ok(true) = self
+                    .store
+                    .expire_and_reset_task_if_unextended(lease.lease_id, now)
+                {
                     // 4.6 (ADR-0028): the retry waits out its backoff in
                     // the WAITING batch class — no more immediate
                     // re-dispatch hammering a dead pin.
@@ -1214,9 +1230,95 @@ impl TaskChannelHandlers for DispatchRuntime {
             }
         }
     }
+
+    /// 4.6 (ADR-0028): a worker's rolling liveness proof. The transport
+    /// verified the envelope signature against the connection peer and
+    /// the recv loop checked `msg.worker == from`; here the store CAS
+    /// additionally guards on the lease's own `worker_id`, so a stale
+    /// or cross-attempt extension is a silent no-op. The new expiry is
+    /// `now + EXTEND_HORIZON_MS`, hard-capped by the lease's ORIGINAL
+    /// budget (`issued_at + lease TTL`) — a wedged or malicious
+    /// extender can never hold a lease past the task's own declared
+    /// budget (plan review BLOCKER-2), and the unconditional set means
+    /// the first extension SHRINKS a long lease to the rolling horizon
+    /// (fast dead-worker detection; plan review BLOCKER-1).
+    fn on_lease_extend(&self, from: NodeId, msg: harness_core::LeaseExtend) {
+        let Some(lease) = self.store.fetch_lease(msg.lease_id).ok().flatten() else {
+            return;
+        };
+        if lease.task_id != msg.task_id {
+            tracing::warn!(
+                target: "harness.dispatch",
+                %from,
+                lease = %msg.lease_id.0,
+                "lease-extend task_id does not match lease; dropped"
+            );
+            return;
+        }
+        let Some(task) = self.store.load_task(lease.task_id).ok().flatten() else {
+            return;
+        };
+        let budget_cap = lease
+            .issued_at
+            .saturating_add(u64::from(lease_ttl_ms(&task)));
+        let new_expiry = now_unix_ms()
+            .saturating_add(EXTEND_HORIZON_MS)
+            .min(budget_cap);
+        match self
+            .store
+            .extend_lease_for_worker(msg.lease_id, from, new_expiry)
+        {
+            Ok(true) => {
+                tracing::trace!(
+                    target: "harness.dispatch",
+                    task = %lease.task_id.0,
+                    %from,
+                    new_expiry,
+                    "lease extended"
+                );
+            }
+            Ok(false) => {} // terminal lease / wrong worker: silent no-op
+            Err(e) => {
+                tracing::warn!(target: "harness.dispatch", ?e, "extend_lease_for_worker");
+            }
+        }
+    }
 }
 
 impl DispatchRuntime {
+    /// Worker side (4.6): send one `LeaseExtend` for `task_id` if we
+    /// still owe its issuer a result. Resolves `{issuer, lease_id}`
+    /// from the LIVE reply-obligation map on every call — a
+    /// re-delivered assign's fresh lease is picked up automatically
+    /// (plan review MAJOR-5). No obligation (locally-issued task, or
+    /// already replied) = no-op. Fire-and-forget sends.
+    pub(crate) fn send_lease_extend(&self, task_id: TaskId) {
+        let Some((issuer, lease_id)) = self
+            .reply
+            .lock()
+            .get(&task_id)
+            .map(|o| (o.issuer, o.lease_id))
+        else {
+            return;
+        };
+        let msg = harness_core::LeaseExtend {
+            seq: 0, // stamped per-stream by the sender task
+            lease_id,
+            task_id,
+            worker: self.local_id,
+            sig: harness_core::Signature::from_bytes([0u8; 64]),
+        };
+        let send = self
+            .net()
+            .ok_or(SendToError::NoConnection)
+            .and_then(|net| net.send_to(issuer, OutboundMsg::LeaseExtend(msg)));
+        if let Err(err) = send {
+            // Best-effort: a lost extension degrades to the pre-4.6
+            // timeout bound; the next tick retries.
+            tracing::debug!(target: "harness.dispatch", task = %task_id.0, %err, "lease-extend send failed");
+        }
+    }
+
     fn send_claim(&self, issuer: NodeId, lease_id: LeaseId, task_id: TaskId) {
         let claim = TaskClaim {
             seq: 0, // stamped per-stream by the sender task
@@ -2279,6 +2381,162 @@ mod tests {
             !f.runtime.is_gated(task.id),
             "cancelled task pruned from waiting sets"
         );
+    }
+
+    // ---- 4.6 (ADR-0028): lease extension, issuer side -----------------
+
+    fn seeded_lease(f: &Fixture, worker: NodeId, timeout_ms: u32) -> (Task, harness_store::Lease) {
+        let mut task = signed_task_for(&f.local, SECRET_CAP);
+        task.execution.timeout_ms = timeout_ms;
+        task.sign(&f.local).expect("re-sign");
+        f.store.insert_task(&task).expect("insert");
+        assert!(f.store.try_dispatch_task(task.id, worker).expect("cas"));
+        let ttl = lease_ttl_ms(&task);
+        let lease = f
+            .store
+            .create_lease(task.id, worker, ttl, 1)
+            .expect("lease");
+        (task, lease)
+    }
+
+    /// BLOCKER-1: the first extension SHRINKS a long lease to the
+    /// rolling horizon — fast dead-worker detection engages.
+    #[tokio::test]
+    async fn t21_extension_shrinks_long_lease_to_rolling_horizon() {
+        let f = fixture();
+        let worker = Identity::generate();
+        // 60 s task ⇒ lease ≈ 60.7 s out. Horizon (test) = 2 s.
+        let (task, lease) = seeded_lease(&f, worker.node_id(), 60_000);
+        let original_expiry = lease.expires_at;
+
+        f.runtime.on_lease_extend(
+            worker.node_id(),
+            harness_core::LeaseExtend {
+                seq: 1,
+                lease_id: lease.lease_id,
+                task_id: task.id,
+                worker: worker.node_id(),
+                sig: Signature::from_bytes([0u8; 64]),
+            },
+        );
+        let now = now_unix_ms();
+        let extended = f
+            .store
+            .fetch_lease(lease.lease_id)
+            .expect("fetch")
+            .expect("present");
+        assert!(
+            extended.expires_at < original_expiry,
+            "first extension must SHRINK the lease: {} !< {original_expiry}",
+            extended.expires_at
+        );
+        assert!(
+            extended.expires_at <= now + EXTEND_HORIZON_MS + 1_000 && extended.expires_at >= now,
+            "rolling horizon: {} vs now {now}",
+            extended.expires_at
+        );
+    }
+
+    /// BLOCKER-2: extensions never exceed the lease's original budget.
+    #[tokio::test]
+    async fn t22_extension_clamped_by_original_budget() {
+        let f = fixture();
+        let worker = Identity::generate();
+        // 1 s task ⇒ budget ≈ issued_at + 1.7 s (test slack 700ms),
+        // SMALLER than the 2 s horizon: the clamp must engage.
+        let (task, lease) = seeded_lease(&f, worker.node_id(), 1_000);
+        let budget_cap = lease.issued_at + u64::from(lease_ttl_ms(&task));
+
+        f.runtime.on_lease_extend(
+            worker.node_id(),
+            harness_core::LeaseExtend {
+                seq: 1,
+                lease_id: lease.lease_id,
+                task_id: task.id,
+                worker: worker.node_id(),
+                sig: Signature::from_bytes([0u8; 64]),
+            },
+        );
+        let extended = f
+            .store
+            .fetch_lease(lease.lease_id)
+            .expect("fetch")
+            .expect("present");
+        assert!(
+            extended.expires_at <= budget_cap,
+            "extension past the original budget: {} > {budget_cap}",
+            extended.expires_at
+        );
+    }
+
+    /// Guards: wrong worker, task-id mismatch, terminal lease — all
+    /// silent no-ops.
+    #[tokio::test]
+    async fn t23_extension_guards_reject_stale_and_forged() {
+        let f = fixture();
+        let worker = Identity::generate();
+        let (task, lease) = seeded_lease(&f, worker.node_id(), 60_000);
+        let original = f
+            .store
+            .fetch_lease(lease.lease_id)
+            .expect("fetch")
+            .expect("present")
+            .expires_at;
+
+        // Wrong worker (transport pins from; the store guard is the
+        // second fence).
+        f.runtime.on_lease_extend(
+            NodeId::from_bytes([9; 16]),
+            harness_core::LeaseExtend {
+                seq: 1,
+                lease_id: lease.lease_id,
+                task_id: task.id,
+                worker: NodeId::from_bytes([9; 16]),
+                sig: Signature::from_bytes([0u8; 64]),
+            },
+        );
+        // Task-id mismatch.
+        f.runtime.on_lease_extend(
+            worker.node_id(),
+            harness_core::LeaseExtend {
+                seq: 2,
+                lease_id: lease.lease_id,
+                task_id: TaskId::new_v7(),
+                worker: worker.node_id(),
+                sig: Signature::from_bytes([0u8; 64]),
+            },
+        );
+        assert_eq!(
+            f.store
+                .fetch_lease(lease.lease_id)
+                .expect("fetch")
+                .expect("present")
+                .expires_at,
+            original,
+            "guarded extensions must not move the expiry"
+        );
+
+        // Terminal lease (cross-attempt replay shape): no resurrection.
+        assert!(f
+            .store
+            .try_expire_lease(lease.lease_id, u64::MAX)
+            .expect("expire"));
+        f.runtime.on_lease_extend(
+            worker.node_id(),
+            harness_core::LeaseExtend {
+                seq: 3,
+                lease_id: lease.lease_id,
+                task_id: task.id,
+                worker: worker.node_id(),
+                sig: Signature::from_bytes([0u8; 64]),
+            },
+        );
+        let after = f
+            .store
+            .fetch_lease(lease.lease_id)
+            .expect("fetch")
+            .expect("present");
+        assert_eq!(after.state, harness_store::LeaseState::Expired);
     }
 
     #[tokio::test]

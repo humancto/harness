@@ -155,15 +155,33 @@ impl Store {
         })
     }
 
-    /// Refresh `expires_at` for an in-flight `claimed` lease.
-    pub fn extend(&self, lease_id: LeaseId, new_expires_at: u64) -> Result<bool, StoreError> {
+    /// 4.6 (ADR-0028): refresh `expires_at` for an in-flight lease on a
+    /// `LeaseExtend` from ITS worker. Guards:
+    /// - `worker_id` — a peer can never extend someone else's lease;
+    /// - `state IN ('pending','claimed')` — claims ride a different
+    ///   stream and may be lost (the R3 doctrine), so a `pending` lease
+    ///   whose worker is demonstrably executing still extends; a
+    ///   terminal lease (`expired`/`completed`) silently no-ops, which
+    ///   kills cross-attempt replays (attempt N's lease is `expired`
+    ///   before attempt N+1 exists).
+    ///
+    /// The CALLER bounds `new_expires_at` by the lease's original
+    /// budget — this is a mechanical setter, not the policy.
+    pub fn extend_lease_for_worker(
+        &self,
+        lease_id: LeaseId,
+        worker: NodeId,
+        new_expires_at: u64,
+    ) -> Result<bool, StoreError> {
         self.with_conn(|c| {
             let n = c.execute(
                 "UPDATE leases SET expires_at = ?
-                  WHERE lease_id = ? AND state = 'claimed'",
+                  WHERE lease_id = ? AND worker_id = ?
+                    AND state IN ('pending', 'claimed')",
                 params![
                     i64::try_from(new_expires_at).unwrap_or(i64::MAX),
                     lease_id.0.as_bytes(),
+                    worker.as_bytes(),
                 ],
             )?;
             Ok(n == 1)
@@ -202,13 +220,39 @@ impl Store {
     /// task has since been re-dispatched to a different node must not
     /// yank that newer assignment back to `submitted`.
     pub fn expire_and_reset_task(&self, lease_id: LeaseId) -> Result<bool, StoreError> {
+        self.expire_and_reset_inner(lease_id, None)
+    }
+
+    /// [`Store::expire_and_reset_task`] guarded on `expires_at <
+    /// now_ms` — the EXPIRY-pass variant (4.6, plan review MAJOR-3): a
+    /// `LeaseExtend` landing between `find_expired`'s snapshot and this
+    /// CAS moves `expires_at` forward and makes the expiry lose, so a
+    /// provably-alive worker's task is never yanked back to
+    /// `submitted` for duplicate execution. The unguarded form remains
+    /// for deliberate early revocation (assign-send failure — the
+    /// worker never received the task, so no extension can race).
+    pub fn expire_and_reset_task_if_unextended(
+        &self,
+        lease_id: LeaseId,
+        now_ms: u64,
+    ) -> Result<bool, StoreError> {
+        self.expire_and_reset_inner(lease_id, Some(now_ms))
+    }
+
+    fn expire_and_reset_inner(
+        &self,
+        lease_id: LeaseId,
+        expired_before_ms: Option<u64>,
+    ) -> Result<bool, StoreError> {
+        let expiry_guard = expired_before_ms.map(|ms| i64::try_from(ms).unwrap_or(i64::MAX));
         self.with_conn(|c| {
             let tx = c.unchecked_transaction()?;
             let row: Option<(Vec<u8>, Option<Vec<u8>>)> = tx
                 .query_row(
                     "SELECT task_id, worker_id FROM leases
-                      WHERE lease_id = ? AND state IN ('pending', 'claimed')",
-                    params![lease_id.0.as_bytes()],
+                      WHERE lease_id = ?1 AND state IN ('pending', 'claimed')
+                        AND (?2 IS NULL OR expires_at < ?2)",
+                    params![lease_id.0.as_bytes(), expiry_guard],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
@@ -217,8 +261,9 @@ impl Store {
             };
             tx.execute(
                 "UPDATE leases SET state = 'expired'
-                  WHERE lease_id = ? AND state IN ('pending', 'claimed')",
-                params![lease_id.0.as_bytes()],
+                  WHERE lease_id = ?1 AND state IN ('pending', 'claimed')
+                    AND (?2 IS NULL OR expires_at < ?2)",
+                params![lease_id.0.as_bytes(), expiry_guard],
             )?;
             tx.execute(
                 "UPDATE tasks SET state = 'submitted', assigned_node = NULL
@@ -239,12 +284,19 @@ impl Store {
     /// expiry path cannot both terminate the same task (3.3-fanout
     /// PR-A2 review M1). Returns `Ok(false)` when the lease is already
     /// terminal — the caller lost the race and must not write anything.
-    pub fn try_expire_lease(&self, lease_id: LeaseId) -> Result<bool, StoreError> {
+    /// 4.6 (plan review MAJOR-3): also guarded on `expires_at <
+    /// now_ms` — a concurrent `LeaseExtend` that moved the expiry
+    /// forward makes this terminal expiry lose.
+    pub fn try_expire_lease(&self, lease_id: LeaseId, now_ms: u64) -> Result<bool, StoreError> {
         self.with_conn(|c| {
             let n = c.execute(
                 "UPDATE leases SET state = 'expired'
-                  WHERE lease_id = ? AND state IN ('pending', 'claimed')",
-                params![lease_id.0.as_bytes()],
+                  WHERE lease_id = ? AND state IN ('pending', 'claimed')
+                    AND expires_at < ?",
+                params![
+                    lease_id.0.as_bytes(),
+                    i64::try_from(now_ms).unwrap_or(i64::MAX)
+                ],
             )?;
             Ok(n == 1)
         })
@@ -493,21 +545,67 @@ mod tests {
     }
 
     #[test]
-    fn extend_only_when_claimed() {
+    fn extend_for_worker_guards_and_states() {
         let s = Store::open_memory().expect("open");
         let id = Identity::generate();
         let task = signed_task(&id);
         s.insert_task(&task).expect("task");
         let worker = NodeId::from_bytes([2; 16]);
         let lease = s.create_lease(task.id, worker, 5_000, 1).expect("create");
-        // pending → extend should fail (not claimed yet)
+        // 4.6: pending EXTENDS (the R3 lost-claim doctrine — a worker
+        // may be executing while its claim was lost in transit).
+        assert!(s
+            .extend_lease_for_worker(lease.lease_id, worker, lease.expires_at + 1000)
+            .expect("extend pending"));
+        // Wrong worker never extends.
         assert!(!s
-            .extend(lease.lease_id, lease.expires_at + 1000)
-            .expect("extend"));
+            .extend_lease_for_worker(
+                lease.lease_id,
+                NodeId::from_bytes([9; 16]),
+                lease.expires_at + 9000
+            )
+            .expect("extend other"));
         s.try_claim(lease.lease_id, worker).expect("claim");
         assert!(s
-            .extend(lease.lease_id, lease.expires_at + 1000)
+            .extend_lease_for_worker(lease.lease_id, worker, lease.expires_at + 2000)
+            .expect("extend claimed"));
+        // Terminal lease: silent no-op (kills cross-attempt replays).
+        assert!(s
+            .try_expire_lease(lease.lease_id, u64::MAX)
+            .expect("expire"));
+        assert!(!s
+            .extend_lease_for_worker(lease.lease_id, worker, lease.expires_at + 3000)
+            .expect("extend expired"));
+    }
+
+    /// 4.6 (plan review MAJOR-3): an extension that moved `expires_at`
+    /// forward makes both expiry CASes lose.
+    #[test]
+    fn extension_beats_expiry_cas() {
+        let s = Store::open_memory().expect("open");
+        let id = Identity::generate();
+        let task = signed_task(&id);
+        s.insert_task(&task).expect("task");
+        let worker = NodeId::from_bytes([2; 16]);
+        s.try_dispatch_task(task.id, worker).expect("dispatch");
+        let lease = s.create_lease(task.id, worker, 0, 1).expect("create");
+        // Snapshot time: the lease looks expired...
+        let now = lease.expires_at + 5;
+        // ...but an extension lands first.
+        assert!(s
+            .extend_lease_for_worker(lease.lease_id, worker, now + 30_000)
             .expect("extend"));
+        assert!(
+            !s.try_expire_lease(lease.lease_id, now).expect("expire"),
+            "terminal expiry must lose to the extension"
+        );
+        assert!(
+            !s.expire_and_reset_task_if_unextended(lease.lease_id, now)
+                .expect("reset"),
+            "reset must lose to the extension"
+        );
+        // The unguarded revocation form still works (deliberate).
+        assert!(s.expire_and_reset_task(lease.lease_id).expect("revoke"));
     }
 
     #[test]

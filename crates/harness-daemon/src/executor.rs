@@ -22,6 +22,13 @@ use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 
 const POLL_INTERVAL_MS: u64 = 100;
+/// 4.6 (ADR-0028): cadence of worker-side `LeaseExtend` ticks while a
+/// remote-issued task executes. Small in test builds so the money test
+/// exercises the rolling horizon in seconds.
+#[cfg(not(test))]
+const EXTEND_INTERVAL_MS: u64 = 10_000;
+#[cfg(test)]
+const EXTEND_INTERVAL_MS: u64 = 300;
 /// Concurrent coordinators per node — IO-idle awaiting, so wider than
 /// the CPU-sized work pool but still bounded (ADR-0027).
 const COORD_PERMITS: usize = 16;
@@ -54,6 +61,12 @@ pub(crate) struct LocalExecutor {
     /// every `ExecutionContext` so capabilities emit Progress frames
     /// without per-trait plumbing. None in bare test fixtures.
     frame_sink: Option<harness_capabilities::FrameSink>,
+    /// 4.6 (ADR-0028): worker-side lease-extension hook, called every
+    /// `EXTEND_INTERVAL_MS` while a REMOTE-issued task executes. The
+    /// dispatch runtime resolves the live lease per call (a
+    /// re-delivered assign's fresh lease is picked up automatically).
+    /// None in bare fixtures and for issuerless installs.
+    lease_extender: Option<Arc<dyn Fn(TaskId) + Send + Sync>>,
 }
 
 impl std::fmt::Debug for LocalExecutor {
@@ -85,7 +98,17 @@ impl LocalExecutor {
             terminal_tx,
             success: None,
             frame_sink: None,
+            lease_extender: None,
         }
+    }
+
+    /// Attach the worker-side lease-extension hook (4.6, ADR-0028).
+    pub(crate) fn with_lease_extender(
+        mut self,
+        extender: Arc<dyn Fn(TaskId) + Send + Sync>,
+    ) -> Self {
+        self.lease_extender = Some(extender);
+        self
     }
 
     /// Attach the partial-stream sink stamped into every
@@ -260,6 +283,13 @@ impl LocalExecutor {
         let local_node_name = self.local_node_name.clone();
         let terminal_tx = self.terminal_tx.clone();
         let frame_sink = self.frame_sink.clone();
+        // 4.6: spawn the extender ONLY for remote-issued rows — locally
+        // issued tasks have no lease to extend.
+        let extender = if task.issued_by == self.local_node {
+            None
+        } else {
+            self.lease_extender.clone()
+        };
 
         // 3.3-fanout issuer-name plumbing (ADR-0009): a remote issuer's
         // display name comes from its announced manifest; fall back to
@@ -290,11 +320,16 @@ impl LocalExecutor {
                 frame_sink,
             };
 
+            let extender_task = spawn_extender(extender, id);
+
             // S2: panic boundary. A panicking capability cannot wedge
             // the daemon — write a Failed terminal, free the permit.
             let outcome = std::panic::AssertUnwindSafe(cap.execute(&ctx, task.input))
                 .catch_unwind()
                 .await;
+            if let Some(h) = extender_task {
+                h.abort();
+            }
 
             let now = now_unix_ms();
             if let Some(t) = &success {
@@ -348,6 +383,28 @@ impl LocalExecutor {
             .replica_apply_local(&failed_replica(id, now, self.local_node, msg));
         let _ = self.terminal_tx.send(id);
     }
+}
+
+/// 4.6 (ADR-0028): rolling liveness proof while a remote-issued task
+/// executes. The hook re-resolves the live lease per tick; the caller
+/// aborts the returned task the moment the capability future settles,
+/// so a finished/panicked task never extends. The immediate first
+/// interval tick is consumed — short tasks send no extension at all.
+fn spawn_extender(
+    extender: Option<Arc<dyn Fn(TaskId) + Send + Sync>>,
+    id: TaskId,
+) -> Option<tokio::task::JoinHandle<()>> {
+    extender.map(|hook| {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(EXTEND_INTERVAL_MS));
+            tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            tick.tick().await; // immediate tick: skip
+            loop {
+                tick.tick().await;
+                hook(id);
+            }
+        })
+    })
 }
 
 fn now_unix_ms() -> u64 {
@@ -681,6 +738,93 @@ mod tests {
         assert_eq!(
             captured[0].1.stream,
             harness_capabilities::StreamKind::Progress
+        );
+    }
+
+    /// 4.6 (ADR-0028): the extender ticks while a REMOTE-issued task
+    /// executes and stops the moment the capability settles; locally
+    /// issued tasks never spawn one.
+    #[tokio::test(start_paused = true)]
+    async fn t17_lease_extender_ticks_during_execution_and_stops() {
+        struct SlowCap;
+        #[async_trait]
+        impl Capability for SlowCap {
+            fn id(&self) -> &str {
+                "slow.cap"
+            }
+            fn manifest(&self) -> ManifestEntry {
+                manifest_for("slow.cap")
+            }
+            async fn execute(
+                &self,
+                _: &ExecutionContext,
+                _: JsonValue,
+            ) -> Result<JsonValue, CapabilityError> {
+                tokio::time::sleep(Duration::from_millis(1_000)).await;
+                Ok(serde_json::json!({"ok": true}))
+            }
+        }
+
+        let store = fresh_store();
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let hook_ticks = ticks.clone();
+        let exec = LocalExecutor::new(
+            store.clone(),
+            registry_with(Arc::new(SlowCap)),
+            local_node(),
+            Arc::from("self"),
+            1,
+        )
+        .with_lease_extender(Arc::new(move |_task| {
+            hook_ticks.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        // REMOTE-issued row (issuer != local): the extender must run.
+        let remote_issuer = Identity::generate();
+        let mut task = dummy_task(
+            TaskId::new_v7(),
+            "slow.cap",
+            serde_json::json!({}),
+            remote_issuer.node_id(),
+        );
+        task.sign(&remote_issuer).expect("sign");
+        assert!(store
+            .insert_task_dispatched(&task, local_node())
+            .expect("ingest"));
+        exec.poll_once().await;
+        assert_eq!(wait_terminal(&store, task.id).await, TaskState::Done);
+        // 1 s execution at 300 ms interval (immediate tick consumed):
+        // ~3 ticks. At least one proves the extender ran.
+        let during = ticks.load(Ordering::SeqCst);
+        assert!(
+            (1..=4).contains(&during),
+            "extender ticked while executing: {during}"
+        );
+        // After settling the extender is aborted: no more ticks.
+        tokio::time::sleep(Duration::from_millis(2_000)).await;
+        assert_eq!(
+            ticks.load(Ordering::SeqCst),
+            during,
+            "extender must stop when the capability settles"
+        );
+
+        // LOCALLY-issued task: never spawns an extender.
+        let local_task = dummy_task(
+            TaskId::new_v7(),
+            "slow.cap",
+            serde_json::json!({}),
+            local_node(),
+        );
+        store.insert_task(&local_task).expect("insert");
+        assert!(store
+            .try_dispatch_task(local_task.id, local_node())
+            .expect("dispatch"));
+        exec.poll_once().await;
+        assert_eq!(wait_terminal(&store, local_task.id).await, TaskState::Done);
+        assert_eq!(
+            ticks.load(Ordering::SeqCst),
+            during,
+            "locally-issued tasks never extend"
         );
     }
 

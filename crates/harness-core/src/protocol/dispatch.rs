@@ -101,6 +101,38 @@ impl Signable for TaskClaim {
     }
 }
 
+/// Worker → issuer on `harness.task.lease` (4.6, ADR-0028): "still
+/// executing under this lease; roll my expiry forward."
+///
+/// Fire-and-forget from the worker (the `TASK_PARTIAL` doctrine —
+/// a lost extension degrades to the pre-4.6 timeout bound). The
+/// issuer CAS-extends `expires_at` to `now + horizon`, bounded by the
+/// lease's ORIGINAL budget (`issued_at + lease TTL`) so a wedged or
+/// malicious worker can never hold a lease past the task's own
+/// declared budget. Replay-protected per-stream via `seq`; replays
+/// inside a lease are harmless (receipt-time-based), and a stale
+/// extension for a previous attempt dies on the `lease_id` + state
+/// guard (the old lease is `expired` before any re-dispatch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseExtend {
+    /// Monotonic per (connection, channel).
+    pub seq: u64,
+    pub lease_id: LeaseId,
+    pub task_id: TaskId,
+    /// The extending node. Must equal the connection peer's `NodeId`.
+    pub worker: NodeId,
+    pub sig: Signature,
+}
+
+impl Signable for LeaseExtend {
+    fn sig_field_mut(&mut self) -> &mut Signature {
+        &mut self.sig
+    }
+    fn sig_field(&self) -> &Signature {
+        &self.sig
+    }
+}
+
 /// Worker → issuer: terminal result for a leased task.
 ///
 /// See the module docs for the outer/inner signature layering.
@@ -242,6 +274,24 @@ mod tests {
         assert!(claim.verify_signature(worker.public_key()).is_ok());
         claim.seq = 2;
         assert!(claim.verify_signature(worker.public_key()).is_err());
+    }
+
+    #[test]
+    fn lease_extend_round_trip_sign_verify_and_tamper() {
+        let worker = Identity::generate();
+        let mut ext = LeaseExtend {
+            seq: 3,
+            lease_id: LeaseId::new_v7(),
+            task_id: TaskId::new_v7(),
+            worker: worker.public_key().node_id(),
+            sig: Signature::from_bytes([0u8; 64]),
+        };
+        ext.sign(&worker).expect("sign");
+        round_trip(&ext);
+        assert!(ext.verify_signature(worker.public_key()).is_ok());
+        let mut tampered = ext;
+        tampered.lease_id = LeaseId::new_v7();
+        assert!(tampered.verify_signature(worker.public_key()).is_err());
     }
 
     #[test]

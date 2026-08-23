@@ -516,7 +516,14 @@ impl DaemonOrchestrator {
         );
         dispatch_runtime.attach_net(&peer_net);
         // 4.4: local terminals feed the shared success EWMA (MAJOR-2).
-        let executor = executor.with_success_tracker(dispatch_runtime.success_tracker());
+        // 4.6: worker-side lease extensions resolve their live lease
+        // through the runtime's reply-obligation map per tick.
+        let extender_runtime = dispatch_runtime.clone();
+        let executor = executor
+            .with_success_tracker(dispatch_runtime.success_tracker())
+            .with_lease_extender(std::sync::Arc::new(move |task_id| {
+                extender_runtime.send_lease_extend(task_id);
+            }));
         // 3.2-stream: issuer-side partials land in the shared ring; the
         // worker-side streamer needs the runtime for issuer lookup +
         // wire access.
