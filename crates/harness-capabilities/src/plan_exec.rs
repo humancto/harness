@@ -575,6 +575,10 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
                     // own row was cancelled — stop minting at this
                     // completion boundary, exactly like a budget
                     // Cancel (stranded steps settle Skipped below).
+                    // A cancel landing AFTER a budget Pause/Cancel
+                    // fired keeps the budget status label — no extra
+                    // minting either way, only the aggregate's
+                    // `status` string differs (diff review m2).
                     if budget_stop.is_none() && exec.own_cancelled(ctx.task_id) {
                         budget_stop = Some("cancelled");
                         break;

@@ -166,6 +166,77 @@ async fn cancel_matrix_and_lease_release() {
 }
 
 #[tokio::test]
+async fn capability_filter_finds_the_coordinator_row() {
+    // 5.10 (Codex P1 on #61): the Costs page fetches
+    // `?capability=plan.execute` — a wide plan's freshly-minted step
+    // rows must not push its own coordinator row out of the page.
+    let (app, store, token) = app_and_token().await;
+    let plan = submit(
+        &app,
+        &token,
+        serde_json::json!({
+            "capability": "plan.execute",
+            "input": {"plan": {"id": uuid::Uuid::now_v7().to_string(), "tasks": {}}},
+        }),
+    )
+    .await;
+    // Strictly-older coordinator row (issued_at ties order
+    // arbitrarily), then 60 newer non-plan rows — more than the
+    // default page of 50.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    for _ in 0..60 {
+        submit(
+            &app,
+            &token,
+            serde_json::json!({"capability": "echo", "input": {}}),
+        )
+        .await;
+    }
+
+    let list = |uri: &'static str| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .expect("req"),
+                )
+                .await
+                .expect("resp");
+            assert_eq!(resp.status(), StatusCode::OK);
+            body_json(resp).await
+        }
+    };
+
+    // Default page: the coordinator row is gone — the premise Codex
+    // flagged (this assertion documents WHY the filter exists).
+    let rows = list("/api/v1/tasks").await;
+    let plan_str = format!("{}", plan.0.as_hyphenated());
+    assert!(rows
+        .as_array()
+        .expect("array")
+        .iter()
+        .all(|r| r["id"] != plan_str.as_str()));
+
+    // Filtered page: exactly the plan.execute row, state filter
+    // composes, and the store row backs it.
+    let rows = list("/api/v1/tasks?capability=plan.execute&limit=200").await;
+    let rows = rows.as_array().expect("array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], plan_str.as_str());
+    let rows = list("/api/v1/tasks?capability=plan.execute&state=done").await;
+    assert_eq!(rows.as_array().expect("array").len(), 0);
+    assert_eq!(
+        store.task_state(plan).expect("state"),
+        Some(TaskState::Submitted)
+    );
+}
+
+#[tokio::test]
 async fn plan_execute_mints_carry_the_plan_id() {
     // 5.10 (plan review B2): the Costs page joins active plans to
     // ledger rows on task.plan_id — the mint must stamp it from

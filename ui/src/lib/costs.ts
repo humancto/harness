@@ -72,10 +72,15 @@ export function runRate(
   windowDays: number,
   nowMs: number,
 ): number | null {
-  const spendDays = perDay.filter((d) => d.usd > 0);
+  // Days before the rendered window are excluded from the numerator
+  // too (diff review m4): the server's ms-precise window can hand us
+  // spend on a partial 31st UTC day the chart never draws — counting
+  // it would over-project against a denominator clamped to the
+  // window. Chart and projection read the same days.
+  const windowStart = utcDay(nowMs - (windowDays - 1) * DAY_MS);
+  const spendDays = perDay.filter((d) => d.usd > 0 && d.day >= windowStart);
   if (spendDays.length === 0) return null;
   const earliest = spendDays.map((d) => d.day).sort()[0];
-  const windowStart = utcDay(nowMs - (windowDays - 1) * DAY_MS);
   const since = earliest > windowStart ? earliest : windowStart;
   const sinceMs = Date.parse(`${since}T00:00:00Z`);
   const elapsed = Math.max(1, Math.floor((nowMs - sinceMs) / DAY_MS) + 1);

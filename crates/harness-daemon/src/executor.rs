@@ -385,7 +385,7 @@ impl LocalExecutor {
                         tracing::info!(
                             target: "harness.executor",
                             task_id = ?id,
-                            "terminal CAS lost (row left Running, e.g. cancelled); result dropped"
+                            "terminal CAS lost (row no longer Running, e.g. cancelled); result dropped"
                         );
                         let _ = terminal_tx.send(id);
                         return;
@@ -451,9 +451,23 @@ impl LocalExecutor {
     /// `Running`.
     fn fail_now_sync(&self, id: TaskId, msg: &str) {
         let now = now_unix_ms();
-        let _ = self
-            .store
-            .try_transition_task(id, TaskState::Running, TaskState::Failed);
+        // Same CAS gate as the async terminal paths (Codex P2 on #61):
+        // an operator cancel landing in the Running window must not be
+        // overwritten by a Failed result + replica broadcast.
+        let won = matches!(
+            self.store
+                .try_transition_task(id, TaskState::Running, TaskState::Failed),
+            Ok(true)
+        );
+        if !won {
+            tracing::info!(
+                target: "harness.executor",
+                task_id = ?id,
+                "terminal CAS lost (fail_now) — row already terminal, skipping writes"
+            );
+            let _ = self.terminal_tx.send(id);
+            return;
+        }
         if let Err(e) = self
             .store
             .write_task_result_failed(id, msg, now, self.local_node)
@@ -659,6 +673,28 @@ mod tests {
             _: JsonValue,
         ) -> Result<JsonValue, CapabilityError> {
             panic!("boom from PanicCap")
+        }
+    }
+
+    /// Blocks until told to finish — pins the cancel-vs-completion
+    /// race deterministically (diff review m1 on #61).
+    struct GatedCap(Arc<tokio::sync::Notify>);
+
+    #[async_trait]
+    impl Capability for GatedCap {
+        fn id(&self) -> &str {
+            "gated"
+        }
+        fn manifest(&self) -> ManifestEntry {
+            manifest_for("gated")
+        }
+        async fn execute(
+            &self,
+            _: &ExecutionContext,
+            _: JsonValue,
+        ) -> Result<JsonValue, CapabilityError> {
+            self.0.notified().await;
+            Ok(serde_json::json!({"finished": true}))
         }
     }
 
@@ -1053,6 +1089,118 @@ mod tests {
             store.task_state(other.id).unwrap(),
             Some(TaskState::Running),
             "other nodes' rows untouched"
+        );
+    }
+
+    // t08c — 5.10 (diff review m1 on #61): the MAIN async terminal
+    // path loses its CAS to an operator cancel landing mid-execution —
+    // no result row, no Done replica, and terminal_tx still fires so
+    // local waiters do not strand.
+    #[tokio::test]
+    async fn t08c_async_done_path_cas_lost_writes_nothing() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let store = fresh_store();
+        let registry = registry_with(Arc::new(GatedCap(gate.clone())));
+        let exec = LocalExecutor::new(store.clone(), registry, local_node(), Arc::from("self"), 1);
+        let mut terminal = exec.subscribe_terminal();
+
+        let id = TaskId::new_v7();
+        store
+            .insert_task(&dummy_task(
+                id,
+                "gated",
+                serde_json::json!({}),
+                local_node(),
+            ))
+            .expect("insert");
+        assert!(store.try_dispatch_task(id, local_node()).expect("seed"));
+        exec.poll_once().await;
+        // The capability future is parked on the gate with the row at
+        // Running; the cancel lands mid-execution.
+        for _ in 0..200 {
+            if store.task_state(id).expect("state") == Some(TaskState::Running) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(matches!(
+            store.cancel_task(id).expect("cancel"),
+            harness_store::CancelOutcome::Cancelled
+        ));
+        gate.notify_one();
+
+        let woke = tokio::time::timeout(Duration::from_secs(2), terminal.recv())
+            .await
+            .expect("terminal_tx fires on a lost CAS")
+            .expect("recv");
+        assert_eq!(woke, id);
+        assert_eq!(
+            store.task_state(id).unwrap(),
+            Some(TaskState::Cancelled),
+            "cancel survives completion"
+        );
+        assert!(
+            store.load_task_result(id).expect("load").is_none(),
+            "lost CAS writes no result"
+        );
+        assert!(
+            store
+                .replica_view_task(id)
+                .expect("view")
+                .is_none_or(|e| e.state != harness_core::ReplicatedState::Done),
+            "lost CAS broadcasts no Done replica"
+        );
+    }
+
+    // t08b — 5.10 (Codex P2 on #61): the unknown-capability failure
+    // path gates on the Running→Failed CAS like every other terminal
+    // write — a cancel landing in the Running window must not be
+    // overwritten by a Failed result + replica broadcast.
+    #[tokio::test]
+    async fn t08b_fail_now_cas_lost_writes_nothing() {
+        let store = fresh_store();
+        let registry = CapabilityRegistry::new();
+        let exec = LocalExecutor::new(store.clone(), registry, local_node(), Arc::from("self"), 1);
+
+        let id = TaskId::new_v7();
+        store
+            .insert_task(&dummy_task(
+                id,
+                "does.not.exist",
+                serde_json::json!({}),
+                local_node(),
+            ))
+            .expect("insert");
+        assert!(store.try_dispatch_task(id, local_node()).expect("seed"));
+        assert!(store
+            .try_transition_task(id, TaskState::Dispatched, TaskState::Claimed)
+            .expect("claim"));
+        assert!(store
+            .try_transition_task(id, TaskState::Claimed, TaskState::Running)
+            .expect("run"));
+        // Operator cancel lands while the row is Running.
+        assert!(matches!(
+            store.cancel_task(id).expect("cancel"),
+            harness_store::CancelOutcome::Cancelled
+        ));
+
+        exec.fail_now_sync(id, "capability not found: does.not.exist");
+
+        assert_eq!(
+            store.task_state(id).unwrap(),
+            Some(TaskState::Cancelled),
+            "cancel survives the failure path"
+        );
+        assert!(
+            store.load_task_result(id).expect("load").is_none(),
+            "lost CAS writes no result"
+        );
+        assert!(
+            store
+                .replica_view_task(id)
+                .expect("view")
+                .is_none_or(|e| e.state != harness_core::ReplicatedState::Failed),
+            "lost CAS broadcasts no Failed replica"
         );
     }
 

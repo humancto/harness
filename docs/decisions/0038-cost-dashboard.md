@@ -46,9 +46,15 @@ Semantics, precisely:
   steps finish on their own timeouts" means capability-internal
   deadlines. A capability without one runs to completion after a
   cancel; it just writes nothing when it gets there.
-- **Plan loop:** `PlanExec::own_cancelled(task_id)` (default false;
-  the store-backed impl does one indexed read) is checked once per
-  step completion in the fan-out loop. Cancelled → stop exactly like
+- **Plan loop:** `PlanExec::own_cancelled(task_id)` (default false)
+  is checked once per step completion in the fan-out loop. The
+  store-backed impl reads the local task row AND the replica view:
+  `plan.execute` is `Cardinality::Anyone`, so the plan may execute
+  on a node other than the issuer — there the issuer's cancel only
+  flips its own row and gossips `Cancelled`, never rewriting the
+  worker's ingested row. Consuming the replicated state makes the
+  stop reach remote executions too, bounded by gossip latency
+  (acceptable for a spend stop). Cancelled → stop exactly like
   the budget-Cancel path: break, stranded steps `Skipped`, aggregate
   `status: "cancelled"`. A cancelled runaway plan stops minting new
   steps at the next completion boundary — bounded by the in-flight
@@ -101,6 +107,12 @@ spend.
 - Cancelled plans report `status: "cancelled"` with the stranded
   steps listed as skipped — same aggregate contract as budget stops
   (ADR-0036).
+- A cloud capability that finishes (and bills) after its row was
+  cancelled records **no** cost row — the lost CAS drops the whole
+  result, dollars included. The ledger undercounts by at most the
+  in-flight steps at cancel time; accepted, since the alternative
+  (writing results for cancelled rows) re-opens the
+  Done-over-Cancelled divergence.
 - True cooperative in-flight cancellation is deferred to the
   checkpointing work (5.11/5.12), where a natural yield point
   exists.

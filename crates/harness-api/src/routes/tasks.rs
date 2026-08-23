@@ -248,6 +248,11 @@ pub struct ListQuery {
     /// Exact per-state filter (the pre-4.8 Submitted-only view is
     /// `?state=submitted`). Unknown states → 400.
     pub state: Option<String>,
+    /// Exact capability filter (5.10 — the Costs page fetches
+    /// `?capability=plan.execute` so a wide plan's step rows cannot
+    /// push its own coordinator row out of the page). Composes with
+    /// `state`. Unknown capabilities simply match zero rows.
+    pub capability: Option<String>,
     /// Row cap for the default recent-across-states listing
     /// (default 50, clamped to [1, 200]).
     pub limit: Option<usize>,
@@ -281,12 +286,9 @@ pub async fn list_handler(
         .limit
         .unwrap_or(LIST_DEFAULT_LIMIT)
         .clamp(1, LIST_MAX_LIMIT);
-    let rows = if let Some(wanted) = &query.state {
-        match wanted.parse::<harness_store::TaskState>() {
-            // The clamp applies to BOTH arms (diff review MINOR-6):
-            // terminal states accumulate forever, so `?state=done`
-            // must page exactly like the default listing.
-            Ok(task_state) => store.list_tasks_by_state_limited(task_state, limit),
+    let wanted_state = match &query.state {
+        Some(wanted) => match wanted.parse::<harness_store::TaskState>() {
+            Ok(task_state) => Some(task_state),
             Err(_) => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -294,7 +296,16 @@ pub async fn list_handler(
                 )
                     .into_response();
             }
-        }
+        },
+        None => None,
+    };
+    // The clamp applies to EVERY arm (diff review MINOR-6): terminal
+    // states accumulate forever, so filtered views must page exactly
+    // like the default listing.
+    let rows = if let Some(capability) = &query.capability {
+        store.list_recent_tasks_by_capability(capability, wanted_state, limit)
+    } else if let Some(task_state) = wanted_state {
+        store.list_tasks_by_state_limited(task_state, limit)
     } else {
         store.list_recent_tasks(limit)
     };
@@ -498,10 +509,10 @@ pub async fn cancel_handler(
             .into_response();
     };
     match store.cancel_task(task_id) {
+        // `cancel_task` releases the row's live leases in the SAME
+        // transaction as the state flip (diff review M1) — no window
+        // for an in-between result ingest.
         Ok(harness_store::CancelOutcome::Cancelled) => {
-            if let Err(err) = store.release_live_leases_for_task(task_id) {
-                tracing::warn!(target: "harness.api.tasks", ?err, "release leases on cancel");
-            }
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))

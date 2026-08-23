@@ -31,9 +31,13 @@
     const ctrl = new AbortController();
     controller = ctrl;
     try {
+      // capability filter (Codex P1 on #61): a wide plan's
+      // freshly-minted step rows would push its own coordinator row
+      // out of the default recent page — precisely the plan the stop
+      // button exists for.
       const [costsRes, tasksRes] = await Promise.all([
         fetch('/api/v1/costs', { signal: ctrl.signal }),
-        fetch('/api/v1/tasks', { signal: ctrl.signal }),
+        fetch('/api/v1/tasks?capability=plan.execute&limit=200', { signal: ctrl.signal }),
       ]);
       if (gen !== myGen) return;
       if (costsRes.status === 401 || tasksRes.status === 401) {
@@ -86,6 +90,11 @@
       }
       // 409 = it finished (or was cancelled) while we looked — a
       // refetch shows the truth; no error state (plan review m8).
+      // Anything else non-OK: the operator's Stop must not silently
+      // do nothing (diff review m5).
+      if (!res.ok && res.status !== 409) {
+        loadError = `stop failed (${res.status})`;
+      }
       await refresh(gen);
     } finally {
       stopPending = null;

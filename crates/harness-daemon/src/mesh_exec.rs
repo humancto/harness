@@ -189,9 +189,22 @@ impl harness_capabilities::PlanExec for StoreMeshExec {
     }
 
     fn own_cancelled(&self, id: harness_core::TaskId) -> bool {
-        matches!(
+        // Local row first: the issuer's cancel endpoint flips it when
+        // the plan runs where it was submitted.
+        if matches!(
             self.store.task_state(id),
             Ok(Some(harness_store::TaskState::Cancelled))
+        ) {
+            return true;
+        }
+        // Remote execution (plan.execute is Anyone): the issuer's cancel
+        // touches ITS row and mirrors Cancelled into the gossip layer —
+        // it never rewrites this worker's ingested row. The replica view
+        // is the cross-node cancellation signal (bounded by gossip
+        // latency, which is fine for a spend stop).
+        matches!(
+            self.store.replica_view_task(id),
+            Ok(Some(entry)) if entry.state == harness_core::ReplicatedState::Cancelled
         )
     }
 
@@ -306,6 +319,38 @@ mod tests {
             version: SemVer::new(0, 1, 0),
             sig: Signature::from_bytes([0u8; 64]),
         }
+    }
+
+    #[test]
+    fn own_cancelled_consumes_replicated_cancellation() {
+        // 5.10 (Codex P1 on #61): when plan.execute runs on another
+        // node, the issuer's cancel flips ITS row and gossips
+        // Cancelled — it never rewrites this worker's ingested row.
+        // own_cancelled must consume the replica view or a remote
+        // stop request keeps spending.
+        let store = Store::open_memory().expect("store");
+        let me = Arc::new(Identity::generate());
+        let exec = StoreMeshExec::new(
+            store.clone(),
+            me.clone(),
+            harness_capabilities::CapabilityRegistry::new().downgrade(),
+            PeerTable::new(),
+        );
+        let id = harness_core::TaskId::new_v7();
+        assert!(!exec.own_cancelled(id), "no row, no replica → false");
+        store
+            .replica_apply_local(&harness_core::ReplicatedTaskState {
+                task_id: id,
+                state: harness_core::ReplicatedState::Cancelled,
+                at_ms: 1,
+                source: me.node_id(),
+                output_preview: None,
+            })
+            .expect("apply");
+        assert!(
+            exec.own_cancelled(id),
+            "gossiped Cancelled must stop the loop"
+        );
     }
 
     #[test]

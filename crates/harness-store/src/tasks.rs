@@ -537,6 +537,42 @@ impl Store {
         })
     }
 
+    /// Recent tasks for ONE capability, newest first, optionally
+    /// narrowed to one state — the 5.10 Costs page's active-plans arm
+    /// (Codex P1 on #61: a wide plan's freshly-minted steps push its
+    /// own `plan.execute` coordinator row out of the default recent
+    /// page, hiding exactly the stop button that plan needs).
+    pub fn list_recent_tasks_by_capability(
+        &self,
+        capability: &str,
+        state: Option<TaskState>,
+        limit: usize,
+    ) -> Result<Vec<TaskRow>, StoreError> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, capability, state, issued_by, issued_at,
+                        completed_by, started_at, finished_at,
+                        parent_id, plan_id
+                   FROM tasks
+                  WHERE capability = ?1
+                    AND (?2 IS NULL OR state = ?2)
+               ORDER BY issued_at DESC
+                  LIMIT ?3",
+            )?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        capability,
+                        state.map(|s| s.as_str()),
+                        i64::try_from(limit).unwrap_or(i64::MAX)
+                    ],
+                    |r| Ok(row_to_task_row(r)),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter().collect::<Result<Vec<_>, _>>()
+        })
+    }
+
     /// Like [`Self::list_tasks_by_state`] with a row cap — the 4.8
     /// API listing's `?state=` arm (one page, never a full-table dump;
     /// terminal states accumulate forever).
@@ -846,6 +882,16 @@ impl Store {
             }
             tx.execute(
                 "UPDATE tasks SET state = 'cancelled' WHERE id = ?1",
+                params![id.0.as_bytes()],
+            )?;
+            // Same transaction as the state flip (diff review M1): a
+            // dispatch pass taking the connection between "cancelled"
+            // and "leases released" could win the live-lease CAS and
+            // ingest a Done over the cancel — gossiped Done outranks
+            // Cancelled in the LWW map, permanently.
+            tx.execute(
+                "UPDATE leases SET state = 'released'
+                  WHERE task_id = ?1 AND state IN ('pending', 'claimed')",
                 params![id.0.as_bytes()],
             )?;
             tx.commit()?;

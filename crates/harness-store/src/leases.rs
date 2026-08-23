@@ -334,25 +334,6 @@ impl Store {
         })
     }
 
-    /// 5.10 (ADR-0038): terminalize every live lease for a cancelled
-    /// task by marking it `released` — a late worker result then drops
-    /// at the terminal-lease guard instead of writing Done over
-    /// Cancelled, expiry cannot fire, and no breaker penalty lands on
-    /// the worker for an operator cancel. Returns the released count.
-    ///
-    /// # Errors
-    /// Underlying sqlite errors.
-    pub fn release_live_leases_for_task(&self, task_id: TaskId) -> Result<usize, StoreError> {
-        self.with_conn(|c| {
-            let n = c.execute(
-                "UPDATE leases SET state = 'released'
-                  WHERE task_id = ?1 AND state IN ('pending', 'claimed')",
-                params![task_id.0.as_bytes()],
-            )?;
-            Ok(n)
-        })
-    }
-
     pub fn list_leases_for_task(&self, task_id: TaskId) -> Result<Vec<Lease>, StoreError> {
         self.with_conn(|c| {
             let mut stmt = c.prepare(

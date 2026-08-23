@@ -51,13 +51,14 @@ describe("runRate", () => {
     expect(rate).toBeCloseTo((8 / 4) * 30, 9);
   });
 
-  it("clamps the denominator to the window", () => {
-    // Earliest datum predates the window start: elapsed = window.
-    const perDay = [{ day: utcDay(NOW - 40 * DAY), usd: 30 }];
-    // (Out-of-window rows do not reach the UI in practice, but the
-    // math must not divide by 40+ days.)
-    const rate = runRate(perDay, 30, NOW);
-    expect(rate).toBeCloseTo(30, 9);
+  it("reads the same days as the chart at the window edge", () => {
+    // A day the chart never draws (before the window start) is
+    // excluded from the numerator too (diff review m4); the edge day
+    // itself is in, with the denominator clamped to the window.
+    const outOfWindow = [{ day: utcDay(NOW - 40 * DAY), usd: 30 }];
+    expect(runRate(outOfWindow, 30, NOW)).toBeNull();
+    const edge = [{ day: utcDay(NOW - 29 * DAY), usd: 30 }];
+    expect(runRate(edge, 30, NOW)).toBeCloseTo(30, 9);
   });
 });
 
