@@ -19,4 +19,10 @@ pub enum ProtocolError {
     CborDecode(#[from] ciborium::de::Error<std::io::Error>),
     #[error("signature: {0}")]
     Signature(#[from] VerifyError),
+    /// 5.11: a value could not be JSON-encoded for hashing. Practically
+    /// unreachable for a `serde_json::Value` (its numbers are always
+    /// finite and its map keys always strings) — surfaced rather than
+    /// unwrapped so a future non-Value caller cannot hash silence.
+    #[error("json encode: {0}")]
+    JsonEncode(String),
 }

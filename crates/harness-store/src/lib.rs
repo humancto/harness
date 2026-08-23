@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod capabilities;
+pub mod checkpoints;
 pub mod error;
 pub mod leases;
 pub mod manifests;
@@ -19,6 +20,7 @@ pub mod scopes;
 pub mod tasks;
 
 pub use crate::capabilities::nodes_for_versioned_capability;
+pub use crate::checkpoints::MAX_CHECKPOINT_OUTPUT_BYTES;
 pub use crate::error::StoreError;
 pub use crate::leases::{Lease, LeaseId, LeaseState};
 pub use crate::open::{Store, StoreConfig};

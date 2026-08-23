@@ -174,6 +174,11 @@ impl DaemonOrchestrator {
         // assigned to self is provably debris from a previous process.
         crate::executor::sweep_boot_orphans(&store, identity.node_id());
 
+        // 5.11 (ADR-0039): a plan that crashed and is never resubmitted
+        // keeps its checkpoints forever — drop the ones nobody can
+        // still resume from.
+        crate::executor::sweep_stale_checkpoints(&store);
+
         // 4.7 (ADR-0029): the shared backpressure switch — heartbeat
         // producer, API surface, and local dispatch view all consult
         // this one instance.
@@ -890,6 +895,16 @@ impl DaemonOrchestrator {
                 .run_expire_loop(self.shutdown_tx.subscribe()),
         );
         self.tasks.lock().push(expire_handle);
+        // 5.11 (ADR-0039): checkpoint housekeeping on a slow tick, so a
+        // long-running daemon does not carry completed plans' rows
+        // until its next restart.
+        if let Some(store) = self.api_state.store.clone() {
+            let checkpoint_handle = tokio::spawn(spawn_checkpoint_sweeper(
+                store,
+                self.shutdown_tx.subscribe(),
+            ));
+            self.tasks.lock().push(checkpoint_handle);
+        }
         let reply_handle = tokio::spawn(self.dispatch.clone().run_reply_pump(
             self.executor.subscribe_terminal(),
             self.shutdown_tx.subscribe(),
@@ -1054,6 +1069,23 @@ fn cloud_planner_model_if_allowed(planning: &harness_policy::PlanningPolicy) -> 
         None
     } else {
         Some(model)
+    }
+}
+
+/// 5.11 (ADR-0039): periodic checkpoint housekeeping — the same sweep
+/// the daemon runs at boot, on an hourly tick. Cheap (two indexed
+/// deletes) and never in the plan driver's crash window.
+async fn spawn_checkpoint_sweeper(
+    store: harness_store::Store,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut tick = tokio::time::interval(Duration::from_secs(3600));
+    tick.tick().await; // the boot sweep already ran
+    loop {
+        tokio::select! {
+            _ = tick.tick() => crate::executor::sweep_stale_checkpoints(&store),
+            _ = shutdown.changed() => return,
+        }
     }
 }
 

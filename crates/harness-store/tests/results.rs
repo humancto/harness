@@ -276,11 +276,11 @@ fn t07_v0006_migrates_populated_v0005_database() {
         .expect("old row");
     }
 
-    // Store::open applies V0006+V0007 on top; the old row must load
+    // Store::open applies V0006..V0008 on top; the old row must load
     // with provenance None, cost None, and intact output.
     let cfg = harness_store::StoreConfig::at(&path);
     let s = Store::open(&cfg).expect("open migrates");
-    assert_eq!(s.schema_version().expect("version"), "7");
+    assert_eq!(s.schema_version().expect("version"), "8");
     let loaded = s
         .load_task_result(TaskId(uuid::Uuid::from_bytes([5; 16])))
         .expect("load")

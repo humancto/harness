@@ -208,6 +208,53 @@ impl harness_capabilities::PlanExec for StoreMeshExec {
         )
     }
 
+    fn checkpoint_lookup(
+        &self,
+        plan: harness_core::PlanId,
+        node: harness_core::TaskId,
+        input_hash: &[u8; 32],
+    ) -> Option<serde_json::Value> {
+        match self.store.checkpoint_get(plan, node, input_hash) {
+            Ok(hit) => hit,
+            Err(e) => {
+                tracing::warn!(target: "harness.mesh_exec", ?e, "checkpoint lookup");
+                None
+            }
+        }
+    }
+
+    fn checkpoint_record(
+        &self,
+        plan: harness_core::PlanId,
+        node: harness_core::TaskId,
+        input_hash: &[u8; 32],
+        step_row: Option<harness_core::TaskId>,
+        output: &serde_json::Value,
+    ) {
+        // Defensive: `task_id` is NOT NULL, and every caller reaches
+        // here from a Done outcome whose row was recorded at submit.
+        // Nothing to write if that ever stops holding.
+        let Some(row) = step_row else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        match self
+            .store
+            .checkpoint_put(plan, node, input_hash, row, output, now)
+        {
+            Ok(true) => {}
+            Ok(false) => tracing::info!(
+                target: "harness.mesh_exec",
+                task = %row.0,
+                "output too large to checkpoint; the step re-runs on resume"
+            ),
+            Err(e) => tracing::warn!(target: "harness.mesh_exec", ?e, "checkpoint record"),
+        }
+    }
+
     fn live_workers(&self) -> usize {
         self.peers.live_snapshot(PEER_TIMEOUT).len() + 1
     }

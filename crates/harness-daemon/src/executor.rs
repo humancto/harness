@@ -481,6 +481,38 @@ impl LocalExecutor {
     }
 }
 
+/// 5.11 (ADR-0039): checkpoint housekeeping, run at daemon build beside
+/// the orphan sweep and again on the periodic maintenance tick. Drops
+/// (a) checkpoints of plans that are durably complete — the safe GC
+/// point, outside the plan driver — and (b) rows older than the
+/// retention window, for plans nobody ever resubmits.
+pub(crate) const CHECKPOINT_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+pub(crate) fn sweep_stale_checkpoints(store: &Store) {
+    // Plans whose own result row is durably written need no
+    // checkpoints (Codex P1 on #62): the driver cannot do this itself
+    // without a crash window between the delete and the result write.
+    match store.checkpoint_sweep_completed_plans() {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            target: "harness.executor",
+            rows = n,
+            "swept checkpoints of durably-completed plans"
+        ),
+        Err(e) => tracing::warn!(target: "harness.executor", ?e, "completed-plan checkpoint sweep"),
+    }
+    let cutoff = now_unix_ms().saturating_sub(CHECKPOINT_RETENTION_MS);
+    match store.checkpoint_sweep_older_than(cutoff) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            target: "harness.executor",
+            rows = n,
+            "swept checkpoints older than the retention window"
+        ),
+        Err(e) => tracing::warn!(target: "harness.executor", ?e, "checkpoint sweep"),
+    }
+}
+
 /// 4.6 (ADR-0028): boot orphan sweep — run ONCE at daemon build, before
 /// any loop spawns (so every `claimed|running(assigned=self)` row is
 /// provably crash debris from a previous process; ADR-0027's headline
