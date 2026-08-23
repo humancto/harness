@@ -1230,6 +1230,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "harness-core",
+ "harness-cost",
  "harness-mesh",
  "harness-policy",
  "harness-store",
@@ -1288,6 +1289,7 @@ dependencies = [
  "futures",
  "harness-brain",
  "harness-core",
+ "harness-cost",
  "harness-orchestrator",
  "harness-policy",
  "harness-vault",
@@ -1353,6 +1355,14 @@ dependencies = [
 [[package]]
 name = "harness-cost"
 version = "0.0.0"
+dependencies = [
+ "harness-core",
+ "harness-store",
+ "serde",
+ "serde_json",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "harness-daemon"
@@ -1369,6 +1379,7 @@ dependencies = [
  "harness-capabilities",
  "harness-cli",
  "harness-core",
+ "harness-cost",
  "harness-merge",
  "harness-mesh",
  "harness-orchestrator",

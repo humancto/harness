@@ -137,6 +137,10 @@ async fn t01_happy_path_via_wiremock() {
         .expect("happy path must succeed");
     assert_eq!(out["text"], json!("hello there"));
     assert_eq!(out["model"], json!("gpt-4o-mini"));
+    // 5.9: longest-prefix pricing — the MINI rate (0.15/0.6 per 1M),
+    // never gpt-4o's ~16x rate.
+    let cost = out["cost_usd"].as_f64().expect("priced");
+    assert!((cost - (7.0 * 0.15 + 3.0 * 0.6) / 1_000_000.0).abs() < 1e-12);
     assert_eq!(out["prompt_tokens"], json!(7));
     assert_eq!(out["completion_tokens"], json!(3));
 }

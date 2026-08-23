@@ -99,8 +99,11 @@ PRICING and per-plan/user/day aggregation are 5.9's `harness-cost`.
   prices steps. Inherent to streaming dispatch.
 - **Failed steps contribute $0** (outcomes carry only an error
   string): a cost-then-fail cloud call undercounts, and a retry loop
-  of expensive failures never trips the cap. Frozen by test; 5.9
-  fixes it by costing the result row rather than worker JSON.
+  of expensive failures never trips the cap. Frozen by test.
+  *(Amended by ADR-0037: the "5.9 fixes it" promise is RETRACTED in
+  part — error paths discard response bodies, so no usage exists to
+  price; 5.9 added the result-row cost column as the future home,
+  and the undercount stands.)*
 - **`unscheduled` conflates two things on Cancel:** budget-parked
   never-ran steps and dispatched-then-dropped in-flight steps (whose
   rows orphan-complete, ADR-0022). 5.12 resume will need to split
@@ -109,4 +112,6 @@ PRICING and per-plan/user/day aggregation are 5.9's `harness-cost`.
   — same trust model as every result. Notably `mcp.proxy` passes
   foreign tool results through top-level, so an external MCP server
   can INFLATE cost (spurious stop) but never deflate below $0
-  (clamp). 5.9's result-row costing removes the vector.
+  (clamp). *(ADR-0037: the LEDGER is now hint-gated and immune; the
+  in-loop enforcement deliberately stays conservative — an inflated
+  claim can only stop a plan early, never underspend.)*

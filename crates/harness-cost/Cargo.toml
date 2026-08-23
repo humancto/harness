@@ -11,3 +11,11 @@ description  = "Estimated and actual cost tracking."
 workspace = true
 
 [dependencies]
+harness-core  = { workspace = true }
+harness-store = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+tracing       = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }

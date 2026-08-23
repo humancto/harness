@@ -276,15 +276,60 @@ fn t07_v0006_migrates_populated_v0005_database() {
         .expect("old row");
     }
 
-    // Store::open applies V0006 on top; the old row must load with
-    // provenance None and intact output.
+    // Store::open applies V0006+V0007 on top; the old row must load
+    // with provenance None, cost None, and intact output.
     let cfg = harness_store::StoreConfig::at(&path);
     let s = Store::open(&cfg).expect("open migrates");
-    assert_eq!(s.schema_version().expect("version"), "6");
+    assert_eq!(s.schema_version().expect("version"), "7");
     let loaded = s
         .load_task_result(TaskId(uuid::Uuid::from_bytes([5; 16])))
         .expect("load")
         .expect("present");
     assert_eq!(loaded.output, Some(json!({"old": true})));
     assert!(loaded.provenance.is_none());
+    assert!(loaded.cost_usd.is_none(), "pre-5.9 rows read NULL cost");
+}
+
+#[test]
+fn t08_result_cost_round_trip_and_ledger_queries() {
+    // 5.9: write_result_cost persists dollars readable via
+    // load_task_result AND the bounded ledger feeds.
+    let s = fresh_store();
+    let id = TaskId::new_v7();
+    let plan_id = harness_core::PlanId::new_v7();
+    let mut task = dummy_task(id, "echo");
+    task.plan_id = Some(plan_id);
+    let signer = harness_core::Identity::generate();
+    task.sign(&signer).expect("re-sign");
+    s.insert_task(&task).expect("insert");
+    s.write_task_result_done(
+        id,
+        &json!({"cost_usd": 0.5}),
+        1_000,
+        NodeId::from_bytes([2; 16]),
+    )
+    .expect("row");
+    s.write_result_cost(id, 0.5).expect("cost");
+    let loaded = s.load_task_result(id).expect("load").expect("present");
+    assert_eq!(loaded.cost_usd, Some(0.5));
+
+    let rows = s.recent_result_costs(0, 100).expect("feed");
+    assert_eq!(rows.len(), 1);
+    let (cap, pid, by, at, cost) = &rows[0];
+    assert_eq!(cap, "echo");
+    assert_eq!(*pid, Some(plan_id));
+    assert_eq!(*by, NodeId::from_bytes([1; 16]));
+    assert_eq!(*at, 1_000);
+    assert_eq!(*cost, Some(0.5));
+    // Window bound excludes it.
+    assert!(s.recent_result_costs(2_000, 100).expect("feed").is_empty());
+
+    let outs = s
+        .recent_outputs_for_capability("echo", 0, 10)
+        .expect("outs");
+    assert_eq!(outs.len(), 1);
+    assert!(s
+        .recent_outputs_for_capability("other", 0, 10)
+        .expect("outs")
+        .is_empty());
 }

@@ -38,12 +38,28 @@ pub struct Policy {
     #[serde(default)]
     pub mcp: McpPolicy,
 
+    /// `[cost]` section — model pricing overrides (5.9, ADR-0037).
+    #[serde(default)]
+    pub cost: CostPolicy,
+
     /// `[execution]` section — runtime plan-budget knobs (5.8,
     /// ADR-0036). Distinct from `[planning].default_max_cost_usd`
     /// (a planning-time ESTIMATE cap): these govern ACTUAL spend
     /// while `plan.execute` runs.
     #[serde(default)]
     pub execution: ExecutionBudgetPolicy,
+}
+
+/// `[cost]` — model pricing overrides (5.9, ADR-0037). Keys are
+/// model-id PREFIXES (longest match wins), values are
+/// `[dollars_per_1M_input_tokens, dollars_per_1M_output_tokens]`.
+/// Built-ins are best-effort snapshots; this map is the operator
+/// contract when prices drift.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CostPolicy {
+    #[serde(default)]
+    pub model_prices: std::collections::BTreeMap<String, [f64; 2]>,
 }
 
 /// Runtime budget knobs for `plan.execute` (5.8, PRD §17.8).

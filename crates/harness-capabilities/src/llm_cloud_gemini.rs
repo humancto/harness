@@ -209,6 +209,7 @@ impl Capability for LlmCloudGeminiCapability {
                     "duration_ms":       { "type": "integer" },
                     "prompt_tokens":     { "type": ["integer", "null"] },
                     "completion_tokens": { "type": ["integer", "null"] },
+                    "cost_usd":          { "type": ["number", "null"] },
                 },
             }),
             cost_hint: CostHint::CloudPaid,
@@ -433,12 +434,24 @@ async fn dispatch_gemini(
         .unwrap_or_default();
 
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    // 5.9 (ADR-0037): price from provider-reported usage; null when
+    // the model is unpriced or usage is absent.
+    let pt = r.usage_metadata.as_ref().and_then(|u| u.prompt_token_count);
+    let ct = r
+        .usage_metadata
+        .as_ref()
+        .and_then(|u| u.candidates_token_count);
+    let cost_usd = match (pt, ct) {
+        (Some(p), Some(c)) => harness_cost::price_usd(&model, p, c),
+        _ => None,
+    };
     Ok(json!({
         "text":              text,
         "model":             model,
         "duration_ms":       duration_ms,
-        "prompt_tokens":     r.usage_metadata.as_ref().and_then(|u| u.prompt_token_count),
-        "completion_tokens": r.usage_metadata.as_ref().and_then(|u| u.candidates_token_count),
+        "prompt_tokens":     pt,
+        "completion_tokens": ct,
+        "cost_usd":          cost_usd,
     }))
 }
 

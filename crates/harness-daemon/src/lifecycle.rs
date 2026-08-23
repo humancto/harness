@@ -407,6 +407,18 @@ impl DaemonOrchestrator {
             // budget knobs thread in from the policy snapshot
             // (available since load at startup — ADR-0036).
             let exec_policy_snapshot = policy_engine.snapshot();
+            // 5.9 (ADR-0037): install the process-wide pricing table
+            // (built-ins + [cost.model_prices] overrides) before any
+            // cloud capability prices a call.
+            let overrides: Vec<(String, f64, f64)> = exec_policy_snapshot
+                .cost
+                .model_prices
+                .iter()
+                .map(|(k, v)| (k.clone(), v[0], v[1]))
+                .collect();
+            if !harness_cost::install_pricing(harness_cost::Pricing::with_overrides(overrides)) {
+                tracing::warn!(target: "harness.cost", "pricing already installed; keeping first");
+            }
             harness_capabilities::enrich_with_plan_exec(
                 &capabilities,
                 mesh_exec,

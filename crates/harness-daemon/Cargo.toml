@@ -35,6 +35,7 @@ harness-core        = { workspace = true }
 harness-cli         = { workspace = true }
 harness-mesh        = { workspace = true }
 harness-api         = { workspace = true }
+harness-cost         = { workspace = true }
 harness-store        = { workspace = true }
 harness-capabilities = { workspace = true, features = ["fs", "mcp"] }
 harness-policy       = { workspace = true }

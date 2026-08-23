@@ -342,3 +342,18 @@ fn t_nonfinite_execution_budget_rejected() {
     assert!((ok.execution.plan_budget_ceiling_usd.expect("set") - 12.5).abs() < f64::EPSILON);
     assert!((ok.execution.default_plan_budget_usd.expect("default") - 5.0).abs() < f64::EPSILON);
 }
+
+#[test]
+fn t_cost_overrides_validated() {
+    // 5.9: garbage pricing overrides rejected; valid ones load.
+    for bad in [
+        "[cost.model_prices]\n\"gpt-4o\" = [nan, 1.0]\n",
+        "[cost.model_prices]\n\"gpt-4o\" = [-1.0, 1.0]\n",
+        "[cost.model_prices]\n\" \" = [1.0, 1.0]\n",
+    ] {
+        assert!(harness_policy::load_from_str(bad).is_err(), "{bad}");
+    }
+    let ok = harness_policy::load_from_str("[cost.model_prices]\n\"gpt-4o\" = [2.5, 10.0]\n")
+        .expect("valid");
+    assert_eq!(ok.cost.model_prices.get("gpt-4o"), Some(&[2.5, 10.0]));
+}
