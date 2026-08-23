@@ -130,6 +130,30 @@ pub(crate) fn mint_task(
     store: &harness_store::Store,
     req: SubmitRequest,
 ) -> Result<TaskId, &'static str> {
+    // Unguarded: `PlanAlreadyRunning` cannot occur, and carrying the
+    // id out is harmless if it somehow did.
+    mint_task_guarded(state, store, req, None).map(|outcome| match outcome {
+        MintOutcome::Minted(id) | MintOutcome::PlanAlreadyRunning(id) => id,
+    })
+}
+
+/// What [`mint_task_guarded`] did.
+pub(crate) enum MintOutcome {
+    Minted(TaskId),
+    /// 5.12: refused — a non-terminal run of this plan already exists.
+    PlanAlreadyRunning(TaskId),
+}
+
+/// The mint path, optionally guarded on "no live run of this plan"
+/// (5.12, Codex P1 on #63). The guard shares ONE transaction with the
+/// insert: checking first and inserting after lets two concurrent
+/// resumes both mint a coordinator and run the DAG twice.
+pub(crate) fn mint_task_guarded(
+    state: &ApiState,
+    store: &harness_store::Store,
+    req: SubmitRequest,
+    guard_plan: Option<harness_core::PlanId>,
+) -> Result<MintOutcome, &'static str> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -180,9 +204,21 @@ pub(crate) fn mint_task(
         return Err("sign_failed");
     }
 
-    if let Err(err) = store.insert_task(&task) {
-        tracing::error!(target: "harness.api.tasks", ?err, "insert task");
-        return Err("store_insert_failed");
+    match guard_plan {
+        Some(plan_id) => match store.insert_task_unless_plan_live(&task, plan_id) {
+            Ok(Some(live)) => return Ok(MintOutcome::PlanAlreadyRunning(live)),
+            Ok(None) => {}
+            Err(err) => {
+                tracing::error!(target: "harness.api.tasks", ?err, "insert task (guarded)");
+                return Err("store_insert_failed");
+            }
+        },
+        None => {
+            if let Err(err) = store.insert_task(&task) {
+                tracing::error!(target: "harness.api.tasks", ?err, "insert task");
+                return Err("store_insert_failed");
+            }
+        }
     }
 
     // Mirror the initial state into the replica map so any peer
@@ -199,7 +235,7 @@ pub(crate) fn mint_task(
         tracing::warn!(target: "harness.api.tasks", ?err, "replica_apply_local");
     }
 
-    Ok(task.id)
+    Ok(MintOutcome::Minted(task.id))
 }
 
 /// `POST /api/v1/tasks` — sign with the local Identity, persist via Store,
@@ -552,4 +588,425 @@ pub async fn cancel_handler(
                 .into_response()
         }
     }
+}
+
+/// Body of `POST /api/v1/tasks/{id}/resume` (5.12). All fields
+/// optional: a bare resume re-runs the plan under its original cap.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResumeRequest {
+    /// Raise (or lower) the plan's cap for the resumed run. Still
+    /// clamped by `[execution] plan_budget_ceiling_usd` at execute
+    /// time — the response reports what actually applies.
+    #[serde(default)]
+    pub max_cost_usd: Option<f64>,
+    /// Resume even when steps were in flight when the plan stopped.
+    /// Those steps were dispatched and their outcome was never
+    /// recorded, so resuming may run them a second time.
+    #[serde(default)]
+    pub allow_in_flight: bool,
+}
+
+/// The unfinished-step lists a stopped plan recorded (5.12).
+struct ResumePoint {
+    /// The original submission, so a resume keeps the caller's
+    /// timeout, failure mode, execution policy, constraints and tags
+    /// (diff review MAJOR-2) instead of silently falling back to
+    /// defaults that fail-fast at 30s.
+    original: Box<Task>,
+    plan: JsonValue,
+    plan_id: harness_core::PlanId,
+    /// The plan ran to completion with nothing left: resuming it would
+    /// re-execute every step and its side effects (Codex P2 on #63).
+    complete: bool,
+    unscheduled: Vec<String>,
+    in_flight: Vec<String>,
+}
+
+/// Read a terminal `plan.execute` row's aggregate and the plan it ran.
+fn resume_point(
+    store: &harness_store::Store,
+    task_id: TaskId,
+) -> Result<ResumePoint, (StatusCode, &'static str)> {
+    let task = match store.load_task(task_id) {
+        Ok(Some(t)) => t,
+        Ok(None) => return Err((StatusCode::NOT_FOUND, "unknown_task")),
+        Err(err) => {
+            tracing::error!(target: "harness.api.tasks", ?err, "load task (resume)");
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "load_failed"));
+        }
+    };
+    if task.capability != "plan.execute" {
+        return Err((StatusCode::CONFLICT, "not_a_plan"));
+    }
+    let plan = task.input.get("plan").cloned().unwrap_or(JsonValue::Null);
+    if !plan.is_object() {
+        return Err((StatusCode::CONFLICT, "plan_missing"));
+    }
+    let aggregate = match store.load_task_result(task_id) {
+        Ok(Some(row)) => row.output.unwrap_or(JsonValue::Null),
+        // No result row: the plan never finished (a crash, or the boot
+        // sweep failed it). Everything the checkpoints do not cover
+        // re-runs, and there is no list to warn about.
+        Ok(None) => JsonValue::Null,
+        Err(err) => {
+            tracing::error!(target: "harness.api.tasks", ?err, "load result (resume)");
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "load_failed"));
+        }
+    };
+    // The aggregate is only ONE source, and not the reliable one
+    // (diff review BLOCKER-1): `drive_plan` returns Err — so the
+    // executor persists an error string and NO aggregate — on exactly
+    // the paths that strand dispatched steps: fail-fast abort,
+    // deadline expiry, "no step succeeded", and a coordinator crash
+    // (no result row at all). The authoritative in-flight source is
+    // the plan's own STEP ROWS: a row exists iff the step was really
+    // dispatched, and a non-terminal one never settled.
+    let ids = |key: &str| -> Vec<String> {
+        aggregate
+            .get("resume")
+            .and_then(|r| r.get(key))
+            .and_then(JsonValue::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(ToString::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let Some(plan_id) = plan
+        .get("id")
+        .and_then(JsonValue::as_str)
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .map(harness_core::PlanId)
+    else {
+        return Err((StatusCode::CONFLICT, "plan_missing"));
+    };
+    // The SAME predicate the checkpoint sweep uses (diff review
+    // MINOR-7): the endpoint refuses to resume exactly the plans whose
+    // checkpoints the sweep deletes, so the two must not drift.
+    let complete = harness_store::aggregate_is_complete(&aggregate);
+    let mut in_flight = ids("in_flight");
+    match store.list_tasks_by_plan(plan_id) {
+        Ok(rows) => {
+            for (row_id, capability, state, _) in rows {
+                if capability == "plan.execute" {
+                    continue;
+                }
+                if matches!(
+                    state,
+                    harness_store::TaskState::Done
+                        | harness_store::TaskState::Failed
+                        | harness_store::TaskState::Cancelled
+                        | harness_store::TaskState::Expired
+                ) {
+                    continue;
+                }
+                let id = format!("{}", row_id.0.as_hyphenated());
+                if !in_flight.contains(&id) {
+                    in_flight.push(id);
+                }
+            }
+        }
+        Err(err) => {
+            tracing::error!(target: "harness.api.tasks", ?err, "list step rows (resume)");
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "load_failed"));
+        }
+    }
+
+    Ok(ResumePoint {
+        original: Box::new(task),
+        plan,
+        plan_id,
+        complete,
+        unscheduled: ids("unscheduled"),
+        in_flight,
+    })
+}
+
+/// Mint the resumed run. Everything but the plan comes from the
+/// ORIGINAL submission (diff review MAJOR-2): `input.timeout_ms` /
+/// `on_failure`, the execution policy, constraints and tags all shape
+/// how a plan runs, and rebuilding a bare request silently downgrades
+/// a 10-minute keep-going run into a 2-minute fail-fast one.
+fn mint_resumed_plan(
+    state: &ApiState,
+    store: &harness_store::Store,
+    point: &ResumePoint,
+    plan_value: JsonValue,
+    replayable: usize,
+) -> axum::response::Response {
+    let mut resumed_input = point.original.input.clone();
+    resumed_input["plan"] = plan_value;
+    let mut tags = point.original.tags.clone();
+    if !tags.iter().any(|t| t == "resume") {
+        tags.push("resume".to_string());
+    }
+    let mint = mint_task_guarded(
+        state,
+        store,
+        SubmitRequest {
+            capability: "plan.execute".to_string(),
+            input: resumed_input,
+            constraints: Some(point.original.constraints.clone()),
+            execution: Some(point.original.execution),
+            tags,
+            resource_hints: Some(point.original.resource_hints.clone()),
+        },
+        // 5.12: the live-run check shares the insert's transaction.
+        Some(point.plan_id),
+    );
+    match mint {
+        Ok(MintOutcome::PlanAlreadyRunning(live_id)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "already_running",
+                "task_id": format!("{}", live_id.0.as_hyphenated()),
+            })),
+        )
+            .into_response(),
+        Ok(MintOutcome::Minted(new_id)) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "task_id": format!("{}", new_id.0.as_hyphenated()),
+                "plan_id": format!("{}", point.plan_id.0.as_hyphenated()),
+                // Checkpoints live on the node that RAN the plan, and a
+                // resumed plan.execute is placed by the scheduler
+                // (Cardinality::Anyone, no pin) — so this counts what
+                // THIS node holds, which may not be where the resumed
+                // run lands (diff review MINOR-4).
+                "replayable_local": replayable,
+                "unscheduled": point.unscheduled,
+                "in_flight": point.in_flight,
+            })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": err })),
+        )
+            .into_response(),
+    }
+}
+
+/// A resume body: absent means "resume as-is", malformed is a 400.
+///
+/// `Option<Json<T>>` cannot express that — in axum 0.7 it turns EVERY
+/// rejection into `None` (diff review MAJOR-1), so a typo'd field
+/// under `deny_unknown_fields` would silently resume at the old cap
+/// and report success.
+fn resume_body(
+    body: Result<Json<ResumeRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<ResumeRequest, axum::response::Response> {
+    match body {
+        Ok(Json(req)) => Ok(req),
+        Err(axum::extract::rejection::JsonRejection::MissingJsonContentType(_)) => {
+            Ok(ResumeRequest::default())
+        }
+        Err(rejection) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "bad_request_body",
+                "detail": rejection.body_text(),
+            })),
+        )
+            .into_response()),
+    }
+}
+
+/// The reasons a resume is refused before anything is minted (5.12).
+fn resume_refusal(point: &ResumePoint, req: &ResumeRequest) -> Option<axum::response::Response> {
+    if point.complete {
+        return Some(
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "nothing_to_resume",
+                    "hint": "this plan finished every step; resuming would re-run all of them",
+                })),
+            )
+                .into_response(),
+        );
+    }
+    if !point.in_flight.is_empty() && !req.allow_in_flight {
+        return Some(
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "steps_in_flight",
+                    "in_flight": point.in_flight,
+                    "hint": "these steps were dispatched and never settled; \
+                             resuming may run them twice — pass allow_in_flight",
+                })),
+            )
+                .into_response(),
+        );
+    }
+    None
+}
+
+/// The id of a non-terminal `plan.execute` row for this plan, if one
+/// exists (5.12) — resuming while a run is live would put two
+/// coordinators on one plan, both minting steps and side effects.
+fn live_plan_run(
+    store: &harness_store::Store,
+    plan_id: harness_core::PlanId,
+) -> Result<Option<TaskId>, (StatusCode, &'static str)> {
+    // `list_tasks_by_plan` yields (id, capability, state, parent).
+    match store.list_tasks_by_plan(plan_id) {
+        Ok(rows) => Ok(rows
+            .iter()
+            .find(|(_, capability, state, _)| {
+                capability == "plan.execute"
+                    && !matches!(
+                        state,
+                        harness_store::TaskState::Done
+                            | harness_store::TaskState::Failed
+                            | harness_store::TaskState::Cancelled
+                            | harness_store::TaskState::Expired
+                    )
+            })
+            .map(|(id, ..)| *id)),
+        Err(err) => {
+            tracing::error!(target: "harness.api.tasks", ?err, "list plan rows (resume)");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "load_failed"))
+        }
+    }
+}
+
+/// Replace a plan's cap for a resumed run, re-signing it with the
+/// local identity (5.12). The plan's signature is not verified at
+/// execute time, but a mutated plan should not carry a stale one.
+/// The raise is still clamped by `[execution] plan_budget_ceiling_usd`
+/// when the plan runs.
+fn raise_plan_cap(
+    state: &ApiState,
+    mut plan_value: JsonValue,
+    cap: f64,
+) -> Result<JsonValue, (StatusCode, &'static str)> {
+    if !cap.is_finite() || cap < 0.0 {
+        return Err((StatusCode::BAD_REQUEST, "bad_max_cost_usd"));
+    }
+    plan_value["budget"] = serde_json::json!({
+        "max_cost_usd": cap,
+        "soft_limit_usd": plan_value
+            .get("budget")
+            .and_then(|b| b.get("soft_limit_usd"))
+            .cloned()
+            .unwrap_or(JsonValue::Null),
+        "on_exceed": plan_value
+            .get("budget")
+            .and_then(|b| b.get("on_exceed"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("cancel")),
+    });
+    match serde_json::from_value::<harness_core::Plan>(plan_value.clone()) {
+        Ok(mut plan) => {
+            // Stamp the signer too, or the artifact verifies against
+            // nobody (diff review MINOR-3).
+            plan.issued_by = state.local_node_id;
+            if let Err(err) = plan.sign(&state.identity) {
+                tracing::error!(target: "harness.api.tasks", ?err, "re-sign plan");
+            }
+            Ok(serde_json::to_value(&plan).unwrap_or(plan_value))
+        }
+        Err(err) => {
+            tracing::warn!(target: "harness.api.tasks", %err, "resume plan re-parse");
+            Err((StatusCode::CONFLICT, "plan_malformed"))
+        }
+    }
+}
+
+/// `POST /api/v1/tasks/{id}/resume` — re-run a stopped plan, replaying
+/// every step whose checkpoint still stands (5.12, ADR-0040).
+///
+/// Mints a NEW `plan.execute` row carrying the SAME plan id, which is
+/// what makes 5.11's checkpoints hit. It cannot re-dispatch the old
+/// row: a plan.execute that ran locally holds no lease, and the boot
+/// orphan sweep marks a crashed one `Failed` — a terminal state with
+/// no outgoing transition.
+pub async fn resume_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id_str): Path<String>,
+    body: Result<Json<ResumeRequest>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    if !is_authenticated(&state.auth, &headers) {
+        return unauthorized();
+    }
+    let Some(store) = state.store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "store_not_configured" })),
+        )
+            .into_response();
+    };
+    let Ok(task_id) = parse_task_id(&id_str) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "bad_task_id" })),
+        )
+            .into_response();
+    };
+    // `Option<Json<T>>` turns EVERY rejection into None (axum 0.7), so
+    // a typo'd or malformed body would silently resume at the old cap
+    // and report success (diff review MAJOR-1). Only a genuinely
+    // absent body defaults.
+    let req = match resume_body(body) {
+        Ok(r) => r,
+        Err(refusal) => return refusal,
+    };
+
+    // 4.7 (ADR-0029): a resume is an authenticated top-level mint, not
+    // a window-bounded internal sub-task — the backlog cap applies
+    // (diff review MINOR-1).
+    if let Some(refusal) = check_admission(store) {
+        return refusal;
+    }
+
+    let point = match resume_point(store, task_id) {
+        Ok(p) => p,
+        Err((code, err)) => {
+            return (code, Json(serde_json::json!({ "error": err }))).into_response()
+        }
+    };
+    let plan_id = point.plan_id;
+
+    // Fast path only: this answers before doing any work, but it is
+    // NOT the guarantee — two concurrent resumes can both pass it.
+    // The authority is the guarded insert below, which checks and
+    // inserts in one transaction (Codex P1 on #63).
+    match live_plan_run(store, plan_id) {
+        Ok(Some(live_id)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "already_running",
+                    "task_id": format!("{}", live_id.0.as_hyphenated()),
+                })),
+            )
+                .into_response()
+        }
+        Ok(None) => {}
+        Err((code, err)) => {
+            return (code, Json(serde_json::json!({ "error": err }))).into_response()
+        }
+    }
+
+    if let Some(refusal) = resume_refusal(&point, &req) {
+        return refusal;
+    }
+
+    let mut plan_value = point.plan.clone();
+    if let Some(cap) = req.max_cost_usd {
+        match raise_plan_cap(&state, plan_value, cap) {
+            Ok(v) => plan_value = v,
+            Err((code, err)) => {
+                return (code, Json(serde_json::json!({ "error": err }))).into_response()
+            }
+        }
+    }
+
+    let replayable = store.checkpoint_count(plan_id).unwrap_or(0);
+    mint_resumed_plan(&state, store, &point, plan_value, replayable)
 }

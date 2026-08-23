@@ -20,7 +20,7 @@ pub mod scopes;
 pub mod tasks;
 
 pub use crate::capabilities::nodes_for_versioned_capability;
-pub use crate::checkpoints::MAX_CHECKPOINT_OUTPUT_BYTES;
+pub use crate::checkpoints::{aggregate_is_complete, MAX_CHECKPOINT_OUTPUT_BYTES};
 pub use crate::error::StoreError;
 pub use crate::leases::{Lease, LeaseId, LeaseState};
 pub use crate::open::{Store, StoreConfig};

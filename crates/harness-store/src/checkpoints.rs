@@ -249,7 +249,7 @@ impl Store {
 /// whose shape we cannot read is treated as INCOMPLETE: keeping
 /// checkpoints costs rows, dropping them costs re-executed side
 /// effects.
-fn aggregate_is_complete(aggregate: &JsonValue) -> bool {
+pub fn aggregate_is_complete(aggregate: &JsonValue) -> bool {
     let zero = |key: &str| aggregate.get(key).and_then(JsonValue::as_u64) == Some(0);
     aggregate.get("status").and_then(JsonValue::as_str) == Some("done")
         && aggregate.get("ok").and_then(JsonValue::as_u64).is_some()

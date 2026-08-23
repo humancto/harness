@@ -2,7 +2,7 @@
 
 use std::str::FromStr;
 
-use harness_core::{NodeId, Signable, Signature, Task, TaskId};
+use harness_core::{NodeId, PlanId, Signable, Signature, Task, TaskId};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -127,6 +127,34 @@ pub struct TaskRow {
     pub plan_id: Option<harness_core::PlanId>,
 }
 
+/// The `tasks` INSERT, shared by the plain and plan-guarded paths so a
+/// new column cannot land in one and not the other (diff review
+/// MINOR-2 on #63).
+fn insert_task_row(
+    c: &rusqlite::Connection,
+    task: &Task,
+    canonical: &[u8],
+    sig: &[u8],
+) -> Result<(), rusqlite::Error> {
+    c.execute(
+        "INSERT INTO tasks (
+            id, parent_id, plan_id, capability, state,
+            issued_by, issued_at, canonical_cbor, signature
+        ) VALUES (?, ?, ?, ?, 'submitted', ?, ?, ?, ?)",
+        params![
+            task.id.0.as_bytes(),
+            task.parent.map(|p| p.0.as_bytes().to_vec()),
+            task.plan_id.map(|p| p.0.as_bytes().to_vec()),
+            task.capability,
+            task.issued_by.as_bytes(),
+            i64::try_from(task.issued_at).unwrap_or(i64::MAX),
+            canonical,
+            sig,
+        ],
+    )
+    .map(|_| ())
+}
+
 impl Store {
     /// Insert a new `Task` in `submitted` state. The full envelope is
     /// canonical-encoded (sig zeroed) and the detached signature is
@@ -141,23 +169,55 @@ impl Store {
             .map_err(|e| StoreError::Cbor(e.to_string()))?;
         let sig = task.sig_field().to_bytes();
         self.with_conn(|c| {
-            c.execute(
-                "INSERT INTO tasks (
-                    id, parent_id, plan_id, capability, state,
-                    issued_by, issued_at, canonical_cbor, signature
-                ) VALUES (?, ?, ?, ?, 'submitted', ?, ?, ?, ?)",
-                params![
-                    task.id.0.as_bytes(),
-                    task.parent.map(|p| p.0.as_bytes().to_vec()),
-                    task.plan_id.map(|p| p.0.as_bytes().to_vec()),
-                    task.capability,
-                    task.issued_by.as_bytes(),
-                    i64::try_from(task.issued_at).unwrap_or(i64::MAX),
-                    bytes,
-                    sig.as_slice(),
-                ],
-            )?;
+            insert_task_row(c, task, &bytes, sig.as_slice())?;
             Ok(())
+        })
+    }
+
+    /// 5.12 (Codex P1 on #63): insert a `plan.execute` row ONLY if no
+    /// non-terminal run of `plan_id` exists — the check and the insert
+    /// in one transaction.
+    ///
+    /// Checking first and inserting after is not enough: two resume
+    /// requests for the same stopped plan can both see "nothing live"
+    /// and both mint a coordinator, and then the DAG runs twice with
+    /// its side effects. Returns the live run's id when it refuses.
+    ///
+    /// # Errors
+    /// Underlying sqlite errors, or a task that cannot be encoded.
+    pub fn insert_task_unless_plan_live(
+        &self,
+        task: &Task,
+        plan_id: PlanId,
+    ) -> Result<Option<TaskId>, StoreError> {
+        let bytes = task
+            .canonical_bytes()
+            .map_err(|e| StoreError::Cbor(e.to_string()))?;
+        let sig = task.sig_field().to_bytes();
+        self.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            let live: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT id FROM tasks
+                      WHERE plan_id = ?1
+                        AND capability = 'plan.execute'
+                        AND state NOT IN ('done', 'failed', 'cancelled', 'expired')
+                      LIMIT 1",
+                    params![plan_id.0.as_bytes()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(raw) = live {
+                // A malformed id blob must not report the NEW task's
+                // id as the live run (diff review MINOR-2).
+                let Ok(bytes16) = <[u8; 16]>::try_from(raw.as_slice()) else {
+                    return Err(StoreError::Cbor("malformed task id in tasks.id".into()));
+                };
+                return Ok(Some(TaskId(uuid::Uuid::from_bytes(bytes16))));
+            }
+            insert_task_row(&tx, task, &bytes, sig.as_slice())?;
+            tx.commit()?;
+            Ok(None)
         })
     }
 
@@ -711,6 +771,74 @@ mod tests {
         };
         t.sign(id).expect("sign");
         t
+    }
+
+    /// 5.12 (diff review MAJOR-3): the guarded insert is where the
+    /// resume idempotence guarantee actually lives — the endpoint's
+    /// up-front check is only a fast path — so it is pinned HERE, at
+    /// the store, not through an HTTP test whose handler has no await
+    /// point to interleave on.
+    #[test]
+    fn insert_task_unless_plan_live_refuses_while_a_run_is_live() {
+        let s = Store::open_memory().expect("open");
+        let id = Identity::generate();
+        let plan = harness_core::PlanId(uuid::Uuid::now_v7());
+
+        let mut first = signed_task(&id);
+        first.capability = "plan.execute".into();
+        first.plan_id = Some(plan);
+        first.sign(&id).expect("sign");
+        assert_eq!(
+            s.insert_task_unless_plan_live(&first, plan)
+                .expect("insert"),
+            None,
+            "nothing live yet"
+        );
+
+        // A second coordinator for the same plan is refused, and the
+        // refusal names the run that already holds it.
+        let mut second = signed_task(&id);
+        second.capability = "plan.execute".into();
+        second.plan_id = Some(plan);
+        second.sign(&id).expect("sign");
+        assert_eq!(
+            s.insert_task_unless_plan_live(&second, plan)
+                .expect("insert"),
+            Some(first.id)
+        );
+        assert!(
+            s.load_task(second.id).expect("load").is_none(),
+            "the refused task is not inserted"
+        );
+
+        // Terminal runs do not block: that is the resume case.
+        for next in [
+            TaskState::Dispatched,
+            TaskState::Claimed,
+            TaskState::Running,
+            TaskState::Done,
+        ] {
+            s.transition_task(first.id, next).expect("hop");
+        }
+        assert_eq!(
+            s.insert_task_unless_plan_live(&second, plan)
+                .expect("insert"),
+            None,
+            "a finished run is not a live one"
+        );
+        assert!(s.load_task(second.id).expect("load").is_some());
+
+        // Another plan's live run is irrelevant.
+        let other_plan = harness_core::PlanId(uuid::Uuid::now_v7());
+        let mut third = signed_task(&id);
+        third.capability = "plan.execute".into();
+        third.plan_id = Some(other_plan);
+        third.sign(&id).expect("sign");
+        assert_eq!(
+            s.insert_task_unless_plan_live(&third, other_plan)
+                .expect("insert"),
+            None
+        );
     }
 
     #[test]
