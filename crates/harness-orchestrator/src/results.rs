@@ -72,6 +72,49 @@ where
     }
 }
 
+/// Detach a [`TaskResultStream`] behind a bounded channel — the
+/// spawned-driver + bounded-mpsc bridge ADR-0024 deferred until a
+/// detached consumer existed (first consumer: the 4.5 federated
+/// coordinator). Returns the driver future — the CALLER spawns it, so
+/// this crate stays runtime-agnostic — and the receiving stream.
+///
+/// Backpressure is the bounded channel: the driver's `send` awaits
+/// when the consumer lags. Dropping the receiver aborts the fan-out
+/// (the driver drops the inner stream — Drop-cancel) and the driver
+/// always resolves to the recovered mapper.
+pub fn into_channel<I, O, M>(
+    stream: TaskResultStream<I, O, M>,
+    capacity: usize,
+) -> (
+    futures::future::BoxFuture<'static, M>,
+    tokio_stream::wrappers::ReceiverStream<TaskResult>,
+)
+where
+    I: Send + 'static,
+    O: Send + 'static,
+    M: ResultMapper<O> + Unpin + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel(capacity.max(1));
+    let driver = Box::pin(async move {
+        let mut stream = stream;
+        loop {
+            match futures::StreamExt::next(&mut stream).await {
+                Some(item) => {
+                    if tx.send(item).await.is_err() {
+                        // Receiver dropped: abandon the fan-out
+                        // (in-flight runner futures are Drop-cancelled
+                        // with the inner stream inside into_mapper).
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+        stream.into_mapper()
+    }) as futures::future::BoxFuture<'static, M>;
+    (driver, tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
 /// The stream returned by [`task_results`]. All fields `Unpin`.
 pub struct TaskResultStream<I, O, M> {
     inner: FanoutStream<I, O>,
@@ -364,5 +407,79 @@ mod tests {
         for tx in gates.lock().drain(..) {
             assert!(tx.send(ItemOutcome::Ok(0)).is_err(), "in-flight cancelled");
         }
+    }
+
+    #[tokio::test]
+    async fn t06_into_channel_delivers_and_recovers_mapper() {
+        let (spec, gates) = gated_spec(3, 3);
+        let mapper = RecordingMapper {
+            items: vec![],
+            ended: 0,
+        };
+        let stream = task_results(FanoutController::stream(spec), ctx_for(Some(3)), mapper);
+        let (driver, mut rx) = into_channel(stream, 3);
+        let handle = tokio::spawn(driver);
+        // The driver populates the gates only once polled — wait for it.
+        for _ in 0..10_000 {
+            if gates.lock().len() == 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        for tx in gates.lock().drain(..) {
+            tx.send(ItemOutcome::Ok(7)).expect("send");
+        }
+        let mut got = 0;
+        while let Some(r) = futures::StreamExt::next(&mut rx).await {
+            let _ = partial(r);
+            got += 1;
+        }
+        assert_eq!(got, 4, "3 items + summary through the channel");
+        let mapper = handle.await.expect("join");
+        assert_eq!(mapper.items.len(), 3);
+        assert_eq!(mapper.ended, 1);
+    }
+
+    #[tokio::test]
+    async fn t07_into_channel_receiver_drop_cancels_fanout() {
+        let (spec, gates) = gated_spec(10, 4);
+        let mapper = RecordingMapper {
+            items: vec![],
+            ended: 0,
+        };
+        let stream = task_results(FanoutController::stream(spec), ctx_for(Some(10)), mapper);
+        let (driver, rx) = into_channel(stream, 1);
+        let handle = tokio::spawn(driver);
+        // Let the fan-out pull its window, then drop the consumer.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(gates.lock().len(), 4, "window in flight");
+        // Complete one item so the driver's send hits a dropped receiver.
+        drop(rx);
+        let tx0 = gates.lock().remove(0);
+        tx0.send(ItemOutcome::Ok(0)).expect("send");
+        let mapper = handle.await.expect("driver resolves after abort");
+        // In-flight gates were dropped with the stream: sends now fail.
+        for tx in gates.lock().drain(..) {
+            assert!(tx.send(ItemOutcome::Ok(0)).is_err(), "cancelled");
+        }
+        assert!(mapper.items.len() <= 1);
+    }
+
+    #[tokio::test]
+    async fn t08_into_channel_empty_source() {
+        let (spec, _gates) = gated_spec(0, 2);
+        let mapper = RecordingMapper {
+            items: vec![],
+            ended: 0,
+        };
+        let stream = task_results(FanoutController::stream(spec), ctx_for(Some(0)), mapper);
+        let (driver, mut rx) = into_channel(stream, 1);
+        let handle = tokio::spawn(driver);
+        let first = futures::StreamExt::next(&mut rx).await.expect("summary");
+        assert_eq!(partial(first).progress, 1.0);
+        assert!(futures::StreamExt::next(&mut rx).await.is_none());
+        assert_eq!(handle.await.expect("join").ended, 1);
     }
 }

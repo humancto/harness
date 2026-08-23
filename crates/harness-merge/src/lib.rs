@@ -210,7 +210,12 @@ pub fn merge(strategy: &MergeStrategy, inputs: &[NodeOutput]) -> Result<Merged, 
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, clippy::float_cmp)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::float_cmp
+)]
 mod tests {
     use super::*;
 
@@ -247,7 +252,10 @@ mod tests {
         let m = merge(
             &MergeStrategy::Dedupe { key: "id".into() },
             &[
-                node(1, json!({"items": [{"id": "x", "from": 1}, {"nokey": true}]})),
+                node(
+                    1,
+                    json!({"items": [{"id": "x", "from": 1}, {"nokey": true}]}),
+                ),
                 node(2, json!({"items": [{"id": "x", "from": 2}, {"id": "y"}]})),
             ],
         )
@@ -267,7 +275,10 @@ mod tests {
             },
             &[
                 node(1, json!({"items": [{"n": "low", "score": 1.0}]})),
-                node(2, json!({"items": [{"n": "hi", "score": 9.0}, {"n": "mid", "score": 5.0}]})),
+                node(
+                    2,
+                    json!({"items": [{"n": "hi", "score": 9.0}, {"n": "mid", "score": 5.0}]}),
+                ),
             ],
         )
         .expect("merge");
@@ -360,7 +371,9 @@ mod tests {
 
     #[test]
     fn t07_truncation_reported_and_accounted() {
-        let big: Vec<JsonValue> = (0..(MAX_MERGE_ITEMS + 5)).map(|i| json!({"i": i})).collect();
+        let big: Vec<JsonValue> = (0..(MAX_MERGE_ITEMS + 5))
+            .map(|i| json!({"i": i}))
+            .collect();
         let m = merge(&MergeStrategy::Concat, &[node(1, json!({"items": big}))]).expect("merge");
         assert_eq!(m.output["items"].as_array().unwrap().len(), MAX_MERGE_ITEMS);
         assert_eq!(m.truncated_items, 5);

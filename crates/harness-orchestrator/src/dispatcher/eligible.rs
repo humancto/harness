@@ -96,6 +96,15 @@ impl Dispatcher {
                 })
             }
             Cardinality::Federated { .. } => {
+                // 4.5 (ADR-0027): a pinned federated task is a federated
+                // SUB-task (or an operator pin) — it must EXECUTE on the
+                // pin, not re-coordinate, or every sub-task would
+                // recursively fan out. Anyone/Owner pin behavior is
+                // untouched. `apply_constraints` already narrowed
+                // candidates to the pin.
+                if let Some(pin) = task.constraints.pin_to_node {
+                    return Ok(DispatchPlan::Single { node: pin });
+                }
                 candidates.sort();
                 Ok(DispatchPlan::Federated { nodes: candidates })
             }
@@ -927,5 +936,39 @@ mod scored_tests {
             picks.windows(2).all(|w| w[0] != w[1]),
             "tie band alternates: {picks:?}"
         );
+    }
+
+    #[test]
+    fn s07_pinned_federated_routes_single_to_pin() {
+        // 4.5 (ADR-0027): federated sub-tasks are pinned and must
+        // EXECUTE, not re-coordinate.
+        let (d, live) = build3();
+        let mut t = task_for("echo");
+        let pin = NodeId::from_bytes([2; 16]);
+        t.constraints.pin_to_node = Some(pin);
+        let fed = harness_core::Cardinality::Federated {
+            merge: harness_core::protocol::MergeStrategy::Concat,
+            on_node_failure: harness_core::PartialPolicy::ReturnPartial,
+        };
+        match d.eligible(&t, &fed, &live).unwrap() {
+            DispatchPlan::Single { node } => assert_eq!(node, pin),
+            other => panic!("must be Single: {other:?}"),
+        }
+        // Unpinned federated still fans out to all.
+        let t = task_for("echo");
+        match d.eligible(&t, &fed, &live).unwrap() {
+            DispatchPlan::Federated { nodes } => assert_eq!(nodes.len(), 3),
+            other => panic!("must be Federated: {other:?}"),
+        }
+        // Anyone + pin is untouched (regression).
+        let mut t = task_for("echo");
+        t.constraints.pin_to_node = Some(pin);
+        match d
+            .eligible(&t, &harness_core::Cardinality::Anyone, &live)
+            .unwrap()
+        {
+            DispatchPlan::Single { node } => assert_eq!(node, pin),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }
