@@ -5,6 +5,8 @@
 //! nothing validates) and converts the message into a Task/Plan
 //! submission via the shared mint path in `routes::tasks`.
 
+pub mod conversation;
+pub mod sms;
 pub mod twilio;
 pub mod whatsapp;
 
