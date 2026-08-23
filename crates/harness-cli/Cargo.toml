@@ -16,6 +16,10 @@ harness-core = { workspace = true }
 futures      = { workspace = true }
 harness-mesh = { workspace = true }
 anyhow       = { workspace = true }
+# 5.7 (ADR-0035): shortcut-token issuance against the encrypted vault.
+harness-vault = { workspace = true }
+hex           = { workspace = true }
+rand          = { workspace = true }
 tracing      = { workspace = true }
 serde_json   = { workspace = true }
 reqwest      = { workspace = true }

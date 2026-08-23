@@ -182,6 +182,28 @@ pub struct AdminArgs {
 pub enum AdminCommand {
     /// Set (or replace) the admin password. Prompts via stdin (no echo).
     SetPassword(AdminSetPasswordArgs),
+    /// Mint a signed JSON token for the iOS Shortcuts adapter (5.7,
+    /// ADR-0035). Generates and stores the vault signing key on first
+    /// use.
+    IssueShortcutToken(IssueShortcutTokenArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct IssueShortcutTokenArgs {
+    /// Audit label baked into the token (1..=64 printable ASCII,
+    /// e.g. "archys-phone"). Shows up in the adapter's accept logs.
+    #[arg(long)]
+    pub sub: String,
+    /// Token lifetime in days.
+    #[arg(long, default_value = "90")]
+    pub ttl_days: u64,
+    /// Mint a token that never expires (overrides --ttl-days).
+    /// Revocation is then only by rotating the signing key, which
+    /// revokes EVERY token at once.
+    #[arg(long)]
+    pub no_expiry: bool,
+    #[arg(long)]
+    pub root: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -410,7 +432,86 @@ fn cmd_leave(args: LeaveArgs) -> Result<String> {
 fn cmd_admin(args: AdminArgs) -> Result<String> {
     match args.command {
         AdminCommand::SetPassword(a) => cmd_admin_set_password(a),
+        AdminCommand::IssueShortcutToken(a) => cmd_admin_issue_shortcut_token(&a),
     }
+}
+
+/// Mint a Shortcuts bearer token against the vault signing key,
+/// generating the key on first use (ADR-0035). Runs entirely locally:
+/// the vault key derives from the node identity, so no daemon or
+/// password is needed — but the DAEMON holds a startup snapshot of
+/// the vault, so a freshly generated key needs a daemon restart (or
+/// `HARNESS_SECRET_SHORTCUTS_SIGNING_KEY` in its environment).
+fn cmd_admin_issue_shortcut_token(args: &IssueShortcutTokenArgs) -> Result<String> {
+    use harness_vault::shortcuts_token::{mint_token, parse_signing_key, SHORTCUTS_KEY_TAG};
+    use harness_vault::SecretsStore as _;
+
+    let root = resolve_root(args.root.clone())?;
+    let id =
+        identity::load(&root).context("load identity (run `harness init` on this node first)")?;
+    let vault_key = harness_vault::derive_vault_key(&id.to_secret_bytes());
+    let enc_path = root.join("secrets.enc");
+    let legacy_path = root.join("secrets.toml");
+    let (mut vault, _origin) =
+        harness_vault::EncryptedStore::open_with_migration(&enc_path, &legacy_path, &vault_key)
+            .context("open encrypted vault")?;
+
+    // Reuse an existing key (env override included — same precedence
+    // the daemon reads with); generate + persist only when absent
+    // everywhere.
+    let (key_hex, generated) = if let Some(v) = vault.get(SHORTCUTS_KEY_TAG) {
+        (
+            String::from_utf8(v.as_bytes().to_vec())
+                .map_err(|_| anyhow::anyhow!("value at {SHORTCUTS_KEY_TAG} is not UTF-8"))?,
+            false,
+        )
+    } else {
+        let mut key_bytes = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key_bytes);
+        let hex = hex::encode(key_bytes);
+        vault
+            .upsert(&enc_path, &vault_key, SHORTCUTS_KEY_TAG, &hex)
+            .context("persist generated signing key")?;
+        (hex, true)
+    };
+    let key = parse_signing_key(&key_hex)
+        .map_err(|e| anyhow::anyhow!("signing key at {SHORTCUTS_KEY_TAG}: {e}"))?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let exp = if args.no_expiry {
+        None
+    } else {
+        Some(now + args.ttl_days.saturating_mul(86_400))
+    };
+    let token =
+        mint_token(&key, &args.sub, now, exp).map_err(|e| anyhow::anyhow!("mint token: {e}"))?;
+
+    let expiry_line = match exp {
+        Some(_) => format!("Expires:  in {} days (re-issue after that)", args.ttl_days),
+        None => "Expires:  never (revoke by rotating the signing key)".to_string(),
+    };
+    let restart_note = if generated {
+        "\nNOTE: a NEW signing key was generated and stored in the vault.\n\
+         The daemon reads the vault at startup — restart it to activate\n\
+         this adapter (or set HARNESS_SECRET_SHORTCUTS_SIGNING_KEY in the\n\
+         daemon's environment).\n"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "Shortcut token for \"{}\":\n\n{token}\n\n{expiry_line}\n{restart_note}\n\
+         iOS Shortcut recipe (two actions):\n\
+         1. Text                — the goal (or Dictate Text)\n\
+         2. Get Contents of URL — POST http://<node>:19198/webhook/shortcuts\n\
+            Headers: Authorization = Bearer <token above>\n\
+            Request Body (JSON): {{\"goal\": <Text variable>}}\n\
+            Then: Show Result (the \"reply\" field)\n\n\
+         Off-LAN use requires TLS termination in front of the daemon —\n\
+         this token is a static bearer credential (see ADR-0035).",
+        args.sub,
+    ))
 }
 
 fn cmd_admin_set_password(args: AdminSetPasswordArgs) -> Result<String> {
@@ -748,5 +849,56 @@ mod tests {
         .expect("leave");
         assert!(out.contains("Phase 6"));
         assert!(out.contains("rm -rf"));
+    }
+
+    #[test]
+    fn issue_shortcut_token_generates_then_reuses_key() {
+        use harness_vault::shortcuts_token::{verify_token, SHORTCUTS_KEY_TAG};
+        use harness_vault::SecretsStore as _;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        identity::init_or_load(&root).expect("identity");
+        let args = |sub: &str| IssueShortcutTokenArgs {
+            sub: sub.to_string(),
+            ttl_days: 30,
+            no_expiry: false,
+            root: Some(root.clone()),
+        };
+
+        // First issue generates + persists the signing key and says so.
+        let out1 = cmd_admin_issue_shortcut_token(&args("phone-a")).expect("issue 1");
+        assert!(out1.contains("NEW signing key"), "{out1}");
+        let id = identity::load(&root).expect("load id");
+        let vault_key = harness_vault::derive_vault_key(&id.to_secret_bytes());
+        let (vault, _) = harness_vault::EncryptedStore::open_with_migration(
+            &root.join("secrets.enc"),
+            &root.join("secrets.toml"),
+            &vault_key,
+        )
+        .expect("vault");
+        let key_hex = vault.get(SHORTCUTS_KEY_TAG).expect("key persisted");
+        let key = harness_vault::shortcuts_token::parse_signing_key(
+            std::str::from_utf8(key_hex.as_bytes()).expect("utf8"),
+        )
+        .expect("valid key");
+
+        // Second issue REUSES the key (no restart note) and the token
+        // verifies against the stored key with the right claims.
+        let out2 = cmd_admin_issue_shortcut_token(&args("phone-b")).expect("issue 2");
+        assert!(!out2.contains("NEW signing key"), "{out2}");
+        let token = out2
+            .lines()
+            .find(|l| l.contains('.') && !l.contains(' '))
+            .expect("token line")
+            .trim();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let payload = verify_token(&key, token, now).expect("verifies");
+        assert_eq!(payload.sub, "phone-b");
+        let exp = payload.exp.expect("ttl set");
+        assert!(exp > now + 29 * 86_400 && exp <= now + 30 * 86_400 + 60);
     }
 }

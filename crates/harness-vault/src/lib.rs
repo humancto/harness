@@ -48,6 +48,7 @@
 
 pub mod encrypted;
 pub mod error;
+pub mod shortcuts_token;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

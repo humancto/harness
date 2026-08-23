@@ -49,6 +49,14 @@ pub fn router(state: ApiState) -> Router {
             "/webhook/sms",
             axum::routing::post(routes::webhook::sms::sms_handler),
         )
+        .route(
+            "/webhook/shortcuts",
+            axum::routing::post(routes::webhook::shortcuts::shortcuts_handler),
+        )
+        .route(
+            "/webhook/shortcuts/result/:id",
+            axum::routing::get(routes::webhook::shortcuts::shortcuts_result_handler),
+        )
         .with_state(state);
     Router::new()
         .nest("/api/v1", api)
