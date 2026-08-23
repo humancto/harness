@@ -48,6 +48,19 @@ fn t01_prd_example_round_trips() {
     assert!((p.planning.confidence_threshold - 0.7).abs() < f64::EPSILON);
     assert_eq!(p.planning.default_max_cost_usd, Some(1.0));
     assert!(p.planning.prefer_local_models.is_empty());
+    // 5.2 field absent → default model applies.
+    assert_eq!(p.planning.cloud_planner_model, "claude-sonnet-5");
+}
+
+#[test]
+fn t01e_planning_cloud_planner_model_round_trips() {
+    let toml = r#"
+[planning]
+allow_cloud_escalation = true
+cloud_planner_model = "claude-opus-5"
+"#;
+    let p = load_from_str(toml).expect("5.2 planning field parses");
+    assert_eq!(p.planning.cloud_planner_model, "claude-opus-5");
 }
 
 #[test]
