@@ -619,10 +619,19 @@ async fn m06_mesh_info_federates_with_provenance_and_frames() {
         Some(b.node_id()),
         10_000,
     );
-    let state =
-        wait_for_state(&a.store, pinned, &[TaskState::Done], Duration::from_secs(20)).await;
+    let state = wait_for_state(
+        &a.store,
+        pinned,
+        &[TaskState::Done],
+        Duration::from_secs(20),
+    )
+    .await;
     assert_eq!(state, TaskState::Done);
-    let row = a.store.load_task_result(pinned).expect("load").expect("row");
+    let row = a
+        .store
+        .load_task_result(pinned)
+        .expect("load")
+        .expect("row");
     let output = row.output.expect("output");
     let items = output["items"].as_array().expect("items");
     assert_eq!(items.len(), 1, "pinned: executes on B alone: {output:#}");
@@ -652,7 +661,11 @@ async fn m07_mesh_info_node_death_returns_partial_with_failed_provenance() {
 
     let id = submit_task(&a, "mesh.info", serde_json::json!({}), None, 30_000);
     let state = wait_for_state(&a.store, id, &[TaskState::Done], Duration::from_secs(45)).await;
-    assert_eq!(state, TaskState::Done, "ReturnPartial: A's item still merges");
+    assert_eq!(
+        state,
+        TaskState::Done,
+        "ReturnPartial: A's item still merges"
+    );
 
     let row = a.store.load_task_result(id).expect("load").expect("row");
     let output = row.output.expect("output");
@@ -670,7 +683,10 @@ async fn m07_mesh_info_node_death_returns_partial_with_failed_provenance() {
         .find(|c| c.node_id == b_id)
         .expect("B in provenance");
     assert!(
-        !matches!(b_contribution.status, harness_core::protocol::NodeStatus::Ok),
+        !matches!(
+            b_contribution.status,
+            harness_core::protocol::NodeStatus::Ok
+        ),
         "B must be non-Ok: {provenance:?}"
     );
     let a_contribution = provenance

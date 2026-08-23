@@ -1,7 +1,7 @@
 # Harness Implementation State
 
 **Current phase:** 4 — Distribution patterns (Phase 3 COMPLETE as of #42)
-**Last updated:** 2026-08-22 (post-3.2-stream, Phase 3 rollover)
+**Last updated:** 2026-08-23 (post-4.5 federated lifecycle)
 
 ## Phase 3 summary (post-merge) — COMPLETE
 
@@ -121,6 +121,20 @@ These will land alongside their natural Phase 3 home, not as a "phase 2.10":
 
 | #47 | 4.4  | Resource-aware scheduler (ADR-0026): pure `fit_score` (hard gates for impossibilities only; soft floored pressure — saturation never fails a task), `eligible_scored` argmax + RR tie-band (equal fleets keep the exact RR sequence), `StoreLoadView` (heartbeat ∪ store counts ∪ same-poll reservations, max-composed), `SuccessTracker` EWMA fed remote + local + expiry + send-fail, truthful heartbeat `queue_depth`, ResourceGated-waits-not-fails, fresh-first batches (risk 10), `ExecutionPolicy::clamped` + submit `resource_hints` (risk 12), `known_capabilities` liveness (4.3 carry). +23 tests |
 
+| #48 | 4.5  | Federated lifecycle (ADR-0027): `FederatedCoordinator` — atomic `submitted→running(self)` claim (`try_start_coordination`, executor can never double-claim), ≤8 coordinations/daemon (no slot = stays Submitted, queueing never failure), ≤64-node fan-out over the 4.1 controller with remaining-budget timeouts, driven through the 4.2 `into_channel` bounded-mpsc bridge (its first detached consumer), stage/streaming frames on the partial pipe; pure `harness-merge` engine (Concat/Dedupe first-wins/TopK stable/Rerank→TopK degradation/Aggregate, items convention, 10k reported truncation); merge-time policy semantics (FailFast=unsettled Skipped; Wait=all-or-Failed with flattened per-node errors; ReturnPartial=`merge.failures` block); provenance persisted (V0006 `task_results.provenance`) → `FinalResult.provenance` (zero wire changes) → `GET /tasks/:id` + types.ts; `ExecutionClass::{Work,Coordination}` + 16 coord permits close the ADR-0022 wedge (peek-skip keeps Work polls live); Federated+pin ⇒ `Single` (sub-tasks execute, never re-coordinate — also the mixed-version path); first federated built-in `mesh.info`; m06/m07 money tests. +40 tests |
+
+4.5 review round 1 (plan): REVISE, all adopted pre-implementation — BLOCKER-1: coordinator
+claims the parent with one atomic `submitted→running(self)` UPDATE (never observable at
+`Dispatched`, executor can't double-claim; race regression f07); MAJOR-1: per-node error
+text homes (Failed = flattened bounded error string; ReturnPartial-Done = `merge.failures`
+block); MAJOR-2: coordination peek-skip filters before consuming batch slots and uses
+`try_acquire_owned` (no TOCTOU). Scope cut: commit 6 (ExecutionContext FrameSink
+promotion, ~37 sites, zero functional dependency) moved to 4.6's first commit.
+**Carried (ADR-0027): leaseless-Running parent orphan until 4.6's sweep; retry-aware Wait
+needs 4.6 backoff; federated fan-outs are pressure-blind (bypass `eligible_scored`);
+coordinator self-load double-count; `must_be_local` still the Phase-2 stub for every
+cardinality.**
+
 4.4 review round 1 (plan): BLOCKER fixed pre-implementation — pressure is soft-floored and
 ResourceGated is exempt from the eligibility terminal window (saturation = queueing, never
 failure); local terminals feed the success EWMA (self-bias fix); heterogeneous-capacity
@@ -150,10 +164,11 @@ consumers (WS, CLI) don't suppress reborn frames under >256 concurrent tasks.
 
 ## Phase 4 — next up
 
-Spine is sequential: ~~4.1 FanoutController~~ → **4.2 result streams** → 4.3 DAG executor →
-4.4 resource-aware scheduler → 4.5 federated lifecycle (owes the ADR-0022 permit-release
-fix) → 4.6 lease extension/retry backoff (owes carried risks 9/10) → 4.7 backpressure
-tests → 4.8 UI DAG viz. Phase-4-owned obligations from below: risks 2 (drop-guard), 9
+Spine is sequential: ~~4.1~~ → ~~4.2~~ → ~~4.3~~ → ~~4.4~~ → ~~4.5 federated lifecycle~~
+(ADR-0022 permit wedge CLOSED via ExecutionClass) → **4.6 lease extension/retry backoff**
+(owes carried risks 9/10, the leaseless-Running orphan sweep, retry-aware Wait, and the
+ExecutionContext FrameSink promotion cut from 4.5) → 4.7 backpressure tests → 4.8 UI DAG
+viz (provenance + federated-stage types shipped in 4.5). Phase-4-owned obligations from below: risks 2 (drop-guard), 9
 (send-failure backoff → 4.6), 10 (dispatch head-of-line → 4.4), 11 (unknown-capability
 fast-fail), 12 (`SubmitRequest.execution` clamps → 4.4).
 

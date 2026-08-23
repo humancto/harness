@@ -130,10 +130,7 @@ mod tests {
         assert_eq!(items[0]["node_name"], "laptop-a");
         assert_eq!(items[0]["os"], std::env::consts::OS);
         assert_eq!(items[0]["arch"], std::env::consts::ARCH);
-        assert_eq!(
-            items[0]["node_id"],
-            NodeId::from_bytes([1; 16]).to_string()
-        );
+        assert_eq!(items[0]["node_id"], NodeId::from_bytes([1; 16]).to_string());
     }
 
     #[test]
