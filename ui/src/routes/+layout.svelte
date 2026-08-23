@@ -24,6 +24,9 @@
         <a href="/shell" class="text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100">
           shell
         </a>
+        <a href="/costs" class="text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100">
+          costs
+        </a>
       </nav>
     </div>
   </header>

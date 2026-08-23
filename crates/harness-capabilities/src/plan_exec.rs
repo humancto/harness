@@ -65,6 +65,14 @@ pub trait PlanExec: Send + Sync + 'static {
     /// Live mesh size (self included) for the 2×N window.
     fn live_workers(&self) -> usize;
 
+    /// 5.10 (ADR-0038): has the plan.execute task ITSELF been
+    /// cancelled? Checked once per step completion — the stop button
+    /// stops new step mints at the next completion boundary. Default
+    /// `false` (harness-api's validation-only context has no store).
+    fn own_cancelled(&self, _id: TaskId) -> bool {
+        false
+    }
+
     /// Full capability entries — id, version, `input_schema` — from the
     /// local registry ∪ stored manifests. Entry validation builds its
     /// schema index from this union (ADR-0025), so remote-only
@@ -563,6 +571,18 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
                             }
                         }
                     }
+                    // 5.10 (ADR-0038): the stop button. The plan's
+                    // own row was cancelled — stop minting at this
+                    // completion boundary, exactly like a budget
+                    // Cancel (stranded steps settle Skipped below).
+                    // A cancel landing AFTER a budget Pause/Cancel
+                    // fired keeps the budget status label — no extra
+                    // minting either way, only the aggregate's
+                    // `status` string differs (diff review m2).
+                    if budget_stop.is_none() && exec.own_cancelled(ctx.task_id) {
+                        budget_stop = Some("cancelled");
+                        break;
+                    }
                     if fatal && fail_fast {
                         aborted = true;
                         break;
@@ -956,6 +976,8 @@ mod tests {
         non_terminal: AtomicUsize,
         peak: AtomicUsize,
         workers: usize,
+        /// 5.10: simulates the plan.execute row being cancelled.
+        cancelled: std::sync::atomic::AtomicBool,
     }
 
     impl FakePlanExec {
@@ -967,6 +989,7 @@ mod tests {
                 non_terminal: AtomicUsize::new(0),
                 peak: AtomicUsize::new(0),
                 workers,
+                cancelled: std::sync::atomic::AtomicBool::new(false),
             })
         }
     }
@@ -1018,6 +1041,9 @@ mod tests {
         }
         fn live_workers(&self) -> usize {
             self.workers
+        }
+        fn own_cancelled(&self, _id: TaskId) -> bool {
+            self.cancelled.load(Ordering::SeqCst)
         }
         fn known_capabilities(&self) -> Vec<ManifestEntry> {
             vec![echo_entry()]
@@ -1757,5 +1783,31 @@ mod tests {
         assert_eq!(out["budget"]["triggered"], true);
         assert_eq!(out["failed"], 1);
         assert!(out["budget"].get("unscheduled").is_none());
+    }
+    #[tokio::test]
+    async fn e10_cancelled_plan_stops_minting_at_the_next_completion() {
+        // 5.10 (ADR-0038, plan review B1): the stop button. The
+        // plan.execute row is cancelled from the start — after the
+        // FIRST step completes, the loop must break: no further
+        // submits, stranded steps Skipped, status "cancelled".
+        let ids = sorted_ids(3);
+        let (a, b, c_id) = (ids[0], ids[1], ids[2]);
+        let exec = FakePlanExec::new(1, 100);
+        exec.cancelled.store(true, Ordering::SeqCst);
+        let cap = PlanExecCapability::new(exec.clone());
+        let c = ctx();
+        let input = json!({ "plan": plan_json(
+            vec![node_of(a, json!({})), node_of(b, json!({})), node_of(c_id, json!({}))],
+            vec![(b, a), (c_id, b)],
+        )});
+        let out = cap.execute(&c, input).await.expect("Ok aggregate");
+        assert_eq!(out["status"], "cancelled");
+        assert_eq!(out["ok"], 1, "only the in-flight first step finished");
+        assert_eq!(out["skipped"], 2);
+        assert_eq!(
+            exec.submits.lock().len(),
+            1,
+            "no further mints after cancel"
+        );
     }
 }

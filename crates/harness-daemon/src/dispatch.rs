@@ -296,6 +296,73 @@ pub(crate) struct DispatchRuntime {
 }
 
 impl DispatchRuntime {
+    /// Issuer side: persist an accepted Ok result — gated on the task
+    /// terminal CAS (diff review M1 on #61, see `finish_local_row`).
+    fn ingest_done(&self, from: NodeId, msg: &TaskResultMsg) {
+        let task_id = msg.result.task_id;
+        let now = msg.result.finished_at;
+        if !self.finish_local_row(task_id, TaskState::Done) {
+            tracing::info!(
+                target: "harness.dispatch",
+                task = %task_id.0,
+                "terminal CAS lost (remote result) — row already terminal, dropping"
+            );
+            return;
+        }
+        if let Err(e) = self
+            .store
+            .write_task_result_done(task_id, &msg.result.output, now, from)
+        {
+            tracing::warn!(target: "harness.dispatch", ?e, "write remote result");
+        }
+        self.persist_ingested_cost(task_id, &msg.result.output);
+        let preview = serde_json::to_vec(&msg.result.output)
+            .ok()
+            .map(|v| v.into_iter().take(256).collect());
+        // Worker is the LWW source (R15) with its timestamps.
+        let _ = self.store.replica_apply_local(&ReplicatedTaskState {
+            task_id,
+            state: ReplicatedState::Done,
+            at_ms: now,
+            source: from,
+            output_preview: preview,
+        });
+    }
+
+    /// Issuer side: persist an accepted failure — same CAS gate.
+    fn ingest_failed(&self, from: NodeId, msg: &TaskResultMsg) {
+        let task_id = msg.result.task_id;
+        let now = msg.result.finished_at;
+        let err_msg = msg
+            .result
+            .output
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("remote execution failed")
+            .to_string();
+        if !self.finish_local_row(task_id, TaskState::Failed) {
+            tracing::info!(
+                target: "harness.dispatch",
+                task = %task_id.0,
+                "terminal CAS lost (remote failure) — row already terminal, dropping"
+            );
+            return;
+        }
+        if let Err(e) = self
+            .store
+            .write_task_result_failed(task_id, &err_msg, now, from)
+        {
+            tracing::warn!(target: "harness.dispatch", ?e, "write remote failure");
+        }
+        let _ = self.store.replica_apply_local(&ReplicatedTaskState {
+            task_id,
+            state: ReplicatedState::Failed,
+            at_ms: now,
+            source: from,
+            output_preview: Some(err_msg.into_bytes().into_iter().take(256).collect()),
+        });
+    }
+
     /// 5.9 (ADR-0037): issuer-side cost gate — judged against the
     /// ISSUER'S OWN local manifest (same binary, same first-party
     /// hints), never the worker's gossiped announcement. This row is
@@ -1057,21 +1124,33 @@ impl DispatchRuntime {
     }
 
     /// Issuer side: walk the local row from wherever it is to `Running`
-    /// (synthetic hops — ADR-0017), then to the terminal.
-    fn finish_local_row(&self, task_id: TaskId, terminal: TaskState) {
+    /// (synthetic hops — ADR-0017), then to the terminal. Returns
+    /// whether the FINAL hop won its CAS: `false` means the row is
+    /// already terminal (an operator cancel raced this ingest — diff
+    /// review M1 on #61) and the caller must not write a result or
+    /// gossip the terminal, because `Done`/`Failed` outrank `Cancelled`
+    /// in the replica LWW order and would supersede it mesh-wide,
+    /// permanently. (The synthetic intermediate hops legitimately
+    /// no-op when the row is already past them.)
+    fn finish_local_row(&self, task_id: TaskId, terminal: TaskState) -> bool {
         for (from, to) in [
             (TaskState::Dispatched, TaskState::Claimed),
             (TaskState::Claimed, TaskState::Running),
             (TaskState::Running, terminal),
         ] {
             match self.store.try_transition_task(task_id, from, to) {
-                Ok(_) => {}
+                Ok(won) => {
+                    if to == terminal {
+                        return won;
+                    }
+                }
                 Err(e) => {
                     tracing::warn!(target: "harness.dispatch", ?e, "finish_local_row hop");
-                    return;
+                    return false;
                 }
             }
         }
+        false
     }
 
     // ------------------------------------------------------------------
@@ -1297,54 +1376,10 @@ impl TaskChannelHandlers for DispatchRuntime {
         // one clears the breaker streak (task-level outcomes are not
         // node-health signals).
         self.breaker.record_ok(from);
-        let task_id = msg.result.task_id;
-        let now = msg.result.finished_at;
         if msg.result.status == Status::Ok {
-            {
-                self.finish_local_row(task_id, TaskState::Done);
-                if let Err(e) =
-                    self.store
-                        .write_task_result_done(task_id, &msg.result.output, now, from)
-                {
-                    tracing::warn!(target: "harness.dispatch", ?e, "write remote result");
-                }
-                self.persist_ingested_cost(task_id, &msg.result.output);
-                let preview = serde_json::to_vec(&msg.result.output)
-                    .ok()
-                    .map(|v| v.into_iter().take(256).collect());
-                // Worker is the LWW source (R15) with its timestamps.
-                let _ = self.store.replica_apply_local(&ReplicatedTaskState {
-                    task_id,
-                    state: ReplicatedState::Done,
-                    at_ms: now,
-                    source: from,
-                    output_preview: preview,
-                });
-            }
+            self.ingest_done(from, &msg);
         } else {
-            {
-                let err_msg = msg
-                    .result
-                    .output
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("remote execution failed")
-                    .to_string();
-                self.finish_local_row(task_id, TaskState::Failed);
-                if let Err(e) = self
-                    .store
-                    .write_task_result_failed(task_id, &err_msg, now, from)
-                {
-                    tracing::warn!(target: "harness.dispatch", ?e, "write remote failure");
-                }
-                let _ = self.store.replica_apply_local(&ReplicatedTaskState {
-                    task_id,
-                    state: ReplicatedState::Failed,
-                    at_ms: now,
-                    source: from,
-                    output_preview: Some(err_msg.into_bytes().into_iter().take(256).collect()),
-                });
-            }
+            self.ingest_failed(from, &msg);
         }
     }
 
@@ -1810,6 +1845,59 @@ mod tests {
                 .expect("lease")
                 .state,
             harness_store::LeaseState::Completed
+        );
+    }
+
+    /// 5.10 (diff review M1 on #61): a result racing an operator
+    /// cancel — lease CAS won while the row flipped Cancelled (the
+    /// mid-`on_result` interleave the cancel transaction cannot
+    /// close) — must not write Done over Cancelled: `Done` outranks
+    /// `Cancelled` in the replica LWW order and would supersede it
+    /// mesh-wide, permanently.
+    #[tokio::test]
+    async fn t01c_result_racing_cancel_drops_at_the_task_cas() {
+        let f = fixture();
+        let task = signed_task(&f.local);
+        f.store.insert_task(&task).expect("insert");
+        assert!(f
+            .store
+            .try_dispatch_task(task.id, f.remote.node_id())
+            .expect("dispatch"));
+        let lease = f
+            .store
+            .create_lease(task.id, f.remote.node_id(), 60_000, 1)
+            .expect("lease");
+        // Simulate the interleave directly: live lease + cancelled row.
+        f.store
+            .transition_task(task.id, TaskState::Cancelled)
+            .expect("cancel row");
+
+        let result = signed_result(&f.remote, task.id, true);
+        f.runtime.on_result(
+            f.remote.node_id(),
+            TaskResultMsg {
+                seq: 0,
+                lease_id: lease.lease_id,
+                result,
+                sig: Signature::from_bytes([0u8; 64]),
+            },
+        );
+
+        assert_eq!(
+            f.store.task_state(task.id).expect("state"),
+            Some(TaskState::Cancelled),
+            "cancel survives the ingest"
+        );
+        assert!(
+            f.store.load_task_result(task.id).expect("load").is_none(),
+            "lost CAS writes no result row"
+        );
+        assert!(
+            f.store
+                .replica_view_task(task.id)
+                .expect("view")
+                .is_none_or(|e| e.state != harness_core::ReplicatedState::Done),
+            "lost CAS gossips no Done"
         );
     }
 

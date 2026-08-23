@@ -108,6 +108,23 @@ pub(crate) fn check_admission(store: &harness_store::Store) -> Option<axum::resp
 ///
 /// Callers gate BEFORE minting (auth + admission for the HTTP path;
 /// Twilio signature + allowlist + admission for webhooks).
+/// 5.10 (ADR-0038, plan review B2): a `plan.execute` submission's
+/// task row carries the PLAN's id, parsed from `input.plan.id` — the
+/// Costs page joins active plan rows to ledger rows on it. Non-plan
+/// submissions (and unparsable plans, which fail validation later
+/// anyway) stay `None`.
+fn plan_exec_plan_id(req: &SubmitRequest) -> Option<harness_core::PlanId> {
+    if req.capability != "plan.execute" {
+        return None;
+    }
+    req.input
+        .get("plan")
+        .and_then(|p| p.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .map(harness_core::PlanId)
+}
+
 pub(crate) fn mint_task(
     state: &ApiState,
     store: &harness_store::Store,
@@ -121,7 +138,7 @@ pub(crate) fn mint_task(
     let mut task = Task {
         id: TaskId::new_v7(),
         parent: None,
-        plan_id: None,
+        plan_id: plan_exec_plan_id(&req),
         capability: req.capability,
         input: req.input,
         constraints: req.constraints.unwrap_or_default(),
@@ -231,6 +248,11 @@ pub struct ListQuery {
     /// Exact per-state filter (the pre-4.8 Submitted-only view is
     /// `?state=submitted`). Unknown states → 400.
     pub state: Option<String>,
+    /// Exact capability filter (5.10 — the Costs page fetches
+    /// `?capability=plan.execute` so a wide plan's step rows cannot
+    /// push its own coordinator row out of the page). Composes with
+    /// `state`. Unknown capabilities simply match zero rows.
+    pub capability: Option<String>,
     /// Row cap for the default recent-across-states listing
     /// (default 50, clamped to [1, 200]).
     pub limit: Option<usize>,
@@ -264,12 +286,9 @@ pub async fn list_handler(
         .limit
         .unwrap_or(LIST_DEFAULT_LIMIT)
         .clamp(1, LIST_MAX_LIMIT);
-    let rows = if let Some(wanted) = &query.state {
-        match wanted.parse::<harness_store::TaskState>() {
-            // The clamp applies to BOTH arms (diff review MINOR-6):
-            // terminal states accumulate forever, so `?state=done`
-            // must page exactly like the default listing.
-            Ok(task_state) => store.list_tasks_by_state_limited(task_state, limit),
+    let wanted_state = match &query.state {
+        Some(wanted) => match wanted.parse::<harness_store::TaskState>() {
+            Ok(task_state) => Some(task_state),
             Err(_) => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -277,7 +296,16 @@ pub async fn list_handler(
                 )
                     .into_response();
             }
-        }
+        },
+        None => None,
+    };
+    // The clamp applies to EVERY arm (diff review MINOR-6): terminal
+    // states accumulate forever, so filtered views must page exactly
+    // like the default listing.
+    let rows = if let Some(capability) = &query.capability {
+        store.list_recent_tasks_by_capability(capability, wanted_state, limit)
+    } else if let Some(task_state) = wanted_state {
+        store.list_tasks_by_state_limited(task_state, limit)
     } else {
         store.list_recent_tasks(limit)
     };
@@ -448,4 +476,80 @@ fn provenance_rows(provenance: &[harness_core::NodeContribution]) -> Vec<serde_j
 
 fn parse_task_id(s: &str) -> Result<TaskId, ()> {
     uuid::Uuid::parse_str(s).map(TaskId).map_err(|_| ())
+}
+
+/// `POST /api/v1/tasks/{id}/cancel` — the §17.8 stop button (5.10,
+/// ADR-0038). Marks a non-terminal row `cancelled`, releases its live
+/// leases (late worker results drop at the terminal-lease guard), and
+/// mirrors the state to replicas. Record-level stop: an
+/// already-executing capability future is not interrupted — but the
+/// plan.execute loop checks its own state per completion and stops
+/// minting steps, and the executor's terminal writes lose their CAS
+/// and skip.
+pub async fn cancel_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id_str): Path<String>,
+) -> axum::response::Response {
+    if !is_authenticated(&state.auth, &headers) {
+        return unauthorized();
+    }
+    let Some(store) = state.store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "store_not_configured" })),
+        )
+            .into_response();
+    };
+    let Ok(task_id) = parse_task_id(&id_str) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "bad_task_id" })),
+        )
+            .into_response();
+    };
+    match store.cancel_task(task_id) {
+        // `cancel_task` releases the row's live leases in the SAME
+        // transaction as the state flip (diff review M1) — no window
+        // for an in-between result ingest.
+        Ok(harness_store::CancelOutcome::Cancelled) => {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            let mirror = harness_core::ReplicatedTaskState {
+                task_id,
+                state: harness_core::ReplicatedState::Cancelled,
+                at_ms: now_ms,
+                source: state.local_node_id,
+                output_preview: None,
+            };
+            if let Err(err) = store.replica_apply_local(&mirror) {
+                tracing::warn!(target: "harness.api.tasks", ?err, "replica_apply_local (cancel)");
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "state": "cancelled" })),
+            )
+                .into_response()
+        }
+        Ok(harness_store::CancelOutcome::Unknown) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown_task" })),
+        )
+            .into_response(),
+        Ok(harness_store::CancelOutcome::AlreadyTerminal(s)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "already_terminal", "state": s.as_str() })),
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::warn!(target: "harness.api.tasks", ?err, "cancel_task");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "cancel_failed" })),
+            )
+                .into_response()
+        }
+    }
 }
