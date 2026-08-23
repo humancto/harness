@@ -64,7 +64,11 @@
     if (!goal.trim()) return;
     const myGen = ++gen;
     controller?.abort();
-    controller = new AbortController();
+    // Captured locally (diff review MINOR-3): a stale op resuming
+    // after Cancel+re-Plan must never adopt the NEW op's signal and
+    // leak a 250s background poll against the abandoned task.
+    const ctrl = new AbortController();
+    controller = ctrl;
     phase = 'planning';
     planError = '';
     planned = null;
@@ -90,7 +94,7 @@
       }
       const submitted = (await res.json()) as SubmitTaskResponse;
       const polled = await pollTask(fetch, submitted.task_id, {
-        signal: controller.signal,
+        signal: ctrl.signal,
       });
       if (gen !== myGen) return;
       switch (polled.kind) {
@@ -142,6 +146,7 @@
         // Codex P2: leaving phase='submitting' would render the
         // restored preview with permanently disabled buttons.
         phase = 'preview';
+        planError = 'session expired — sign in, then confirm again';
         authed = false;
         return;
       }

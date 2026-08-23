@@ -84,7 +84,11 @@ export function parsePlanOutcome(task: TaskDetailDto): PlanOutcome {
   }
   const out = (task.output ?? {}) as Record<string, unknown>;
   const plan = out.plan;
-  if (typeof plan !== "object" || plan === null) {
+  if (
+    typeof plan !== "object" ||
+    plan === null ||
+    typeof (plan as Record<string, unknown>).tasks !== "object"
+  ) {
     return { kind: "failed", error: "planner returned no plan object" };
   }
   return {
@@ -110,7 +114,10 @@ const TERMINAL_STATES = new Set(["done", "failed", "cancelled", "expired"]);
 export interface PollOptions {
   /** Between polls. Default 1000. */
   intervalMs?: number;
-  /** Overall budget. Default envelope + 2×slack (CLI parity). */
+  /** Overall budget. Default envelope + 2×slack. Counts sleep
+   * intervals only (not fetch latency), so wall-clock can overshoot
+   * by cumulative fetch time — acceptable: the server envelope
+   * terminates the task at 245s regardless (diff review NIT-6). */
   budgetMs?: number;
   signal?: AbortSignal;
   /** Injected clock/sleep for tests. Defaults to real setTimeout. */
@@ -159,10 +166,20 @@ export async function pollTask(
     if (res.status === 401) {
       return { kind: "unauthorized" };
     }
-    if (!res.ok) {
-      return { kind: "http_error", status: res.status, body: await res.text() };
+    let task: TaskDetailDto;
+    try {
+      if (!res.ok) {
+        return { kind: "http_error", status: res.status, body: await res.text() };
+      }
+      task = (await res.json()) as TaskDetailDto;
+    } catch (err) {
+      // Body reads reject mid-flight when the signal fires (NIT-5) —
+      // keep the documented contract instead of leaking AbortError.
+      if (opts.signal?.aborted) {
+        return { kind: "aborted" };
+      }
+      throw err;
     }
-    const task = (await res.json()) as TaskDetailDto;
     if (TERMINAL_STATES.has(String(task.state))) {
       return { kind: "terminal", task };
     }
