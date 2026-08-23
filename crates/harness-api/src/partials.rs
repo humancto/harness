@@ -45,6 +45,11 @@ pub struct PartialFrame {
 struct TaskRing {
     next_seq: u64,
     frames: VecDeque<PartialFrame>,
+    /// 4.7 (ADR-0029): frames lost for this task — local ring
+    /// evictions plus wire-reported drops (the worker's pending-queue
+    /// overflows, accumulated by `on_partial`). Surfaced as the API's
+    /// additive `partials_dropped` lossiness flag.
+    dropped: u64,
 }
 
 #[derive(Debug, Default)]
@@ -89,6 +94,7 @@ impl PartialBuffers {
         ring.next_seq += 1;
         if ring.frames.len() >= RING_CAPACITY {
             ring.frames.pop_front();
+            ring.dropped += 1;
         }
         ring.frames.push_back(PartialFrame {
             seq,
@@ -113,6 +119,36 @@ impl PartialBuffers {
     #[must_use]
     pub fn total_appended(&self, task: TaskId) -> u64 {
         self.inner.lock().rings.get(&task).map_or(0, |r| r.next_seq)
+    }
+
+    /// Record `n` frames lost before they ever reached this ring — the
+    /// worker's wire-reported drop count (4.7, ADR-0029). Creates the
+    /// task entry (with the usual entry eviction) so a fully-lossy task
+    /// still reports its loss.
+    pub fn add_dropped(&self, task: TaskId, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        if !inner.rings.contains_key(&task) {
+            if inner.order.len() >= MAX_TRACKED_TASKS {
+                if let Some(evict) = inner.order.pop_front() {
+                    inner.rings.remove(&evict);
+                }
+            }
+            inner.order.push_back(task);
+            inner.rings.insert(task, TaskRing::default());
+        }
+        if let Some(ring) = inner.rings.get_mut(&task) {
+            ring.dropped = ring.dropped.saturating_add(n);
+        }
+    }
+
+    /// Frames lost for `task`: ring evictions + wire-reported drops.
+    /// `0` for unknown (or evicted) tasks.
+    #[must_use]
+    pub fn dropped(&self, task: TaskId) -> u64 {
+        self.inner.lock().rings.get(&task).map_or(0, |r| r.dropped)
     }
 }
 
@@ -171,5 +207,28 @@ mod tests {
         let b = PartialBuffers::new();
         assert!(b.frames(TaskId::new_v7()).is_empty());
         assert_eq!(b.total_appended(TaskId::new_v7()), 0);
+        assert_eq!(b.dropped(TaskId::new_v7()), 0);
+    }
+
+    /// 4.7 (ADR-0029): the lossiness flag counts BOTH loss classes —
+    /// local ring evictions and the worker's wire-reported drops.
+    #[test]
+    fn dropped_counts_ring_evictions_and_wire_reports() {
+        let b = PartialBuffers::new();
+        let t = TaskId::new_v7();
+        for i in 0..(RING_CAPACITY + 7) {
+            b.append(t, "stdout", format!("line-{i}"));
+        }
+        assert_eq!(b.dropped(t), 7, "ring evictions counted");
+        b.add_dropped(t, 5);
+        b.add_dropped(t, 0); // no-op
+        assert_eq!(b.dropped(t), 12, "wire-reported drops accumulate");
+
+        // A fully-lossy task (drops before any frame landed) still
+        // reports its loss.
+        let lossy = TaskId::new_v7();
+        b.add_dropped(lossy, 3);
+        assert!(b.frames(lossy).is_empty());
+        assert_eq!(b.dropped(lossy), 3);
     }
 }

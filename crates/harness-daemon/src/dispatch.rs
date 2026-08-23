@@ -982,12 +982,29 @@ impl DispatchRuntime {
         let mut ids: std::collections::HashSet<TaskId> =
             self.backoff.lock().keys().copied().collect();
         ids.extend(self.gated.lock().iter().copied());
+        // 4.7 (ADR-0029, plan risk #13): eligibility-window entries are
+        // bounded by the same rule — a task that left `Submitted`
+        // sideways (cancel, remote completion) must not hold its
+        // first-failure instant forever.
+        ids.extend(self.elig_failures.lock().keys().copied());
         for id in ids {
             let still_submitted =
                 matches!(self.store.task_state(id), Ok(Some(TaskState::Submitted)));
             if !still_submitted {
                 self.backoff.lock().remove(&id);
                 self.gated.lock().remove(&id);
+                self.elig_failures.lock().remove(&id);
+            }
+        }
+        // Worker-side reply obligations for CANCELLED tasks are
+        // immortal without this sweep: a cancelled task never fires the
+        // terminal pump, so `try_reply` never consumes the entry. The
+        // issuer learns the outcome via replica gossip (ADR-0019), not
+        // a result reply — dropping the obligation loses nothing.
+        let owed: Vec<TaskId> = self.reply.lock().keys().copied().collect();
+        for id in owed {
+            if matches!(self.store.task_state(id), Ok(Some(TaskState::Cancelled))) {
+                self.reply.lock().remove(&id);
             }
         }
     }
@@ -1336,6 +1353,16 @@ impl TaskChannelHandlers for DispatchRuntime {
             {
                 buffers.append(msg.task_id, stream, line.to_string());
             }
+        }
+        // 4.7 (ADR-0029): the worker reports frames its pending queue
+        // overflowed before this batch — fold them into the task's
+        // lossiness flag (`partials_dropped`).
+        if let Some(dropped) = msg
+            .output_chunk
+            .get("dropped")
+            .and_then(serde_json::Value::as_u64)
+        {
+            buffers.add_dropped(msg.task_id, dropped);
         }
     }
 
@@ -3242,5 +3269,65 @@ mod tests {
         );
         shutdown_tx.send(true).expect("shutdown");
         pump.await.expect("pump join");
+    }
+
+    /// 4.7 (ADR-0029, plan risk #13): the prune sweep also bounds the
+    /// eligibility-failure window map and worker-side reply obligations
+    /// for cancelled tasks — neither entry class is immortal.
+    #[tokio::test]
+    async fn t33_prune_covers_elig_failures_and_cancelled_reply_obligations() {
+        let f = fixture();
+        // No candidates for this capability → eligibility failure entry.
+        let task = signed_task_for(&f.local, "no.such.capability");
+        f.store.insert_task(&task).expect("insert");
+        f.runtime.poll_submitted_once();
+        assert!(
+            f.runtime.elig_failures.lock().contains_key(&task.id),
+            "failure window opened"
+        );
+        // Cancelled out from under the window: the entry must not
+        // survive the next prune pass.
+        f.store
+            .transition_task(task.id, TaskState::Cancelled)
+            .expect("cancel");
+        f.runtime.expire_pass();
+        assert!(
+            !f.runtime.elig_failures.lock().contains_key(&task.id),
+            "elig_failures pruned"
+        );
+
+        // Worker side: an obligation for a CANCELLED task never fires
+        // the terminal pump — the sweep is its only exit.
+        let cancelled = signed_task_for(&f.remote, SECRET_CAP);
+        f.store.insert_task(&cancelled).expect("insert");
+        f.store
+            .transition_task(cancelled.id, TaskState::Cancelled)
+            .expect("cancel");
+        f.runtime.reply.lock().insert(
+            cancelled.id,
+            ReplyObligation {
+                issuer: f.remote.node_id(),
+                lease_id: harness_core::LeaseId::new_v7(),
+            },
+        );
+        // A live obligation (Submitted task) survives the same pass.
+        let live = signed_task_for(&f.remote, SECRET_CAP);
+        f.store.insert_task(&live).expect("insert");
+        f.runtime.reply.lock().insert(
+            live.id,
+            ReplyObligation {
+                issuer: f.remote.node_id(),
+                lease_id: harness_core::LeaseId::new_v7(),
+            },
+        );
+        f.runtime.expire_pass();
+        assert!(
+            !f.runtime.reply.lock().contains_key(&cancelled.id),
+            "cancelled obligation swept"
+        );
+        assert!(
+            f.runtime.reply.lock().contains_key(&live.id),
+            "live obligation untouched"
+        );
     }
 }

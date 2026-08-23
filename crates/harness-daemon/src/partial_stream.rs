@@ -42,6 +42,14 @@ use crate::peer_net::OutboundMsg;
 /// batch's `dropped` field.
 pub(crate) const PENDING_QUEUE_DEPTH: usize = 256;
 
+/// 4.7 (ADR-0029): tasks tracked in `pending` at once — the map's own
+/// bound, mirroring `PartialBuffers::MAX_TRACKED_TASKS`. Hygiene, not
+/// a hazard: live streaming tasks are bounded by the executor's work
+/// permits (≤8), so 256 means an accumulation bug, and eviction (the
+/// OLDEST task's whole queue, warned with its frame count) beats
+/// unbounded growth. Partials are best-effort telemetry (ADR-0020).
+pub(crate) const MAX_TRACKED_TASKS: usize = 256;
+
 /// Wire-flush cadence: one coalesced `PartialResult` per task per tick
 /// → at most 20 sends per second per task.
 pub(crate) const FLUSH_INTERVAL_MS: u64 = 50;
@@ -72,7 +80,15 @@ pub(crate) struct PartialStreamer {
     /// before the registry, which the runtime needs — same shape as
     /// `DispatchRuntime::net`). Unset ⇒ every task routes local.
     dispatch: OnceLock<Weak<DispatchRuntime>>,
-    pending: ParkingMutex<HashMap<TaskId, PendingQueue>>,
+    pending: ParkingMutex<PendingState>,
+}
+
+/// The pending map plus its insertion order (4.7): `order` names the
+/// eviction victim when `queues` hits [`MAX_TRACKED_TASKS`].
+#[derive(Default)]
+struct PendingState {
+    queues: HashMap<TaskId, PendingQueue>,
+    order: VecDeque<TaskId>,
 }
 
 impl PartialStreamer {
@@ -81,7 +97,7 @@ impl PartialStreamer {
             local_id,
             buffers,
             dispatch: OnceLock::new(),
-            pending: ParkingMutex::new(HashMap::new()),
+            pending: ParkingMutex::new(PendingState::default()),
         })
     }
 
@@ -113,11 +129,32 @@ impl PartialStreamer {
             }
             Some(issuer) => {
                 let mut pending = self.pending.lock();
-                let q = pending.entry(task_id).or_insert_with(|| PendingQueue {
-                    issuer,
-                    frames: VecDeque::new(),
-                    dropped: 0,
-                });
+                if !pending.queues.contains_key(&task_id) {
+                    if pending.queues.len() >= MAX_TRACKED_TASKS {
+                        // Evict the OLDEST task's queue (4.7): its
+                        // frames are lost — say so, loudly.
+                        if let Some(oldest) = pending.order.pop_front() {
+                            if let Some(evicted) = pending.queues.remove(&oldest) {
+                                tracing::warn!(
+                                    target: "harness.dispatch",
+                                    task = %oldest.0,
+                                    lost_frames = evicted.frames.len(),
+                                    lost_dropped = evicted.dropped,
+                                    "pending partial queue evicted at task cap"
+                                );
+                            }
+                        }
+                    }
+                    pending.order.push_back(task_id);
+                }
+                let q = pending
+                    .queues
+                    .entry(task_id)
+                    .or_insert_with(|| PendingQueue {
+                        issuer,
+                        frames: VecDeque::new(),
+                        dropped: 0,
+                    });
                 if q.frames.len() >= PENDING_QUEUE_DEPTH {
                     q.frames.pop_front();
                     q.dropped += 1;
@@ -133,7 +170,7 @@ impl PartialStreamer {
     pub(crate) fn flush_batches(&self) -> Vec<Batch> {
         let mut out = Vec::new();
         let mut pending = self.pending.lock();
-        pending.retain(|task_id, q| {
+        pending.queues.retain(|task_id, q| {
             if q.frames.is_empty() {
                 return false;
             }
@@ -152,6 +189,11 @@ impl PartialStreamer {
             out.push((q.issuer, *task_id, frames, std::mem::take(&mut q.dropped)));
             !q.frames.is_empty()
         });
+        // Keep the eviction order aligned with the live map (a stale
+        // order entry would evict nothing and strand a live one).
+        let state = &mut *pending;
+        let queues = &state.queues;
+        state.order.retain(|id| queues.contains_key(id));
         out
     }
 
@@ -299,7 +341,7 @@ mod tests {
     /// obligation for a remotely-assigned task, attached to a streamer.
     struct RemoteFixture {
         streamer: Arc<PartialStreamer>,
-        _runtime: Arc<DispatchRuntime>,
+        runtime: Arc<DispatchRuntime>,
         remote: Arc<Identity>,
         task_id: TaskId,
         buffers: Arc<PartialBuffers>,
@@ -352,7 +394,7 @@ mod tests {
         );
         RemoteFixture {
             streamer,
-            _runtime: runtime,
+            runtime,
             remote,
             task_id,
             buffers,
@@ -411,6 +453,40 @@ mod tests {
             all_frames[0].line,
             format!("l{extra}"),
             "oldest frames must be the ones dropped"
+        );
+    }
+
+    /// 4.7 (ADR-0029): the pending map itself is bounded — one task
+    /// past [`MAX_TRACKED_TASKS`] evicts the OLDEST task's whole queue
+    /// (with a warn naming the lost count), never unbounded growth.
+    #[test]
+    fn pending_task_cap_evicts_oldest_queue() {
+        let f = remote_fixture();
+        // The fixture's task becomes the FIRST tracked entry…
+        f.streamer
+            .on_frame(f.task_id, frame(StreamKind::Stdout, "first"));
+        // …and MAX_TRACKED_TASKS more remote tasks push it out.
+        for _ in 0..MAX_TRACKED_TASKS {
+            let task = signed_task(&f.remote, "shell.exec", serde_json::json!({"cmd": "x"}));
+            let id = task.id;
+            f.runtime.on_assign(
+                f.remote.node_id(),
+                TaskAssign {
+                    seq: 0,
+                    lease_id: harness_core::LeaseId::new_v7(),
+                    task,
+                    assigned_by: f.remote.node_id(),
+                    lease_expires_at: 0,
+                    sig: Signature::from_bytes([0u8; 64]),
+                },
+            );
+            f.streamer.on_frame(id, frame(StreamKind::Stdout, "x"));
+        }
+        let batches = f.streamer.flush_batches();
+        assert_eq!(batches.len(), MAX_TRACKED_TASKS, "map capped");
+        assert!(
+            batches.iter().all(|(_, id, _, _)| *id != f.task_id),
+            "the oldest task's queue was the one evicted"
         );
     }
 

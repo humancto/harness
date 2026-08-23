@@ -339,6 +339,13 @@ pub async fn get_handler(
     if !frames.is_empty() {
         body["partials"] = serde_json::json!(frames);
     }
+    // 4.7 (ADR-0029): additive lossiness flag — frames lost to ring
+    // eviction locally plus the worker's wire-reported queue drops.
+    // OMITTED when nothing was lost (the common case).
+    let partials_dropped = state.partials.dropped(task_id);
+    if partials_dropped > 0 {
+        body["partials_dropped"] = serde_json::json!(partials_dropped);
+    }
     if let Some(r) = result {
         body["completed_at_ms"] = serde_json::json!(r.completed_at_ms);
         if let Some(out) = r.output {

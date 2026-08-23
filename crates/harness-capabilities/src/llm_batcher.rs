@@ -27,11 +27,38 @@ use crate::traits::CapabilityError;
 const DEFAULT_BATCH_WINDOW_MS: u64 = 50;
 const ENV_BATCH_WINDOW_MS: &str = "HARNESS_LLM_BATCH_WINDOW_MS";
 
+/// 4.7 (ADR-0029): senders coalesced into one slot. The caller that
+/// would overflow the cap FLUSHES the batch immediately with its own
+/// dispatch closure — early dispatch, never an error. The atomic
+/// `slots.remove` is the double-flush guard (the window timer finds
+/// the slot gone and does nothing).
+pub const MAX_SLOT_SENDERS: usize = 64;
+
+/// 4.7 (ADR-0029): live fingerprints tracked at once. At the cap, a
+/// NEW fingerprint bypasses batching and dispatches directly — a
+/// documented degradation (no coalescing), never an error or an
+/// unbounded map.
+pub const MAX_LIVE_FINGERPRINTS: usize = 256;
+
 /// 32-byte blake3 over the canonicalized output-determining fields of
 /// the request, including the model id. Two callers with the same
 /// fingerprint share a backend call.
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
 pub struct Fingerprint(pub [u8; 32]);
+
+/// What `submit`'s slot-table transaction decided (4.7, ADR-0029).
+enum Action {
+    /// First caller: a slot was inserted; spawn the window timer.
+    First,
+    /// Sibling: attached to an existing slot; just wait.
+    Attached,
+    /// The slot hit `MAX_SLOT_SENDERS` — this caller removed it and
+    /// flushes NOW with its own closure.
+    FlushNow(BatchSlot),
+    /// `MAX_LIVE_FINGERPRINTS` live slots — bypass batching for this
+    /// new fingerprint.
+    Bypass,
+}
 
 /// One in-flight batch slot.
 struct BatchSlot {
@@ -117,42 +144,71 @@ impl LlmBatcher {
         }
 
         let (tx, rx) = oneshot::channel();
-        let is_first = {
+        let action = {
             // Sync mutex; we never await with the lock held.
             let mut slots = self.slots.lock();
             if let Some(slot) = slots.get_mut(&fp) {
-                slot.senders.push(tx);
-                false
+                if slot.senders.len() >= MAX_SLOT_SENDERS {
+                    // Atomic remove = double-flush guard.
+                    slots.remove(&fp).map_or(Action::Bypass, Action::FlushNow)
+                } else {
+                    slot.senders.push(tx);
+                    Action::Attached
+                }
+            } else if slots.len() >= MAX_LIVE_FINGERPRINTS {
+                Action::Bypass
             } else {
                 slots.insert(fp, BatchSlot { senders: vec![tx] });
-                true
+                Action::First
             }
         };
 
-        if is_first {
-            let slots = Arc::clone(&self.slots);
-            let window = self.window;
-            // Spawned task owns drain-and-dispatch — survives the first
-            // caller's cancellation.
-            tokio::spawn(async move {
-                tokio::time::sleep(window).await;
-                // Remove the slot atomically *before* awaiting dispatch
-                // so siblings arriving during the dispatch start a fresh
-                // batch instead of attaching to a slot that's about to
-                // be drained.
-                let slot = {
-                    let mut slots = slots.lock();
-                    slots.remove(&fp)
-                };
-                let Some(slot) = slot else {
-                    return; // already drained — defensive
-                };
+        match action {
+            Action::Attached => {}
+            Action::Bypass => {
+                tracing::debug!(
+                    target: "harness.llm.batcher",
+                    "fingerprint cap reached; dispatching unbatched"
+                );
+                return dispatch().await;
+            }
+            Action::FlushNow(slot) => {
+                tracing::debug!(
+                    target: "harness.llm.batcher",
+                    senders = slot.senders.len(),
+                    "slot full; flushing batch early"
+                );
                 let result = dispatch().await;
                 for sender in slot.senders {
-                    // `Err(_)` only if the receiver was dropped — fine.
                     let _ = sender.send(clone_result(&result));
                 }
-            });
+                return result;
+            }
+            Action::First => {
+                let slots = Arc::clone(&self.slots);
+                let window = self.window;
+                // Spawned task owns drain-and-dispatch — survives the first
+                // caller's cancellation.
+                tokio::spawn(async move {
+                    tokio::time::sleep(window).await;
+                    // Remove the slot atomically *before* awaiting dispatch
+                    // so siblings arriving during the dispatch start a fresh
+                    // batch instead of attaching to a slot that's about to
+                    // be drained.
+                    let slot = {
+                        let mut slots = slots.lock();
+                        slots.remove(&fp)
+                    };
+                    let Some(slot) = slot else {
+                        return; // already drained — defensive
+                    };
+                    let result = dispatch().await;
+                    for sender in slot.senders {
+                        // `Err(_)` only if the receiver was dropped — fine.
+                        let _ = sender.send(clone_result(&result));
+                    }
+                });
+            }
         }
 
         rx.await.map_err(|_| {
@@ -216,6 +272,72 @@ mod unit_tests {
         let s = format!("{b:?}");
         assert!(s.contains("LlmBatcher"));
         assert!(s.contains("50"));
+    }
+
+    /// 4.7 (ADR-0029): the caller that would overflow
+    /// `MAX_SLOT_SENDERS` flushes the batch immediately. Time stays
+    /// paused throughout — completion without advancing the clock IS
+    /// the proof that the window timer wasn't what fired.
+    #[tokio::test(start_paused = true)]
+    async fn full_slot_flushes_early_without_waiting_the_window() {
+        let b = Arc::new(LlmBatcher::with_window(Duration::from_secs(60)));
+        let fp = Fingerprint([2u8; 32]);
+        let mut siblings = Vec::new();
+        for _ in 0..MAX_SLOT_SENDERS {
+            let b = b.clone();
+            siblings.push(tokio::spawn(async move {
+                b.submit(fp, || async {
+                    panic!("parked senders never dispatch — the flusher does")
+                })
+                .await
+            }));
+        }
+        // Let every sibling attach before the overflowing caller.
+        for _ in 0..500 {
+            tokio::task::yield_now().await;
+        }
+        let flushed = b
+            .submit(fp, || async { Ok(serde_json::json!("flushed")) })
+            .await
+            .expect("early flush");
+        assert_eq!(flushed, serde_json::json!("flushed"));
+        for s in siblings {
+            let got = s.await.expect("join").expect("sibling result");
+            assert_eq!(got, serde_json::json!("flushed"), "one dispatch served all");
+        }
+    }
+
+    /// 4.7 (ADR-0029): at `MAX_LIVE_FINGERPRINTS` live slots, a NEW
+    /// fingerprint dispatches directly (documented degradation) — again
+    /// proven by completing under paused time.
+    #[tokio::test(start_paused = true)]
+    async fn fingerprint_cap_bypasses_batching_for_new_fingerprints() {
+        let b = Arc::new(LlmBatcher::with_window(Duration::from_secs(60)));
+        let mut parked = Vec::new();
+        for i in 0..MAX_LIVE_FINGERPRINTS {
+            let b = b.clone();
+            let mut fp = [0u8; 32];
+            fp[..8].copy_from_slice(&u64::try_from(i).unwrap().to_le_bytes());
+            parked.push(tokio::spawn(async move {
+                b.submit(Fingerprint(fp), || async { Ok(serde_json::json!(1)) })
+                    .await
+            }));
+        }
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+        }
+        let out = b
+            .submit(Fingerprint([0xFF; 32]), || async {
+                Ok(serde_json::json!("unbatched"))
+            })
+            .await
+            .expect("bypass dispatch");
+        assert_eq!(out, serde_json::json!("unbatched"));
+        // The parked slots are still live (they flush when their timers
+        // fire); abort them — this test only pins the bypass.
+        for p in parked {
+            p.abort();
+        }
     }
 
     #[tokio::test]

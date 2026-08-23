@@ -18,7 +18,7 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::StreamExt;
 use harness_core::NodeId;
 use serde_json::{json, Value as JsonValue};
 
@@ -27,6 +27,11 @@ use crate::{obtain_session_token, resolve_root, RunArgs};
 const POLL_INITIAL_MS: u64 = 100;
 const POLL_MAX_MS: u64 = 800;
 const CLI_DEADLINE_SLACK_MS: u64 = 5_000;
+
+/// 4.7 (ADR-0029): concurrent per-target submit+poll chains for
+/// `harness run --all/--where`. Completion-ordered output is unchanged;
+/// targets beyond the window start as earlier ones finish.
+const CLI_FANOUT_WINDOW: usize = 16;
 const DEFAULT_CAPABILITY_TIMEOUT_MS: u64 = 60_000;
 /// Extra headroom on `execution.timeout_ms` over the shell timeout so
 /// the capability-level timeout fires first (clean `timed_out` output)
@@ -97,16 +102,18 @@ pub async fn run_run(args: RunArgs) -> Result<RunOutcome> {
         .context("fetch mesh view (GET /api/v1/peers)")?;
     let targets = resolve_targets(&args, &mesh)?;
 
-    // Fan out: one pinned task per target, polled concurrently. Outputs
-    // are appended in completion order; `[node]` prefixes disambiguate.
+    // Fan out: one pinned task per target, polled concurrently but
+    // windowed at CLI_FANOUT_WINDOW (4.7, ADR-0029) — a `--all` against
+    // a large fleet must not open hundreds of simultaneous submit+poll
+    // request chains from one terminal. Outputs are appended in
+    // completion order; `[node]` prefixes disambiguate.
     let cli_deadline = Duration::from_millis(timeout_ms + CLI_DEADLINE_SLACK_MS);
-    let mut in_flight = FuturesUnordered::new();
-    for target in targets {
+    let mut in_flight = futures::stream::iter(targets.into_iter().map(|target| {
         let client = client.clone();
         let api_base = api_base.clone();
         let token = token.clone();
         let input = input.clone();
-        in_flight.push(async move {
+        async move {
             let outcome = run_on_node(
                 &client,
                 &api_base,
@@ -118,8 +125,9 @@ pub async fn run_run(args: RunArgs) -> Result<RunOutcome> {
             )
             .await;
             (target, outcome)
-        });
-    }
+        }
+    }))
+    .buffer_unordered(CLI_FANOUT_WINDOW);
 
     let mut combined = RunOutcome::default();
     while let Some((target, outcome)) = in_flight.next().await {
