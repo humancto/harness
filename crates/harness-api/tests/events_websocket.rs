@@ -172,6 +172,50 @@ async fn ws_origin_check_rejects_foreign_origin() {
     server.shutdown().await;
 }
 
+/// 4.7 (ADR-0029): a subscriber lagging past `MESH_EVENT_CAPACITY` is
+/// closed with 1011 "lagged" — the documented resync story (reconnect,
+/// refetch snapshot). Capacity-1 channel makes the lag deterministic.
+#[tokio::test(flavor = "current_thread")]
+async fn ws_lagged_subscriber_closed_1011_for_resync() {
+    let id = Arc::new(Identity::generate());
+    let (events_tx, _keepalive) = broadcast::channel::<MeshEvent>(1);
+    let state = ApiStateBuilder::new(id, "ws-lag-test")
+        .with_events(events_tx.clone())
+        .build();
+    let server = harness_api::serve("127.0.0.1:0".parse().unwrap(), state)
+        .await
+        .expect("bind");
+    let addr = server.local_addr();
+
+    let mut ws = connect(addr).await;
+    // Give the server a tick to attach the subscriber.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Burst past the capacity-1 channel before the forwarder task can
+    // poll (current-thread runtime: no await between sends) — its next
+    // recv() is Lagged.
+    for score in 0..3 {
+        let _ = events_tx.send(MeshEvent::LeaderChanged {
+            leader: None,
+            brain_score: score,
+        });
+    }
+
+    let frame = tokio::time::timeout(Duration::from_millis(1500), ws.next())
+        .await
+        .expect("frame timeout")
+        .expect("frame")
+        .expect("frame ok");
+    match frame {
+        Message::Close(Some(cf)) => {
+            assert_eq!(u16::from(cf.code), 1011, "close code");
+            assert_eq!(cf.reason, "lagged");
+        }
+        other => panic!("expected 1011 close, got {other:?}"),
+    }
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn ws_leader_changed_pushes_frame() {
     let id = Arc::new(Identity::generate());

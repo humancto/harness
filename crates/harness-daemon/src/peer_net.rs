@@ -322,6 +322,23 @@ impl PeerNet {
             .map_err(|_| SendToError::QueueFull)
     }
 
+    /// Test-only (4.7): swap `node`'s outbound queue for a
+    /// capacity-`cap` channel whose receiver the TEST holds (no sender
+    /// task drains it) — deterministic `QueueFull` without stalling a
+    /// real QUIC stream. The returned receiver must stay alive for the
+    /// duration (a dropped receiver reads as Closed, not Full).
+    #[cfg(test)]
+    #[allow(clippy::expect_used)]
+    pub(crate) fn swap_outbound_queue(
+        &self,
+        node: NodeId,
+        cap: usize,
+    ) -> mpsc::Receiver<OutboundMsg> {
+        let (tx, rx) = mpsc::channel(cap);
+        self.peers.lock().get_mut(&node).expect("peer entry").out_tx = tx;
+        rx
+    }
+
     /// Enqueue a heartbeat to every live peer; sweeps closed entries.
     pub(crate) fn broadcast_heartbeat(&self, hb: &Heartbeat) {
         let mut peers = self.peers.lock();
@@ -1061,6 +1078,109 @@ mod tests {
         got.task
             .verify_signature(a.identity.public_key())
             .expect("inner sig");
+    }
+
+    fn test_assign(identity: &Identity, lease_id: LeaseId) -> TaskAssign {
+        TaskAssign {
+            seq: 0,
+            lease_id,
+            task: signed_test_task(identity),
+            assigned_by: identity.node_id(),
+            lease_expires_at: 1_700_000_060_000,
+            sig: Signature::from_bytes([0u8; 64]),
+        }
+    }
+
+    /// 4.7 (ADR-0029, plan review MINOR-9): a full outbound queue
+    /// surfaces `SendToError::QueueFull` from `send_to` — the inline
+    /// dispatch arm maps any `SendToError` into lease reset + backoff
+    /// (dispatch t17); this pins the QueueFull variant actually fires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn t08_full_outbound_queue_surfaces_queue_full() {
+        let a = build_node("node-a", Arc::new(NoopHandlers));
+        let b = build_node("node-b", Arc::new(NoopHandlers));
+        interconnect(&a, &b).await;
+        let b_id = b.identity.node_id();
+        // Capacity-1 queue nobody drains: the receiver stays alive in
+        // the test so the second try_send is Full, not Closed.
+        let _parked_rx = a.net.swap_outbound_queue(b_id, 1);
+
+        a.net
+            .send_to(
+                b_id,
+                OutboundMsg::Assign(test_assign(&a.identity, LeaseId::new_v7())),
+            )
+            .expect("first enqueue fills the capacity-1 queue");
+        let err = a
+            .net
+            .send_to(
+                b_id,
+                OutboundMsg::Assign(test_assign(&a.identity, LeaseId::new_v7())),
+            )
+            .expect_err("second enqueue must be refused");
+        assert!(matches!(err, SendToError::QueueFull), "got {err}");
+    }
+
+    struct SendFailHandlers {
+        failed: Arc<ParkingMutex<Vec<(NodeId, LeaseId)>>>,
+    }
+
+    impl TaskChannelHandlers for SendFailHandlers {
+        fn on_assign(&self, _: NodeId, _: TaskAssign) {}
+        fn on_claim(&self, _: NodeId, _: TaskClaim) {}
+        fn on_result(&self, _: NodeId, _: TaskResultMsg) {}
+        fn on_assign_send_failed(&self, node: NodeId, lease_id: LeaseId) {
+            self.failed.lock().push((node, lease_id));
+        }
+    }
+
+    /// 4.7 (plan review MINOR-9), async arm: an Assign the sender task
+    /// cannot deliver (connection closed → both send attempts fail)
+    /// invokes `on_assign_send_failed` so the dispatcher resets the
+    /// lease — no assign is ever silently dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn t09_undeliverable_assign_invokes_on_assign_send_failed() {
+        let a = build_node("node-a", Arc::new(NoopHandlers));
+        let b = build_node("node-b", Arc::new(NoopHandlers));
+        let b_accept = tokio::spawn({
+            let t = b.transport.clone();
+            async move {
+                let inc = t.accept_one().await.expect("accept");
+                inc.accept(|_| true).expect("approve")
+            }
+        });
+        let dialed = a
+            .transport
+            .dial(
+                b.transport.local_addr().expect("addr"),
+                b.identity.public_key(),
+            )
+            .await
+            .expect("dial");
+        let _accepted = b_accept.await.expect("join");
+        let conn = Arc::new(dialed);
+        conn.close_ref(); // every send_once now fails deterministically
+
+        let failed = Arc::new(ParkingMutex::new(Vec::new()));
+        let handlers: Arc<dyn TaskChannelHandlers> = Arc::new(SendFailHandlers {
+            failed: failed.clone(),
+        });
+        let (tx, rx) = mpsc::channel(4);
+        let sender = tokio::spawn(PeerNet::sender_task(
+            conn,
+            rx,
+            a.identity.clone(),
+            handlers,
+            b.identity.node_id(),
+        ));
+        let lease_id = LeaseId::new_v7();
+        tx.send(OutboundMsg::Assign(test_assign(&a.identity, lease_id)))
+            .await
+            .expect("enqueue");
+        wait_until(|| !failed.lock().is_empty(), "send failure surfaced").await;
+        assert_eq!(failed.lock()[0], (b.identity.node_id(), lease_id));
+        drop(tx);
+        sender.await.expect("sender task exits cleanly");
     }
 
     struct RecordingPartialHandlers {

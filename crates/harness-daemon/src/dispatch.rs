@@ -3199,4 +3199,48 @@ mod tests {
         );
         assert_eq!(f.store.list_leases_for_task(task.id).unwrap().len(), 0);
     }
+
+    /// 4.7 (ADR-0029): the reply pump survives `Lagged` on the
+    /// terminal broadcast — it logs, skips (the issuer recovers those
+    /// via lease expiry + assign-time terminal-resend, ADR-0017), and
+    /// KEEPS processing later terminals. Capacity-1 channel makes the
+    /// lag deterministic (current-thread runtime: the burst outruns
+    /// the pump's first poll).
+    #[tokio::test(flavor = "current_thread")]
+    async fn t32_reply_pump_survives_lag_and_processes_later_terminals() {
+        let f = fixture();
+        let ids: Vec<TaskId> = (0..3).map(|_| TaskId::new_v7()).collect();
+        for id in &ids {
+            f.runtime.reply.lock().insert(
+                *id,
+                ReplyObligation {
+                    issuer: f.remote.node_id(),
+                    lease_id: harness_core::LeaseId::new_v7(),
+                },
+            );
+        }
+        let (terminal_tx, terminal_rx) = tokio::sync::broadcast::channel(1);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let pump = tokio::spawn(f.runtime.clone().run_reply_pump(terminal_rx, shutdown_rx));
+        for id in &ids {
+            let _ = terminal_tx.send(*id);
+        }
+        for _ in 0..200 {
+            if !f.runtime.reply.lock().contains_key(&ids[2]) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !f.runtime.reply.lock().contains_key(&ids[2]),
+            "the post-lag terminal was processed — the pump did not exit"
+        );
+        assert!(
+            f.runtime.reply.lock().contains_key(&ids[0])
+                && f.runtime.reply.lock().contains_key(&ids[1]),
+            "lagged obligations remain for the assign-time resend to cover"
+        );
+        shutdown_tx.send(true).expect("shutdown");
+        pump.await.expect("pump join");
+    }
 }

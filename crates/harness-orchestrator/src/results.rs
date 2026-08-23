@@ -477,4 +477,69 @@ mod tests {
         assert!(futures::StreamExt::next(&mut rx).await.is_none());
         assert_eq!(handle.await.expect("join").ended, 1);
     }
+
+    /// Shared-count mapper for observing producer progress mid-flight
+    /// (the mapper itself is owned by the driver until it resolves).
+    struct CountingMapper {
+        seen: Arc<std::sync::atomic::AtomicU64>,
+        ended: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl ResultMapper<u64> for CountingMapper {
+        fn on_item(&mut self, index: u64, _outcome: &ItemOutcome<u64>) -> JsonValue {
+            self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            json!({ "index": index })
+        }
+        fn on_end(&mut self, _summary: &FanoutSummary) -> JsonValue {
+            self.ended.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            json!({ "end": true })
+        }
+    }
+
+    /// 4.7 (ADR-0029): the bounded channel PARKS the producer — with
+    /// capacity 1 and three ready results, the driver advances at most
+    /// two items deep (one sent + one awaiting `send`) until the
+    /// consumer drains. Backpressure is real, not advisory.
+    #[tokio::test(flavor = "current_thread")]
+    async fn t11_into_channel_capacity_one_parks_producer() {
+        let (spec, gates) = gated_spec(3, 3);
+        let seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ended = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mapper = CountingMapper {
+            seen: seen.clone(),
+            ended: ended.clone(),
+        };
+        let stream = task_results(FanoutController::stream(spec), ctx_for(Some(3)), mapper);
+        let (driver, mut rx) = into_channel(stream, 1);
+        let handle = tokio::spawn(driver);
+        for _ in 0..10_000 {
+            if gates.lock().len() == 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // All three results ready at once.
+        for tx in gates.lock().drain(..) {
+            tx.send(ItemOutcome::Ok(7)).expect("send");
+        }
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "producer parked at capacity: one item in the channel, one in `send`"
+        );
+        assert_eq!(ended.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Draining releases the park; everything flows.
+        let mut got = 0;
+        while futures::StreamExt::next(&mut rx).await.is_some() {
+            got += 1;
+        }
+        assert_eq!(got, 4, "3 items + summary after the drain");
+        handle.await.expect("join");
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(ended.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 }

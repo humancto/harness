@@ -33,6 +33,12 @@ const EXTEND_INTERVAL_MS: u64 = 300;
 /// the CPU-sized work pool but still bounded (ADR-0027).
 const COORD_PERMITS: usize = 16;
 const POLL_BATCH: usize = 8;
+/// Capacity of the terminal-task broadcast feeding the reply pump and
+/// wrapper awaits (4.7 names the former bare literal). A subscriber
+/// lagging past it sees `Lagged` and recovers via the issuer's lease
+/// expiry + assign-time terminal-resend (ADR-0017) — never by blocking
+/// the executor.
+const TERMINAL_EVENT_CAPACITY: usize = 256;
 
 /// Per-task local executor. Cheap to clone; all expensive state is
 /// behind `Arc`s.
@@ -91,7 +97,7 @@ impl LocalExecutor {
         max_concurrent: usize,
     ) -> Self {
         let max = max_concurrent.max(1);
-        let (terminal_tx, _) = tokio::sync::broadcast::channel(256);
+        let (terminal_tx, _) = tokio::sync::broadcast::channel(TERMINAL_EVENT_CAPACITY);
         Self {
             store,
             registry,
