@@ -85,6 +85,11 @@ pub struct PlanRequest {
     /// `LocalFast` (3.9) which inlines the issuer into the system
     /// prompt for traceability.
     pub issuing_node: NodeId,
+    /// 5.3 (ADR-0032) — replanning repair hint. `None` on first
+    /// attempts; on a validation-failure retry the executor sets the
+    /// validation error text so LLM tiers can emit a corrected plan
+    /// ("retry with stricter prompt", PRD §15.4). Template ignores it.
+    pub repair: Option<String>,
 }
 
 /// Backend output. The plan is wrapped in [`Unsigned`] so the

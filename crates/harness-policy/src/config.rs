@@ -154,6 +154,44 @@ pub struct PlanningPolicy {
     /// this default tracks the current mid-tier model instead.
     #[serde(default = "default_cloud_planner_model")]
     pub cloud_planner_model: String,
+
+    /// 5.3 (ADR-0032) — conditions under which the tier-3 Cloud
+    /// planner may be attempted after an earlier LLM tier failed
+    /// (PRD §15.2 `escalate_to_cloud_if`). Typed, so a typo fails
+    /// policy load loudly (house rule) instead of silently narrowing
+    /// escalation. The default covers every failure mode local tiers
+    /// actually produce — the PRD's TOML example names only the
+    /// first two; ADR-0032 documents why the exhaustive-gate reading
+    /// would regress §15.3's "until one returns a confident,
+    /// validated plan".
+    #[serde(default = "default_escalate_to_cloud_if")]
+    pub escalate_to_cloud_if: Vec<CloudTrigger>,
+
+    /// 5.3 — how many REPAIR retries a tier gets after emitting a
+    /// plan that failed validation (PRD §15.2 default 2; the cloud
+    /// tier is further capped at 1 by the executor — paid retries).
+    #[serde(default = "default_max_replanning_attempts")]
+    pub max_replanning_attempts: u32,
+}
+
+/// Escalation-trigger vocabulary for `escalate_to_cloud_if` (5.3,
+/// ADR-0032). Serde names are the PRD §15.2 strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudTrigger {
+    /// An earlier tier emitted a `Confident` plan that failed
+    /// `validate_plan`.
+    PlanValidationFailed,
+    /// An earlier tier matched but a capability was missing
+    /// (`MatchedButUnsupported`), or validation failed with
+    /// `UnknownCapability`/`UnknownSchema`.
+    ToolNotFound,
+    /// An earlier tier's `Confident` plan fell below the
+    /// confidence threshold.
+    LowConfidence,
+    /// An earlier tier errored (transport / timeout / decode /
+    /// internal).
+    BackendError,
 }
 
 fn default_confidence_threshold() -> f64 {
@@ -166,6 +204,17 @@ fn default_max_cost_usd() -> Option<f64> {
 fn default_cloud_planner_model() -> String {
     "claude-sonnet-5".to_string()
 }
+fn default_escalate_to_cloud_if() -> Vec<CloudTrigger> {
+    vec![
+        CloudTrigger::PlanValidationFailed,
+        CloudTrigger::ToolNotFound,
+        CloudTrigger::LowConfidence,
+        CloudTrigger::BackendError,
+    ]
+}
+fn default_max_replanning_attempts() -> u32 {
+    2
+}
 
 impl Default for PlanningPolicy {
     fn default() -> Self {
@@ -176,6 +225,8 @@ impl Default for PlanningPolicy {
             prefer_local_models: Vec::new(),
             default_max_cost_usd: default_max_cost_usd(),
             cloud_planner_model: default_cloud_planner_model(),
+            escalate_to_cloud_if: default_escalate_to_cloud_if(),
+            max_replanning_attempts: default_max_replanning_attempts(),
         }
     }
 }

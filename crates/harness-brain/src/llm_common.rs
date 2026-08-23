@@ -60,11 +60,13 @@ Goal: read README.md
     // Cap list — projected to id + required-fields.
     let projections = project_capabilities(&req.available_capabilities, &req.schemas);
 
-    // Fixed-overhead bytes (header + constraints + goal). Reserve room
-    // for them; the cap list takes whatever's left.
+    // Fixed-overhead bytes (header + constraints + repair + goal).
+    // Reserve room for them; the cap list takes whatever's left.
     let constraints_block = format_constraints(&req.constraints);
+    let repair_block = req.repair.as_deref().map_or_else(String::new, repair_block);
     let goal_line = format!("\nGoal: {}\n", req.goal);
-    let fixed_overhead = header.len() + constraints_block.len() + goal_line.len() + 64;
+    let fixed_overhead =
+        header.len() + constraints_block.len() + repair_block.len() + goal_line.len() + 64;
     let cap_budget = prompt_byte_cap.saturating_sub(fixed_overhead);
 
     let cap_block = render_capabilities(&projections, cap_budget);
@@ -74,8 +76,28 @@ Goal: read README.md
     out.push_str(&cap_block);
     out.push('\n');
     out.push_str(&constraints_block);
+    out.push_str(&repair_block);
     out.push_str(&goal_line);
     out
+}
+
+/// 5.3 (ADR-0032): replanning repair hint, byte-capped so a verbose
+/// validation error (e.g. `SchemaViolation` embedding instance
+/// values) cannot starve the capability list — or burn paid tokens
+/// on the cloud tier.
+const REPAIR_BYTE_CAP: usize = 1024;
+
+fn repair_block(error: &str) -> String {
+    let mut e = error;
+    if e.len() > REPAIR_BYTE_CAP {
+        // Char-safe truncation: back off to a boundary.
+        let mut cut = REPAIR_BYTE_CAP;
+        while cut > 0 && !e.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        e = &e[..cut];
+    }
+    format!("\nYour previous plan failed validation: {e}\nEmit a corrected plan that fixes exactly this.\n")
 }
 
 fn format_constraints(c: &crate::backend::PlanConstraints) -> String {
@@ -425,5 +447,45 @@ mod unit_tests {
     fn extract_handles_multiple_stray_closes() {
         let s = "}}} eventually {\"x\":42} more";
         assert_eq!(extract_json_object(s).unwrap(), "{\"x\":42}");
+    }
+
+    fn req_with_repair(repair: Option<String>) -> crate::backend::PlanRequest {
+        crate::backend::PlanRequest {
+            goal: "run: ls".to_string(),
+            available_capabilities: vec![],
+            schemas: CapabilitySchemaIndex::default(),
+            constraints: crate::backend::PlanConstraints::default(),
+            context: None,
+            issuing_node: NodeId::from_bytes([7; 16]),
+            repair,
+        }
+    }
+
+    #[test]
+    fn prompt_includes_repair_block_only_when_set() {
+        let plain = build_prompt(&req_with_repair(None), 8 * 1024);
+        assert!(!plain.contains("failed validation"));
+
+        let repaired = build_prompt(
+            &req_with_repair(Some("plan has a cycle".to_string())),
+            8 * 1024,
+        );
+        assert!(repaired.contains("Your previous plan failed validation: plan has a cycle"));
+        assert!(repaired.contains("Emit a corrected plan"));
+        // Repair sits before the goal line so the goal stays last
+        // (rfind: the header's worked examples also contain "Goal:").
+        let r = repaired.find("failed validation").unwrap();
+        let g = repaired.rfind("\nGoal:").unwrap();
+        assert!(r < g, "repair block precedes the goal line");
+    }
+
+    #[test]
+    fn repair_block_truncates_char_safely_at_cap() {
+        // 2-byte chars straddling the cap must not panic and must
+        // stay under cap + framing.
+        let long = "é".repeat(REPAIR_BYTE_CAP); // 2×cap bytes
+        let block = repair_block(&long);
+        assert!(block.len() < REPAIR_BYTE_CAP + 128);
+        assert!(block.contains("failed validation"));
     }
 }

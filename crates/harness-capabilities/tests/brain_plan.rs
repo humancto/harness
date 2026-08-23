@@ -59,6 +59,7 @@ fn snapshot_with_shell() -> CapabilitySnapshot {
     CapabilitySnapshot {
         refs: shell_only(),
         schemas: shell_schema_index(),
+        cloud_caps: std::collections::HashSet::new(),
     }
 }
 
@@ -66,6 +67,7 @@ fn empty_snapshot() -> CapabilitySnapshot {
     CapabilitySnapshot {
         refs: vec![],
         schemas: CapabilitySchemaIndex::default(),
+        cloud_caps: std::collections::HashSet::new(),
     }
 }
 
@@ -270,6 +272,7 @@ async fn t21_brain_plan_snapshot_consistent_across_backends() {
         CapabilitySnapshot {
             refs: v,
             schemas: shell_schema_index(),
+            cloud_caps: std::collections::HashSet::new(),
         }
     });
     let cap = BrainPlanCapability::new(
@@ -931,4 +934,394 @@ async fn t32_cloud_needs_policy_approval_and_per_task_opt_in() {
         !c.allow_cloud,
         "cloud_ok tag alone cannot resurrect cloud when policy denies it"
     );
+}
+
+// ───────────────────────────────────────── 5.3 escalation triggers + replanning
+
+use harness_policy::CloudTrigger;
+
+/// A `Confident` response whose plan fails schema validation
+/// (`cmd` is an integer) — the pure `plan_validation_failed` shape
+/// (NOT `tool_not_found`: the capability exists, its input is wrong).
+fn bad_schema_plan_response() -> PlanResponse {
+    PlanResponse {
+        plan: Unsigned(plan_one_node("shell.exec", json!({"cmd": 5}))),
+        confidence: 0.9,
+        rationale: "spy".into(),
+        estimated_cost_usd: 0.0,
+        estimated_duration_ms: 0,
+        fallback_plan: None,
+    }
+}
+
+/// Repair hints observed by a [`SeqSpy`], one entry per call.
+type RepairLog = Arc<std::sync::Mutex<Vec<Option<String>>>>;
+
+/// Sequence spy (5.3): scripted per-call outcomes, records the
+/// `repair` field of every request it sees.
+#[derive(Debug)]
+struct SeqSpy {
+    id: String,
+    outcomes: std::sync::Mutex<std::collections::VecDeque<SpyOutcome>>,
+    repairs: RepairLog,
+}
+
+#[async_trait]
+impl PlannerBackend for SeqSpy {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    async fn plan(&self, req: &PlanRequest) -> Result<PlanOutcome, PlannerError> {
+        self.repairs.lock().expect("lock").push(req.repair.clone());
+        let next = self
+            .outcomes
+            .lock()
+            .expect("lock")
+            .pop_front()
+            .expect("SeqSpy exhausted");
+        match next {
+            SpyOutcome::Confident(b) => Ok(PlanOutcome::Confident(b)),
+            SpyOutcome::NoMatch => Ok(PlanOutcome::NoMatch),
+        }
+    }
+}
+
+fn seq_spy(id: &str, outcomes: Vec<SpyOutcome>) -> (Arc<dyn PlannerBackend>, RepairLog) {
+    let repairs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let spy = SeqSpy {
+        id: id.to_string(),
+        outcomes: std::sync::Mutex::new(outcomes.into_iter().collect()),
+        repairs: Arc::clone(&repairs),
+    };
+    (Arc::new(spy), repairs)
+}
+
+fn escalation_cap(
+    backends: Vec<Arc<dyn PlannerBackend>>,
+    triggers: &[CloudTrigger],
+    max_replanning: u32,
+    budget: Option<u64>,
+) -> BrainPlanCapability {
+    let provider: Arc<dyn Fn() -> CapabilitySnapshot + Send + Sync> = Arc::new(snapshot_with_shell);
+    BrainPlanCapability::new(backends, provider, PlanConstraints::default())
+        .with_escalation(triggers.iter().copied().collect(), max_replanning)
+        .with_chain_budget(budget)
+}
+
+#[tokio::test]
+async fn t33_validation_failure_opens_cloud_and_empty_trigger_set_keeps_it_shut() {
+    // Arm 1: a local tier emits an invalid plan; trigger set contains
+    // plan_validation_failed → the cloud tier is attempted and wins.
+    let cloud_calls = Arc::new(AtomicUsize::new(0));
+    let (bad_local, _) = seq_spy(
+        "localfast:stub",
+        vec![SpyOutcome::Confident(Box::new(bad_schema_plan_response()))],
+    );
+    let cloud: Arc<dyn PlannerBackend> = Arc::new(SpyBackend {
+        id: "cloud:stub".into(),
+        calls: cloud_calls.clone(),
+        outcome: SpyOutcome::Confident(Box::new(good_plan_response("shell.exec", 0.9))),
+    });
+    let cap = escalation_cap(
+        vec![bad_local, cloud],
+        &[CloudTrigger::PlanValidationFailed],
+        0,
+        None,
+    );
+    let out = cap
+        .execute(&ctx(), json!({"goal": "anything"}))
+        .await
+        .expect("cloud serves after the trigger fires");
+    assert_eq!(out["confidence"], 0.9);
+    assert_eq!(cloud_calls.load(Ordering::SeqCst), 1);
+
+    // Arm 2: same failure, EMPTY trigger set → cloud never invoked;
+    // the walk ends with the trigger-skip diagnostic.
+    let cloud_calls = Arc::new(AtomicUsize::new(0));
+    let (bad_local, _) = seq_spy(
+        "localfast:stub",
+        vec![SpyOutcome::Confident(Box::new(bad_schema_plan_response()))],
+    );
+    let cloud: Arc<dyn PlannerBackend> = Arc::new(SpyBackend {
+        id: "cloud:stub".into(),
+        calls: cloud_calls.clone(),
+        outcome: SpyOutcome::Confident(Box::new(good_plan_response("shell.exec", 0.9))),
+    });
+    let cap = escalation_cap(vec![bad_local, cloud], &[], 0, None);
+    let err = cap
+        .execute(&ctx(), json!({"goal": "anything"}))
+        .await
+        .expect_err("no tier serves");
+    assert_eq!(cloud_calls.load(Ordering::SeqCst), 0, "cloud stays shut");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("no escalation trigger fired"),
+        "diagnostic names the gate: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn t34_tool_not_found_trigger_via_matched_but_unsupported() {
+    let cloud_calls = Arc::new(AtomicUsize::new(0));
+    let unsupported: Arc<dyn PlannerBackend> = Arc::new(EmitsUnsupported {
+        id: "localfast:stub".into(),
+    });
+    let cloud: Arc<dyn PlannerBackend> = Arc::new(SpyBackend {
+        id: "cloud:stub".into(),
+        calls: cloud_calls.clone(),
+        outcome: SpyOutcome::Confident(Box::new(good_plan_response("shell.exec", 0.9))),
+    });
+    let cap = escalation_cap(
+        vec![unsupported, cloud],
+        &[CloudTrigger::ToolNotFound],
+        0,
+        None,
+    );
+    let out = cap
+        .execute(&ctx(), json!({"goal": "anything"}))
+        .await
+        .expect("cloud serves");
+    assert_eq!(out["confidence"], 0.9);
+    assert_eq!(cloud_calls.load(Ordering::SeqCst), 1);
+}
+
+/// Emits `MatchedButUnsupported` — the `tool_not_found` shape.
+#[derive(Debug)]
+struct EmitsUnsupported {
+    id: String,
+}
+
+#[async_trait]
+impl PlannerBackend for EmitsUnsupported {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    async fn plan(&self, _req: &PlanRequest) -> Result<PlanOutcome, PlannerError> {
+        Ok(PlanOutcome::MatchedButUnsupported {
+            matched_pattern: "run:",
+            missing_capability: "shell.exec".to_string(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn t35_nomatch_never_opens_cloud() {
+    // NoMatch is "this tier cannot help", not a failure — even the
+    // full trigger set leaves cloud shut (pinning the ADR-0032
+    // vocabulary: NoMatch is deliberately not a trigger).
+    let cloud_calls = Arc::new(AtomicUsize::new(0));
+    let (local, _) = seq_spy("localfast:stub", vec![SpyOutcome::NoMatch]);
+    let cloud: Arc<dyn PlannerBackend> = Arc::new(SpyBackend {
+        id: "cloud:stub".into(),
+        calls: cloud_calls.clone(),
+        outcome: SpyOutcome::Confident(Box::new(good_plan_response("shell.exec", 0.9))),
+    });
+    let all = [
+        CloudTrigger::PlanValidationFailed,
+        CloudTrigger::ToolNotFound,
+        CloudTrigger::LowConfidence,
+        CloudTrigger::BackendError,
+    ];
+    let cap = escalation_cap(vec![local, cloud], &all, 0, None);
+    let _ = cap
+        .execute(&ctx(), json!({"goal": "anything"}))
+        .await
+        .expect_err("nothing serves");
+    assert_eq!(cloud_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn t36_cloud_is_baseline_when_no_local_llm_tier_exists() {
+    // Model-less mesh with cloud configured: there is nothing to
+    // escalate FROM, so cloud plans as baseline (ADR-0032 rule b) —
+    // even with an empty trigger set.
+    let cloud_calls = Arc::new(AtomicUsize::new(0));
+    let cloud: Arc<dyn PlannerBackend> = Arc::new(SpyBackend {
+        id: "cloud:stub".into(),
+        calls: cloud_calls.clone(),
+        outcome: SpyOutcome::Confident(Box::new(good_plan_response("shell.exec", 0.9))),
+    });
+    let cap = escalation_cap(vec![cloud], &[], 0, None);
+    let out = cap
+        .execute(&ctx(), json!({"goal": "anything"}))
+        .await
+        .expect("cloud baseline serves");
+    assert_eq!(out["confidence"], 0.9);
+    assert_eq!(cloud_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn t37_replanning_repairs_with_stricter_prompt() {
+    // Invalid then valid: the second attempt must carry the repair
+    // hint and the tier succeeds without escalating.
+    let (local, repairs) = seq_spy(
+        "localfast:stub",
+        vec![
+            SpyOutcome::Confident(Box::new(bad_schema_plan_response())),
+            SpyOutcome::Confident(Box::new(good_plan_response("shell.exec", 0.9))),
+        ],
+    );
+    let cap = escalation_cap(vec![local], &[], 2, None);
+    let out = cap
+        .execute(&ctx(), json!({"goal": "anything"}))
+        .await
+        .expect("repaired attempt serves");
+    assert_eq!(out["confidence"], 0.9);
+    let seen = repairs.lock().expect("lock").clone();
+    assert_eq!(seen.len(), 2, "exactly one retry");
+    assert!(seen[0].is_none(), "first attempt has no repair hint");
+    let hint = seen[1].as_deref().expect("retry carries the hint");
+    assert!(
+        hint.contains("schema"),
+        "hint is the validation error: {hint}"
+    );
+}
+
+#[tokio::test]
+async fn t38_zero_replanning_attempts_advances_after_one_call() {
+    let (local, repairs) = seq_spy(
+        "localfast:stub",
+        vec![SpyOutcome::Confident(Box::new(bad_schema_plan_response()))],
+    );
+    let tpl: Arc<dyn PlannerBackend> = Arc::new(TemplateBackend::new(NodeId::from_bytes([1; 16])));
+    let cap = escalation_cap(vec![local, tpl], &[], 0, None);
+    let _ = cap
+        .execute(&ctx(), json!({"goal": "run: ls"}))
+        .await
+        .expect("template covers");
+    assert_eq!(repairs.lock().expect("lock").len(), 1, "no retry");
+}
+
+#[tokio::test]
+async fn t39_exhausted_chain_budget_skips_llm_tiers_but_never_template() {
+    let llm_calls = Arc::new(AtomicUsize::new(0));
+    let local: Arc<dyn PlannerBackend> = Arc::new(SpyBackend {
+        id: "localfast:stub".into(),
+        calls: llm_calls.clone(),
+        outcome: SpyOutcome::Confident(Box::new(good_plan_response("shell.exec", 0.9))),
+    });
+    let tpl: Arc<dyn PlannerBackend> = Arc::new(TemplateBackend::new(NodeId::from_bytes([1; 16])));
+    let cap = escalation_cap(vec![local, tpl], &[], 0, Some(0));
+    let out = cap
+        .execute(&ctx(), json!({"goal": "run: ls"}))
+        .await
+        .expect("template is exempt from the budget");
+    assert!(out["plan"].is_object());
+    assert_eq!(llm_calls.load(Ordering::SeqCst), 0, "LLM tier never starts");
+}
+
+#[tokio::test]
+async fn t40_low_confidence_trigger_opens_cloud() {
+    let cloud_calls = Arc::new(AtomicUsize::new(0));
+    let (local, _) = seq_spy(
+        "localfast:stub",
+        vec![SpyOutcome::Confident(Box::new(good_plan_response(
+            "shell.exec",
+            0.2,
+        )))],
+    );
+    let cloud: Arc<dyn PlannerBackend> = Arc::new(SpyBackend {
+        id: "cloud:stub".into(),
+        calls: cloud_calls.clone(),
+        outcome: SpyOutcome::Confident(Box::new(good_plan_response("shell.exec", 0.9))),
+    });
+    let provider: Arc<dyn Fn() -> CapabilitySnapshot + Send + Sync> = Arc::new(snapshot_with_shell);
+    let cap = BrainPlanCapability::new(
+        vec![local, cloud],
+        provider,
+        PlanConstraints {
+            confidence_threshold: Some(0.7),
+            ..PlanConstraints::default()
+        },
+    )
+    .with_escalation([CloudTrigger::LowConfidence].into_iter().collect(), 0);
+    let out = cap
+        .execute(&ctx(), json!({"goal": "anything"}))
+        .await
+        .expect("cloud serves after low-confidence trigger");
+    assert_eq!(out["confidence"], 0.9);
+    assert_eq!(cloud_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn t41_snapshot_cloud_caps_detects_paid_and_tagged_caps() {
+    use harness_core::protocol::CostHint;
+    use harness_core::{Cardinality, SemVer};
+
+    #[derive(Debug)]
+    struct StubCap {
+        id: &'static str,
+        cost_hint: CostHint,
+        tags: Vec<String>,
+    }
+
+    #[async_trait]
+    impl Capability for StubCap {
+        fn id(&self) -> &str {
+            self.id
+        }
+        fn manifest(&self) -> harness_core::Capability {
+            harness_core::Capability {
+                id: self.id.into(),
+                version: SemVer {
+                    major: 0,
+                    minor: 1,
+                    patch: 0,
+                },
+                cardinality: Cardinality::Anyone,
+                input_schema: json!({"type": "object"}),
+                output_schema: json!({"type": "object"}),
+                cost_hint: self.cost_hint,
+                tags: self.tags.clone(),
+                rate_limit: None,
+                resource_hints: ResourceHints {
+                    cpu_class: CpuClass::Light,
+                    memory_mb: None,
+                    gpu_required: false,
+                    gpu_memory_mb: None,
+                    network_class: NetworkClass::None,
+                    disk_io_class: DiskIoClass::None,
+                    estimated_duration_ms: None,
+                },
+                requires_secrets: vec![],
+            }
+        }
+        async fn execute(
+            &self,
+            _ctx: &ExecutionContext,
+            input: serde_json::Value,
+        ) -> Result<serde_json::Value, harness_capabilities::traits::CapabilityError> {
+            Ok(input)
+        }
+    }
+
+    let registry = CapabilityRegistry::new();
+    for cap in [
+        StubCap {
+            id: "llm.cloud.stub",
+            cost_hint: CostHint::CloudPaid,
+            tags: vec![],
+        },
+        StubCap {
+            id: "gateway.stub",
+            cost_hint: CostHint::LocalFast,
+            tags: vec!["cloud".to_string()],
+        },
+        StubCap {
+            id: "shell.stub",
+            cost_hint: CostHint::LocalFast,
+            tags: vec!["shell".to_string()],
+        },
+    ] {
+        registry.register(Arc::new(cap)).expect("register");
+    }
+
+    let snap = registry.downgrade().snapshot();
+    assert!(snap.cloud_caps.contains("llm.cloud.stub"), "CloudPaid hint");
+    assert!(snap.cloud_caps.contains("gateway.stub"), "\"cloud\" tag");
+    assert!(
+        !snap.cloud_caps.contains("shell.stub"),
+        "local caps stay out"
+    );
+    assert_eq!(snap.refs.len(), 3, "cloud detection never drops refs");
 }

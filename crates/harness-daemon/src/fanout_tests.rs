@@ -203,6 +203,29 @@ async fn wait_for_state(
     }
 }
 
+/// Poll for the issuer-side result row. Task STATE can reach `Done`
+/// via replica gossip before the result reply lands on the reply
+/// channel (by-design eventual consistency, ADR-0006/0019) — reading
+/// the row immediately after `wait_for_state` lost that race on slow
+/// CI runners (macOS, 5.3 PR). Bounded, never a behavioral wait.
+async fn wait_for_result_row(
+    store: &Store,
+    id: TaskId,
+    budget: Duration,
+) -> harness_store::TaskResult {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if let Ok(Some(row)) = store.load_task_result(id) {
+            return row;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "task {id:?} reached a terminal state but its result row never arrived"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Wait until both nodes hold each other's manifest AND at least one
 /// heartbeat (the `mesh_meta` target filter requires peer liveness).
 pub(crate) async fn wait_for_mesh(a: &TestDaemon, b: &TestDaemon) {
@@ -240,7 +263,7 @@ async fn m01_pinned_task_executes_on_remote_node_end_to_end() {
     assert_eq!(state, TaskState::Done);
 
     // Result on the issuer names the worker.
-    let row = a.store.load_task_result(id).expect("load").expect("row");
+    let row = wait_for_result_row(&a.store, id, Duration::from_secs(5)).await;
     assert_eq!(row.completed_by, b.node_id());
     assert_eq!(
         row.output,
@@ -328,7 +351,7 @@ allow = [{ cmd = "sleep", any_args = true }]
     // 2 s test eligibility window + margins.
     let state = wait_for_state(&a.store, id, &[TaskState::Failed], Duration::from_secs(30)).await;
     assert_eq!(state, TaskState::Failed);
-    let row = a.store.load_task_result(id).expect("load").expect("row");
+    let row = wait_for_result_row(&a.store, id, Duration::from_secs(5)).await;
     let err = row.error.expect("error text");
     assert!(
         err.contains("undispatchable"),
@@ -383,7 +406,7 @@ async fn m04_mesh_grep_federates_across_both_nodes() {
     let state = wait_for_state(&a.store, id, &[TaskState::Done], Duration::from_secs(30)).await;
     assert_eq!(state, TaskState::Done);
 
-    let row = a.store.load_task_result(id).expect("load").expect("row");
+    let row = wait_for_result_row(&a.store, id, Duration::from_secs(5)).await;
     let output = row.output.expect("output");
     let results = output["results"].as_array().expect("results array");
     assert_eq!(results.len(), 2, "both scopes must contribute: {output:#}");
@@ -502,7 +525,7 @@ async fn m05_plan_execute_chains_steps_with_output_threading() {
     let state = wait_for_state(&a.store, id, &[TaskState::Done], Duration::from_secs(30)).await;
     assert_eq!(state, TaskState::Done);
 
-    let row = a.store.load_task_result(id).expect("load").expect("row");
+    let row = wait_for_result_row(&a.store, id, Duration::from_secs(5)).await;
     let output = row.output.expect("output");
     assert_eq!(output["ok"], 2, "both steps done: {output:#}");
     let steps = output["steps"].as_object().expect("steps");
@@ -572,7 +595,7 @@ async fn m06_mesh_info_federates_with_provenance_and_frames() {
     let state = wait_for_state(&a.store, id, &[TaskState::Done], Duration::from_secs(30)).await;
     assert_eq!(state, TaskState::Done);
 
-    let row = a.store.load_task_result(id).expect("load").expect("row");
+    let row = wait_for_result_row(&a.store, id, Duration::from_secs(5)).await;
     let output = row.output.expect("output");
     let items = output["items"].as_array().expect("items");
     assert_eq!(items.len(), 2, "one inventory item per node: {output:#}");
@@ -649,11 +672,7 @@ async fn m06_mesh_info_federates_with_provenance_and_frames() {
     )
     .await;
     assert_eq!(state, TaskState::Done);
-    let row = a
-        .store
-        .load_task_result(pinned)
-        .expect("load")
-        .expect("row");
+    let row = wait_for_result_row(&a.store, pinned, Duration::from_secs(5)).await;
     let output = row.output.expect("output");
     let items = output["items"].as_array().expect("items");
     assert_eq!(items.len(), 1, "pinned: executes on B alone: {output:#}");
@@ -689,7 +708,7 @@ async fn m07_mesh_info_node_death_returns_partial_with_failed_provenance() {
         "ReturnPartial: A's item still merges"
     );
 
-    let row = a.store.load_task_result(id).expect("load").expect("row");
+    let row = wait_for_result_row(&a.store, id, Duration::from_secs(5)).await;
     let output = row.output.expect("output");
     let items = output["items"].as_array().expect("items");
     assert_eq!(items.len(), 1, "only A contributed: {output:#}");
@@ -820,7 +839,7 @@ allow = [{ cmd = "sleep", any_args = true }]
         elapsed < Duration::from_secs(20),
         "fast detection: took {elapsed:?}, budget was 60 s"
     );
-    let row = a.store.load_task_result(id2).expect("load").expect("row");
+    let row = wait_for_result_row(&a.store, id2, Duration::from_secs(5)).await;
     let err = row.error.expect("error");
     assert!(
         err.contains("undispatchable") || err.contains("expired"),
@@ -938,7 +957,7 @@ allow = [{ cmd = "sh", any_args = true }]
     let fed = submit_task(&a, "mesh.info", serde_json::json!({}), None, 20_000);
     let state = wait_for_state(&a.store, fed, &[TaskState::Done], Duration::from_secs(20)).await;
     assert_eq!(state, TaskState::Done);
-    let row = a.store.load_task_result(fed).expect("load").expect("row");
+    let row = wait_for_result_row(&a.store, fed, Duration::from_secs(5)).await;
     let output = row.output.expect("output");
     let items = output["items"].as_array().expect("items");
     assert_eq!(items.len(), 1, "only A contributed: {output:#}");

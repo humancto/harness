@@ -49,6 +49,7 @@ fn cloud_req(goal: &str) -> PlanRequest {
         },
         context: None,
         issuing_node: NodeId::from_bytes([7; 16]),
+        repair: None,
     }
 }
 

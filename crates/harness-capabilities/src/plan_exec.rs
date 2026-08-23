@@ -232,6 +232,11 @@ impl Capability for PlanExecCapability {
             &PlanConstraints::default(),
             &schemas,
             &refs,
+            // 5.3: constraints are `default()` here (must_be_local
+            // false) so the locality rule is inert — execution-side
+            // locality is the executing node's policy (§10.4). Pass
+            // the empty set explicitly rather than a mesh-derived one.
+            &std::collections::HashSet::new(),
         )
         .map_err(|e| CapabilityError::InvalidInput(format!("plan validation failed: {e}")))?;
 

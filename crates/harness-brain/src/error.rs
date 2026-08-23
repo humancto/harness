@@ -75,4 +75,10 @@ pub enum PlanValidationError {
          dependencies — add the edge)"
     )]
     UndeclaredOutputRef { task: TaskId, referenced: TaskId },
+
+    #[error(
+        "task {task:?} references cloud capability {cap:?} but the plan is \
+         constrained must_be_local (PRD §15.4 rule 4)"
+    )]
+    LocalityConflict { task: TaskId, cap: String },
 }
