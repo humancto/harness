@@ -428,32 +428,65 @@ impl DaemonOrchestrator {
             let mut backends: Vec<std::sync::Arc<dyn harness_brain::PlannerBackend>> = Vec::new();
 
             #[cfg(feature = "llm")]
-            if let Some(model) =
-                resolve_local_fast_model(&capabilities, &planning.prefer_local_models)
             {
-                let host_str = std::env::var("OLLAMA_HOST")
-                    .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
-                let host = harness_capabilities::llm_local::parse_ollama_host(&host_str)
-                    .unwrap_or_else(|()| {
-                        #[allow(clippy::expect_used)]
-                        url::Url::parse("http://127.0.0.1:11434").expect("default host parses")
-                    });
-                match harness_brain::LocalFastBackend::new(host, model.clone(), identity.node_id())
-                {
-                    Ok(b) => {
-                        tracing::info!(
-                            target: "harness.brain",
-                            local_fast_model = %model,
-                            "registered LocalFast planner backend"
-                        );
-                        backends.push(std::sync::Arc::new(b));
+                // 5.1 (ADR-0030): partition the preferred+registered
+                // local models by class — first fast-class model →
+                // tier 1, first strong-class model → tier 2. Lineup
+                // order is §15.2's local_first: fast, strong, template.
+                let lineup = resolve_local_models(&capabilities, &planning.prefer_local_models);
+                if lineup.fast.is_some() || lineup.strong.is_some() {
+                    let host_str = std::env::var("OLLAMA_HOST")
+                        .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+                    let host = harness_capabilities::llm_local::parse_ollama_host(&host_str)
+                        .unwrap_or_else(|()| {
+                            #[allow(clippy::expect_used)]
+                            url::Url::parse("http://127.0.0.1:11434").expect("default host parses")
+                        });
+                    if let Some(model) = lineup.fast {
+                        match harness_brain::LocalFastBackend::new(
+                            host.clone(),
+                            model.clone(),
+                            identity.node_id(),
+                        ) {
+                            Ok(b) => {
+                                tracing::info!(
+                                    target: "harness.brain",
+                                    local_fast_model = %model,
+                                    "registered LocalFast planner backend"
+                                );
+                                backends.push(std::sync::Arc::new(b));
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    target: "harness.brain",
+                                    ?err,
+                                    "failed to construct LocalFastBackend; tier skipped"
+                                );
+                            }
+                        }
                     }
-                    Err(err) => {
-                        tracing::warn!(
-                            target: "harness.brain",
-                            ?err,
-                            "failed to construct LocalFastBackend; brain.plan will run Template-only"
-                        );
+                    if let Some(model) = lineup.strong {
+                        match harness_brain::LocalStrongBackend::new(
+                            host,
+                            model.clone(),
+                            identity.node_id(),
+                        ) {
+                            Ok(b) => {
+                                tracing::info!(
+                                    target: "harness.brain",
+                                    local_strong_model = %model,
+                                    "registered LocalStrong planner backend"
+                                );
+                                backends.push(std::sync::Arc::new(b));
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    target: "harness.brain",
+                                    ?err,
+                                    "failed to construct LocalStrongBackend; tier skipped"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -835,19 +868,94 @@ fn map_discovery(err: &DiscoveryError) -> anyhow::Error {
 /// registered. Returns `None` when no preference matches — the daemon
 /// then registers brain.plan with a Template-only lineup.
 #[cfg(all(feature = "brain", feature = "llm"))]
-fn resolve_local_fast_model(
+/// 5.1 (ADR-0030): the two-tier local planner lineup — first
+/// preferred fast-class model and first preferred strong-class model
+/// that are actually registered as `llm.local.<tag>`.
+#[cfg_attr(not(all(feature = "brain", feature = "llm")), allow(dead_code))]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LocalPlannerLineup {
+    fast: Option<String>,
+    strong: Option<String>,
+}
+
+/// Parameter count (in billions, effective) at or above which a local
+/// model counts as tier-2 `LocalStrong`. PRD §15.1 names the 32B–70B
+/// class; 20 keeps 22B/27B-class models in tier 2 while 13B/14B stay
+/// tier 1 (ADR-0030).
+#[cfg_attr(not(all(feature = "brain", feature = "llm")), allow(dead_code))]
+const STRONG_MIN_PARAMS_B: f64 = 20.0;
+
+#[cfg_attr(not(all(feature = "brain", feature = "llm")), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalModelClass {
+    Fast,
+    Strong,
+}
+
+/// Classify a VERBATIM Ollama tag (`llama3.1:70b-instruct-q4_K_M`,
+/// `qwen2:0.5b`, `mixtral:8x7b-instruct-v0.1-q4_0`, `llama3:latest`)
+/// by parameter count. Tokenize on `:` then `-`; match tokens
+/// case-insensitively as `<n>x<m>b` (`MoE` — effective n×m) or `<m>b`.
+/// No size token → Fast (conservative: never over-promise tier 2).
+#[cfg_attr(not(all(feature = "brain", feature = "llm")), allow(dead_code))]
+fn classify_local_model(tag: &str) -> LocalModelClass {
+    fn parse_size_token(token: &str) -> Option<f64> {
+        let t = token.to_ascii_lowercase();
+        let body = t.strip_suffix('b')?;
+        if let Some((experts, per)) = body.split_once('x') {
+            let e: f64 = experts.parse().ok()?;
+            let p: f64 = per.parse().ok()?;
+            if e <= 0.0 || p <= 0.0 {
+                return None;
+            }
+            return Some(e * p);
+        }
+        let p: f64 = body.parse().ok()?;
+        if p <= 0.0 {
+            return None;
+        }
+        Some(p)
+    }
+    for part in tag.split(':') {
+        for token in part.split('-') {
+            if let Some(size_b) = parse_size_token(token) {
+                return if size_b >= STRONG_MIN_PARAMS_B {
+                    LocalModelClass::Strong
+                } else {
+                    LocalModelClass::Fast
+                };
+            }
+        }
+    }
+    LocalModelClass::Fast
+}
+
+#[cfg_attr(not(all(feature = "brain", feature = "llm")), allow(dead_code))]
+fn resolve_local_models(
     registry: &harness_capabilities::CapabilityRegistry,
     prefer_models: &[String],
-) -> Option<String> {
+) -> LocalPlannerLineup {
     let registered_ids: std::collections::HashSet<String> = registry
         .ids()
         .into_iter()
         .filter_map(|id| id.strip_prefix("llm.local.").map(str::to_string))
         .collect();
-    prefer_models
-        .iter()
-        .find(|m| registered_ids.contains(m.as_str()))
-        .cloned()
+    let mut lineup = LocalPlannerLineup::default();
+    for model in prefer_models {
+        if !registered_ids.contains(model.as_str()) {
+            continue;
+        }
+        match classify_local_model(model) {
+            LocalModelClass::Fast if lineup.fast.is_none() => {
+                lineup.fast = Some(model.clone());
+            }
+            LocalModelClass::Strong if lineup.strong.is_none() => {
+                lineup.strong = Some(model.clone());
+            }
+            _ => {}
+        }
+    }
+    lineup
 }
 
 fn spawn_election_pump(
@@ -1106,5 +1214,97 @@ mod tests {
             .expect("build orchestrator");
         let api_addr = orch.api_addr();
         assert!(api_addr.port() != 0, "api should bind to a real port");
+    }
+
+    /// 5.1 (ADR-0030): tag classification over VERBATIM Ollama tags —
+    /// quantization suffixes, decimals, `MoE`, and size-less tags.
+    #[test]
+    fn classify_local_model_table() {
+        use super::{classify_local_model, LocalModelClass::*};
+        let cases = [
+            ("llama3.1:70b", Strong),
+            ("llama3.1:70b-instruct-q4_K_M", Strong),
+            ("qwen2.5-coder:32b", Strong),
+            ("gemma2:27b", Strong),
+            ("mistral-small:22b", Strong),
+            ("mixtral:8x7b", Strong), // 8×7 = 56 effective
+            ("mixtral:8x7b-instruct-v0.1-q4_0", Strong),
+            ("llama3.1:8b", Fast),
+            ("qwen2:0.5b", Fast),
+            ("llama2:13b", Fast),
+            ("phi-4", Fast),         // no size token
+            ("llama3:latest", Fast), // no size token
+            ("garbage", Fast),
+            ("weird:xb", Fast), // unparseable size
+        ];
+        for (tag, want) in cases {
+            assert_eq!(classify_local_model(tag), want, "tag {tag:?}");
+        }
+    }
+
+    /// 5.1: the preferred list partitions into [fast, strong] against
+    /// what the registry actually holds; missing classes stay None.
+    #[test]
+    fn resolve_local_models_partitions_by_class() {
+        use super::{resolve_local_models, LocalPlannerLineup};
+        use harness_capabilities::CapabilityRegistry;
+
+        fn registry_with(models: &[&str]) -> CapabilityRegistry {
+            let registry = CapabilityRegistry::new();
+            let policy = std::sync::Arc::new(harness_policy::PolicyEngine::new(
+                harness_policy::Policy::deny_all(),
+            ));
+            #[allow(clippy::expect_used)]
+            let host = url::Url::parse("http://127.0.0.1:11434").expect("host");
+            let client = reqwest::Client::new();
+            let batcher =
+                std::sync::Arc::new(harness_capabilities::llm_batcher::LlmBatcher::with_window(
+                    std::time::Duration::ZERO,
+                ));
+            for m in models {
+                registry
+                    .register(std::sync::Arc::new(
+                        harness_capabilities::llm_local::LlmLocalCapability::new(
+                            policy.clone(),
+                            (*m).to_string(),
+                            host.clone(),
+                            client.clone(),
+                            batcher.clone(),
+                        ),
+                    ))
+                    .expect("register");
+            }
+            registry
+        }
+
+        let prefer: Vec<String> = ["llama3.1:70b", "qwen2.5:32b", "llama3.1:8b"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+
+        // Both classes present: first strong (70b), first fast (8b).
+        let lineup =
+            resolve_local_models(&registry_with(&["llama3.1:70b", "llama3.1:8b"]), &prefer);
+        assert_eq!(
+            lineup,
+            LocalPlannerLineup {
+                fast: Some("llama3.1:8b".into()),
+                strong: Some("llama3.1:70b".into()),
+            }
+        );
+
+        // Fast-only mesh: 3.9 behavior.
+        let lineup = resolve_local_models(&registry_with(&["llama3.1:8b"]), &prefer);
+        assert_eq!(lineup.fast.as_deref(), Some("llama3.1:8b"));
+        assert_eq!(lineup.strong, None);
+
+        // Strong-only mesh.
+        let lineup = resolve_local_models(&registry_with(&["qwen2.5:32b"]), &prefer);
+        assert_eq!(lineup.fast, None);
+        assert_eq!(lineup.strong.as_deref(), Some("qwen2.5:32b"));
+
+        // Nothing registered → template-only lineup upstream.
+        let lineup = resolve_local_models(&registry_with(&[]), &prefer);
+        assert_eq!(lineup, LocalPlannerLineup::default());
     }
 }
