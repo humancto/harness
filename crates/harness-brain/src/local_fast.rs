@@ -43,23 +43,64 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 /// byte-stable cache friendliness; ~2300 tokens at 3.5 chars/token.
 const PROMPT_BYTE_CAP: usize = 8 * 1024;
 
+/// 5.1 (ADR-0030): tier-2 request timeout. A 32B–70B model on consumer
+/// hardware streams slowly; the CLI's plan budget (180 s as of 5.1)
+/// outer-bounds the whole escalation chain with room for Template.
+const STRONG_TIMEOUT_MS: u64 = 120_000;
+/// 5.1: strong models afford a fuller capability projection.
+const STRONG_PROMPT_BYTE_CAP: usize = 16 * 1024;
+
 /// Capabilities that always make it into the prompt before sorted-id
 /// truncation. These are the prefixes the Template backend matches; if
 /// `LocalFast` is asked to plan a `run:`/`fetch:`/`summarize:`/`search:`
 /// goal it must see them.
 static ALWAYS_INCLUDE: &[&str] = &["shell.exec", "http.fetch", "doc.summarize", "mesh.search"];
 
-/// Phase 3.9 `LocalFast` backend.
+/// Shared Ollama-backed planner core (5.1, ADR-0030): `LocalFast`
+/// (tier 1) and `LocalStrong` (tier 2) differ ONLY in id prefix,
+/// request timeout, and prompt byte cap — one implementation, two
+/// thin public wrappers.
 #[derive(Debug, Clone)]
-pub struct LocalFastBackend {
+struct LocalLlmCore {
     host: Url,
     client: reqwest::Client,
     model: String,
     local_node: NodeId,
-    /// `"localfast:<model>"`. Stored once at construction so `id()`
+    /// `"<tier>:<model>"`. Stored once at construction so `id()`
     /// returns `&str` cheaply.
     id: String,
+    timeout_ms: u64,
+    prompt_byte_cap: usize,
 }
+
+impl LocalLlmCore {
+    fn new(
+        host: Url,
+        model: String,
+        local_node: NodeId,
+        id_prefix: &str,
+        timeout_ms: u64,
+        prompt_byte_cap: usize,
+    ) -> Result<Self, reqwest::Error> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(60))
+            .build()?;
+        let id = format!("{id_prefix}:{model}");
+        Ok(Self {
+            host,
+            client,
+            model,
+            local_node,
+            id,
+            timeout_ms,
+            prompt_byte_cap,
+        })
+    }
+}
+
+/// Phase 3.9 `LocalFast` backend (tier 1).
+#[derive(Debug, Clone)]
+pub struct LocalFastBackend(LocalLlmCore);
 
 impl LocalFastBackend {
     /// Construct a `LocalFast` backend.
@@ -68,28 +109,65 @@ impl LocalFastBackend {
     /// Returns `Err(reqwest::Error)` if the underlying HTTP client
     /// builder fails (rare; surfaces TLS-init / OS-resource issues).
     pub fn new(host: Url, model: String, local_node: NodeId) -> Result<Self, reqwest::Error> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(60))
-            .build()?;
-        let id = format!("localfast:{model}");
-        Ok(Self {
+        LocalLlmCore::new(
             host,
-            client,
             model,
             local_node,
-            id,
-        })
+            "localfast",
+            DEFAULT_TIMEOUT_MS,
+            PROMPT_BYTE_CAP,
+        )
+        .map(Self)
+    }
+}
+
+/// 5.1 `LocalStrong` backend (tier 2, 32B–70B class). Same Ollama
+/// plumbing as tier 1; slower budget, fuller prompt.
+#[derive(Debug, Clone)]
+pub struct LocalStrongBackend(LocalLlmCore);
+
+impl LocalStrongBackend {
+    /// Construct a `LocalStrong` backend.
+    ///
+    /// # Errors
+    /// Returns `Err(reqwest::Error)` if the underlying HTTP client
+    /// builder fails (rare; surfaces TLS-init / OS-resource issues).
+    pub fn new(host: Url, model: String, local_node: NodeId) -> Result<Self, reqwest::Error> {
+        LocalLlmCore::new(
+            host,
+            model,
+            local_node,
+            "localstrong",
+            STRONG_TIMEOUT_MS,
+            STRONG_PROMPT_BYTE_CAP,
+        )
+        .map(Self)
     }
 }
 
 #[async_trait]
 impl PlannerBackend for LocalFastBackend {
     fn id(&self) -> &str {
-        &self.id
+        &self.0.id
     }
-
     async fn plan(&self, req: &PlanRequest) -> Result<PlanOutcome, PlannerError> {
-        let prompt = build_prompt(req);
+        self.0.plan(req).await
+    }
+}
+
+#[async_trait]
+impl PlannerBackend for LocalStrongBackend {
+    fn id(&self) -> &str {
+        &self.0.id
+    }
+    async fn plan(&self, req: &PlanRequest) -> Result<PlanOutcome, PlannerError> {
+        self.0.plan(req).await
+    }
+}
+
+impl LocalLlmCore {
+    async fn plan(&self, req: &PlanRequest) -> Result<PlanOutcome, PlannerError> {
+        let prompt = build_prompt(req, self.prompt_byte_cap);
         let url = self
             .host
             .join("api/generate")
@@ -104,7 +182,7 @@ impl PlannerBackend for LocalFastBackend {
             .client
             .post(url)
             .json(&body)
-            .timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS))
+            .timeout(Duration::from_millis(self.timeout_ms))
             .send()
             .await
             .map_err(|e| {
@@ -146,7 +224,7 @@ impl PlannerBackend for LocalFastBackend {
 
 // ───────────────────────────────────────── Prompt construction
 
-fn build_prompt(req: &PlanRequest) -> String {
+fn build_prompt(req: &PlanRequest, prompt_byte_cap: usize) -> String {
     let header = "\
 You are a task planner for a typed mesh of capabilities. Output a single JSON \
 object with this exact shape:
@@ -187,11 +265,11 @@ Goal: read README.md
     let constraints_block = format_constraints(&req.constraints);
     let goal_line = format!("\nGoal: {}\n", req.goal);
     let fixed_overhead = header.len() + constraints_block.len() + goal_line.len() + 64;
-    let cap_budget = PROMPT_BYTE_CAP.saturating_sub(fixed_overhead);
+    let cap_budget = prompt_byte_cap.saturating_sub(fixed_overhead);
 
     let cap_block = render_capabilities(&projections, cap_budget);
 
-    let mut out = String::with_capacity(PROMPT_BYTE_CAP);
+    let mut out = String::with_capacity(prompt_byte_cap);
     out.push_str(header);
     out.push_str(&cap_block);
     out.push('\n');

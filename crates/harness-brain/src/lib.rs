@@ -32,4 +32,4 @@ pub use template::{TemplateBackend, BACKEND_ID as TEMPLATE_BACKEND_ID, TEMPLATE_
 pub use validate::{validate_plan, validate_plan_well_formed};
 
 #[cfg(feature = "localfast")]
-pub use local_fast::LocalFastBackend;
+pub use local_fast::{LocalFastBackend, LocalStrongBackend};

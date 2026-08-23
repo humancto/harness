@@ -89,7 +89,7 @@ When an item lands, flip its checkbox **in the same PR** as `STATE.md` is update
 
 **Demo:** WhatsApp message → mesh executes multi-step plan → text reply with cost summary. Crash brain mid-plan; new brain resumes from checkpoint.
 
-- [ ] **5.1** `brain.plan` LocalStrong backend (tier 2, 32B–70B class).
+- [x] **5.1** `brain.plan` LocalStrong backend (tier 2, 32B–70B class). Shared Ollama core with tier knobs (id/timeout 120s/prompt cap 16KiB), verbatim-tag model-class detection (≥20B effective incl. MoE/quantized/decimal forms), `[fast, strong, template]` lineup partition from one `prefer_local_models` list, CLI planning budget raised to 180s + `--timeout-ms` wired through. ADR-0030.
 - [ ] **5.2** `brain.plan` Cloud backend (tier 3) with policy-driven escalation rules.
 - [ ] **5.3** Full plan validation ruleset (`plan_validation_failed` / `tool_not_found` escalation triggers).
 - [ ] **5.4** Natural-language Submit mode in UI (textarea → planner → DAG preview → confirm).

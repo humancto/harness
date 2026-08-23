@@ -21,7 +21,11 @@ const CLI_SLACK_MS: u64 = 5_000;
 /// critical path.
 const DEFAULT_EXEC_TIMEOUT_MS: u64 = 120_000;
 const MAX_EXEC_TIMEOUT_MS: u64 = 600_000;
-const DEFAULT_PLAN_TIMEOUT_MS: u64 = 60_000;
+/// 5.1 (ADR-0030): the planning budget must cover the full escalation
+/// chain — `LocalFast` (30 s) + `LocalStrong` (120 s) + Template — with
+/// slack, or a slow tier-2 model starves the Template fallback. The
+/// user's `--timeout-ms` overrides it.
+const DEFAULT_PLAN_TIMEOUT_MS: u64 = 180_000;
 
 /// `harness plan "<goal>"` — plan only, render the DAG.
 pub async fn run_plan(args: PlanArgs) -> Result<RunOutcome> {
@@ -87,13 +91,19 @@ async fn obtain_plan(
     token: &str,
     args: &PlanArgs,
 ) -> Result<JsonValue> {
+    // 5.1 (review MAJOR-2): the user's --timeout-ms governs planning
+    // too — previously it was silently ignored here.
+    let plan_timeout_ms = args
+        .timeout_ms
+        .unwrap_or(DEFAULT_PLAN_TIMEOUT_MS)
+        .clamp(1_000, MAX_EXEC_TIMEOUT_MS);
     let envelope = submit_and_poll(
         client,
         api_base,
         token,
         "brain.plan",
         json!({ "goal": args.goal }),
-        DEFAULT_PLAN_TIMEOUT_MS,
+        plan_timeout_ms,
         false,
     )
     .await?;

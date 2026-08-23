@@ -429,3 +429,41 @@ fn extract_json_object_handles_unicode_escape_in_string() {
     let s = r#"prose {"emoji":"é hi"} more"#;
     assert_eq!(extract_json_object(s).unwrap(), r#"{"emoji":"é hi"}"#);
 }
+
+// ───────────────────────────────────────── 5.1 LocalStrong (shared core)
+
+#[tokio::test]
+async fn t29_local_strong_id_and_happy_path() {
+    // The tier-2 wrapper shares the tier-1 core (ADR-0030): one
+    // success test pins its id scheme and that the plumbing works
+    // end-to-end; every parsing/error path is covered by the tier-1
+    // suite over the same core.
+    use harness_brain::local_fast::LocalStrongBackend;
+
+    let mock = MockServer::start().await;
+    let inner = serde_json::to_string(&llm_one_node("shell.exec", json!({"cmd": "ls"}))).unwrap();
+    Mock::given(method("POST"))
+        .and(path("/api/generate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ollama_response(&inner)))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let host = url::Url::parse(&format!("{}/", mock.uri())).unwrap();
+    let b = LocalStrongBackend::new(
+        host,
+        "llama3.1:70b".to_string(),
+        NodeId::from_bytes([1; 16]),
+    )
+    .unwrap();
+    assert_eq!(b.id(), "localstrong:llama3.1:70b");
+
+    let r = req("run: ls", shell_only(), shell_index());
+    let outcome = b.plan(&r).await.expect("ok");
+    match outcome {
+        PlanOutcome::Confident(p) => {
+            assert_eq!(p.plan.as_inner().tasks.len(), 1);
+        }
+        other => panic!("want Confident, got {other:?}"),
+    }
+}

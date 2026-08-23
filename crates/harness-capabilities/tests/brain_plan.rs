@@ -576,6 +576,52 @@ async fn t24_brain_plan_validation_failure_propagates_to_diagnostic() {
     assert!(msg.contains("validation failed"), "msg = {msg}");
 }
 
+/// 5.1 (ADR-0030): the three-tier local_first lineup — a
+/// low-confidence LocalFast escalates to a confident LocalStrong;
+/// Template never runs.
+#[tokio::test]
+async fn t29_low_confidence_fast_escalates_to_confident_strong() {
+    let fast_calls = Arc::new(AtomicUsize::new(0));
+    let strong_calls = Arc::new(AtomicUsize::new(0));
+    let tpl_calls = Arc::new(AtomicUsize::new(0));
+    let fast: Arc<dyn PlannerBackend> = Arc::new(SpyBackend {
+        id: "localfast:llama3.1:8b".into(),
+        calls: fast_calls.clone(),
+        outcome: SpyOutcome::Confident(Box::new(good_plan_response("shell.exec", 0.2))),
+    });
+    let strong: Arc<dyn PlannerBackend> = Arc::new(SpyBackend {
+        id: "localstrong:llama3.1:70b".into(),
+        calls: strong_calls.clone(),
+        outcome: SpyOutcome::Confident(Box::new(good_plan_response("shell.exec", 0.95))),
+    });
+    let tpl: Arc<dyn PlannerBackend> = Arc::new(SpyBackend {
+        id: "template".into(),
+        calls: tpl_calls.clone(),
+        outcome: SpyOutcome::NoMatch,
+    });
+    let provider: Arc<dyn Fn() -> CapabilitySnapshot + Send + Sync> = Arc::new(snapshot_with_shell);
+    let constraints = PlanConstraints {
+        confidence_threshold: Some(0.7),
+        ..PlanConstraints::default()
+    };
+    let cap = BrainPlanCapability::new(vec![fast, strong, tpl], provider, constraints);
+
+    let out = cap
+        .execute(&ctx(), json!({"goal": "anything"}))
+        .await
+        .expect("strong tier serves the plan");
+    // The output carries no backend id — the winning tier is proven
+    // by its distinctive confidence.
+    assert_eq!(out["confidence"], 0.95);
+    assert_eq!(fast_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(strong_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        tpl_calls.load(Ordering::SeqCst),
+        0,
+        "Template never invoked when a stronger tier is confident"
+    );
+}
+
 #[tokio::test]
 async fn t25_low_confidence_backend_escalated_past() {
     let lf_calls = Arc::new(AtomicUsize::new(0));

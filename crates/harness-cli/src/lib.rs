@@ -83,7 +83,9 @@ pub enum Command {
 pub struct PlanArgs {
     /// Natural-language goal for the planner.
     pub goal: String,
-    /// Whole-plan execution timeout in milliseconds (default 120000).
+    /// Timeout in milliseconds. Governs the planning call (default
+    /// 180000 — must cover the LocalFast→LocalStrong→Template chain)
+    /// and, for `exec`, the whole-plan execution (default 120000).
     #[arg(long)]
     pub timeout_ms: Option<u64>,
     /// Keep executing independent branches past a step failure
