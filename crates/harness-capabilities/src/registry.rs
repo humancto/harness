@@ -96,13 +96,22 @@ impl WeakCapabilityRegistry {
             return CapabilitySnapshot {
                 refs: Vec::new(),
                 schemas: CapabilitySchemaIndex::default(),
+                cloud_caps: std::collections::HashSet::new(),
             };
         };
         let g = strong.read();
         let mut refs = Vec::with_capacity(g.len());
         let mut schema_pairs = Vec::with_capacity(g.len());
+        let mut cloud_caps = std::collections::HashSet::new();
         for cap in g.values() {
             let m = cap.manifest();
+            // 5.3 (ADR-0032): cloud-tier detection for §15.4 rule 4 —
+            // paid cost hint or an explicit "cloud" tag.
+            if matches!(m.cost_hint, harness_core::protocol::CostHint::CloudPaid)
+                || m.tags.iter().any(|t| t == "cloud")
+            {
+                cloud_caps.insert(m.id.clone());
+            }
             refs.push(CapabilityRef {
                 id: m.id.clone(),
                 version_major: m.version.major,
@@ -112,6 +121,7 @@ impl WeakCapabilityRegistry {
         CapabilitySnapshot {
             refs,
             schemas: CapabilitySchemaIndex::from_pairs(schema_pairs),
+            cloud_caps,
         }
     }
 }
@@ -129,6 +139,10 @@ impl WeakCapabilityRegistry {
 pub struct CapabilitySnapshot {
     pub refs: Vec<CapabilityRef>,
     pub schemas: harness_brain::CapabilitySchemaIndex,
+    /// 5.3 (ADR-0032): ids of locally-registered cloud-tier caps
+    /// (`CostHint::CloudPaid` or a "cloud" tag) — feeds §15.4 rule 4
+    /// (`LocalityConflict`) in `validate_plan`.
+    pub cloud_caps: std::collections::HashSet<String>,
 }
 
 impl std::fmt::Debug for CapabilityRegistry {

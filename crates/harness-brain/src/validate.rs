@@ -71,6 +71,10 @@ pub fn validate_plan_well_formed(
 /// `confidence_threshold` is NOT checked here — that lives at the
 /// brain.plan executor so a low-confidence `Confident(_)` becomes an
 /// escalation diagnostic, not a hard validation failure.
+// implicit_hasher: callers pass std sets exclusively; generalizing the
+// hasher would ripple a type parameter through every call site for a
+// lookup-only argument.
+#[allow(clippy::implicit_hasher)]
 pub fn validate_plan(
     plan: &Plan,
     response_cost_usd: f64,

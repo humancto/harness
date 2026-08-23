@@ -60,6 +60,26 @@ pub struct BrainPlanConfig {
     /// explicit `must_be_local: true` is never loosened). Gates the
     /// cloud tier for tagged tasks.
     pub local_only_for_tags: HashSet<String>,
+
+    /// 5.3 (ADR-0032) — triggers that open the cloud tier after an
+    /// earlier LLM tier failed (PRD §15.2 `escalate_to_cloud_if`).
+    /// The derived default is EMPTY — cloud then runs only as
+    /// baseline (no earlier LLM tier); the daemon always passes the
+    /// policy value.
+    pub escalate_to_cloud_if: Vec<harness_policy::CloudTrigger>,
+
+    /// 5.3 — validation-repair retries per tier (PRD §15.2
+    /// `max_replanning_attempts`; cloud is further capped at 1 by
+    /// the executor). Derived default 0 = single attempt per tier
+    /// (pre-5.3 behavior).
+    pub max_replanning_attempts: u32,
+
+    /// 5.3 — chain planning budget in ms. `None` = unbounded
+    /// (derived default — direct-construction tests keep pre-5.3
+    /// behavior); `Some(0)` = LLM/cloud tiers immediately skipped.
+    /// The daemon passes `Some(210_000)` (the 240 s CLI plan default
+    /// minus Template + polling slack).
+    pub chain_budget_ms: Option<u64>,
 }
 
 /// `brain.plan` capability — wraps an ordered list of backends.
@@ -79,6 +99,15 @@ pub struct BrainPlanCapability {
     /// Empty by default (and in `new`); set via
     /// [`BrainPlanCapability::with_local_only_tags`].
     local_only_for_tags: HashSet<String>,
+    /// 5.3 — see [`BrainPlanConfig::escalate_to_cloud_if`]. Empty in
+    /// `new`; set via [`BrainPlanCapability::with_escalation`].
+    escalate_to_cloud_if: HashSet<harness_policy::CloudTrigger>,
+    /// 5.3 — see [`BrainPlanConfig::max_replanning_attempts`]. 0 in
+    /// `new` (single attempt per tier, pre-5.3 behavior).
+    max_replanning_attempts: u32,
+    /// 5.3 — see [`BrainPlanConfig::chain_budget_ms`]. `None` in
+    /// `new` (unbounded).
+    chain_budget_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for BrainPlanCapability {
@@ -105,6 +134,9 @@ impl BrainPlanCapability {
             snapshot_provider,
             default_constraints,
             local_only_for_tags: HashSet::new(),
+            escalate_to_cloud_if: HashSet::new(),
+            max_replanning_attempts: 0,
+            chain_budget_ms: None,
         }
     }
 
@@ -112,6 +144,27 @@ impl BrainPlanCapability {
     #[must_use]
     pub fn with_local_only_tags(mut self, tags: HashSet<String>) -> Self {
         self.local_only_for_tags = tags;
+        self
+    }
+
+    /// 5.3: install the escalation-trigger set and per-tier repair
+    /// budget (ADR-0032).
+    #[must_use]
+    pub fn with_escalation(
+        mut self,
+        triggers: HashSet<harness_policy::CloudTrigger>,
+        max_replanning_attempts: u32,
+    ) -> Self {
+        self.escalate_to_cloud_if = triggers;
+        self.max_replanning_attempts = max_replanning_attempts;
+        self
+    }
+
+    /// 5.3: install the chain planning budget (ADR-0032). `None` =
+    /// unbounded.
+    #[must_use]
+    pub fn with_chain_budget(mut self, budget_ms: Option<u64>) -> Self {
+        self.chain_budget_ms = budget_ms;
         self
     }
 
@@ -322,72 +375,204 @@ impl Capability for BrainPlanCapability {
             constraints,
             context: input.context,
             issuing_node: ctx.issued_by,
+            repair: None,
         };
 
+        self.walk_lineup(&req, &snapshot.cloud_caps).await
+    }
+}
+
+/// Backend tier, classified from the backend id (5.3, ADR-0032). The
+/// trait object exposes only `id()`; the shipped prefixes are stable
+/// (`localfast:`/`localstrong:`/`cloud:`/template). Unknown prefixes
+/// count as LLM tiers — the conservative reading for escalation
+/// accounting, and never eligible for the cloud gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlannerTier {
+    Llm,
+    Cloud,
+    Template,
+}
+
+fn classify_tier(id: &str) -> PlannerTier {
+    if id.starts_with("cloud:") {
+        PlannerTier::Cloud
+    } else if id == harness_brain::TEMPLATE_BACKEND_ID {
+        PlannerTier::Template
+    } else {
+        PlannerTier::Llm
+    }
+}
+
+impl BrainPlanCapability {
+    /// 5.3 (ADR-0032): the escalation walk. Tier order is the lineup;
+    /// per tier there is an attempt loop (first try + validation-repair
+    /// retries), a chain planning budget that LLM/cloud attempts may
+    /// neither start past nor run beyond (Template is exempt — the
+    /// §15.2 floor), and a trigger gate in front of the cloud tier:
+    /// cloud is attempted only if an earlier LLM tier produced a
+    /// condition in `escalate_to_cloud_if` — or if no earlier LLM tier
+    /// exists at all (cloud-as-baseline on a model-less mesh; there is
+    /// nothing to escalate FROM).
+    #[allow(clippy::too_many_lines)]
+    async fn walk_lineup(
+        &self,
+        req: &PlanRequest,
+        cloud_caps: &HashSet<String>,
+    ) -> Result<JsonValue, CapabilityError> {
+        use harness_brain::PlanValidationError;
+        use harness_policy::CloudTrigger;
+
+        let started = std::time::Instant::now();
         let mut diagnostics: Vec<String> = Vec::new();
+        let mut fired: HashSet<CloudTrigger> = HashSet::new();
+        let mut earlier_llm_tier = false;
+
         for backend in &self.backends {
-            match backend.plan(&req).await {
-                Ok(PlanOutcome::Confident(resp)) => {
-                    // 3.9 confidence-threshold gate.
-                    if let Some(threshold) = req.constraints.confidence_threshold {
-                        if resp.confidence < threshold {
+            let id = backend.id();
+            let tier = classify_tier(id);
+
+            if tier == PlannerTier::Cloud
+                && earlier_llm_tier
+                && !self.escalate_to_cloud_if.iter().any(|t| fired.contains(t))
+            {
+                diagnostics.push(format!(
+                    "{id}: skipped — no escalation trigger fired (policy escalate_to_cloud_if)"
+                ));
+                continue;
+            }
+            if tier == PlannerTier::Llm {
+                earlier_llm_tier = true;
+            }
+
+            // Validation-repair retries (§15.4 "retry with stricter
+            // prompt"). Template is deterministic — never retried.
+            // Cloud retries cost real money — capped at one.
+            let max_retries = match tier {
+                PlannerTier::Template => 0,
+                PlannerTier::Cloud => self.max_replanning_attempts.min(1),
+                PlannerTier::Llm => self.max_replanning_attempts,
+            };
+            let mut repair: Option<String> = None;
+
+            'attempts: for attempt in 0..=max_retries {
+                // Chain budget: an LLM/cloud attempt may not START
+                // past the budget, and a running one is clipped to
+                // the remainder — Template always gets to run.
+                let remaining_ms = match (tier, self.chain_budget_ms) {
+                    (PlannerTier::Template, _) | (_, None) => None,
+                    (_, Some(budget)) => {
+                        let elapsed =
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        if elapsed >= budget {
+                            diagnostics
+                                .push(format!("{id}: skipped — chain planning budget exhausted"));
+                            break 'attempts;
+                        }
+                        Some(budget - elapsed)
+                    }
+                };
+
+                let repaired_req;
+                let request = if let Some(r) = &repair {
+                    repaired_req = PlanRequest {
+                        repair: Some(r.clone()),
+                        ..req.clone()
+                    };
+                    &repaired_req
+                } else {
+                    req
+                };
+
+                let planned = match remaining_ms {
+                    Some(ms) => {
+                        let clip = std::time::Duration::from_millis(ms);
+                        let Ok(clipped) = tokio::time::timeout(clip, backend.plan(request)).await
+                        else {
                             diagnostics.push(format!(
-                                "{}: confidence {:.2} < threshold {:.2}",
-                                backend.id(),
-                                resp.confidence,
-                                threshold,
+                                "{id}: aborted — chain planning budget exhausted mid-attempt"
                             ));
-                            continue;
+                            break 'attempts;
+                        };
+                        clipped
+                    }
+                    None => backend.plan(request).await,
+                };
+
+                match planned {
+                    Ok(PlanOutcome::Confident(resp)) => {
+                        // 3.9 confidence-threshold gate — escalation,
+                        // not repair (a threshold miss is a capability
+                        // ceiling, not a fixable mistake).
+                        if let Some(threshold) = req.constraints.confidence_threshold {
+                            if resp.confidence < threshold {
+                                diagnostics.push(format!(
+                                    "{id}: confidence {:.2} < threshold {threshold:.2}",
+                                    resp.confidence,
+                                ));
+                                fired.insert(CloudTrigger::LowConfidence);
+                                break 'attempts;
+                            }
+                        }
+                        // Full validation: structural + schema + cost
+                        // + locality (5.3).
+                        let validation = validate_plan(
+                            resp.plan.as_inner(),
+                            resp.estimated_cost_usd,
+                            &req.constraints,
+                            &req.schemas,
+                            &req.available_capabilities,
+                            cloud_caps,
+                        );
+                        match validation {
+                            Ok(()) => return encode_success(&resp),
+                            Err(e) => {
+                                fired.insert(CloudTrigger::PlanValidationFailed);
+                                if matches!(
+                                    e,
+                                    PlanValidationError::UnknownCapability { .. }
+                                        | PlanValidationError::UnknownSchema { .. }
+                                ) {
+                                    fired.insert(CloudTrigger::ToolNotFound);
+                                }
+                                diagnostics.push(format!(
+                                    "{id}: validation failed (attempt {}): {e}",
+                                    attempt + 1
+                                ));
+                                if attempt < max_retries {
+                                    repair = Some(e.to_string());
+                                    continue 'attempts;
+                                }
+                                break 'attempts;
+                            }
                         }
                     }
-                    // Full validation: structural + schema + cost.
-                    let validation = validate_plan(
-                        resp.plan.as_inner(),
-                        resp.estimated_cost_usd,
-                        &req.constraints,
-                        &req.schemas,
-                        &req.available_capabilities,
-                    );
-                    if let Err(e) = validation {
-                        diagnostics.push(format!("{}: validation failed: {e}", backend.id()));
-                        continue;
+                    Ok(PlanOutcome::NoMatch) => break 'attempts,
+                    Ok(PlanOutcome::MatchedButUnsupported {
+                        matched_pattern,
+                        missing_capability,
+                    }) => {
+                        fired.insert(CloudTrigger::ToolNotFound);
+                        diagnostics.push(format!(
+                            "{id}: matched pattern {matched_pattern:?} but capability {missing_capability:?} not registered"
+                        ));
+                        break 'attempts;
                     }
-                    let inner = resp.plan.as_inner().clone();
-                    let fallback = resp.fallback_plan.as_ref().map(Unsigned::as_inner);
-                    return serde_json::to_value(serde_json::json!({
-                        "plan":                  inner,
-                        "confidence":            resp.confidence,
-                        "rationale":             resp.rationale,
-                        "estimated_cost_usd":    resp.estimated_cost_usd,
-                        "estimated_duration_ms": resp.estimated_duration_ms,
-                        "fallback_plan":         fallback,
-                    }))
-                    .map_err(|e| CapabilityError::Failed(format!("encode plan response: {e}")));
-                }
-                Ok(PlanOutcome::NoMatch) => continue,
-                Ok(PlanOutcome::MatchedButUnsupported {
-                    matched_pattern,
-                    missing_capability,
-                }) => {
-                    diagnostics.push(format!(
-                        "{}: matched pattern {matched_pattern:?} but capability {missing_capability:?} not registered",
-                        backend.id()
-                    ));
-                    continue;
-                }
-                Err(e) => {
-                    diagnostics.push(format!("{}: backend error: {e}", backend.id()));
-                    continue;
-                }
-                // PlanOutcome is `#[non_exhaustive]`. A future variant
-                // we don't recognize is treated as "this backend can
-                // not help" — the only fail-closed answer.
-                Ok(_other) => {
-                    diagnostics.push(format!(
-                        "{}: backend returned an unknown PlanOutcome variant",
-                        backend.id()
-                    ));
-                    continue;
+                    Err(e) => {
+                        fired.insert(CloudTrigger::BackendError);
+                        diagnostics.push(format!("{id}: backend error: {e}"));
+                        break 'attempts;
+                    }
+                    // PlanOutcome is `#[non_exhaustive]`. A future
+                    // variant we don't recognize is treated as "this
+                    // backend cannot help" — the only fail-closed
+                    // answer.
+                    Ok(_other) => {
+                        diagnostics.push(format!(
+                            "{id}: backend returned an unknown PlanOutcome variant"
+                        ));
+                        break 'attempts;
+                    }
                 }
             }
         }
@@ -401,6 +586,20 @@ impl Capability for BrainPlanCapability {
             "no backend produced a confident plan: {summary}"
         )))
     }
+}
+
+fn encode_success(resp: &harness_brain::PlanResponse) -> Result<JsonValue, CapabilityError> {
+    let inner = resp.plan.as_inner().clone();
+    let fallback = resp.fallback_plan.as_ref().map(Unsigned::as_inner);
+    serde_json::to_value(serde_json::json!({
+        "plan":                  inner,
+        "confidence":            resp.confidence,
+        "rationale":             resp.rationale,
+        "estimated_cost_usd":    resp.estimated_cost_usd,
+        "estimated_duration_ms": resp.estimated_duration_ms,
+        "fallback_plan":         fallback,
+    }))
+    .map_err(|e| CapabilityError::Failed(format!("encode plan response: {e}")))
 }
 
 /// Register a `brain.plan` capability into `registry` with the given
@@ -421,7 +620,12 @@ pub async fn enrich_with_brain_plan(
     let snapshot_provider: Arc<dyn Fn() -> CapabilitySnapshot + Send + Sync> =
         Arc::new(move || weak.snapshot());
     let cap = BrainPlanCapability::new(backends, snapshot_provider, config.default_constraints)
-        .with_local_only_tags(config.local_only_for_tags);
+        .with_local_only_tags(config.local_only_for_tags)
+        .with_escalation(
+            config.escalate_to_cloud_if.into_iter().collect(),
+            config.max_replanning_attempts,
+        )
+        .with_chain_budget(config.chain_budget_ms);
     #[allow(clippy::expect_used)]
     registry
         .register(Arc::new(cap))

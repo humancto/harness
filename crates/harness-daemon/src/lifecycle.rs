@@ -558,6 +558,12 @@ impl DaemonOrchestrator {
                 // time by the brain.plan executor (force must_be_local
                 // for tagged tasks; gates the cloud tier).
                 local_only_for_tags: planning.local_only_for_tags.clone(),
+                // 5.3 (ADR-0032): escalation triggers + replanning
+                // budget from policy; chain budget is the 240 s CLI
+                // plan default minus Template + polling slack.
+                escalate_to_cloud_if: planning.escalate_to_cloud_if.clone(),
+                max_replanning_attempts: planning.max_replanning_attempts,
+                chain_budget_ms: Some(PLAN_CHAIN_BUDGET_MS),
             };
             harness_capabilities::enrich_with_brain_plan(&capabilities, backends, brain_config)
                 .await;
@@ -1006,6 +1012,13 @@ fn resolve_local_models(
     }
     lineup
 }
+
+/// 5.3 (ADR-0032): chain planning budget handed to the brain.plan
+/// executor — the 240 s CLI plan default minus slack for Template and
+/// result polling, so the fallback tier always gets to run inside the
+/// caller's window.
+#[cfg_attr(not(feature = "brain"), allow(dead_code))]
+const PLAN_CHAIN_BUDGET_MS: u64 = 210_000;
 
 /// 5.2 (ADR-0031): the tier-3 Cloud planner registers only when
 /// policy approves escalation AND a model is configured. An empty
