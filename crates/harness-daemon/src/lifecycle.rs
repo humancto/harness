@@ -411,12 +411,13 @@ impl DaemonOrchestrator {
         // Lives last in the enricher list so it observes every other
         // registered capability via `WeakCapabilityRegistry::snapshot`.
         //
-        // Backend lineup resolution:
+        // Backend lineup resolution (5.1, ADR-0030):
         //   1. Read `policy.planning.prefer_local_models` (PRD §15.2).
-        //   2. Walk the registry's `llm.local.*` ids; pick the first
-        //      preferred model that's locally registered.
-        //   3. Build `[LocalFastBackend, TemplateBackend]` if a model
-        //      resolved; otherwise just `[TemplateBackend]`.
+        //   2. `resolve_local_models` partitions the preferred models
+        //      that are registered as `llm.local.*` by class — first
+        //      fast-class match and first strong-class match.
+        //   3. Build `[LocalFast?, LocalStrong?, Template]` in §15.2
+        //      local_first order; classless meshes get Template only.
         //
         // Default constraints flow from `policy.planning.confidence_threshold`
         // + `default_max_cost_usd` per ADR-0014 §9.
