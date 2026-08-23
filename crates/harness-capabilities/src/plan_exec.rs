@@ -165,6 +165,11 @@ fn manifest() -> ManifestEntry {
 
 #[async_trait]
 impl Capability for PlanExecCapability {
+    fn execution_class(&self) -> crate::traits::ExecutionClass {
+        // Coordinator: awaits step sub-tasks (ADR-0027 wedge fix).
+        crate::traits::ExecutionClass::Coordination
+    }
+
     fn id(&self) -> &'static str {
         "plan.execute"
     }

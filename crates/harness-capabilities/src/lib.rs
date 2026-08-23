@@ -69,7 +69,9 @@ pub use fs::{
     FsGrepCapability, FsListCapability, FsReadCapability, FsSearchCapability, ScopeConfig,
     ScopeError, ScopeRegistry,
 };
-pub use traits::{Capability, CapabilityError, ExecutionContext, FrameSink, LogFrame, StreamKind};
+pub use traits::{
+    Capability, CapabilityError, ExecutionClass, ExecutionContext, FrameSink, LogFrame, StreamKind,
+};
 
 #[cfg(feature = "echo")]
 pub use echo::EchoCapability;
