@@ -1,7 +1,7 @@
 # Harness Implementation State
 
 **Current phase:** 4 — Distribution patterns (Phase 3 COMPLETE as of #42)
-**Last updated:** 2026-08-23 (post-4.5 federated lifecycle)
+**Last updated:** 2026-08-23 (post-4.6 lease extension/retry backoff)
 
 ## Phase 3 summary (post-merge) — COMPLETE
 
@@ -121,7 +121,22 @@ These will land alongside their natural Phase 3 home, not as a "phase 2.10":
 
 | #47 | 4.4  | Resource-aware scheduler (ADR-0026): pure `fit_score` (hard gates for impossibilities only; soft floored pressure — saturation never fails a task), `eligible_scored` argmax + RR tie-band (equal fleets keep the exact RR sequence), `StoreLoadView` (heartbeat ∪ store counts ∪ same-poll reservations, max-composed), `SuccessTracker` EWMA fed remote + local + expiry + send-fail, truthful heartbeat `queue_depth`, ResourceGated-waits-not-fails, fresh-first batches (risk 10), `ExecutionPolicy::clamped` + submit `resource_hints` (risk 12), `known_capabilities` liveness (4.3 carry). +23 tests |
 
+| #49 | 4.6  | Lease extension + retry backoff (ADR-0028): `LeaseExtend` on the additive `harness.task.lease` channel (worker extender per remote task, aborted on settle, live-lease lookup per tick; issuer CAS-sets rolling `now+30s` horizon UNCONDITIONALLY — first extension shrinks a long lease so dead workers are caught in seconds — hard-capped by `issued_at + original TTL` so wedged/malicious extenders gain nothing; expiry CASes require `expires_at < now` so extensions beat racing expiry); backoff finally reads `RetryPolicy` (expiry + both send-failure paths, waiting-class pacing, deadline enforced in the skip path, in-memory + pruned); circuit breaker (5 consecutive node-health fails ⇒ 60s bench; results — even Failed — prove liveness; self/pin/Federated exempt; all-benched waits in the gated arm, sole-benched-owner included); boot orphan sweep (local⇒Failed with reason, remote⇒Dispatched(self) re-execution — no retry-budget poisoning); FrameSink promoted into ExecutionContext (`progress_sink` trait methods deleted); RR cursor skipped for pinned routes. m08 money test: live worker's 60s lease shrinks over real QUIC and completes exactly once; killed worker detected in seconds. +30 tests |
+
 | #48 | 4.5  | Federated lifecycle (ADR-0027): `FederatedCoordinator` — atomic `submitted→running(self)` claim (`try_start_coordination`, executor can never double-claim), ≤8 coordinations/daemon (no slot = stays Submitted, queueing never failure), ≤64-node fan-out over the 4.1 controller with remaining-budget timeouts, driven through the 4.2 `into_channel` bounded-mpsc bridge (its first detached consumer), stage/streaming frames on the partial pipe; pure `harness-merge` engine (Concat/Dedupe first-wins/TopK stable/Rerank→TopK degradation/Aggregate, items convention, 10k reported truncation); merge-time policy semantics (FailFast=unsettled Skipped; Wait=all-or-Failed with flattened per-node errors; ReturnPartial=`merge.failures` block); provenance persisted (V0006 `task_results.provenance`) → `FinalResult.provenance` (zero wire changes) → `GET /tasks/:id` + types.ts; `ExecutionClass::{Work,Coordination}` + 16 coord permits close the ADR-0022 wedge (peek-skip keeps Work polls live); Federated+pin ⇒ `Single` (sub-tasks execute, never re-coordinate — also the mixed-version path); first federated built-in `mesh.info`; m06/m07 money tests. +40 tests |
+
+4.6 review round 1 (plan): REVISE, all adopted pre-implementation — BLOCKER-1: the
+extension CAS is an unconditional `min(now+horizon, budget)` set (the drafted `max()` was
+dead code and "first-extension" detection unnecessary); BLOCKER-2: issuer-side budget cap
+`issued_at + lease TTL` (never trust the worker to stop); expiry CASes gained
+`expires_at < now` (extension-vs-expiry race); extension accepts `pending|claimed` (R3);
+extender resolves the live lease per tick (re-assign staleness); async send-fail path
+feeds backoff; deadline enforced in the backoff-skip path (no other check reachable);
+breaker feeds narrowed to node-health signals + self-exempt + structural pin/Federated
+bypass + all-benched→gated remap; remote-issued orphans reset (not Failed — synthetic
+terminals would poison the issuer's retry budget via terminal-resend).
+**Carried (ADR-0028): federated-parent leases → Phase 5 wrapper work; retry-aware Wait →
+Phase 5; federated scoring → 4.7; shell.exec ctor sink → Phase 6.**
 
 4.5 review round 1 (plan): REVISE, all adopted pre-implementation — BLOCKER-1: coordinator
 claims the parent with one atomic `submitted→running(self)` UPDATE (never observable at
@@ -164,11 +179,10 @@ consumers (WS, CLI) don't suppress reborn frames under >256 concurrent tasks.
 
 ## Phase 4 — next up
 
-Spine is sequential: ~~4.1~~ → ~~4.2~~ → ~~4.3~~ → ~~4.4~~ → ~~4.5 federated lifecycle~~
-(ADR-0022 permit wedge CLOSED via ExecutionClass) → **4.6 lease extension/retry backoff**
-(owes carried risks 9/10, the leaseless-Running orphan sweep, retry-aware Wait, and the
-ExecutionContext FrameSink promotion cut from 4.5) → 4.7 backpressure tests → 4.8 UI DAG
-viz (provenance + federated-stage types shipped in 4.5). Phase-4-owned obligations from below: risks 2 (drop-guard), 9
+Spine is sequential: ~~4.1~~ → ~~4.2~~ → ~~4.3~~ → ~~4.4~~ → ~~4.5~~ → ~~4.6 lease
+extension/retry backoff~~ (risks 9/10 CLOSED; orphan sweep + FrameSink promotion landed)
+→ **4.7 backpressure tests** (owes the federated-scoring note from ADR-0026/0028) → 4.8
+UI DAG viz (provenance + federated-stage types shipped in 4.5). Phase-4-owned obligations from below: risks 2 (drop-guard), 9
 (send-failure backoff → 4.6), 10 (dispatch head-of-line → 4.4), 11 (unknown-capability
 fast-fail), 12 (`SubmitRequest.execution` clamps → 4.4).
 
