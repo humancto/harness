@@ -862,12 +862,6 @@ fn map_discovery(err: &DiscoveryError) -> anyhow::Error {
     anyhow::anyhow!("discovery: {err}")
 }
 
-/// Resolve which local Ollama model the `LocalFast` planner should bind
-/// to. Walks `prefer_local_models` in declared order and returns the
-/// first that has a corresponding `llm.local.<model>` capability
-/// registered. Returns `None` when no preference matches — the daemon
-/// then registers brain.plan with a Template-only lineup.
-#[cfg(all(feature = "brain", feature = "llm"))]
 /// 5.1 (ADR-0030): the two-tier local planner lineup — first
 /// preferred fast-class model and first preferred strong-class model
 /// that are actually registered as `llm.local.<tag>`.
