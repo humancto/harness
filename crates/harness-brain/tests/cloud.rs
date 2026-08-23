@@ -15,8 +15,21 @@ use harness_brain::cloud::{CloudBackend, CloudKeyProvider, HeaderValue};
 use harness_brain::{CapabilitySchemaIndex, PlanConstraints, PlannerError};
 use harness_core::{CapabilityRef, NodeId};
 use serde_json::json;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Regression guard (diff review BLOCKER-1): current Anthropic models
+/// reject sampling parameters with HTTP 400 — the request body must
+/// never carry them.
+struct NoSamplingParams;
+
+impl wiremock::Match for NoSamplingParams {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        serde_json::from_slice::<serde_json::Value>(&request.body).is_ok_and(|v| {
+            v.get("temperature").is_none() && v.get("top_p").is_none() && v.get("top_k").is_none()
+        })
+    }
+}
 
 fn shell_only() -> Vec<CapabilityRef> {
     vec![CapabilityRef {
@@ -103,6 +116,12 @@ async fn t01_happy_path_id_headers_and_edge_flip() {
         .and(path("/v1/messages"))
         .and(header("x-api-key", "sk-ant-test"))
         .and(header("anthropic-version", "2023-06-01"))
+        .and(body_partial_json(json!({
+            "model": "claude-sonnet-5",
+            "max_tokens": 16_384,
+            "messages": [{"role": "user"}],
+        })))
+        .and(NoSamplingParams)
         .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_response(&inner)))
         .expect(1)
         .mount(&mock)

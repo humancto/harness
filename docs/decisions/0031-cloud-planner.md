@@ -14,10 +14,15 @@
    `local_fast.rs` into `llm_common.rs` (pure move). Tier knobs:
    id `cloud:<model>`, 60 s timeout (matches the `llm.cloud.claude`
    capability default), 16 KiB prompt cap (as `LocalStrong`),
-   `max_tokens` 4096, temperature pinned 0.0 — planning wants
-   determinism, not creativity. Errors map exactly like the local
-   tiers (Timeout / Transport / Decode → executor advances with a
-   diagnostic), so Template always remains reachable.
+   `max_tokens` 16 384 — on current models the always-on adaptive
+   thinking counts against `max_tokens`, so a tight cap can truncate
+   the plan JSON mid-object. NO sampling parameters are sent
+   (`temperature`/`top_p`/`top_k`): current Anthropic models reject
+   them with HTTP 400, which would have made every cloud attempt
+   fail into Template (diff review BLOCKER-1); the sampling-free
+   request shape is pinned by a wiremock matcher. Errors map exactly
+   like the local tiers (Timeout / Transport / Decode → executor
+   advances with a diagnostic), so Template always remains reachable.
 
 2. **Double-gated escalation ("policy-driven rules").**
    - *Policy approval is a registration cap:* the daemon registers

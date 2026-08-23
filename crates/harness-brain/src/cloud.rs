@@ -50,8 +50,12 @@ pub type CloudKeyProvider = Arc<dyn Fn() -> Option<HeaderValue> + Send + Sync>;
 const CLOUD_TIMEOUT_MS: u64 = 60_000;
 /// Same fuller projection as `LocalStrong` — frontier models afford it.
 const CLOUD_PROMPT_BYTE_CAP: usize = 16 * 1024;
-/// Response budget. Plan JSON is compact; 4096 tokens is ample.
-const CLOUD_MAX_TOKENS: u64 = 4096;
+/// Response budget. Plan JSON is compact, but on current models the
+/// (always-on, adaptive) thinking tokens count against `max_tokens`
+/// too — a tight cap can truncate the plan mid-object. 16k leaves
+/// ample headroom and stays well inside the 60 s timeout (diff
+/// review MINOR-2).
+const CLOUD_MAX_TOKENS: u64 = 16_384;
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// 5.2 `Cloud` backend (tier 3). Anthropic-only in 5.2 (ADR-0031).
@@ -134,11 +138,14 @@ impl PlannerBackend for CloudBackend {
             .base_url
             .join("messages")
             .map_err(|e| PlannerError::Internal(format!("bad anthropic base url: {e}")))?;
+        // NO sampling parameters (`temperature`/`top_p`/`top_k`):
+        // current Anthropic models reject them with HTTP 400 (diff
+        // review BLOCKER-1 — a hardcoded temperature would have made
+        // every cloud attempt fail into Template). t01 pins their
+        // absence.
         let body = json!({
             "model": &self.model,
             "max_tokens": CLOUD_MAX_TOKENS,
-            // Planning wants determinism, not creativity (ADR-0031).
-            "temperature": 0.0,
             "messages": [{"role": "user", "content": prompt}],
         });
 
