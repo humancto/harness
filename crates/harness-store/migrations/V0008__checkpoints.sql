@@ -34,3 +34,7 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     created_at INTEGER NOT NULL,   -- unix ms — the boot age sweep reads this
     UNIQUE(plan_id, node_id)
 );
+
+-- Both sweeps (durably-complete plans, and the age cutoff) run on the
+-- periodic maintenance tick, not just at boot.
+CREATE INDEX IF NOT EXISTS idx_checkpoints_created_at ON checkpoints(created_at);

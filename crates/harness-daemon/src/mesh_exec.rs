@@ -231,8 +231,9 @@ impl harness_capabilities::PlanExec for StoreMeshExec {
         step_row: Option<harness_core::TaskId>,
         output: &serde_json::Value,
     ) {
-        // A step settled without a row (itself replayed) has nothing
-        // new to record; the existing row already holds this output.
+        // Defensive: `task_id` is NOT NULL, and every caller reaches
+        // here from a Done outcome whose row was recorded at submit.
+        // Nothing to write if that ever stops holding.
         let Some(row) = step_row else {
             return;
         };
@@ -251,19 +252,6 @@ impl harness_capabilities::PlanExec for StoreMeshExec {
                 "output too large to checkpoint; the step re-runs on resume"
             ),
             Err(e) => tracing::warn!(target: "harness.mesh_exec", ?e, "checkpoint record"),
-        }
-    }
-
-    fn checkpoint_finish(&self, plan: harness_core::PlanId) {
-        match self.store.checkpoint_delete_plan(plan) {
-            Ok(n) if n > 0 => tracing::debug!(
-                target: "harness.mesh_exec",
-                plan = %plan.0,
-                rows = n,
-                "plan complete; checkpoints dropped"
-            ),
-            Ok(_) => {}
-            Err(e) => tracing::warn!(target: "harness.mesh_exec", ?e, "checkpoint gc"),
         }
     }
 

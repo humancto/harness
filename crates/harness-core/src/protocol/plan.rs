@@ -50,9 +50,15 @@ pub enum HashFn {
     Blake3,
 }
 
-/// 5.11 (ADR-0039): the checkpoint dedup key — `blake3` over the
-/// canonical JSON encoding of a step's RESOLVED input (after
-/// `OutputRef` substitution, i.e. the bytes that actually executed).
+/// 5.11 (ADR-0039): the checkpoint validity key — `blake3` over the
+/// canonical JSON encoding of what a step actually ran: its capability
+/// AND its RESOLVED input (after `OutputRef` substitution).
+///
+/// The capability is in the preimage because plan node ids are the
+/// checkpoint's identity, and a repaired plan may keep a node's id and
+/// input while changing its capability (Codex P2 on #62) — replaying
+/// the old capability's output for a new operation would skip the
+/// dispatch entirely.
 ///
 /// Canonical because `serde_json`'s object map is a `BTreeMap` in this
 /// workspace (the `preserve_order` feature is off — pinned by test),
@@ -60,19 +66,27 @@ pub enum HashFn {
 /// built. `HashFn` is matched exhaustively: a future variant is a
 /// compile error here, never a silently wrong key.
 ///
-/// Hash equality means "the same input already ran"; a differing
-/// encoding (say a number that did not survive a CBOR round-trip
-/// bit-identically) yields a MISS, which re-runs the step — degraded,
-/// never wrong.
+/// A hash that fails to match means "this is not the step that ran",
+/// which yields a MISS and re-runs the step — degraded, never wrong.
 ///
 /// # Errors
 /// [`ProtocolError::JsonEncode`] if the value cannot be serialized —
 /// practically unreachable for a `Value`.
-pub fn input_hash(input: &JsonValue, hash_fn: HashFn) -> Result<[u8; 32], ProtocolError> {
+pub fn step_hash(
+    capability: &str,
+    input: &JsonValue,
+    hash_fn: HashFn,
+) -> Result<[u8; 32], ProtocolError> {
     match hash_fn {
         HashFn::Blake3 => {
-            let bytes = serde_json::to_vec(input)
-                .map_err(|e| ProtocolError::JsonEncode(format!("checkpoint input: {e}")))?;
+            // An object, not a concatenation: `capability` and `input`
+            // cannot bleed into each other whatever either contains.
+            let preimage = serde_json::json!({
+                "capability": capability,
+                "input": input,
+            });
+            let bytes = serde_json::to_vec(&preimage)
+                .map_err(|e| ProtocolError::JsonEncode(format!("checkpoint step: {e}")))?;
             Ok(*blake3::hash(&bytes).as_bytes())
         }
     }
@@ -386,7 +400,7 @@ mod tests {
     // 5.11 (ADR-0039): the checkpoint dedup key.
 
     #[test]
-    fn input_hash_is_key_order_invariant() {
+    fn step_hash_is_key_order_invariant() {
         // The canonical property the whole scheme rests on: two values
         // that differ only in how they were WRITTEN hash the same, so a
         // resumed step recognizes its own prior input. (serde_json's
@@ -396,13 +410,13 @@ mod tests {
         let a: JsonValue = serde_json::from_str(r#"{"a":1,"b":{"x":true,"y":null}}"#).expect("a");
         let b: JsonValue = serde_json::from_str(r#"{"b":{"y":null,"x":true},"a":1}"#).expect("b");
         assert_eq!(
-            input_hash(&a, HashFn::Blake3).expect("hash a"),
-            input_hash(&b, HashFn::Blake3).expect("hash b"),
+            step_hash("echo", &a, HashFn::Blake3).expect("hash a"),
+            step_hash("echo", &b, HashFn::Blake3).expect("hash b"),
         );
     }
 
     #[test]
-    fn input_hash_separates_different_inputs() {
+    fn step_hash_separates_different_inputs() {
         let cases = [
             serde_json::json!({"n": 1}),
             serde_json::json!({"n": 2}),
@@ -414,7 +428,7 @@ mod tests {
         ];
         let hashes: std::collections::HashSet<[u8; 32]> = cases
             .iter()
-            .map(|v| input_hash(v, HashFn::Blake3).expect("hash"))
+            .map(|v| step_hash("echo", v, HashFn::Blake3).expect("hash"))
             .collect();
         assert_eq!(
             hashes.len(),
@@ -424,15 +438,27 @@ mod tests {
     }
 
     #[test]
-    fn input_hash_survives_a_json_text_round_trip() {
+    fn step_hash_survives_a_json_text_round_trip() {
         // Resume reads dependency outputs back from TEXT columns, so
         // the hash must be stable across Value -> text -> Value.
         let v = serde_json::json!({"z": [1, 2, 3], "a": {"deep": {"k": "v"}}, "n": 42});
         let text = serde_json::to_string(&v).expect("to text");
         let back: JsonValue = serde_json::from_str(&text).expect("from text");
         assert_eq!(
-            input_hash(&v, HashFn::Blake3).expect("hash v"),
-            input_hash(&back, HashFn::Blake3).expect("hash back"),
+            step_hash("echo", &v, HashFn::Blake3).expect("hash v"),
+            step_hash("echo", &back, HashFn::Blake3).expect("hash back"),
+        );
+    }
+
+    #[test]
+    fn step_hash_separates_capabilities() {
+        // Codex P2 on #62: a repaired plan can keep a node's id and
+        // input while changing its capability — replaying the old
+        // output there would skip a different operation entirely.
+        let input = serde_json::json!({"path": "/etc/hosts"});
+        assert_ne!(
+            step_hash("fs.read", &input, HashFn::Blake3).expect("read"),
+            step_hash("fs.delete", &input, HashFn::Blake3).expect("delete"),
         );
     }
 

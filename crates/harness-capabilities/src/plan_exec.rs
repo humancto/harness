@@ -100,12 +100,6 @@ pub trait PlanExec: Send + Sync + 'static {
     ) {
     }
 
-    /// 5.11: the plan finished cleanly — its checkpoints exist to
-    /// survive interruption, not as a cache, so drop them. NOT called
-    /// for budget stops, cancels, aborts or crashes (5.12 resumes
-    /// from those). Default no-op.
-    fn checkpoint_finish(&self, _plan: PlanId) {}
-
     /// Full capability entries — id, version, `input_schema` — from the
     /// local registry ∪ stored manifests. Entry validation builds its
     /// schema index from this union (ADR-0025), so remote-only
@@ -790,20 +784,16 @@ async fn drive_plan(args: DriveArgs<'_>) -> Result<JsonValue, CapabilityError> {
         Some(s) if !unscheduled.is_empty() => s,
         _ => "done",
     };
-    // 5.11 (ADR-0039): a plan that finished cleanly has nothing left to
-    // resume — drop its checkpoints. Budget stops, cancels, aborts,
-    // deadline hits and crashes KEEP them (that is what 5.12 resumes
-    // from). The condition is EVERY step done, not `status == "done"`
-    // (plan review BLOCKER-2): a fail-fast abort also reports "done"
-    // with `budget_stop` unset, and GC there would delete exactly the
-    // successful prefix the operator resubmits for.
-    if checkpointing && summary.done == summary.total {
-        exec.checkpoint_finish(plan.id);
-    }
-    // 5.11 (plan review minor): `ok` counts steps that SUCCEEDED, not
-    // steps this run executed — a resume reports ok: N with spent_usd
-    // 0.00 because replayed steps were paid for in the earlier run.
-    // The count makes that legible instead of surprising.
+    // 5.11 GC lives OUTSIDE this driver (Codex P1 on #62): dropping
+    // checkpoints here — before the executor persists this plan's own
+    // result — leaves a crash window in which the rows are gone and
+    // the plan is not recorded done, so a resubmission re-runs every
+    // step. `Store::checkpoint_sweep_completed_plans` does it once the
+    // enclosing result is durable.
+    // 5.11: `ok` counts steps that SUCCEEDED, not steps this run
+    // executed — a resume reports ok: N with spent_usd 0.00 because
+    // replayed steps were paid for in the earlier run. The count makes
+    // that legible instead of surprising.
     let replayed = records.values().filter(|r| r.from_checkpoint).count();
     let mut aggregate = json!({
         "plan_id": plan.id.0.to_string(),
@@ -910,8 +900,8 @@ fn emit_budget_frame(sink: Option<&FrameSink>, plan_task: TaskId, body: &JsonVal
 /// stops feeding and returns `true` so the caller aborts the plan
 /// (diff review MAJOR-1 — a feed-time failure is a step failure).
 #[allow(clippy::too_many_arguments)]
-/// 5.11 (ADR-0039): everything `feed_ready` needs to consult and fill
-/// the checkpoint store, or `None` when the plan asked for no
+/// 5.11 (ADR-0039): everything the ready-feed needs to consult and
+/// fill the checkpoint store, or `None` when the plan asked for no
 /// checkpointing (then the whole path is inert).
 struct CheckpointCtx<'a> {
     exec: &'a Arc<dyn PlanExec>,
@@ -936,6 +926,10 @@ enum FeedOutcome {
     Cancelled,
 }
 
+/// Resolve, validate and dispatch every ready node, cascading through
+/// nodes that become ready as this pass settles others. Returns what
+/// the pass concluded — see [`FeedOutcome`]; `Continue` is the
+/// ordinary case.
 #[allow(clippy::too_many_arguments)]
 fn feed_ready(
     ready: Vec<TaskId>,
@@ -977,7 +971,7 @@ fn feed_ready(
                 // just run, and the settle cascades `newly_ready` the
                 // same way the failure arm below does.
                 if let Some(cp) = checkpoint.as_deref_mut() {
-                    match harness_core::input_hash(&input, cp.hash_fn) {
+                    match harness_core::step_hash(&node.capability, &input, cp.hash_fn) {
                         Ok(hash) => {
                             if let Some(cached) =
                                 cp.exec.checkpoint_lookup(cp.plan_id, node_id, &hash)
@@ -989,6 +983,18 @@ fn feed_ready(
                                         r.from_checkpoint = true;
                                     }
                                     emit_step_frame(sink, plan_task, node_id, records, row_ids);
+                                    // Same bookkeeping as the other two
+                                    // settle sites: a node the scheduler
+                                    // skipped must not report `waiting`
+                                    // while the summary counts it skipped.
+                                    for skipped in &progress.newly_skipped {
+                                        records
+                                            .entry(*skipped)
+                                            .and_modify(|r| r.state = StepState::Skipped);
+                                        emit_step_frame(
+                                            sink, plan_task, *skipped, records, row_ids,
+                                        );
+                                    }
                                     // A fully-checkpointed resume never
                                     // reaches the Item arm, so the stop
                                     // button is checked HERE too — else
@@ -1194,8 +1200,6 @@ mod tests {
         /// 5.11: in-memory checkpoint store, keyed like the real one:
         /// (plan, node) -> (input hash, output).
         checkpoints: Mutex<FakeCheckpoints>,
-        /// 5.11: plans whose checkpoints were GC'd by the driver.
-        gc_calls: Mutex<Vec<PlanId>>,
     }
 
     impl FakePlanExec {
@@ -1209,7 +1213,6 @@ mod tests {
                 workers,
                 cancelled: std::sync::atomic::AtomicBool::new(false),
                 checkpoints: Mutex::new(HashMap::new()),
-                gc_calls: Mutex::new(vec![]),
             })
         }
     }
@@ -1288,9 +1291,6 @@ mod tests {
             self.checkpoints
                 .lock()
                 .insert((plan, node), (*input_hash, output.clone()));
-        }
-        fn checkpoint_finish(&self, plan: PlanId) {
-            self.gc_calls.lock().push(plan);
         }
         fn known_capabilities(&self) -> Vec<ManifestEntry> {
             vec![echo_entry()]
@@ -2103,7 +2103,7 @@ mod tests {
         let b_input = json!({ "from_a": a_out.clone() });
         let b_out = json!({"echoed": b_input.clone()});
         for (node, input, out) in [(a, a_input, a_out), (b, b_input.clone(), b_out.clone())] {
-            let h = harness_core::input_hash(&input, HashFn::Blake3).expect("hash");
+            let h = harness_core::step_hash("echo", &input, HashFn::Blake3).expect("hash");
             exec.checkpoint_record(plan_id, node, &h, None, &out);
         }
 
@@ -2141,8 +2141,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn e12_successful_steps_are_recorded_and_gc_runs_only_when_all_done() {
-        // Run 1: a clean 2-chain records both steps, then GCs.
+    async fn e12_only_successful_steps_are_recorded() {
+        // Run 1: a clean 2-chain records both steps.
         let ids = sorted_ids(2);
         let (a, b) = (ids[0], ids[1]);
         let plan_id = PlanId::new_v7();
@@ -2158,11 +2158,9 @@ mod tests {
         assert_eq!(out["ok"], 2);
         assert_eq!(out["replayed"], 0);
         assert_eq!(exec.checkpoints.lock().len(), 2, "both steps recorded");
-        assert_eq!(
-            exec.gc_calls.lock().as_slice(),
-            &[plan_id],
-            "a fully-done plan drops its checkpoints"
-        );
+        // GC is NOT the driver's job (Codex P1 on #62) — the store
+        // sweeps a plan only once its own result row is durable, which
+        // `checkpoints.rs::c07b` pins.
 
         // Run 2: the second step fails under fail_fast. The successful
         // prefix stays checkpointed and GC must NOT fire — that prefix
@@ -2180,10 +2178,10 @@ mod tests {
             harness_core::CheckpointStorage::Sqlite,
         )});
         let _ = cap2.execute(&ctx(), input2).await;
-        assert_eq!(exec2.checkpoints.lock().len(), 1, "only the success");
-        assert!(
-            exec2.gc_calls.lock().is_empty(),
-            "an incomplete plan keeps its checkpoints"
+        assert_eq!(
+            exec2.checkpoints.lock().len(),
+            1,
+            "only the successful step is recorded — the failure re-runs"
         );
     }
 
@@ -2198,7 +2196,7 @@ mod tests {
         let exec = FakePlanExec::new(2, 100);
         let (a_in, b_in) = (json!({"cost": 4.0}), json!({"cost": 4.0, "n": 2}));
         for (node, input) in [(a, a_in.clone()), (b, b_in.clone())] {
-            let h = harness_core::input_hash(&input, HashFn::Blake3).expect("hash");
+            let h = harness_core::step_hash("echo", &input, HashFn::Blake3).expect("hash");
             exec.checkpoint_record(plan_id, node, &h, None, &json!({"echoed": input}));
         }
         let mut plan_value = checkpointed_plan_json(
@@ -2232,8 +2230,16 @@ mod tests {
         let a = ids[0];
         let plan_id = PlanId::new_v7();
         let exec = FakePlanExec::new(1, 100);
-        let h = harness_core::input_hash(&json!({}), HashFn::Blake3).expect("hash");
+        let h = harness_core::step_hash("echo", &json!({}), HashFn::Blake3).expect("hash");
         exec.checkpoint_record(plan_id, a, &h, None, &json!("stale"));
+
+        // Capture frames so the promised warning is pinned, not assumed.
+        let frames: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+        let sink_frames = frames.clone();
+        let mut c = ctx();
+        c.frame_sink = Some(Arc::new(move |_task, frame: LogFrame| {
+            sink_frames.lock().push(frame.line);
+        }));
 
         let cap = PlanExecCapability::new(exec.clone());
         let input = json!({ "plan": checkpointed_plan_json(
@@ -2242,10 +2248,18 @@ mod tests {
             vec![],
             harness_core::CheckpointStorage::File { path: "/tmp/cp".into() },
         )});
-        let out = cap.execute(&ctx(), input).await.expect("Ok aggregate");
+        let out = cap.execute(&c, input).await.expect("Ok aggregate");
         assert_eq!(out["ok"], 1);
         assert_eq!(out["replayed"], 0, "the seeded checkpoint is not consulted");
         assert_eq!(exec.submits.lock().len(), 1, "the step really ran");
+        assert!(
+            frames
+                .lock()
+                .iter()
+                .any(|line| line.contains("running uncheckpointed")),
+            "an unimplemented backend says so out loud: {:?}",
+            frames.lock()
+        );
     }
 
     #[tokio::test]
@@ -2258,7 +2272,7 @@ mod tests {
         let plan_id = PlanId::new_v7();
         let exec = FakePlanExec::new(2, 100);
         exec.cancelled.store(true, Ordering::SeqCst);
-        let h = harness_core::input_hash(&json!({}), HashFn::Blake3).expect("hash");
+        let h = harness_core::step_hash("echo", &json!({}), HashFn::Blake3).expect("hash");
         exec.checkpoint_record(plan_id, a, &h, None, &json!("a"));
         exec.checkpoint_record(plan_id, b, &h, None, &json!("b"));
 
@@ -2272,6 +2286,14 @@ mod tests {
         let out = cap.execute(&ctx(), input).await.expect("Ok aggregate");
         assert_eq!(out["ok"], 1, "the replay stopped at the first boundary");
         assert_eq!(out["skipped"], 1);
-        assert!(exec.gc_calls.lock().is_empty(), "not a complete plan");
+        // Without the `budget_stop.is_none()` guard on the event-loop
+        // entry, this plan still ENDS here — but only after waiting out
+        // the whole plan deadline with nothing in flight (diff review
+        // m6). The duration is the assertion.
+        assert!(
+            out["duration_ms"].as_u64().unwrap_or(u64::MAX) < 5_000,
+            "a stopped replay must not wait out the deadline: {}",
+            out["duration_ms"]
+        );
     }
 }

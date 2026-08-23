@@ -21,7 +21,7 @@ pub use identity::{
     verify, Identity, KeyError, NodeId, ParseNodeIdError, PublicKey, Signature, VerifyError,
 };
 pub use protocol::{
-    find_output_refs, input_hash, resolve_output_refs, Budget, BudgetAction, Capability,
+    find_output_refs, resolve_output_refs, step_hash, Budget, BudgetAction, Capability,
     CapabilityRef, Cardinality, CheckpointConfig, CheckpointStorage, Constraints, Cost,
     ExecutionPolicy, FinalResult, HashFn, Heartbeat, LeaseExtend, LeaseId, LogLevel, LogLine,
     MergeStrategy, NodeContribution, NodeManifest, NodeStatus, OutputRef, OutputRefError,

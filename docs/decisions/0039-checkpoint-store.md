@@ -75,18 +75,44 @@ consequences fall out of that placement:
 - **Only successful steps are recorded.** Re-running a failure on
   resume is the point.
 
-## Decision 3 — GC when every step is done, not when status says "done"
+## Decision 3 — GC runs outside the driver, on four conditions
 
-`checkpoint_finish` (which drops the plan's rows) fires only when
-`summary.done == summary.total`. The aggregate's `status` field is
-*not* the condition: it reads `"done"` whenever no budget stop fired,
-including a fail-fast abort. GCing there would delete precisely the
-successful prefix an operator resubmits for. Budget stops, cancels,
-aborts, deadline hits and crashes all keep their checkpoints.
+Checkpoints for a plan are dropped by
+`Store::checkpoint_sweep_completed_plans`, run at daemon boot and on
+an hourly maintenance tick — **not** by the plan driver. Four
+conditions must all hold:
 
-A plan that crashes and is never resubmitted would keep its rows
-forever, so the daemon sweeps checkpoints older than 7 days at boot,
-beside the existing orphan sweep.
+1. the plan's own `plan.execute` row is `done`;
+2. its result is **persisted**;
+3. that result's aggregate reports a genuinely finished plan —
+   `status == "done"` with zero failed, timed-out and skipped steps;
+4. no run of the same plan id is currently in flight.
+
+Each condition exists because dropping it breaks a real case:
+
+- **Durability (1–2).** Deleting inside the driver, at the moment the
+  aggregate is built, opens a crash window: the daemon can die after
+  the rows are gone but before the executor writes the plan's result.
+  The resubmitted plan then re-runs every step, side effects and all —
+  the exact failure checkpoints exist to prevent. Durability of the
+  enclosing result is the only safe signal, and it is observable only
+  from outside the driver.
+- **Completeness (3).** `drive_plan` returns `Ok` — and the executor
+  therefore writes `done` plus a result — for plans that did *not*
+  finish: a continue-mode run with a failed step, or a budget pause
+  parking half the graph. The aggregate's `status` field is not
+  sufficient either; it reads `"done"` whenever no budget stop fired,
+  including a fail-fast abort. Those partial plans are precisely the
+  ones an operator resubmits. An aggregate whose shape cannot be read
+  counts as incomplete: keeping checkpoints costs rows, dropping them
+  costs re-executed side effects.
+- **Not in flight (4).** A plan id's earlier terminal row satisfies
+  conditions 1–3 forever. Without this check, resubmitting a plan
+  would have the fresh checkpoints it is writing swept out from under
+  it by the next tick.
+
+A plan that crashes and is never resubmitted satisfies none of these,
+so a second sweep drops checkpoints older than 7 days.
 
 ## Decision 4 — outputs are stored, not referenced
 
@@ -102,6 +128,13 @@ index B-tree, which is the wrong shape for a 256 KiB text column.
 
 ## Consequences and limits
 
+- **`interval_items` is accepted and ignored.** The SQLite backend
+  records every successful step: each put is one indexed upsert on an
+  already-open WAL connection, so there is nothing to batch. The knob
+  exists for the `File` backend that does not exist yet. Unlike an
+  unimplemented *storage* backend, which warns, this degrades
+  silently — a plan author setting it gets the behavior they wanted
+  (a checkpoint at least that often), just more often.
 - **Local only, so 5.12 is not free.** Checkpoints are local derived
   data and are never gossiped. `plan.execute` is `Cardinality::Anyone`,
   so a plan resubmitted after the coordinating node dies can land on a

@@ -1,7 +1,8 @@
 //! 5.11 (ADR-0039): checkpoint rows for `plan.execute` DAG steps.
 //!
 //! One row per `(plan_id, node_id)` — the output that plan node
-//! produced, plus the hash of the resolved input it produced it FOR.
+//! produced, plus the hash of the capability + resolved input it
+//! produced it FOR.
 //! On resume the plan loop recomputes each ready node's input hash and
 //! settles the step from this table when the hash still matches,
 //! instead of dispatching it.
@@ -148,6 +149,82 @@ impl Store {
         })
     }
 
+    /// Drop checkpoints for every plan that is **durably and fully
+    /// finished**: its own `plan.execute` row is `done`, its result is
+    /// persisted, that result's aggregate reports every step done, and
+    /// no run of the same plan is currently in flight.
+    ///
+    /// All four conditions are load-bearing:
+    ///
+    /// - *durable* (Codex P1 on #62) — deleting inside the plan driver
+    ///   opens a crash window where the rows are gone but the plan is
+    ///   not recorded done, so a resubmission re-runs every step.
+    /// - *fully finished* (diff review B1) — `drive_plan` returns `Ok`
+    ///   (and the executor writes `done` + a result) for partial plans
+    ///   too: a continue-mode run with a failed step, or a budget
+    ///   pause parking half the graph. Those are exactly the plans an
+    ///   operator resubmits, so their checkpoints must survive.
+    /// - *not in flight* (diff review M1) — a plan id's earlier
+    ///   terminal row satisfies the first two conditions forever, so a
+    ///   resubmission of the same plan would have the checkpoints it
+    ///   is writing swept out from under it mid-run.
+    ///
+    /// Joins on the `tasks.plan_id` stamp added in 5.10. Returns the
+    /// number of rows deleted.
+    ///
+    /// # Errors
+    /// Underlying sqlite errors.
+    pub fn checkpoint_sweep_completed_plans(&self) -> Result<usize, StoreError> {
+        let finished = self.completed_plans_with_checkpoints()?;
+        let mut deleted = 0;
+        for plan_id in finished {
+            deleted += self.checkpoint_delete_plan(plan_id)?;
+        }
+        Ok(deleted)
+    }
+
+    /// The plan ids from [`Self::checkpoint_sweep_completed_plans`]'s
+    /// predicate. Split out so the aggregate check is plain Rust
+    /// rather than SQL `json_extract`.
+    fn completed_plans_with_checkpoints(&self) -> Result<Vec<PlanId>, StoreError> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT DISTINCT cp.plan_id, r.output
+                   FROM checkpoints cp
+                   JOIN tasks t
+                     ON t.plan_id = cp.plan_id
+                    AND t.capability = 'plan.execute'
+                    AND t.state = 'done'
+                   JOIN task_results r ON r.task_id = t.id
+                  WHERE NOT EXISTS (
+                     SELECT 1 FROM tasks live
+                      WHERE live.plan_id = cp.plan_id
+                        AND live.capability = 'plan.execute'
+                        AND live.state NOT IN ('done', 'failed', 'cancelled', 'expired')
+                  )",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Option<String>>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut out = Vec::new();
+            for (raw_id, output) in rows {
+                let Some(text) = output else { continue };
+                let Ok(aggregate) = serde_json::from_str::<JsonValue>(&text) else {
+                    continue;
+                };
+                if !aggregate_is_complete(&aggregate) {
+                    continue;
+                }
+                if let Ok(bytes) = <[u8; 16]>::try_from(raw_id.as_slice()) {
+                    out.push(PlanId(uuid::Uuid::from_bytes(bytes)));
+                }
+            }
+            Ok(out)
+        })
+    }
+
     /// Boot sweep (plan review minor): a plan that crashed and is never
     /// resumed keeps its checkpoints forever. Drop rows older than
     /// `cutoff_ms`. Returns the number deleted.
@@ -165,6 +242,22 @@ impl Store {
     }
 }
 
+/// A `plan.execute` aggregate describes a plan with nothing left to
+/// do: it ran to `done` with no failed, timed-out or skipped step.
+/// Anything else — a continue-mode failure, a budget pause, a
+/// cancel — is a plan someone may resubmit (diff review B1). A result
+/// whose shape we cannot read is treated as INCOMPLETE: keeping
+/// checkpoints costs rows, dropping them costs re-executed side
+/// effects.
+fn aggregate_is_complete(aggregate: &JsonValue) -> bool {
+    let zero = |key: &str| aggregate.get(key).and_then(JsonValue::as_u64) == Some(0);
+    aggregate.get("status").and_then(JsonValue::as_str) == Some("done")
+        && aggregate.get("ok").and_then(JsonValue::as_u64).is_some()
+        && zero("failed")
+        && zero("timed_out")
+        && zero("skipped")
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -176,7 +269,7 @@ mod tests {
     }
 
     fn hash_of(v: &JsonValue) -> [u8; 32] {
-        harness_core::input_hash(v, HashFn::Blake3).expect("hash")
+        harness_core::step_hash("echo", v, HashFn::Blake3).expect("hash")
     }
 
     #[test]
@@ -325,6 +418,162 @@ mod tests {
             s.checkpoint_get(p, node, &h).expect("get").is_none(),
             "a corrupt checkpoint must not wedge the plan"
         );
+    }
+
+    /// Insert a `plan.execute` row for `plan`, walk it to `state`,
+    /// and optionally persist `aggregate` as its result.
+    fn seed_plan_row(
+        s: &Store,
+        plan: PlanId,
+        state: crate::TaskState,
+        aggregate: Option<&JsonValue>,
+    ) -> TaskId {
+        use harness_core::{Identity, Signable};
+        let me = Identity::generate();
+        let mut task = harness_core::Task {
+            id: TaskId::new_v7(),
+            parent: None,
+            plan_id: Some(plan),
+            capability: "plan.execute".into(),
+            input: serde_json::json!({}),
+            constraints: harness_core::Constraints::default(),
+            retry: harness_core::RetryPolicy::default(),
+            execution: harness_core::ExecutionPolicy::default(),
+            resource_hints: harness_core::ResourceHints {
+                cpu_class: harness_core::protocol::CpuClass::Light,
+                memory_mb: None,
+                gpu_required: false,
+                gpu_memory_mb: None,
+                network_class: harness_core::protocol::NetworkClass::None,
+                disk_io_class: harness_core::protocol::DiskIoClass::None,
+                estimated_duration_ms: None,
+            },
+            trace_ctx: harness_core::TraceContext::default(),
+            issued_by: me.node_id(),
+            issued_at: 1,
+            tags: vec![],
+            sig: harness_core::Signature::from_bytes([0u8; 64]),
+        };
+        task.sign(&me).expect("sign");
+        s.insert_task(&task).expect("insert");
+        for next in [
+            crate::TaskState::Dispatched,
+            crate::TaskState::Claimed,
+            crate::TaskState::Running,
+            crate::TaskState::Done,
+        ] {
+            if next as u8 > state as u8 {
+                break;
+            }
+            s.transition_task(task.id, next).expect("hop");
+            if next == state {
+                break;
+            }
+        }
+        if let Some(agg) = aggregate {
+            s.write_task_result_done(task.id, agg, 2, me.node_id())
+                .expect("result");
+        }
+        task.id
+    }
+
+    fn complete_aggregate() -> JsonValue {
+        serde_json::json!({
+            "status": "done", "ok": 2, "failed": 0, "timed_out": 0, "skipped": 0
+        })
+    }
+
+    fn seed_checkpoint(s: &Store, plan: PlanId) -> ([u8; 32], TaskId) {
+        let node = TaskId::new_v7();
+        let h = hash_of(&serde_json::json!({}));
+        s.checkpoint_put(
+            plan,
+            node,
+            &h,
+            TaskId::new_v7(),
+            &serde_json::json!("out"),
+            1,
+        )
+        .expect("put");
+        (h, node)
+    }
+
+    #[test]
+    fn c07b_completed_plan_sweep_needs_a_durable_result() {
+        // Codex P1 on #62: checkpoints outlive the driver and are
+        // dropped only once the plan's OWN row is done AND its result
+        // is persisted — a crash between those two points must still
+        // find the checkpoints there.
+        let s = Store::open_memory().expect("store");
+        let p = plan();
+        let (h, node) = seed_checkpoint(&s, p);
+
+        seed_plan_row(&s, p, crate::TaskState::Done, None);
+        assert_eq!(
+            s.checkpoint_sweep_completed_plans().expect("sweep"),
+            0,
+            "no result row yet — the checkpoints must survive"
+        );
+        assert!(s.checkpoint_get(p, node, &h).expect("get").is_some());
+
+        // Result persisted and complete: now the plan is finished.
+        let task = seed_plan_row(&s, p, crate::TaskState::Done, Some(&complete_aggregate()));
+        assert!(s.load_task_result(task).expect("load").is_some());
+        assert_eq!(s.checkpoint_sweep_completed_plans().expect("sweep"), 1);
+        assert!(s.checkpoint_get(p, node, &h).expect("get").is_none());
+    }
+
+    #[test]
+    fn c07c_partial_plans_keep_their_checkpoints() {
+        // Diff review B1: `drive_plan` returns Ok — and the executor
+        // writes `done` + a result — for plans that did NOT finish: a
+        // continue-mode run with a failed step, and a budget pause
+        // parking half the graph. Those are exactly the plans an
+        // operator resubmits, so a durable-but-partial result must
+        // NOT sweep their checkpoints.
+        for aggregate in [
+            serde_json::json!({"status": "done", "ok": 3, "failed": 1, "timed_out": 0, "skipped": 1}),
+            serde_json::json!({"status": "paused_budget", "ok": 2, "failed": 0, "timed_out": 0, "skipped": 3}),
+            serde_json::json!({"status": "done", "ok": 1, "failed": 0, "timed_out": 1, "skipped": 0}),
+            // An aggregate we cannot read is treated as incomplete.
+            serde_json::json!({"unexpected": "shape"}),
+        ] {
+            let s = Store::open_memory().expect("store");
+            let p = plan();
+            let (h, node) = seed_checkpoint(&s, p);
+            seed_plan_row(&s, p, crate::TaskState::Done, Some(&aggregate));
+
+            assert_eq!(
+                s.checkpoint_sweep_completed_plans().expect("sweep"),
+                0,
+                "partial plan swept: {aggregate}"
+            );
+            assert!(
+                s.checkpoint_get(p, node, &h).expect("get").is_some(),
+                "checkpoints must survive for {aggregate}"
+            );
+        }
+    }
+
+    #[test]
+    fn c07d_an_in_flight_rerun_is_never_swept() {
+        // Diff review M1: an earlier terminal row for a plan id
+        // satisfies the durability predicate forever. A resubmission
+        // writing fresh checkpoints must not have them deleted mid-run
+        // by the periodic sweeper.
+        let s = Store::open_memory().expect("store");
+        let p = plan();
+        seed_plan_row(&s, p, crate::TaskState::Done, Some(&complete_aggregate()));
+        // Run 2 of the same plan is in flight, and has recorded a step.
+        seed_plan_row(&s, p, crate::TaskState::Running, None);
+        let (h, node) = seed_checkpoint(&s, p);
+
+        assert_eq!(
+            s.checkpoint_sweep_completed_plans().expect("sweep"),
+            0,
+            "a live run's checkpoints are not the old run's leftovers"
+        );
+        assert!(s.checkpoint_get(p, node, &h).expect("get").is_some());
     }
 
     #[test]
