@@ -149,8 +149,15 @@ impl LlmBatcher {
             let mut slots = self.slots.lock();
             if let Some(slot) = slots.get_mut(&fp) {
                 if slot.senders.len() >= MAX_SLOT_SENDERS {
-                    // Atomic remove = double-flush guard.
-                    slots.remove(&fp).map_or(Action::Bypass, Action::FlushNow)
+                    // Atomic remove = double-flush guard. This caller
+                    // joins the removed batch as one more sibling.
+                    match slots.remove(&fp) {
+                        Some(mut slot) => {
+                            slot.senders.push(tx);
+                            Action::FlushNow(slot)
+                        }
+                        None => Action::Bypass, // unreachable: get_mut just hit
+                    }
                 } else {
                     slot.senders.push(tx);
                     Action::Attached
@@ -178,11 +185,16 @@ impl LlmBatcher {
                     senders = slot.senders.len(),
                     "slot full; flushing batch early"
                 );
-                let result = dispatch().await;
-                for sender in slot.senders {
-                    let _ = sender.send(clone_result(&result));
-                }
-                return result;
+                // Spawned, not inlined (diff review MINOR-2): if the
+                // overflowing caller's future is dropped mid-dispatch,
+                // the ≤64 parked siblings must still get their result —
+                // the same cancellation-safety the timer path has.
+                tokio::spawn(async move {
+                    let result = dispatch().await;
+                    for sender in slot.senders {
+                        let _ = sender.send(clone_result(&result));
+                    }
+                });
             }
             Action::First => {
                 let slots = Arc::clone(&self.slots);

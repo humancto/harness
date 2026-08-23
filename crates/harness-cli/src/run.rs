@@ -371,8 +371,17 @@ async fn submit_task(
         .await
         .context("submit POST")?;
     let status = resp.status();
+    // 4.7: a 429 admission refusal carries Retry-After — surface it.
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let body: JsonValue = resp.json().await.context("decode submit response")?;
     if !status.is_success() {
+        if let Some(after) = retry_after {
+            bail!("submit failed: HTTP {status} — {body} (retry after {after}s)");
+        }
         bail!("submit failed: HTTP {status} — {body}");
     }
     body["task_id"]

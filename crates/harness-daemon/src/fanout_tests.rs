@@ -836,14 +836,17 @@ allow = [{ cmd = "sh", any_args = true }]
     let (a, b) = boot_pair_with_depths(Some(policy), 64, 4).await;
     wait_for_mesh(&a, &b).await;
 
-    // 1. Saturate B: five pinned 8 s sleeps. Depth (assigned,
+    // 1. Saturate B: five pinned 15 s sleeps. Depth (assigned,
     // non-terminal) ≥ 4 latches the hysteresis on B's next snapshot.
+    // 15 s (review NIT-4): the paused window must comfortably outlast
+    // legs 2–4 even on a stalled CI runner — the first completions
+    // release the latch at depth ≤ 3.
     let mut sleepers = Vec::new();
     for _ in 0..5 {
         sleepers.push(submit_task(
             &a,
             "shell.exec",
-            serde_json::json!({"cmd": "sh", "args": ["-c", "sleep 8"], "timeout_ms": 30_000}),
+            serde_json::json!({"cmd": "sh", "args": ["-c", "sleep 15"], "timeout_ms": 30_000}),
             Some(b.node_id()),
             30_000,
         ));
@@ -914,6 +917,15 @@ allow = [{ cmd = "sh", any_args = true }]
 
     // 4. Federated work EXCLUDES the paused node — visibly: B lands in
     // provenance as Skipped (item_count 0), A contributes normally.
+    // Guard the leg's precondition explicitly (review NIT-4): a CI
+    // stall that let B drain early fails HERE with a clear message,
+    // not downstream with a confusing 2-item merge.
+    assert!(
+        a.peers
+            .get(&b.node_id())
+            .is_some_and(|e| e.heartbeat.paused),
+        "precondition: B must still be paused when the federated task submits"
+    );
     let fed = submit_task(&a, "mesh.info", serde_json::json!({}), None, 20_000);
     let state = wait_for_state(&a.store, fed, &[TaskState::Done], Duration::from_secs(20)).await;
     assert_eq!(state, TaskState::Done);

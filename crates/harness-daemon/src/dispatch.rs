@@ -501,7 +501,7 @@ impl DispatchRuntime {
             // 4.6 (ADR-0028): a backing-off task waits out its delay
             // in the gated class (deadline enforced inside — plan
             // review MAJOR-7).
-            if self.waits_in_backoff(&task) {
+            if self.waits_in_backoff(&task) || self.gated_deadline_expired(&task) {
                 continue;
             }
             let cardinality = self.cardinality_for(&task.capability);
@@ -754,6 +754,27 @@ impl DispatchRuntime {
                 self.schedule_backoff(task.id, &task.retry, attempt);
             }
         }
+    }
+
+    /// 4.7 (diff review MINOR-1): a task WAITING in the gated class
+    /// whose deadline elapsed terminalizes even when the gate opens in
+    /// the same poll gap (a paused pin un-pausing, an all-benched set
+    /// clearing) — the success-path dispatch must never run it
+    /// posthumously. Scoped to the gated set so plain user tasks keep
+    /// their semantics (deadline otherwise enforced on failure paths).
+    /// Returns `true` when the task was terminalized.
+    fn gated_deadline_expired(&self, task: &Task) -> bool {
+        if self.gated.lock().contains(&task.id)
+            && task
+                .constraints
+                .deadline
+                .is_some_and(|d| now_unix_ms() >= d)
+        {
+            self.gated.lock().remove(&task.id);
+            self.fail_undispatchable(task, "deadline exceeded while resource-gated");
+            return true;
+        }
+        false
     }
 
     fn eligibility_failure(&self, task: &Task, err: &DispatchError, bench_filtered: bool) {
@@ -3329,5 +3350,56 @@ mod tests {
             f.runtime.reply.lock().contains_key(&live.id),
             "live obligation untouched"
         );
+    }
+
+    /// 4.7 (diff review MINOR-1): the gate opening and the deadline
+    /// elapsing inside the SAME poll gap must still terminalize — the
+    /// success-path dispatch never runs a gated task posthumously.
+    #[tokio::test]
+    async fn t34_gate_opening_and_deadline_racing_still_terminal() {
+        let f = fixture();
+        let pause = crate::pause::PauseState::new();
+        f.runtime.attach_pause(pause.clone());
+        let m = signed_peer_manifest(&f.local, vec![]);
+        f.runtime.dispatcher.capability_index().upsert_node(&m);
+        f.store.upsert_manifest(&m).expect("upsert");
+
+        let mut task = signed_task_for(&f.local, SECRET_CAP);
+        task.constraints.pin_to_node = Some(f.local.node_id());
+        // Deadline in the near future: alive at poll 1, elapsed by
+        // poll 2 (wall clock — the deadline checks read now_unix_ms).
+        task.constraints.deadline = Some(now_unix_ms() + 50);
+        task.sign(&f.local).expect("re-sign");
+        f.store.insert_task(&task).expect("insert");
+
+        pause.set_operator(true);
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.task_state(task.id).unwrap(),
+            Some(TaskState::Submitted),
+            "poll 1: gated behind the pause, deadline still alive"
+        );
+        assert!(f.runtime.is_gated(task.id));
+
+        // The gap: deadline elapses AND the gate opens before the next
+        // poll ever observes the (paused ∧ expired) combination.
+        std::thread::sleep(Duration::from_millis(60));
+        pause.set_operator(false);
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.task_state(task.id).unwrap(),
+            Some(TaskState::Failed),
+            "poll 2 must terminalize, never dispatch posthumously"
+        );
+        let row = f
+            .store
+            .load_task_result(task.id)
+            .expect("load")
+            .expect("row");
+        assert!(row
+            .error
+            .expect("error")
+            .contains("deadline exceeded while resource-gated"));
+        assert!(!f.runtime.is_gated(task.id));
     }
 }
