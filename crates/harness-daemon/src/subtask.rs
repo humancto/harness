@@ -49,6 +49,12 @@ pub(crate) fn build_pinned_subtask(
         input,
         constraints: Constraints {
             pin_to_node: Some(pin_to),
+            // 4.7 (ADR-0029, plan review BLOCKER-2): the pre-dispatch
+            // waiting phase (paused pin, gated class) is bounded by the
+            // caller's await budget — past it the sub-task terminalizes
+            // via the dispatch loop's deadline checks instead of
+            // executing posthumously (ADR-0022's rule, pre-lease phase).
+            deadline: Some(now_ms.saturating_add(u64::from(timeout_ms))),
             ..Constraints::default()
         },
         retry: RetryPolicy {
@@ -174,6 +180,25 @@ mod tests {
         ] {
             store.transition_task(id, next).expect("hop");
         }
+    }
+
+    /// 4.7 (plan review BLOCKER-2): every pinned sub-task carries a
+    /// deadline bounding its pre-dispatch wait — a paused pin can gate
+    /// it only until the caller's await budget elapses.
+    #[test]
+    fn build_pinned_subtask_stamps_deadline_from_timeout() {
+        let identity = Identity::generate();
+        let t = build_pinned_subtask(
+            &identity,
+            "echo",
+            serde_json::json!({}),
+            identity.node_id(),
+            TaskId::new_v7(),
+            30_000,
+        )
+        .expect("build");
+        assert_eq!(t.constraints.deadline, Some(t.issued_at + 30_000));
+        assert_eq!(t.retry.max_attempts, 1, "posthumous-work rule intact");
     }
 
     /// PR #48 review (P2): a poll observing the worker's

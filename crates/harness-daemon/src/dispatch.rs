@@ -548,7 +548,7 @@ impl DispatchRuntime {
                     loads.note_assigned(node);
                     self.dispatch_to(&task, node);
                 }
-                Ok(DispatchPlan::Federated { nodes }) => {
+                Ok(DispatchPlan::Federated { nodes, excluded }) => {
                     // 4.5 (ADR-0027): hand the parent to the federated
                     // coordinator. It claims atomically (submitted →
                     // running(self)) and a detached driver fans out /
@@ -575,7 +575,7 @@ impl DispatchRuntime {
                     };
                     if self
                         .federated
-                        .try_start(&task, nodes, merge, on_node_failure)
+                        .try_start(&task, nodes, excluded, merge, on_node_failure)
                     {
                         self.gated.lock().remove(&task.id);
                     } else {
@@ -3073,5 +3073,130 @@ mod tests {
             Some(b.node_id()),
             "unreliable node must lose ranking"
         );
+    }
+
+    /// 4.7 (ADR-0029, plan review MAJOR-3): a paused node stops
+    /// dispatching to ITSELF — the self snapshot reads the local
+    /// `PauseState` (there is no `PeerTable` self entry). Resume
+    /// dispatches; already-`Dispatched` rows keep draining (executor).
+    #[tokio::test]
+    async fn t29_self_pause_gates_dispatch_to_self_until_resume() {
+        let f = fixture();
+        let pause = crate::pause::PauseState::new();
+        f.runtime.attach_pause(pause.clone());
+        let m = signed_peer_manifest(&f.local, vec![]);
+        f.runtime.dispatcher.capability_index().upsert_node(&m);
+        f.store.upsert_manifest(&m).expect("upsert");
+
+        let mut task = signed_task_for(&f.local, SECRET_CAP);
+        task.constraints.pin_to_node = Some(f.local.node_id());
+        task.sign(&f.local).expect("re-sign");
+        f.store.insert_task(&task).expect("insert");
+
+        pause.set_operator(true);
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.task_state(task.id).unwrap(),
+            Some(TaskState::Submitted),
+            "paused self never receives new work"
+        );
+        assert!(f.runtime.is_gated(task.id), "waits in the gated class");
+
+        pause.set_operator(false);
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.task_state(task.id).unwrap(),
+            Some(TaskState::Dispatched),
+            "resume dispatches to self"
+        );
+        assert!(!f.runtime.is_gated(task.id));
+    }
+
+    /// 4.7: a live peer advertising `paused` in its heartbeat WAITS
+    /// pinned work (no lease minted), and the route resumes on the
+    /// first unpaused heartbeat. Dead pins keep their fast-terminal
+    /// path (s08 unit + m08).
+    #[tokio::test]
+    async fn t30_paused_peer_heartbeat_gates_pinned_dispatch() {
+        let f = fixture();
+        let peer = Identity::generate();
+        add_live_candidate(&f, &peer, vec![SECRET_TAG.to_string()]);
+        let mut hb = live_heartbeat(peer.node_id());
+        hb.seq = 2;
+        hb.paused = true;
+        f.peers.record(hb);
+
+        let mut task = signed_task_for(&f.local, SECRET_CAP);
+        task.constraints.pin_to_node = Some(peer.node_id());
+        task.sign(&f.local).expect("re-sign");
+        f.store.insert_task(&task).expect("insert");
+
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.task_state(task.id).unwrap(),
+            Some(TaskState::Submitted)
+        );
+        assert_eq!(
+            f.store.list_leases_for_task(task.id).unwrap().len(),
+            0,
+            "no lease minted toward a paused pin"
+        );
+        assert!(f.runtime.is_gated(task.id));
+
+        let mut hb = live_heartbeat(peer.node_id());
+        hb.seq = 3;
+        f.peers.record(hb);
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.list_leases_for_task(task.id).unwrap().len(),
+            1,
+            "unpaused heartbeat resumes the route (lease minted; the \
+             no-net send failure afterwards is t17's territory)"
+        );
+    }
+
+    /// 4.7 (plan review BLOCKER-2): a sub-task parked behind a paused
+    /// pin terminalizes once its deadline passes — and can never run
+    /// posthumously after an un-pause.
+    #[tokio::test]
+    async fn t31_paused_pin_deadline_elapse_terminal_never_posthumous() {
+        let f = fixture();
+        let pause = crate::pause::PauseState::new();
+        f.runtime.attach_pause(pause.clone());
+        let m = signed_peer_manifest(&f.local, vec![]);
+        f.runtime.dispatcher.capability_index().upsert_node(&m);
+        f.store.upsert_manifest(&m).expect("upsert");
+
+        let mut task = signed_task_for(&f.local, SECRET_CAP);
+        task.constraints.pin_to_node = Some(f.local.node_id());
+        task.constraints.deadline = Some(1); // long since elapsed
+        task.sign(&f.local).expect("re-sign");
+        f.store.insert_task(&task).expect("insert");
+
+        pause.set_operator(true);
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.task_state(task.id).unwrap(),
+            Some(TaskState::Failed),
+            "deadline-elapsed paused-pin terminalizes"
+        );
+        let row = f
+            .store
+            .load_task_result(task.id)
+            .expect("load")
+            .expect("row");
+        assert!(row
+            .error
+            .expect("error")
+            .contains("deadline exceeded while"));
+
+        pause.set_operator(false);
+        f.runtime.poll_submitted_once();
+        assert_eq!(
+            f.store.task_state(task.id).unwrap(),
+            Some(TaskState::Failed),
+            "never dispatched after un-pause"
+        );
+        assert_eq!(f.store.list_leases_for_task(task.id).unwrap().len(), 0);
     }
 }
