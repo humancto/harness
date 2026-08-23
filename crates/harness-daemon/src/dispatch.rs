@@ -650,8 +650,12 @@ impl DispatchRuntime {
 
     fn dispatch_to(&self, task: &Task, node: NodeId) {
         self.elig_failures.lock().remove(&task.id);
-        if let Err(e) = self.store.set_last_dispatched(&task.capability, node) {
-            tracing::warn!(target: "harness.dispatch", ?e, "persist rr cursor");
+        // 4.6 (ADR-0027 carry): pinned routes never consult RR — don't
+        // churn the cursor N times per federated fan-out.
+        if task.constraints.pin_to_node.is_none() {
+            if let Err(e) = self.store.set_last_dispatched(&task.capability, node) {
+                tracing::warn!(target: "harness.dispatch", ?e, "persist rr cursor");
+            }
         }
         match self.store.try_dispatch_task(task.id, node) {
             Ok(true) => {}

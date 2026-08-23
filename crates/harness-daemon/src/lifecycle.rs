@@ -159,6 +159,11 @@ impl DaemonOrchestrator {
         let store = harness_store::Store::open(&harness_store::StoreConfig::at(&db_path))
             .context("open harness-store")?;
 
+        // 4.6 (ADR-0028): sweep crash-stranded claimed/running rows
+        // BEFORE any loop spawns — at this point every such row
+        // assigned to self is provably debris from a previous process.
+        crate::executor::sweep_boot_orphans(&store, identity.node_id());
+
         // Load the admin file if present; absence means the operator
         // hasn't run `harness admin set-password` yet, and mutating
         // endpoints will surface a 503 until they do.

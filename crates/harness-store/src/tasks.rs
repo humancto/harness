@@ -282,6 +282,41 @@ impl Store {
         })
     }
 
+    /// 4.6 (ADR-0028): boot orphan sweep, remote-issued arm — reset a
+    /// crash-stranded `claimed|running` row back to
+    /// `dispatched(assigned=node)` so the executor re-executes it after
+    /// a restart (at-least-once, the re-dispatch doctrine). A synthetic
+    /// hop (running → dispatched is not a ladder transition), precedent
+    /// ADR-0017/0027; guarded on the row still being assigned to
+    /// `node`. Call ONLY from the boot sweep, before any loops spawn.
+    pub fn sweep_orphan_to_dispatched(&self, id: TaskId, node: NodeId) -> Result<bool, StoreError> {
+        self.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE tasks SET state = 'dispatched'
+                  WHERE id = ?1 AND state IN ('claimed', 'running')
+                    AND assigned_node = ?2",
+                params![id.0.as_bytes(), node.as_bytes()],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
+    /// 4.6 (ADR-0028): boot orphan sweep, locally-issued arm — fail a
+    /// crash-stranded `claimed|running` row terminally (there is no
+    /// lease and no coordinator to recover it). Guarded like
+    /// [`Store::sweep_orphan_to_dispatched`].
+    pub fn sweep_orphan_to_failed(&self, id: TaskId, node: NodeId) -> Result<bool, StoreError> {
+        self.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE tasks SET state = 'failed'
+                  WHERE id = ?1 AND state IN ('claimed', 'running')
+                    AND assigned_node = ?2",
+                params![id.0.as_bytes(), node.as_bytes()],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
     /// Worker-side ingest of a remote assignment: insert the task with the
     /// row born at `dispatched`, assigned to `assigned_node` (the local
     /// node). Idempotent — a re-delivered assignment after a reconnect is

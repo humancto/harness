@@ -385,6 +385,59 @@ impl LocalExecutor {
     }
 }
 
+/// 4.6 (ADR-0028): boot orphan sweep — run ONCE at daemon build, before
+/// any loop spawns (so every `claimed|running(assigned=self)` row is
+/// provably crash debris from a previous process; ADR-0027's headline
+/// carry).
+///
+/// - LOCALLY-issued rows → `Failed` with an honest reason: they have no
+///   lease and no coordinator left to recover them.
+/// - REMOTE-issued rows → reset to `Dispatched(self)`: the executor
+///   re-executes after boot (at-least-once, the re-dispatch doctrine)
+///   and the issuer's own recovery (lease expiry → re-assign →
+///   terminal-resend) then ships the REAL result — a synthetic stored
+///   Failed would poison the issuer's retry budget through the
+///   terminal-resend arm (plan review MAJOR-10).
+pub(crate) fn sweep_boot_orphans(store: &Store, local_node: NodeId) {
+    for state in [TaskState::Claimed, TaskState::Running] {
+        let rows = match store.list_tasks_by_state_assigned(state, Some(local_node)) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(target: "harness.executor", ?e, "orphan sweep list");
+                continue;
+            }
+        };
+        for row in rows {
+            if row.issued_by == local_node {
+                let msg = format!(
+                    "orphaned by daemon restart (was {} at boot)",
+                    state.as_str()
+                );
+                if let Ok(true) = store.sweep_orphan_to_failed(row.id, local_node) {
+                    tracing::warn!(
+                        target: "harness.executor",
+                        task = %row.id.0,
+                        %msg,
+                        "boot orphan failed terminally"
+                    );
+                    let now = now_unix_ms();
+                    if let Err(e) = store.write_task_result_failed(row.id, &msg, now, local_node) {
+                        tracing::warn!(target: "harness.executor", ?e, "orphan result write");
+                    }
+                    let _ =
+                        store.replica_apply_local(&failed_replica(row.id, now, local_node, &msg));
+                }
+            } else if let Ok(true) = store.sweep_orphan_to_dispatched(row.id, local_node) {
+                tracing::info!(
+                    target: "harness.executor",
+                    task = %row.id.0,
+                    "boot orphan reset for re-execution (remote-issued)"
+                );
+            }
+        }
+    }
+}
+
 /// 4.6 (ADR-0028): rolling liveness proof while a remote-issued task
 /// executes. The hook re-resolves the live lease per tick; the caller
 /// aborts the returned task the moment the capability future settles,
@@ -825,6 +878,99 @@ mod tests {
             ticks.load(Ordering::SeqCst),
             during,
             "locally-issued tasks never extend"
+        );
+    }
+
+    /// 4.6 (ADR-0028): the boot sweep splits by issuer — locally
+    /// issued orphans fail with a reason; remote-issued ones reset to
+    /// Dispatched(self) for re-execution; everything else untouched.
+    #[tokio::test]
+    async fn t18_boot_orphan_sweep_splits_by_issuer() {
+        let store = fresh_store();
+        let me = local_node();
+        let remote = Identity::generate();
+
+        // Locally-issued orphan at Running(self).
+        let local_orphan = dummy_task(TaskId::new_v7(), "echo", serde_json::json!({}), me);
+        store.insert_task(&local_orphan).expect("insert");
+        store.try_dispatch_task(local_orphan.id, me).expect("cas");
+        store
+            .transition_task(local_orphan.id, TaskState::Claimed)
+            .expect("claim");
+        store
+            .transition_task(local_orphan.id, TaskState::Running)
+            .expect("run");
+
+        // Remote-issued orphan at Claimed(self).
+        let mut remote_orphan = dummy_task(
+            TaskId::new_v7(),
+            "echo",
+            serde_json::json!({}),
+            remote.node_id(),
+        );
+        remote_orphan.sign(&remote).expect("sign");
+        assert!(store
+            .insert_task_dispatched(&remote_orphan, me)
+            .expect("ingest"));
+        store
+            .transition_task(remote_orphan.id, TaskState::Claimed)
+            .expect("claim");
+
+        // Control rows the sweep must NOT touch: a Dispatched(self)
+        // row and a Running row assigned to ANOTHER node.
+        let dispatched = dummy_task(TaskId::new_v7(), "echo", serde_json::json!({}), me);
+        store.insert_task(&dispatched).expect("insert");
+        store.try_dispatch_task(dispatched.id, me).expect("cas");
+        let other = dummy_task(TaskId::new_v7(), "echo", serde_json::json!({}), me);
+        store.insert_task(&other).expect("insert");
+        store
+            .try_dispatch_task(other.id, remote.node_id())
+            .expect("cas");
+        store
+            .transition_task(other.id, TaskState::Claimed)
+            .expect("claim");
+        store
+            .transition_task(other.id, TaskState::Running)
+            .expect("run");
+
+        sweep_boot_orphans(&store, me);
+
+        assert_eq!(
+            store.task_state(local_orphan.id).unwrap(),
+            Some(TaskState::Failed),
+            "local orphan fails terminally"
+        );
+        let row = store
+            .load_task_result(local_orphan.id)
+            .expect("load")
+            .expect("row");
+        assert!(row
+            .error
+            .expect("error")
+            .contains("orphaned by daemon restart"));
+
+        assert_eq!(
+            store.task_state(remote_orphan.id).unwrap(),
+            Some(TaskState::Dispatched),
+            "remote orphan resets for re-execution"
+        );
+        assert!(
+            store
+                .load_task_result(remote_orphan.id)
+                .expect("load")
+                .is_none(),
+            "no synthetic terminal for remote orphans (issuer retry budget)"
+        );
+
+        assert_eq!(
+            store.task_state(dispatched.id).unwrap(),
+            Some(TaskState::Dispatched),
+            "dispatched rows untouched"
+        );
+        assert_eq!(
+            store.task_state(other.id).unwrap(),
+            Some(TaskState::Running),
+            "other nodes' rows untouched"
         );
     }
 
