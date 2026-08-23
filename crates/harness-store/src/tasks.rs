@@ -260,6 +260,28 @@ impl Store {
         })
     }
 
+    /// 4.5 (ADR-0027): CAS `submitted → running` AND assign the local
+    /// node, in one UPDATE. The Federated coordinator claims the *parent*
+    /// task with this before fanning sub-tasks out; the executor never
+    /// sees the row because it only claims from `dispatched`.
+    ///
+    /// This is a deliberate synthetic hop — the parent skips `dispatched`
+    /// because no single worker runs it; the coordinator on this node
+    /// "runs" it by orchestrating sub-tasks. Returns `Ok(true)` if this
+    /// call won the claim, `Ok(false)` if another coordinator (or a
+    /// concurrent dispatch pass) got there first — the loser must release
+    /// its coordinator slot and do nothing.
+    pub fn try_start_coordination(&self, id: TaskId, node: NodeId) -> Result<bool, StoreError> {
+        self.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE tasks SET state = 'running', assigned_node = ?1
+                  WHERE id = ?2 AND state = 'submitted'",
+                params![node.as_bytes(), id.0.as_bytes()],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
     /// Worker-side ingest of a remote assignment: insert the task with the
     /// row born at `dispatched`, assigned to `assigned_node` (the local
     /// node). Idempotent — a re-delivered assignment after a reconnect is
@@ -560,6 +582,28 @@ mod tests {
         s.transition_task(task.id, TaskState::Running).expect("run");
         s.transition_task(task.id, TaskState::Done).expect("done");
         assert_eq!(s.task_state(task.id).unwrap(), Some(TaskState::Done));
+    }
+
+    #[test]
+    fn try_start_coordination_claims_once_and_assigns_self() {
+        let s = Store::open_memory().expect("open");
+        let id = Identity::generate();
+        let task = signed_task(&id);
+        s.insert_task(&task).expect("insert");
+
+        let me = id.public_key().node_id();
+        assert!(s.try_start_coordination(task.id, me).expect("first claim"));
+        assert_eq!(s.task_state(task.id).unwrap(), Some(TaskState::Running));
+        assert_eq!(s.assigned_node(task.id).unwrap(), Some(me));
+
+        // A second claim (another coordinator racing, or a dispatch pass)
+        // must lose: the row is no longer `submitted`.
+        let other = NodeId::from_bytes([9; 16]);
+        assert!(!s.try_start_coordination(task.id, other).expect("second"));
+        assert_eq!(s.assigned_node(task.id).unwrap(), Some(me));
+
+        // And try_dispatch_task can no longer steal the row either.
+        assert!(!s.try_dispatch_task(task.id, other).expect("dispatch"));
     }
 
     #[test]

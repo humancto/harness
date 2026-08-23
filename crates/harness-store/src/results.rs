@@ -6,8 +6,12 @@
 //!
 //! Writes use `INSERT ... ON CONFLICT(task_id) DO UPDATE SET ...` so a
 //! retry doesn't error on the unique key.
+//!
+//! 4.5 (ADR-0027): the `provenance` column stores a JSON
+//! `Vec<NodeContribution>` for Federated parents; `NULL` for the
+//! Anyone/Owner single-node case.
 
-use harness_core::{NodeId, TaskId};
+use harness_core::{NodeContribution, NodeId, TaskId};
 use rusqlite::{params, OptionalExtension};
 use serde_json::Value as JsonValue;
 
@@ -21,6 +25,12 @@ pub struct TaskResult {
     pub error: Option<String>,
     pub completed_at_ms: u64,
     pub completed_by: NodeId,
+    /// Per-node contributions for a Federated result; `None` otherwise.
+    pub provenance: Option<Vec<NodeContribution>>,
+}
+
+fn encode_provenance(provenance: &[NodeContribution]) -> Result<String, StoreError> {
+    serde_json::to_string(provenance).map_err(|e| StoreError::Cbor(format!("encode provenance: {e}")))
 }
 
 impl Store {
@@ -32,22 +42,49 @@ impl Store {
         completed_at_ms: u64,
         completed_by: NodeId,
     ) -> Result<(), StoreError> {
+        self.write_done_inner(task_id, output, completed_at_ms, completed_by, None)
+    }
+
+    /// Persist a successful *federated* execution with its per-node
+    /// provenance (4.5, ADR-0027).
+    pub fn write_task_result_done_with_provenance(
+        &self,
+        task_id: TaskId,
+        output: &JsonValue,
+        completed_at_ms: u64,
+        completed_by: NodeId,
+        provenance: &[NodeContribution],
+    ) -> Result<(), StoreError> {
+        let json = encode_provenance(provenance)?;
+        self.write_done_inner(task_id, output, completed_at_ms, completed_by, Some(json))
+    }
+
+    fn write_done_inner(
+        &self,
+        task_id: TaskId,
+        output: &JsonValue,
+        completed_at_ms: u64,
+        completed_by: NodeId,
+        provenance_json: Option<String>,
+    ) -> Result<(), StoreError> {
         let output_json = serde_json::to_string(output)
             .map_err(|e| StoreError::Cbor(format!("encode output: {e}")))?;
         self.with_conn(|c| {
             c.execute(
-                "INSERT INTO task_results (task_id, output, error, completed_at_ms, completed_by)
-                 VALUES (?1, ?2, NULL, ?3, ?4)
+                "INSERT INTO task_results (task_id, output, error, completed_at_ms, completed_by, provenance)
+                 VALUES (?1, ?2, NULL, ?3, ?4, ?5)
                  ON CONFLICT(task_id) DO UPDATE SET
                     output           = excluded.output,
                     error            = NULL,
                     completed_at_ms  = excluded.completed_at_ms,
-                    completed_by     = excluded.completed_by",
+                    completed_by     = excluded.completed_by,
+                    provenance       = excluded.provenance",
                 params![
                     task_id.0.as_bytes(),
                     output_json,
                     completed_at_ms,
                     completed_by.as_bytes(),
+                    provenance_json,
                 ],
             )?;
             Ok(())
@@ -62,20 +99,47 @@ impl Store {
         completed_at_ms: u64,
         completed_by: NodeId,
     ) -> Result<(), StoreError> {
+        self.write_failed_inner(task_id, error, completed_at_ms, completed_by, None)
+    }
+
+    /// Persist a failed *federated* execution, keeping the per-node
+    /// provenance so the UI can show which nodes did answer (4.5).
+    pub fn write_task_result_failed_with_provenance(
+        &self,
+        task_id: TaskId,
+        error: &str,
+        completed_at_ms: u64,
+        completed_by: NodeId,
+        provenance: &[NodeContribution],
+    ) -> Result<(), StoreError> {
+        let json = encode_provenance(provenance)?;
+        self.write_failed_inner(task_id, error, completed_at_ms, completed_by, Some(json))
+    }
+
+    fn write_failed_inner(
+        &self,
+        task_id: TaskId,
+        error: &str,
+        completed_at_ms: u64,
+        completed_by: NodeId,
+        provenance_json: Option<String>,
+    ) -> Result<(), StoreError> {
         self.with_conn(|c| {
             c.execute(
-                "INSERT INTO task_results (task_id, output, error, completed_at_ms, completed_by)
-                 VALUES (?1, NULL, ?2, ?3, ?4)
+                "INSERT INTO task_results (task_id, output, error, completed_at_ms, completed_by, provenance)
+                 VALUES (?1, NULL, ?2, ?3, ?4, ?5)
                  ON CONFLICT(task_id) DO UPDATE SET
                     output           = NULL,
                     error            = excluded.error,
                     completed_at_ms  = excluded.completed_at_ms,
-                    completed_by     = excluded.completed_by",
+                    completed_by     = excluded.completed_by,
+                    provenance       = excluded.provenance",
                 params![
                     task_id.0.as_bytes(),
                     error,
                     completed_at_ms,
                     completed_by.as_bytes(),
+                    provenance_json,
                 ],
             )?;
             Ok(())
@@ -87,7 +151,7 @@ impl Store {
         self.with_conn(|c| {
             let row = c
                 .query_row(
-                    "SELECT output, error, completed_at_ms, completed_by
+                    "SELECT output, error, completed_at_ms, completed_by, provenance
                        FROM task_results WHERE task_id = ?1",
                     params![task_id.0.as_bytes()],
                     |r| {
@@ -95,11 +159,12 @@ impl Store {
                         let error: Option<String> = r.get(1)?;
                         let completed_at_ms: u64 = r.get(2)?;
                         let by_blob: Vec<u8> = r.get(3)?;
-                        Ok((output, error, completed_at_ms, by_blob))
+                        let provenance: Option<String> = r.get(4)?;
+                        Ok((output, error, completed_at_ms, by_blob, provenance))
                     },
                 )
                 .optional()?;
-            let Some((output, error, completed_at_ms, by_blob)) = row else {
+            let Some((output, error, completed_at_ms, by_blob, provenance)) = row else {
                 return Ok(None);
             };
             let by_arr: [u8; 16] = by_blob
@@ -113,12 +178,20 @@ impl Store {
                 ),
                 None => None,
             };
+            let parsed_provenance = match provenance {
+                Some(s) => Some(
+                    serde_json::from_str::<Vec<NodeContribution>>(&s)
+                        .map_err(|e| StoreError::Cbor(format!("decode provenance: {e}")))?,
+                ),
+                None => None,
+            };
             Ok(Some(TaskResult {
                 task_id,
                 output: parsed_output,
                 error,
                 completed_at_ms,
                 completed_by: NodeId::from_bytes(by_arr),
+                provenance: parsed_provenance,
             }))
         })
     }
