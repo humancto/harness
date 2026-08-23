@@ -94,6 +94,19 @@ executing node). Builds on 5.2's double gate (ADR-0031).
    Unknown prefixes count as LLM tiers — conservative for trigger
    accounting, never eligible for the cloud gate.
 
+6. **Accounting details** (diff review round 2): only LOCAL LLM
+   tiers feed the fired-trigger set — a cloud tier's own failure can
+   never open a later cloud tier (latent today with one cloud tier;
+   enforced so a future multi-cloud lineup cannot self-escalate).
+   A budget-skipped LLM tier still counts as "an earlier LLM tier
+   exists" for the baseline rule — existence, not attempt: a
+   budget-starved mesh must not silently convert an escalation-only
+   cloud tier into a baseline planner. When the budget (not the
+   trigger policy) is what shut the chain down, the cloud tier's
+   skip diagnostic still names the trigger policy — the preceding
+   budget-skip diagnostics appear in the same joined summary, so
+   the true cause is visible one entry earlier.
+
 ## Not in 5.3 (deliberate)
 
 - `max_replanning_attempts` read as per-CHAIN (the PRD is ambiguous;

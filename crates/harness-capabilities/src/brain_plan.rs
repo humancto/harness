@@ -404,6 +404,21 @@ fn classify_tier(id: &str) -> PlannerTier {
     }
 }
 
+/// Escalation accounting (ADR-0032, diff review MINOR-1): only LOCAL
+/// LLM tiers feed the trigger set — a cloud tier's own failure must
+/// never open a later cloud tier, and Template sits after every gate.
+/// Latent today (one cloud tier, evaluated before it runs), enforced
+/// so a future multi-cloud lineup cannot self-escalate.
+fn fire_trigger(
+    fired: &mut HashSet<harness_policy::CloudTrigger>,
+    tier: PlannerTier,
+    trigger: harness_policy::CloudTrigger,
+) {
+    if tier == PlannerTier::Llm {
+        fired.insert(trigger);
+    }
+}
+
 impl BrainPlanCapability {
     /// 5.3 (ADR-0032): the escalation walk. Tier order is the lineup;
     /// per tier there is an attempt loop (first try + validation-repair
@@ -510,7 +525,7 @@ impl BrainPlanCapability {
                                     "{id}: confidence {:.2} < threshold {threshold:.2}",
                                     resp.confidence,
                                 ));
-                                fired.insert(CloudTrigger::LowConfidence);
+                                fire_trigger(&mut fired, tier, CloudTrigger::LowConfidence);
                                 break 'attempts;
                             }
                         }
@@ -527,13 +542,13 @@ impl BrainPlanCapability {
                         match validation {
                             Ok(()) => return encode_success(&resp),
                             Err(e) => {
-                                fired.insert(CloudTrigger::PlanValidationFailed);
+                                fire_trigger(&mut fired, tier, CloudTrigger::PlanValidationFailed);
                                 if matches!(
                                     e,
                                     PlanValidationError::UnknownCapability { .. }
                                         | PlanValidationError::UnknownSchema { .. }
                                 ) {
-                                    fired.insert(CloudTrigger::ToolNotFound);
+                                    fire_trigger(&mut fired, tier, CloudTrigger::ToolNotFound);
                                 }
                                 diagnostics.push(format!(
                                     "{id}: validation failed (attempt {}): {e}",
@@ -552,14 +567,14 @@ impl BrainPlanCapability {
                         matched_pattern,
                         missing_capability,
                     }) => {
-                        fired.insert(CloudTrigger::ToolNotFound);
+                        fire_trigger(&mut fired, tier, CloudTrigger::ToolNotFound);
                         diagnostics.push(format!(
                             "{id}: matched pattern {matched_pattern:?} but capability {missing_capability:?} not registered"
                         ));
                         break 'attempts;
                     }
                     Err(e) => {
-                        fired.insert(CloudTrigger::BackendError);
+                        fire_trigger(&mut fired, tier, CloudTrigger::BackendError);
                         diagnostics.push(format!("{id}: backend error: {e}"));
                         break 'attempts;
                     }
