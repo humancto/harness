@@ -62,12 +62,14 @@
       authed = false;
       return false;
     }
+    // Any non-401 response proves the session works — render errors
+    // (404 incl.) in the page, never bounce back to the login form.
+    authed = true;
     if (!res.ok) {
       pageError = res.status === 404 ? 'task not found' : `fetch failed (${res.status})`;
       return false;
     }
     const d = (await res.json()) as TaskDetailDto;
-    authed = true;
     detail = d;
     liveState = String(d.state);
     if (d.output !== undefined) output = d.output;
@@ -103,6 +105,11 @@
         liveState = frame.state;
         if (frame.output !== undefined) output = frame.output;
         if (frame.error !== undefined) errorText = frame.error;
+        if (TERMINAL.has(frame.state)) {
+          // Final snapshot: provenance and partials_dropped ride only
+          // GET /tasks/:id — the terminal frame carries neither.
+          void fetchDetail();
+        }
       } catch {
         // Malformed frame — telemetry only; the poll fallback covers us.
       }
