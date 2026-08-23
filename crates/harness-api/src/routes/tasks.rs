@@ -246,9 +246,16 @@ pub async fn list_handler(
         )
             .into_response();
     };
+    let limit = query
+        .limit
+        .unwrap_or(LIST_DEFAULT_LIMIT)
+        .clamp(1, LIST_MAX_LIMIT);
     let rows = if let Some(wanted) = &query.state {
         match wanted.parse::<harness_store::TaskState>() {
-            Ok(task_state) => store.list_tasks_by_state(task_state),
+            // The clamp applies to BOTH arms (diff review MINOR-6):
+            // terminal states accumulate forever, so `?state=done`
+            // must page exactly like the default listing.
+            Ok(task_state) => store.list_tasks_by_state_limited(task_state, limit),
             Err(_) => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -258,10 +265,6 @@ pub async fn list_handler(
             }
         }
     } else {
-        let limit = query
-            .limit
-            .unwrap_or(LIST_DEFAULT_LIMIT)
-            .clamp(1, LIST_MAX_LIMIT);
         store.list_recent_tasks(limit)
     };
     match rows {

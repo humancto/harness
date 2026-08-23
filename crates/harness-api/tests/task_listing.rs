@@ -147,6 +147,11 @@ async fn listing_spans_states_links_children_and_filters() {
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["state"], "submitted");
 
+    // The limit clamps the `?state=` arm too (diff review MINOR-6).
+    let resp = get(&app, &token, "/api/v1/tasks?state=done&limit=1").await;
+    let arr = body_json(resp).await;
+    assert_eq!(arr.as_array().expect("array").len(), 1);
+
     // Unknown state → 400, not an empty 200.
     let resp = get(&app, &token, "/api/v1/tasks?state=bogus").await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);

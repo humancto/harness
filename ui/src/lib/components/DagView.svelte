@@ -3,7 +3,7 @@
   import type { StepView } from '$lib/progress';
   import type { PlanInput } from '$lib/types';
 
-  let { plan, steps }: { plan: PlanInput; steps: Map<string, StepView> } = $props();
+  let { plan, steps }: { plan: PlanInput; steps: Record<string, StepView> } = $props();
 
   const layout: DagLayout = $derived(
     layoutDag(
@@ -14,7 +14,7 @@
   );
 
   function stateOf(id: string): string {
-    return steps.get(id)?.state ?? 'pending';
+    return steps[id]?.state ?? 'pending';
   }
 
   // Node fill by live state. `in_flight` frames arrive at dispatch
@@ -73,7 +73,7 @@
       {/each}
       {#each layout.nodes as node (node.id)}
         {@const state = stateOf(node.id)}
-        {@const taskId = steps.get(node.id)?.taskId}
+        {@const taskId = steps[node.id]?.taskId}
         <g>
           <rect
             x={node.x}

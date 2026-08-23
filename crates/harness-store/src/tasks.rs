@@ -531,6 +531,34 @@ impl Store {
         })
     }
 
+    /// Like [`Self::list_tasks_by_state`] with a row cap — the 4.8
+    /// API listing's `?state=` arm (one page, never a full-table dump;
+    /// terminal states accumulate forever).
+    pub fn list_tasks_by_state_limited(
+        &self,
+        state: TaskState,
+        limit: usize,
+    ) -> Result<Vec<TaskRow>, StoreError> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, capability, state, issued_by, issued_at,
+                        completed_by, started_at, finished_at,
+                        parent_id, plan_id
+                   FROM tasks
+                  WHERE state = ?1
+               ORDER BY issued_at DESC
+                  LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(
+                    params![state.as_str(), i64::try_from(limit).unwrap_or(i64::MAX)],
+                    |r| Ok(row_to_task_row(r)),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter().collect::<Result<Vec<_>, _>>()
+        })
+    }
+
     pub fn list_tasks_by_state(&self, state: TaskState) -> Result<Vec<TaskRow>, StoreError> {
         self.with_conn(|c| {
             let mut stmt = c.prepare(

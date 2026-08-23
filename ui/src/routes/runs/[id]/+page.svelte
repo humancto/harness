@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { onDestroy, onMount } from 'svelte';
   import { page } from '$app/stores';
   import AuthGate from '$lib/components/AuthGate.svelte';
   import DagView from '$lib/components/DagView.svelte';
@@ -26,6 +25,11 @@
   let ws: WebSocket | null = null;
   let wsRetried = false;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // Bumped on every teardown; stale async callbacks (reconnects, poll
+  // ticks, in-flight fetches) compare against it and no-op (diff
+  // review MAJOR-2/MINOR-3).
+  let gen = 0;
   let seenSeq = new Set<number>();
   let logPane = $state<HTMLElement | null>(null);
 
@@ -57,7 +61,17 @@
   }
 
   async function fetchDetail(): Promise<boolean> {
-    const res = await fetch(`/api/v1/tasks/${taskId}`);
+    const g = gen;
+    let res: Response;
+    try {
+      res = await fetch(`/api/v1/tasks/${taskId}`);
+    } catch (err) {
+      // Daemon down/restarting is a normal event — surface it, never
+      // an unhandled rejection (diff review MINOR-4).
+      if (g === gen) pageError = `daemon unreachable: ${err}`;
+      return false;
+    }
+    if (g !== gen) return false; // navigated away mid-fetch
     if (res.status === 401) {
       authed = false;
       return false;
@@ -70,6 +84,7 @@
       return false;
     }
     const d = (await res.json()) as TaskDetailDto;
+    if (g !== gen) return false;
     detail = d;
     liveState = String(d.state);
     if (d.output !== undefined) output = d.output;
@@ -79,11 +94,17 @@
     return true;
   }
 
-  function startPolling() {
-    if (pollTimer) return;
+  function startPolling(g: number) {
+    if (g !== gen || pollTimer) return;
     pollTimer = setInterval(async () => {
-      const ok = await fetchDetail();
-      if (!ok || (liveState && TERMINAL.has(liveState))) stopPolling();
+      if (g !== gen) {
+        stopPolling();
+        return;
+      }
+      await fetchDetail();
+      // Keep polling through transient errors (the daemon coming back
+      // recovers the view); stop on terminal or a lost session.
+      if (!authed || (liveState && TERMINAL.has(liveState))) stopPolling();
     }, 2000);
   }
 
@@ -92,10 +113,12 @@
     pollTimer = null;
   }
 
-  function connectWs() {
+  function connectWs(g: number) {
+    if (g !== gen) return;
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${proto}//${window.location.host}/api/v1/runs/${taskId}`);
     ws.onmessage = (msg) => {
+      if (g !== gen) return;
       try {
         const frame = JSON.parse(msg.data) as RunStreamFrame;
         if ('partials' in frame) {
@@ -116,16 +139,17 @@
     };
     ws.onclose = (ev) => {
       ws = null;
+      if (g !== gen) return; // torn down — no reconnects, no polling
       // 1000 = server pushed the terminal frame: never reconnect.
       if (ev.code === 1000 || (liveState && TERMINAL.has(liveState))) return;
       // 1011 = row-vanished/store-error; anything else (auth/origin
       // refusal, network) — one reconnect, then honest polling.
       if (!wsRetried) {
         wsRetried = true;
-        setTimeout(connectWs, 500);
+        reconnectTimer = setTimeout(() => connectWs(g), 500);
       } else {
         liveNote = 'live stream unavailable — polling every 2s';
-        startPolling();
+        startPolling(g);
       }
     };
     ws.onerror = () => {
@@ -133,24 +157,42 @@
     };
   }
 
+  function teardown() {
+    gen += 1;
+    ws?.close(1000, 'leaving');
+    ws = null;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    stopPolling();
+  }
+
   async function boot() {
+    teardown();
+    const g = gen;
+    wsRetried = false;
+    liveNote = null;
+    pageError = null;
     seenSeq = new Set();
     logs = [];
     progress = emptyProgress();
+    detail = null;
+    liveState = null;
+    output = undefined;
+    errorText = null;
     const ok = await fetchDetail();
-    if (!ok) return;
+    if (g !== gen || !ok) return;
     if (liveState && TERMINAL.has(liveState)) return;
-    connectWs();
+    connectWs(g);
   }
 
-  onMount(() => {
+  // Re-boot whenever the route param changes (diff review MAJOR-2):
+  // SvelteKit reuses this component for /runs/A → /runs/B (the DAG
+  // drill-down links), so lifecycle must key on taskId, not onMount.
+  // Runs on mount too; the cleanup covers destroy.
+  $effect(() => {
+    void taskId;
     void boot();
-  });
-
-  onDestroy(() => {
-    ws?.close(1000, 'leaving page');
-    ws = null;
-    stopPolling();
+    return teardown;
   });
 
   function fmtJson(v: unknown): string {

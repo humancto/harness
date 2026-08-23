@@ -27,8 +27,13 @@ export interface StepView {
 export interface RunProgress {
   /** 0..=1 when derivable, null → indeterminate. */
   fraction: number | null;
-  /** Plan-node id → live view (plan.execute parents only). */
-  steps: Map<string, StepView>;
+  /**
+   * Plan-node id → live view (plan.execute parents only). A plain
+   * object ON PURPOSE (diff review BLOCKER-1): Svelte 5's `$state`
+   * proxies deep-track plain objects/arrays but never `Map`, so a
+   * Map here renders once and then silently stops updating the DAG.
+   */
+  steps: Record<string, StepView>;
   /** Federated per-node settle lines, in arrival order. */
   federated: { node_name: string; outcome: string }[];
   /** True once a terminal summary frame arrived. */
@@ -36,7 +41,7 @@ export interface RunProgress {
 }
 
 export function emptyProgress(): RunProgress {
-  return { fraction: null, steps: new Map(), federated: [], summarized: false };
+  return { fraction: null, steps: {}, federated: [], summarized: false };
 }
 
 const TERMINAL_STEP_STATES = new Set(["done", "failed", "timed_out", "skipped"]);
@@ -44,8 +49,8 @@ const TERMINAL_STEP_STATES = new Set(["done", "failed", "timed_out", "skipped"])
 /**
  * Fold one `progress` frame line into the running view. `planSize` is
  * `Object.keys(input.plan.tasks).length` for plan parents (0 = not a
- * plan). Returns the same object, mutated — callers reassign for
- * reactivity.
+ * plan). Mutates and returns the same object — under a `$state` proxy
+ * the property writes themselves are what fire reactivity.
  */
 export function applyProgressLine(
   view: RunProgress,
@@ -65,21 +70,21 @@ export function applyProgressLine(
     | { id?: string; capability?: string; state?: string; task_id?: string; error?: string }
     | undefined;
   if (step && typeof step.id === "string") {
-    const prev = view.steps.get(step.id);
+    const prev = view.steps[step.id];
     // A settle frame never regresses to in_flight (frames can arrive
     // ring-batched out of order across ticks).
     const next = step.state ?? "waiting";
     if (!prev || !TERMINAL_STEP_STATES.has(prev.state) || TERMINAL_STEP_STATES.has(next)) {
-      view.steps.set(step.id, {
+      view.steps[step.id] = {
         capability: step.capability ?? prev?.capability ?? "?",
         state: next,
         taskId: step.task_id ?? prev?.taskId,
         error: step.error ?? prev?.error,
-      });
+      };
     }
     if (planSize > 0) {
       let settled = 0;
-      for (const s of view.steps.values()) {
+      for (const s of Object.values(view.steps)) {
         if (TERMINAL_STEP_STATES.has(s.state)) settled += 1;
       }
       view.fraction = Math.min(1, settled / planSize);

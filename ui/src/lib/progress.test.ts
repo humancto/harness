@@ -16,8 +16,8 @@ describe("applyProgressLine", () => {
       }),
       2,
     );
-    expect(v.steps.get("s1")?.state).toBe("in_flight");
-    expect(v.steps.get("s1")?.taskId).toBe("t-1");
+    expect(v.steps["s1"]?.state).toBe("in_flight");
+    expect(v.steps["s1"]?.taskId).toBe("t-1");
     expect(v.fraction).toBe(0);
 
     v = applyProgressLine(
@@ -25,9 +25,9 @@ describe("applyProgressLine", () => {
       JSON.stringify({ step: { id: "s1", capability: "echo", state: "done" } }),
       2,
     );
-    expect(v.steps.get("s1")?.state).toBe("done");
+    expect(v.steps["s1"]?.state).toBe("done");
     // task_id learned at in_flight survives the settle frame.
-    expect(v.steps.get("s1")?.taskId).toBe("t-1");
+    expect(v.steps["s1"]?.taskId).toBe("t-1");
     expect(v.fraction).toBe(0.5);
 
     v = applyProgressLine(
@@ -50,8 +50,8 @@ describe("applyProgressLine", () => {
       JSON.stringify({ step: { id: "s1", capability: "echo", state: "in_flight" } }),
       1,
     );
-    expect(v.steps.get("s1")?.state).toBe("failed");
-    expect(v.steps.get("s1")?.error).toBe("boom");
+    expect(v.steps["s1"]?.state).toBe("failed");
+    expect(v.steps["s1"]?.error).toBe("boom");
   });
 
   it("derives the fraction from mesh completed/total frames and finishes on summary", () => {
@@ -91,6 +91,6 @@ describe("applyProgressLine", () => {
     v = applyProgressLine(v, JSON.stringify({ something: "else" }), 2);
     v = applyProgressLine(v, JSON.stringify(null), 2);
     expect(v.fraction).toBeNull();
-    expect(v.steps.size).toBe(0);
+    expect(Object.keys(v.steps).length).toBe(0);
   });
 });

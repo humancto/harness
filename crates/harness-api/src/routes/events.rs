@@ -24,6 +24,10 @@ use tokio::sync::broadcast;
 
 use crate::state::ApiState;
 
+/// DELIBERATELY session-less (unlike `WS /runs/:id`, gated in 4.8):
+/// this socket carries peer presence/leader metadata only — the same
+/// class of data the unauthenticated `GET /status` serves — never task
+/// input, output, or partials. Loopback-Origin is the browser gate.
 pub async fn ws_events(
     State(state): State<ApiState>,
     headers: HeaderMap,
