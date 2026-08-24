@@ -39,7 +39,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::traits::{
-    Capability, CapabilityError, ExecutionContext, FrameSink, LogFrame, StreamKind,
+    audit_actor, Capability, CapabilityError, ExecutionContext, FrameSink, LogFrame, StreamKind,
 };
 use harness_core::TaskId;
 
@@ -247,14 +247,58 @@ impl Capability for ShellExecCapability {
                 args: &input.args,
             },
         });
+        // 5.13a (ADR-0041): the §10.6 record. NEVER argv — a shell
+        // command routinely carries credentials (`curl -H
+        // "Authorization: ..."`), and this row is destined for
+        // replication. The command name and a hash of the arguments
+        // are enough to answer "what ran, and was it this again?".
+        let argv_hash = harness_core::step_hash(
+            &input.cmd,
+            &serde_json::json!(input.args),
+            harness_core::HashFn::Blake3,
+        )
+        .map(|h| harness_core::hash_hex(&h))
+        .unwrap_or_default();
         match decision {
-            Decision::Allow => {}
+            Decision::Allow => {
+                ctx.audit(
+                    harness_core::AuditRecord::new(
+                        harness_core::AuditAction::ShellAllowed,
+                        audit_actor(ctx),
+                    )
+                    .with_subject(input.cmd.clone())
+                    .with_detail(&serde_json::json!({
+                        "argv_hash": argv_hash,
+                        "task_id": ctx.task_id.0.to_string(),
+                    })),
+                );
+            }
             Decision::Deny { reason } => {
+                ctx.audit(
+                    harness_core::AuditRecord::new(
+                        harness_core::AuditAction::ShellDenied,
+                        audit_actor(ctx),
+                    )
+                    .with_subject(input.cmd.clone())
+                    .with_detail(&serde_json::json!({
+                        "argv_hash": argv_hash,
+                        "reason": reason,
+                        "task_id": ctx.task_id.0.to_string(),
+                    })),
+                );
                 return Err(CapabilityError::Failed(format!("policy denied: {reason}")));
             }
             // `Decision` is `#[non_exhaustive]`; future variants we
             // don't yet know how to translate must fail closed.
             _ => {
+                ctx.audit(
+                    harness_core::AuditRecord::new(
+                        harness_core::AuditAction::ShellDenied,
+                        audit_actor(ctx),
+                    )
+                    .with_subject(input.cmd.clone())
+                    .with_detail(&serde_json::json!({ "reason": "unknown_decision" })),
+                );
                 return Err(CapabilityError::Failed(
                     "policy returned unknown decision (fail-closed)".to_string(),
                 ));

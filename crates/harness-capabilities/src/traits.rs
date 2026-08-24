@@ -37,6 +37,37 @@ pub struct ExecutionContext {
     /// partial-stream sink here so any capability can emit `Progress`
     /// frames without bespoke plumbing. `None` disables emission.
     pub frame_sink: Option<FrameSink>,
+    /// 5.13a (ADR-0041): where privileged actions are recorded. The
+    /// executor stamps the daemon's store-backed sink here, so a
+    /// capability can audit without depending on `harness-store`
+    /// (this crate is core-only by design — plan review BLOCKER-1).
+    /// `None` records nothing: bare fixtures and the validation-only
+    /// API context have no chain to append to.
+    pub audit: Option<std::sync::Arc<dyn harness_core::AuditSink>>,
+}
+
+/// 5.13a: who asked for an execution. A task issued elsewhere is a
+/// peer; one this node issued is the daemon acting on a local
+/// submission. Deliberately never carries caller-supplied text
+/// (plan review MAJOR-2).
+#[must_use]
+pub fn audit_actor(ctx: &ExecutionContext) -> harness_core::AuditActor {
+    if ctx.issued_by == ctx.local_node {
+        harness_core::AuditActor::System
+    } else {
+        harness_core::AuditActor::Peer {
+            node: ctx.issued_by,
+        }
+    }
+}
+
+impl ExecutionContext {
+    /// Record a privileged action, if this context has a sink.
+    pub fn audit(&self, record: harness_core::AuditRecord) {
+        if let Some(sink) = &self.audit {
+            sink.record(record);
+        }
+    }
 }
 
 impl std::fmt::Debug for ExecutionContext {
@@ -50,6 +81,7 @@ impl std::fmt::Debug for ExecutionContext {
             .field("task_id", &self.task_id)
             .field("tags", &self.tags)
             .field("frame_sink", &self.frame_sink.is_some())
+            .field("audit", &self.audit.is_some())
             .finish()
     }
 }

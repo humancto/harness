@@ -80,6 +80,7 @@ fn ctx() -> ExecutionContext {
         task_id: TaskId::new_v7(),
         tags: Arc::from(Vec::<String>::new()),
         frame_sink: None,
+        audit: None,
     }
 }
 
@@ -861,6 +862,7 @@ fn ctx_with_tags(tags: &[&str]) -> ExecutionContext {
         task_id: TaskId::new_v7(),
         tags: Arc::from(tags.iter().map(|s| (*s).to_string()).collect::<Vec<_>>()),
         frame_sink: None,
+        audit: None,
     }
 }
 

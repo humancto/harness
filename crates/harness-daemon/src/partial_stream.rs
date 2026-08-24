@@ -372,6 +372,7 @@ mod tests {
             trust,
             PeerTable::new(),
             Arc::new(harness_vault::PlaintextStore::empty()),
+            std::sync::Arc::new(harness_core::NullAuditSink),
         );
         let buffers = Arc::new(PartialBuffers::new());
         let streamer = PartialStreamer::new(local.node_id(), buffers.clone());

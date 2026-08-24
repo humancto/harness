@@ -71,7 +71,8 @@ pub use fs::{
     ScopeError, ScopeRegistry,
 };
 pub use traits::{
-    Capability, CapabilityError, ExecutionClass, ExecutionContext, FrameSink, LogFrame, StreamKind,
+    audit_actor, Capability, CapabilityError, ExecutionClass, ExecutionContext, FrameSink,
+    LogFrame, StreamKind,
 };
 
 #[cfg(feature = "echo")]

@@ -33,6 +33,7 @@ fn ctx() -> ExecutionContext {
         task_id: TaskId::new_v7(),
         tags: std::sync::Arc::from(Vec::<String>::new()),
         frame_sink: None,
+        audit: None,
     }
 }
 

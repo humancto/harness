@@ -40,7 +40,7 @@ use serde::Deserialize;
 use serde_json::{json, Value as JsonValue};
 
 use crate::registry::{CapabilityRegistry, CapabilitySnapshot};
-use crate::traits::{Capability, CapabilityError, ExecutionContext};
+use crate::traits::{audit_actor, Capability, CapabilityError, ExecutionContext};
 
 /// Stable id for the capability surface.
 pub const ID: &str = "brain.plan";
@@ -378,7 +378,7 @@ impl Capability for BrainPlanCapability {
             repair: None,
         };
 
-        self.walk_lineup(&req, &snapshot.cloud_caps).await
+        self.walk_lineup(&req, &snapshot.cloud_caps, ctx).await
     }
 }
 
@@ -434,6 +434,7 @@ impl BrainPlanCapability {
         &self,
         req: &PlanRequest,
         cloud_caps: &HashSet<String>,
+        ctx: &ExecutionContext,
     ) -> Result<JsonValue, CapabilityError> {
         use harness_brain::PlanValidationError;
         use harness_policy::CloudTrigger;
@@ -458,6 +459,26 @@ impl BrainPlanCapability {
             }
             if tier == PlannerTier::Llm {
                 earlier_llm_tier = true;
+            }
+            if tier == PlannerTier::Cloud {
+                // 5.13a (ADR-0041): §10.6 names cloud escalation a
+                // privileged action — this is the moment a local-first
+                // mesh decides to send a goal off-LAN. The GOAL never
+                // enters the record (it is user text, and this row is
+                // destined for replication); the backend id and the
+                // triggers that opened the gate do.
+                ctx.audit(
+                    harness_core::AuditRecord::new(
+                        harness_core::AuditAction::CloudEscalated,
+                        audit_actor(ctx),
+                    )
+                    .with_subject(id.to_string())
+                    .with_detail(&serde_json::json!({
+                        "task_id": ctx.task_id.0.to_string(),
+                        "triggers": fired.iter().map(|t| format!("{t:?}")).collect::<Vec<_>>(),
+                        "baseline": !earlier_llm_tier,
+                    })),
+                );
             }
 
             // Validation-repair retries (§15.4 "retry with stricter
