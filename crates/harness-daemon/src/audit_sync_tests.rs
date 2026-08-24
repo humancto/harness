@@ -12,7 +12,7 @@ use std::time::Duration;
 use harness_core::{AuditAction, AuditActor, AuditRecord, AuditSink, Signable, Signature};
 use harness_store::{PinStatus, StoreAuditSink};
 
-use crate::fanout_tests::{boot_pair, wait_for_mesh, TestDaemon};
+use crate::fanout_tests::{boot_pair, now_ms, wait_for_mesh, TestDaemon};
 
 fn append_entries(daemon: &TestDaemon, n: usize) {
     let sink = StoreAuditSink::new(daemon.store.clone(), daemon.node_id());
@@ -593,4 +593,109 @@ fn m11_relay_ranks_on_our_clock_and_selects_our_newest_observation() {
         "most recently OBSERVED first — B's u64::MAX at_ms buys nothing, got {order:?}"
     );
     assert!(order.contains(&[0xB1; 32]), "B's head is still relayed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m12_a_pin_is_corroborated_from_entries_over_the_wire() {
+    // The 5.13c-2 property, end to end: B pins A's head, asks A for
+    // the entries behind it, walks them, and upgrades the pin from
+    // `unchecked` to `corroborated`. Nothing here reaches into a
+    // store directly — the request and the batch both cross QUIC.
+    let (a, b) = boot_pair(None).await;
+    wait_for_mesh(&a, &b).await;
+
+    append_entries(&a, 12);
+    let target = wait_for_pin(&b, a.node_id(), "b to pin a's head").await;
+
+    let pins = b.store.peer_head_pins(a.node_id()).expect("pins");
+    assert_eq!(
+        pins.last().expect("pin").status,
+        PinStatus::Unchecked,
+        "a fresh pin claims nothing until the entries are walked"
+    );
+
+    // b asks a for everything up to the pinned position.
+    let svc = b.audit_sync.clone();
+    assert!(
+        svc.request_range(a.node_id(), a.node_id(), 1, target, now_ms()),
+        "request sent"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if b.store
+            .audit_run_corroborates(a.node_id(), target)
+            .expect("check")
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for corroboration"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let settled = b
+        .store
+        .peer_head_pins(a.node_id())
+        .expect("pins")
+        .into_iter()
+        .find(|p| p.seq == target)
+        .expect("pin");
+    assert_eq!(settled.status, PinStatus::Corroborated);
+
+    // And the entries really landed, stamped with OUR receive clock.
+    let rows = b
+        .store
+        .audit_entries_for_range(a.node_id(), 1, target)
+        .expect("read")
+        .0;
+    assert_eq!(u64::try_from(rows.len()).unwrap_or(0), target);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m13_an_unmatched_response_is_dropped() {
+    // No request/response primitive exists in this mesh, so a reply is
+    // matched by an explicit req_id. An unsolicited batch — or one
+    // answering a question we never asked — must not be ingested.
+    let (a, b) = boot_pair(None).await;
+    wait_for_mesh(&a, &b).await;
+    append_entries(&a, 5);
+
+    let (entries, _) = a
+        .store
+        .audit_entries_for_range(a.node_id(), 1, 5)
+        .expect("serve");
+    let mut env = harness_core::AuditSyncEnvelope {
+        source: a.node_id(),
+        assembled_at: now_ms(),
+        heads: Vec::new(),
+        range_req: None,
+        range_resp: Some(harness_core::AuditRangeResp {
+            req_id: [0xAB; 16],
+            node_id: a.node_id(),
+            entries,
+            truncated: false,
+        }),
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    env.sign(a.identity.as_ref()).expect("sign");
+
+    let svc = crate::audit_sync::AuditSyncService::new(
+        b.store.clone(),
+        b.identity.clone(),
+        b.trust.clone(),
+    );
+    svc.ingest(a.node_id(), &env, now_ms());
+
+    let (rows, _) = b
+        .store
+        .audit_entries_for_range(a.node_id(), 1, 5)
+        .expect("read");
+    assert!(
+        rows.is_empty(),
+        "an unsolicited batch must not be ingested, got {} rows",
+        rows.len()
+    );
 }

@@ -797,6 +797,13 @@ impl DaemonOrchestrator {
         self.api_state.partials.clone()
     }
 
+    /// Audit-sync handle for test assertions — m12 drives a real pull
+    /// through the daemon's own service, not a fresh one.
+    #[cfg(test)]
+    pub(crate) fn audit_sync(&self) -> Arc<crate::audit_sync::AuditSyncService> {
+        self.audit_sync.clone()
+    }
+
     /// Audit sink handle for test assertions.
     #[cfg(test)]
     pub(crate) fn audit_sink(&self) -> std::sync::Arc<harness_store::StoreAuditSink> {

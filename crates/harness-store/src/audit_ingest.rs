@@ -26,6 +26,14 @@ use crate::peer_heads::PinStatus;
 /// that bounded `verify_page` in 5.13a.
 pub const MAX_INGEST_ROWS_PER_PULL: usize = 5_000;
 
+/// Encoded-size budget for one served batch.
+///
+/// The row cap alone is not a size bound: `detail` is capped at 4 KiB
+/// per row, so 5000 rows could be 20 MB — far past any sane frame.
+/// Serving stops at whichever limit is reached first and reports
+/// `truncated`, and the requester asks again from where it stopped.
+pub const MAX_SERVE_BYTES: usize = 768 * 1024;
+
 /// How far ahead of our clock an ingested row's `at_ms` may be before
 /// we refuse it. Clock skew across a LAN is seconds; a row claiming
 /// next century is an attempt to own the top of every History page.
@@ -295,8 +303,27 @@ impl Store {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(out)
         })?;
-        let truncated = rows.len() > cap;
-        Ok((rows.into_iter().take(cap).collect(), truncated))
+        let over_rows = rows.len() > cap;
+        let mut budget = MAX_SERVE_BYTES;
+        let mut out = Vec::new();
+        let mut over_bytes = false;
+        for row in rows.into_iter().take(cap) {
+            // Cheap upper bound on the encoded row: the variable parts
+            // plus fixed framing. Exactness does not matter — this is
+            // a bound, not an accounting.
+            let cost = row.action.len()
+                + row.subject.as_ref().map_or(0, String::len)
+                + row.detail.as_ref().map_or(0, String::len)
+                + row.actor.len()
+                + 160;
+            if !out.is_empty() && cost > budget {
+                over_bytes = true;
+                break;
+            }
+            budget = budget.saturating_sub(cost);
+            out.push(row);
+        }
+        Ok((out, over_rows || over_bytes))
     }
 }
 
