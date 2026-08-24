@@ -125,13 +125,29 @@ async fn m03_a_rewritten_chain_is_caught_as_a_fork() {
     forged.sign(a.identity.as_ref()).expect("sign");
     assert_ne!(forged.entry_hash, held, "the rewrite really differs");
 
-    let outcome = b
-        .store
-        .pin_peer_head(&forged, a.node_id(), 10_000_000)
-        .expect("pin");
+    // Delivered the way a real one would be: through the ingest path
+    // b's `harness.audit` recv arm calls, with signature verification
+    // and trust-store key lookup in the loop. An earlier version
+    // called `pin_peer_head` directly, which made this a duplicate of
+    // store test p07 rather than a test of the wire path.
+    let mut env = harness_core::AuditSyncEnvelope {
+        source: a.node_id(),
+        assembled_at: 10_000_000,
+        heads: vec![forged],
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    env.sign(a.identity.as_ref()).expect("sign envelope");
+    let svc = crate::audit_sync::AuditSyncService::new(
+        b.store.clone(),
+        b.identity.clone(),
+        b.trust.clone(),
+    );
+    let outcomes = svc.ingest(a.node_id(), &env, 10_000_000);
+    assert_eq!(outcomes.len(), 1, "the head verified and was processed");
     assert!(
-        matches!(outcome, harness_store::PinOutcome::Fork { .. }),
-        "a second signed head at a pinned position is a fork, got {outcome:?}"
+        matches!(outcomes[0].1, harness_store::PinOutcome::Fork { .. }),
+        "a second signed head at a pinned position is a fork, got {:?}",
+        outcomes[0].1
     );
 
     let conflicts = b.store.head_conflicts(10).expect("conflicts");
@@ -324,5 +340,169 @@ async fn m07_housekeeping_actually_thins_the_pin_table() {
     assert!(
         after.iter().any(|p| p.seq == 1),
         "the oldest pin still anchors the range"
+    );
+}
+
+/// Three trusted identities, no QUIC: enough to express the attacks
+/// `boot_pair` structurally cannot (diff review BLOCKER-2 / MAJOR-8).
+/// B is a trusted peer of ours; C is a trusted third node.
+fn trio() -> (
+    harness_store::Store,
+    std::sync::Arc<harness_core::Identity>,
+    harness_mesh::trust::TrustStore,
+    harness_core::Identity,
+    harness_core::Identity,
+    tempfile::TempDir,
+) {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let me = std::sync::Arc::new(harness_mesh::identity::init_or_load(tmp.path()).expect("id"));
+    let trust = harness_mesh::trust::TrustStore::open(tmp.path(), me.node_id()).expect("trust");
+    let b = harness_core::Identity::generate();
+    let c = harness_core::Identity::generate();
+    for (id, name) in [(&b, "node-b"), (&c, "node-c")] {
+        trust
+            .add(harness_mesh::trust::Peer {
+                node_id: id.node_id(),
+                pubkey: *id.public_key(),
+                hostname: name.into(),
+                tier: harness_mesh::trust::TrustTier::Default,
+                added_at: 0,
+                added_via: harness_mesh::trust::AddedVia::Static,
+            })
+            .expect("trust add");
+    }
+    let store = harness_store::Store::open_memory().expect("store");
+    (store, me, trust, b, c, tmp)
+}
+
+fn envelope(
+    from: &harness_core::Identity,
+    heads: Vec<harness_core::AuditHead>,
+) -> harness_core::AuditSyncEnvelope {
+    let mut env = harness_core::AuditSyncEnvelope {
+        source: from.node_id(),
+        assembled_at: 1_000,
+        heads,
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    env.sign(from).expect("sign envelope");
+    env
+}
+
+#[test]
+fn m08_a_trusted_relayer_cannot_forge_a_head_for_a_third_node() {
+    // The invariant ADR Decision 11 spends the most words on, and the
+    // one no earlier test expressed: B is trusted, C is trusted, and B
+    // sends a head CLAIMING to be C's but signed with B's own key. If
+    // the key came from the relayer instead of our trust store, B
+    // would be able to forge C's entire history.
+    let (store, me, trust, b, c, _tmp) = trio();
+    let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me, trust);
+
+    let mut forged = harness_core::AuditHead {
+        node_id: c.node_id(),
+        seq: 42,
+        entry_hash: [0xAB; 32],
+        at_ms: 1_000,
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    // Signed by B, claiming to be C.
+    forged.sign(&b).expect("sign");
+
+    let outcomes = svc.ingest(b.node_id(), &envelope(&b, vec![forged]), 2_000);
+    assert!(
+        outcomes.is_empty(),
+        "a head signed by the relayer, not the subject, must be dropped"
+    );
+    assert!(
+        store.peer_head_pins(c.node_id()).expect("pins").is_empty(),
+        "nothing pinned for C from B's forgery"
+    );
+}
+
+#[test]
+fn m09_a_genuine_relayed_head_is_accepted_from_a_third_party() {
+    // The other half: relaying is the point. C's own signature makes
+    // its head verifiable no matter who carries it, which is what
+    // lets a pin outlive C going offline.
+    let (store, me, trust, b, c, _tmp) = trio();
+    let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me, trust);
+
+    let mut genuine = harness_core::AuditHead {
+        node_id: c.node_id(),
+        seq: 42,
+        entry_hash: [0xCD; 32],
+        at_ms: 1_000,
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    genuine.sign(&c).expect("sign");
+
+    // Carried by B, signed by C.
+    let outcomes = svc.ingest(b.node_id(), &envelope(&b, vec![genuine]), 2_000);
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].0, c.node_id());
+    let pins = store.peer_head_pins(c.node_id()).expect("pins");
+    assert_eq!(pins.len(), 1);
+    assert_eq!(pins[0].entry_hash, [0xCD; 32]);
+}
+
+#[test]
+fn m10_one_huge_seq_cannot_immunize_a_node_from_further_pinning() {
+    // diff review BLOCKER-1: a validly-signed head at u64::MAX used to
+    // be pinned and then compare above every genuine head forever, so
+    // the node was never pinned again and could rewrite freely. The
+    // classification may say "stale"; the storage must not.
+    let (store, me, trust, _b, c, _tmp) = trio();
+    let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me, trust);
+
+    let sign_head = |seq: u64, hash: u8| {
+        let mut h = harness_core::AuditHead {
+            node_id: c.node_id(),
+            seq,
+            entry_hash: [hash; 32],
+            at_ms: seq,
+            sig: Signature::from_bytes([0u8; 64]),
+        };
+        h.sign(&c).expect("sign");
+        h
+    };
+
+    svc.ingest(c.node_id(), &envelope(&c, vec![sign_head(10, 0x10)]), 1_000);
+    // The poison: signed, enormous.
+    svc.ingest(
+        c.node_id(),
+        &envelope(&c, vec![sign_head(u64::MAX, 0xFF)]),
+        2_000,
+    );
+    // Genuine growth afterwards.
+    for seq in 11..=15u64 {
+        svc.ingest(
+            c.node_id(),
+            &envelope(&c, vec![sign_head(seq, u8::try_from(seq).unwrap_or(0))]),
+            3_000 + seq,
+        );
+    }
+
+    let pins = store.peer_head_pins(c.node_id()).expect("pins");
+    let seqs: Vec<u64> = pins.iter().map(|p| p.seq).collect();
+    for seq in 11..=15u64 {
+        assert!(
+            seqs.contains(&seq),
+            "genuine head {seq} still pinned after the poison, have {seqs:?}"
+        );
+    }
+    assert!(
+        !seqs.contains(&u64::MAX),
+        "an unrepresentable seq is rejected, not clamped onto a real row"
+    );
+
+    // And a contradiction at one of those positions still forks.
+    let mut contra = sign_head(12, 0xEE);
+    contra.sign(&c).expect("sign");
+    let outcomes = svc.ingest(c.node_id(), &envelope(&c, vec![contra]), 9_000);
+    assert!(
+        matches!(outcomes[0].1, harness_store::PinOutcome::Fork { .. }),
+        "fork detection survives the poison, got {:?}",
+        outcomes[0].1
     );
 }

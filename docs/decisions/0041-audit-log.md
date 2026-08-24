@@ -271,6 +271,28 @@ push honest historical pins into the tail. A store test asserts the
 Rust `evictable()` predicate and the thinning SQL agree, because they
 are two statements of the same rule.
 
+**Decision 13 — a low head is classified, not discarded.** The first
+version of `pin_peer_head` returned `StaleIgnored` *without inserting*.
+That let one validly-signed head at `u64::MAX` permanently immunize its
+sender: every genuine head afterwards compared below the poisoned
+maximum, was dropped, and no peer ever pinned that node again — with no
+log line and no removal path. Not treating a low head as EVIDENCE is
+correct and is Decision 9; not STORING it is a different thing, and it
+was the one that mattered. A below-newest head is now pinned and
+classified `StalePinned`, which costs one row and buys a position a
+later contradiction can fork against. Relatedly, an oversized `seq` is
+REJECTED rather than clamped to `i64::MAX`: clamping collides distinct
+signed heads onto one row (a fork manufactured by a lossy cast) and
+makes the relayed rebuild carry a seq the signer never signed, so it
+fails verification at every receiver.
+
+**Decision 14 — relays rank on our clock, not the head's.** `at_ms` is
+stamped by the head's own signer, so ordering the relay window by it
+lets a node stamp `u64::MAX` and hold a slot forever, pushing honest
+heads out on any mesh larger than the window. Ranking uses
+`observed_at_ms`, which is ours. The same rule applies to entry
+ordering in 5.13c-2.
+
 ### What 5.13c-1 does NOT yet give you
 
 Pins alone detect two things: two signed heads at one position, and a
@@ -280,3 +302,20 @@ because linking pin `(100, h100)` to pin `(200, h200)` requires walking
 entries 101..200. Until 5.13c-2 pulls entries, every pin sits at
 `unchecked`, and the UI must render that as what it is rather than as
 corroboration.
+
+Three further gaps, named so they are not mistaken for coverage:
+
+- **Detection of an in-place rewrite is racy against the push
+  cadence.** The newest pin sits at the subject's current head, so a
+  rewrite that leaves `seq` unchanged forks on the next push — but a
+  node that appends one entry first lands its new head at an unpinned
+  position, which reads as ordinary growth. Pin density is the
+  mitigation, and it is a 30s timer, not a guarantee.
+- **A node that never advertises is invisible.** Nothing consumes
+  `observed_at_ms` to age a peer out or flag silence.
+- **A detected fork has no reader.** `head_conflicts`,
+  `peer_head_pins` and `set_pin_status` have no non-test callers: a
+  fork surfaces as one `tracing::error!` and a database row. The
+  History UI shipped in 5.13b shows nothing. Surfacing it is 5.13c-3
+  work, and until then the loudest signal this feature produces is a
+  log line.

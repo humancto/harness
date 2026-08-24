@@ -63,6 +63,10 @@ impl PinStatus {
     }
 }
 
+/// Raw pin columns as read back: `seq`, `entry_hash`, `at_ms`, `sig`,
+/// `observed_at_ms`.
+type PinRow = (i64, Vec<u8>, i64, Vec<u8>, i64);
+
 /// One stored pin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerHeadPin {
@@ -86,13 +90,29 @@ pub enum PinOutcome {
     /// that node's key. Recorded in `audit_head_conflicts` with both
     /// signatures.
     Fork { conflict_id: i64 },
-    /// Below a pin we hold, contradicting nothing. NOT evidence: the
-    /// envelope carrying heads is not replay-protected, so any peer
-    /// can rebroadcast a genuine old head forever, and a node
-    /// returning from a partition does it by accident. Treating this
-    /// as a regression would make replay a one-packet permanent
-    /// defamation of an honest node.
-    StaleIgnored,
+    /// Pinned, but at a position BELOW the newest we hold — so it is
+    /// not a regression claim.
+    ///
+    /// The head is still stored (diff review BLOCKER-1 on #66). An
+    /// earlier version returned this WITHOUT inserting, which let one
+    /// validly-signed head at `u64::MAX` permanently immunize its
+    /// sender: every genuine head afterwards compared below the
+    /// poisoned maximum, was discarded, and no peer ever pinned that
+    /// node again. Not treating a low head as EVIDENCE (which is
+    /// correct — the envelope is not replay-protected, so any peer can
+    /// rebroadcast a genuine old head forever) is a different thing
+    /// from not STORING it. Storing costs one row and buys a position
+    /// a later contradiction can fork against.
+    StalePinned,
+    /// `seq` exceeds what the store can represent (`i64::MAX`).
+    ///
+    /// Rejected rather than clamped (diff review MAJOR-3): clamping
+    /// maps every oversized seq onto one row, so two distinct signed
+    /// heads collide and are recorded as a FORK manufactured by a
+    /// lossy cast — and the relayed rebuild carries the clamped seq,
+    /// which is not what the signer signed, so it fails verification
+    /// at every receiver.
+    RejectedSeq,
 }
 
 fn to_hash(raw: &[u8]) -> [u8; 32] {
@@ -120,7 +140,10 @@ impl Store {
         reported_by: NodeId,
         now_ms: u64,
     ) -> Result<PinOutcome, StoreError> {
-        let seq = i64::try_from(head.seq).unwrap_or(i64::MAX);
+        // Never clamp a value a signature covers.
+        let Ok(seq) = i64::try_from(head.seq) else {
+            return Ok(PinOutcome::RejectedSeq);
+        };
         self.with_conn(|c| {
             let tx = c.unchecked_transaction()?;
             let existing: Option<(Vec<u8>, i64, Vec<u8>)> = tx
@@ -195,23 +218,27 @@ impl Store {
                         )
                         .optional()?
                         .flatten();
+                    // ALWAYS insert. Whether this position is below the
+                    // newest we hold changes only the CLASSIFICATION
+                    // (it is not a regression claim), never whether we
+                    // keep the pin — see `PinOutcome::StalePinned`.
+                    tx.execute(
+                        "INSERT INTO audit_peer_heads(
+                             node_id, seq, entry_hash, at_ms, sig,
+                             first_seen_ms, observed_at_ms, status)
+                         VALUES (?1,?2,?3,?4,?5,?6,?6,'unchecked')",
+                        params![
+                            head.node_id.as_bytes(),
+                            seq,
+                            head.entry_hash.as_slice(),
+                            i64_ms(head.at_ms),
+                            head.sig.to_bytes().as_slice(),
+                            i64_ms(now_ms),
+                        ],
+                    )?;
                     if highest.is_some_and(|h| seq < h) {
-                        PinOutcome::StaleIgnored
+                        PinOutcome::StalePinned
                     } else {
-                        tx.execute(
-                            "INSERT INTO audit_peer_heads(
-                                 node_id, seq, entry_hash, at_ms, sig,
-                                 first_seen_ms, observed_at_ms, status)
-                             VALUES (?1,?2,?3,?4,?5,?6,?6,'unchecked')",
-                            params![
-                                head.node_id.as_bytes(),
-                                seq,
-                                head.entry_hash.as_slice(),
-                                i64_ms(head.at_ms),
-                                head.sig.to_bytes().as_slice(),
-                                i64_ms(now_ms),
-                            ],
-                        )?;
                         PinOutcome::Pinned
                     }
                 }
@@ -321,10 +348,16 @@ impl Store {
                 "DELETE FROM audit_peer_heads
                   WHERE status IN ('unchecked','corroborated')
                     AND rowid NOT IN (
-                        -- newest N per node
+                        -- newest N EVICTABLE pins per node. Filtered on
+                        -- status so a burst of manufactured forks
+                        -- cannot consume the recent window and
+                        -- accelerate eviction of honest pins (diff
+                        -- review, thinning wrinkle).
                         SELECT rowid FROM audit_peer_heads a
-                         WHERE (SELECT COUNT(*) FROM audit_peer_heads b
+                         WHERE a.status IN ('unchecked','corroborated')
+                           AND (SELECT COUNT(*) FROM audit_peer_heads b
                                  WHERE b.node_id = a.node_id
+                                   AND b.status IN ('unchecked','corroborated')
                                    AND (b.first_seen_ms > a.first_seen_ms
                                         OR (b.first_seen_ms = a.first_seen_ms
                                             AND b.rowid > a.rowid))) < ?1
@@ -352,22 +385,32 @@ impl Store {
     /// carries its own signature, so node C can learn A's head from B
     /// and still verify it against A's key. We are not re-signing
     /// anything — the stored signature is A's, returned verbatim.
-    pub fn newest_pin_as_head(&self, node: NodeId) -> Result<Option<AuditHead>, StoreError> {
+    pub fn newest_pin_as_head(&self, node: NodeId) -> Result<Option<(AuditHead, u64)>, StoreError> {
         self.with_conn(|c| {
-            let row: Option<(i64, Vec<u8>, i64, Vec<u8>)> = c
+            let row: Option<PinRow> = c
                 .query_row(
-                    "SELECT seq, entry_hash, at_ms, sig FROM audit_peer_heads
+                    "SELECT seq, entry_hash, at_ms, sig, observed_at_ms
+                       FROM audit_peer_heads
                       WHERE node_id = ?1 ORDER BY seq DESC LIMIT 1",
                     params![node.as_bytes()],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )
                 .optional()?;
-            Ok(row.map(|(seq, hash, at_ms, sig)| AuditHead {
-                node_id: node,
-                seq: u64::try_from(seq).unwrap_or(0),
-                entry_hash: to_hash(&hash),
-                at_ms: u64::try_from(at_ms).unwrap_or(0),
-                sig: to_sig(&sig),
+            Ok(row.map(|(seq, hash, at_ms, sig, observed)| {
+                (
+                    AuditHead {
+                        node_id: node,
+                        seq: u64::try_from(seq).unwrap_or(0),
+                        entry_hash: to_hash(&hash),
+                        at_ms: u64::try_from(at_ms).unwrap_or(0),
+                        sig: to_sig(&sig),
+                    },
+                    // OUR clock, for relay ordering. `at_ms` is chosen
+                    // by the head's signer, so ranking relays by it
+                    // lets a node stamp `u64::MAX` and hold a relay
+                    // slot forever (diff review MAJOR-6).
+                    u64::try_from(observed).unwrap_or(0),
+                )
             }))
         })
     }
@@ -518,14 +561,17 @@ mod tests {
         let outcome = s
             .pin_peer_head(&head(1, 10, 0xAA, 100), node(9), 4_000)
             .expect("pin");
-        assert_eq!(outcome, PinOutcome::StaleIgnored);
+        assert_eq!(outcome, PinOutcome::StalePinned);
         assert!(
             s.head_conflicts(10).expect("conflicts").is_empty(),
             "a stale relay is not an accusation"
         );
+        // It IS stored, though: classification and storage are
+        // separate decisions (BLOCKER-1). Discarding it let one huge
+        // signed seq immunize a node forever.
         let pins = s.peer_head_pins(node(1)).expect("pins");
-        assert_eq!(pins.len(), 1);
-        assert_eq!(pins[0].status, PinStatus::Unchecked);
+        assert_eq!(pins.len(), 2);
+        assert!(pins.iter().all(|p| p.status == PinStatus::Unchecked));
     }
 
     #[test]

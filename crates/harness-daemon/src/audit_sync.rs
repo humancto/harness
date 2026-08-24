@@ -72,19 +72,24 @@ impl AuditSyncService {
         let _ = self.net.set(Arc::downgrade(net));
     }
 
-    /// Public key for a node, from our OWN trust store only.
+    /// Public keys from our OWN trust store only.
     ///
     /// Never from the relaying envelope: a relayer that could supply
     /// the key would mint a keypair and forge the whole history it
     /// claims to be reporting. A head for a node we cannot
     /// independently key is dropped, not stored — an unverifiable
     /// accusation is worse than none.
-    fn pubkey_for(&self, node: NodeId) -> Option<PublicKey> {
+    ///
+    /// Built once per envelope, not once per head: `all_peers()`
+    /// clones the whole peer list, and a 64-head envelope arriving at
+    /// the sender's chosen rate would otherwise be 64 full clones
+    /// (diff review MAJOR-5).
+    fn pubkey_map(&self) -> HashMap<NodeId, PublicKey> {
         self.trust
             .all_peers()
             .into_iter()
-            .find(|p| p.node_id == node)
-            .map(|p| p.pubkey)
+            .map(|p| (p.node_id, p.pubkey))
+            .collect()
     }
 
     /// Verify and pin every head in an envelope.
@@ -99,6 +104,7 @@ impl AuditSyncService {
         now_ms: u64,
     ) -> Vec<(NodeId, PinOutcome)> {
         let mut out = Vec::new();
+        let keys = self.pubkey_map();
         for head in env.heads.iter().take(harness_core::MAX_HEADS_PER_ENVELOPE) {
             // Our own chain is authoritative locally; a peer telling
             // us about ourselves proves nothing and a forged one would
@@ -106,7 +112,7 @@ impl AuditSyncService {
             if head.node_id == self.local_id {
                 continue;
             }
-            let Some(pubkey) = self.pubkey_for(head.node_id) else {
+            let Some(pubkey) = keys.get(&head.node_id).copied() else {
                 tracing::debug!(
                     target: "harness.audit.sync",
                     relayer = %from,
@@ -126,15 +132,35 @@ impl AuditSyncService {
             }
             match self.store.pin_peer_head(head, from, now_ms) {
                 Ok(outcome) => {
-                    if let PinOutcome::Fork { conflict_id } = outcome {
-                        tracing::error!(
+                    match outcome {
+                        PinOutcome::Fork { conflict_id } => tracing::error!(
                             target: "harness.audit.sync",
                             subject = %head.node_id,
                             seq = head.seq,
                             conflict_id,
                             reported_by = %from,
                             "AUDIT CHAIN FORK: two signed heads at one position"
-                        );
+                        ),
+                        // A node offering a position below one we
+                        // already hold is the loudest signal available
+                        // before entries exist — a wiped or restored
+                        // DB looks exactly like this — so it is not
+                        // silent, even though it is not evidence
+                        // (diff review 1(c)/1(d)).
+                        PinOutcome::StalePinned => tracing::warn!(
+                            target: "harness.audit.sync",
+                            subject = %head.node_id,
+                            offered_seq = head.seq,
+                            reported_by = %from,
+                            "audit head below a pin we already hold"
+                        ),
+                        PinOutcome::RejectedSeq => tracing::warn!(
+                            target: "harness.audit.sync",
+                            subject = %head.node_id,
+                            reported_by = %from,
+                            "audit head seq exceeds the representable range; rejected"
+                        ),
+                        PinOutcome::Pinned | PinOutcome::Refreshed => {}
                     }
                     out.push((head.node_id, outcome));
                 }
@@ -165,22 +191,27 @@ impl AuditSyncService {
     /// outlive its subject: node C can learn A's head from B and it
     /// still verifies against A's key.
     fn relayable_heads(&self) -> Vec<AuditHead> {
-        let mut relayed = Vec::new();
+        let mut relayed: Vec<(AuditHead, u64)> = Vec::new();
         for peer in self.trust.all_peers() {
             if peer.node_id == self.local_id {
                 continue;
             }
             match self.store.newest_pin_as_head(peer.node_id) {
-                Ok(Some(head)) => relayed.push(head),
+                Ok(Some(pair)) => relayed.push(pair),
                 Ok(None) => {}
                 Err(e) => {
                     tracing::debug!(target: "harness.audit.sync", ?e, "reading pin for relay");
                 }
             }
         }
-        relayed.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
+        // Rank by when WE observed the pin, never by the head's own
+        // `at_ms` — that field is chosen by the head's signer, so
+        // ranking on it lets a node stamp `u64::MAX` and hold a relay
+        // slot forever, pushing honest heads out of the window on any
+        // mesh bigger than RELAY_HEADS (diff review MAJOR-6).
+        relayed.sort_by(|(_, a_seen), (_, b_seen)| b_seen.cmp(a_seen));
         relayed.truncate(RELAY_HEADS);
-        relayed
+        relayed.into_iter().map(|(head, _)| head).collect()
     }
 
     /// One push round.
@@ -188,10 +219,14 @@ impl AuditSyncService {
         let Some(net) = self.net.get().and_then(Weak::upgrade) else {
             return;
         };
-        let heads = self.outgoing_heads(now_ms);
+        let mut heads = self.outgoing_heads(now_ms);
         if heads.is_empty() {
             return;
         }
+        // Structurally bounded at 1 + RELAY_HEADS, but pin the
+        // contract on the send side too so a future change cannot
+        // drift past what receivers accept.
+        heads.truncate(harness_core::MAX_HEADS_PER_ENVELOPE);
         let mut env = AuditSyncEnvelope {
             source: self.local_id,
             assembled_at: now_ms,

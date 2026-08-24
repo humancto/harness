@@ -773,6 +773,18 @@ impl PeerNet {
                                     .unwrap_or(0);
                                 svc.ingest(peer_id, &env, now);
                             } else {
+                                // Unreachable in the daemon:
+                                // `attach_audit_sync` runs in `build()`
+                                // before the accept loop is spawned.
+                                // Loud rather than silent, because a
+                                // regression here would swallow every
+                                // envelope and the mesh would simply
+                                // stop pinning (diff review).
+                                tracing::warn!(
+                                    target: "harness.audit.sync",
+                                    peer = %peer_id,
+                                    "audit envelope arrived before the sync service was attached"
+                                );
                                 self.handlers.on_audit_heads(peer_id, env);
                             }
                             Ok(())
