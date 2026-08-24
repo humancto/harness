@@ -171,7 +171,11 @@ choose. ADR-0006's promise is retired, not deferred again.
   flush time, and the burst's real time is in `window_start_ms`
   (which the History page renders). Daemon shutdown force-closes
   every open window, elapsed or not — an operator restarting mid-flood
-  is the expected reaction to a flood. An UNGRACEFUL exit (SIGKILL,
+  is the expected reaction to a flood. That flush runs in `shutdown()`
+  itself, NOT on the housekeeping task's shutdown arm: `shutdown()`
+  aborts every spawned task synchronously before its first await, so
+  such an arm is racy on a multi-thread runtime and unreachable on the
+  current-thread one the daemon uses. An UNGRACEFUL exit (SIGKILL,
   power loss) still loses the open window's count: that residual is
   irreducible for an in-memory map and is stated rather than implied
   away. The window map is in

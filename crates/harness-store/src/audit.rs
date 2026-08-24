@@ -636,6 +636,12 @@ impl Window {
         // exactly the record of the attempts.
         let mut sample: Vec<String> = Vec::new();
         let mut encoded = 2usize; // the `[]`
+                                  // Named for what it counts: rejections by BYTE budget only.
+                                  // Subjects beyond `SAMPLE_SUBJECTS` were never candidates —
+                                  // `distinct_subjects` against `sample_subjects.len()` shows
+                                  // that gap, and a bare `sample_dropped: 0` beside
+                                  // `distinct_subjects: 64` would read as "all 64 are shown"
+                                  // (re-review MINOR-3 on #65).
         let mut sample_dropped = 0usize;
         for subject in self.sample {
             let cost = serde_json::to_string(&subject).map_or(usize::MAX, |s| s.len() + 1);
@@ -652,7 +658,7 @@ impl Window {
                 "distinct_subjects": self.distinct.len(),
                 "distinct_subjects_capped": self.distinct_overflow,
                 "sample_subjects": sample,
-                "sample_dropped": sample_dropped,
+                "sample_dropped_for_size": sample_dropped,
                 "appended_before_suppressing": self.appended,
                 "window_start_ms": self.start_ms,
                 "window_ms": SUPPRESSION_WINDOW_MS,
@@ -1476,6 +1482,64 @@ mod tests {
         assert!(
             rows[0].detail.as_deref().expect("detail").len() < MAX_AUDIT_DETAIL_BYTES / 4,
             "the numeric-only detail is nowhere near the cap"
+        );
+    }
+
+    #[test]
+    fn a09l_the_encoded_sample_budget_actually_fires() {
+        // Re-review MAJOR-2 on #65: `a09h` pins the CONTROL-CHARACTER
+        // folding, and after folding those samples are small enough
+        // that the byte budget never runs — deleting the budget loop
+        // left all eleven store tests passing. The budget is the
+        // guard against the erasure two earlier rounds got wrong, so
+        // it needs a case that reaches it: backslashes are not
+        // control characters, folding does not touch them, and each
+        // costs two bytes in JSON.
+        let s = Store::open_memory().expect("store");
+        let sink = StoreAuditSink::new(s.clone(), node());
+        for _ in 0..BURST_ALLOWANCE {
+            sink.record(denial("warmup"));
+        }
+        for i in 0..SAMPLE_SUBJECTS {
+            // Distinct (the distinct set hashes the UNtruncated
+            // subject) but identical once truncated, so all eight are
+            // sampled at full width.
+            sink.record(denial(&format!("{}{i}", "\\".repeat(400))));
+        }
+        sink.flush_at(now_ms() + SUPPRESSION_WINDOW_MS + 1);
+
+        let rows = s
+            .audit_recent(None, Some("shell.denied"), None, 100)
+            .expect("recent");
+        let stored = rows[0]
+            .detail
+            .as_deref()
+            .expect("the summary kept its detail");
+        assert!(
+            stored.len() <= MAX_AUDIT_DETAIL_BYTES,
+            "summary detail must fit the cap, got {} bytes",
+            stored.len()
+        );
+        let summary: serde_json::Value = serde_json::from_str(stored).expect("json");
+        assert_eq!(
+            summary["suppressed_repeats"],
+            serde_json::json!(SAMPLE_SUBJECTS),
+            "the counts are written first and survive the budget"
+        );
+        assert_eq!(
+            summary["sample_dropped_for_size"],
+            serde_json::json!(1),
+            "the budget rejected the sample that did not fit"
+        );
+        assert_eq!(
+            summary["sample_subjects"].as_array().expect("sample").len(),
+            SAMPLE_SUBJECTS - 1
+        );
+        assert_eq!(
+            s.audit_verify_chain(node(), 1, 1_000).expect("verify"),
+            ChainStatus::Verified {
+                through_seq: BURST_ALLOWANCE + 1
+            }
         );
     }
 }

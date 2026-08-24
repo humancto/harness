@@ -783,6 +783,12 @@ impl DaemonOrchestrator {
         self.api_state.partials.clone()
     }
 
+    /// Audit sink handle for test assertions.
+    #[cfg(test)]
+    pub(crate) fn audit_sink(&self) -> std::sync::Arc<harness_store::StoreAuditSink> {
+        self.store_audit_sink.clone()
+    }
+
     /// Store handle for test assertions.
     #[cfg(test)]
     pub(crate) fn store(&self) -> harness_store::Store {
@@ -988,6 +994,19 @@ impl DaemonOrchestrator {
     }
 
     async fn shutdown(self) {
+        // 5.13b: BEFORE aborting anything. An operator restarting the
+        // daemon mid-flood is the expected reaction to a flood, and
+        // the periodic close skips a window that has not elapsed — so
+        // an in-progress burst's suppressed count would go with it.
+        //
+        // This runs here, not on the housekeeping task's shutdown arm
+        // (re-review MAJOR-1 on #65): the abort loop below is
+        // synchronous and reached before any await, so that arm is
+        // racy on a multi-thread runtime and UNREACHABLE on the
+        // current-thread one the daemon actually uses. A flush that
+        // depends on losing a scheduling race is the same defect as
+        // an ADR describing a function with no callers.
+        self.store_audit_sink.close_all_windows();
         // Stop accepting first so listener tasks see Closed naturally.
         let tasks: Vec<_> = self.tasks.lock().drain(..).collect();
         for task in tasks {
@@ -1154,15 +1173,7 @@ async fn spawn_checkpoint_sweeper(
                 audit_sink.flush_suppressed();
                 crate::executor::prune_audit_log(&store, node);
             }
-            _ = shutdown.changed() => {
-                // 5.13b re-review MAJOR-2: an operator restarting the
-                // daemon mid-flood is the expected reaction to a
-                // flood, and `close_expired` skips a window that has
-                // not elapsed — so the in-progress burst's count
-                // would go with it.
-                audit_sink.close_all_windows();
-                return;
-            }
+            _ = shutdown.changed() => return,
         }
     }
 }
@@ -1423,6 +1434,78 @@ mod tests {
             .expect("build orchestrator");
         let api_addr = orch.api_addr();
         assert!(api_addr.port() != 0, "api should bind to a real port");
+    }
+
+    /// 5.13b (re-review MAJOR-1 on #65): shutdown must actually flush
+    /// an in-progress suppression window.
+    ///
+    /// The obvious wiring — a `shutdown.changed()` arm on the
+    /// housekeeping task — does NOT work: `shutdown()` aborts every
+    /// spawned task synchronously before its first await, so that arm
+    /// is racy on a multi-thread runtime and unreachable on the
+    /// current-thread one the daemon uses. This test drives the real
+    /// run loop, so it fails against that wiring and passes against
+    /// the flush in `shutdown()` itself.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_flushes_an_in_progress_denial_burst() {
+        use harness_core::{AuditAction, AuditActor, AuditRecord, AuditSink};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let id = harness_mesh::identity::init_or_load(tmp.path()).expect("identity");
+        let node_id = id.node_id();
+        let identity = Arc::new(id);
+        let trust = TrustStore::open(tmp.path(), node_id).expect("trust open");
+        let cfg = DaemonRuntimeConfig {
+            mesh_name: "shutdown-flush".into(),
+            node_name: "test-node".into(),
+            api_bind: SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 0),
+            mesh_bind: SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 0),
+            mdns_enabled: false,
+            static_peers: vec![],
+            harness_root: tmp.path().to_path_buf(),
+            max_queue_depth: 64,
+        };
+        let orch = DaemonOrchestrator::build(identity, trust, cfg)
+            .await
+            .expect("build orchestrator");
+        let store = orch.store();
+        let sink = orch.audit_sink();
+
+        // A flood, still in progress — the window has NOT elapsed, so
+        // the periodic close would skip it.
+        let over = harness_store::BURST_ALLOWANCE + 5;
+        for _ in 0..over {
+            sink.record(
+                AuditRecord::new(AuditAction::ShellDenied, AuditActor::System)
+                    .with_subject("rm -rf /"),
+            );
+        }
+        let appended = store
+            .audit_recent(None, Some("shell.denied"), None, 100)
+            .expect("recent")
+            .len();
+        assert_eq!(
+            u64::try_from(appended).expect("fits"),
+            harness_store::BURST_ALLOWANCE,
+            "the allowance appended; five are held in the open window"
+        );
+
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move { orch.run_until(stop_rx).await });
+        let _ = stop_tx.send(true);
+        let _ = handle.await;
+
+        let rows = store
+            .audit_recent(None, Some("shell.denied"), None, 100)
+            .expect("recent");
+        assert_eq!(
+            rows.len(),
+            appended + 1,
+            "shutdown left the summary for the in-progress burst"
+        );
+        let detail: serde_json::Value =
+            serde_json::from_str(rows[0].detail.as_deref().expect("detail")).expect("json");
+        assert_eq!(detail["suppressed_repeats"], serde_json::json!(5));
     }
 
     /// 5.1 (ADR-0030): tag classification over VERBATIM Ollama tags —
