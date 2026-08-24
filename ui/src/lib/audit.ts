@@ -126,7 +126,10 @@ export function actionLabel(action: string): string {
  * rows proves nothing at all. Saying otherwise would be the same
  * overstatement the ADR refuses.
  */
-export function verificationSummary(v: Verification | undefined): {
+export function verificationSummary(
+  v: Verification | undefined,
+  maxLocalSeq?: number,
+): {
   tone: "ok" | "warn" | "broken";
   text: string;
 } {
@@ -149,7 +152,35 @@ export function verificationSummary(v: Verification | undefined): {
     v.from_seq !== undefined && v.through_seq !== undefined
       ? ` (seq ${v.from_seq}–${v.through_seq})`
       : "";
+  // The server walks a bounded number of ROWS upward from the lowest
+  // local seq on the page. With an action filter, or once a second
+  // node interleaves, the page's local rows are sparse and the walk
+  // can stop below the newest row on screen — so say so rather than
+  // painting uncovered rows green (diff review MAJOR-7).
+  if (
+    v.through_seq !== undefined &&
+    maxLocalSeq !== undefined &&
+    v.through_seq < maxLocalSeq
+  ) {
+    return {
+      tone: "warn",
+      text: `chain verified${span}; rows above seq ${v.through_seq} on this page were NOT checked`,
+    };
+  }
   return { tone: "ok", text: `chain verified for this page${span}` };
+}
+
+/**
+ * Highest seq on the page belonging to the node whose chain the
+ * server verified. Feeds the coverage check above.
+ */
+export function maxSeqForNode(
+  entries: AuditEntry[],
+  node: string | undefined,
+): number | undefined {
+  if (!node) return undefined;
+  const seqs = entries.filter((e) => e.node === node).map((e) => e.seq);
+  return seqs.length > 0 ? Math.max(...seqs) : undefined;
 }
 
 /** `YYYY-MM-DD HH:MM:SS` in UTC — audit rows are cross-node. */
@@ -173,15 +204,24 @@ export function toJson(entries: AuditEntry[]): string {
  * Quotes every field and doubles inner quotes: `detail` is JSON and
  * `subject` can be arbitrary, so an unquoted writer would corrupt the
  * file on the first comma — in an AUDIT export, silently.
+ *
+ * Formula injection is neutralized too (diff review MAJOR-5): a
+ * denial's `subject` IS the command a remote peer submitted, so a
+ * paired peer can get `=cmd|'/c calc'!A1` into the log by having it
+ * DENIED, and quoting does not help — a spreadsheet evaluates the
+ * unquoted cell content. Any cell opening with a formula trigger is
+ * prefixed with an apostrophe, the convention every spreadsheet
+ * reads as "this is text".
  */
 export function toCsv(entries: AuditEntry[]): string {
   const cell = (v: unknown): string => {
-    const s =
+    let s =
       v === null || v === undefined
         ? ""
         : typeof v === "string"
           ? v
           : JSON.stringify(v);
+    if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
     return `"${s.replace(/"/g, '""')}"`;
   };
   const header = [

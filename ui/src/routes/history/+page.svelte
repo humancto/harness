@@ -7,6 +7,7 @@
     auditQuery,
     fmtTime,
     isNotable,
+    maxSeqForNode,
     shortNode,
     toCsv,
     toJson,
@@ -51,10 +52,18 @@
     return Number.isNaN(ms) ? undefined : ms;
   }
 
+  // Changing a filter starts a new query while the old one may still
+  // be in flight; the slower response must not overwrite the newer
+  // one and leave the table disagreeing with the controls above it
+  // (Codex P2 on #65).
+  let generation = 0;
+
   async function load(cursor?: AuditPage['next_cursor']) {
+    const mine = ++generation;
     loading = true;
     try {
       const res = await fetch(auditQuery(filters, cursor));
+      if (mine !== generation) return;
       if (res.status === 401) {
         authed = false;
         return;
@@ -63,23 +72,36 @@
         loadError = `fetch failed (${res.status})`;
         return;
       }
-      page = (await res.json()) as AuditPage;
+      const body = (await res.json()) as AuditPage;
+      if (mine !== generation) return;
+      page = body;
       rows = applyFilters(page.entries, filters);
       loadError = '';
     } catch {
-      loadError = 'network error';
+      if (mine === generation) loadError = 'network error';
     } finally {
-      loading = false;
+      if (mine === generation) loading = false;
     }
   }
 
   onMount(() => {
-    fetch('/api/v1/audit?limit=1').then((res) => {
-      if (res.ok) {
+    // Only 401 means "log in". A 503 (no store) or a network failure
+    // is an error to show, not a password prompt that can never
+    // succeed (diff review MINOR-11).
+    fetch('/api/v1/audit?limit=1')
+      .then((res) => {
+        if (res.status === 401) return;
         authed = true;
-        void load();
-      }
-    });
+        if (res.ok) {
+          void load();
+        } else {
+          loadError = `audit unavailable (${res.status})`;
+        }
+      })
+      .catch(() => {
+        authed = true;
+        loadError = 'network error';
+      });
   });
 
   function applyAndReload() {
@@ -103,6 +125,16 @@
 
   // Export what is on screen — the rows the operator is actually
   // looking at, filters included.
+  // Named for what it is: the rows on screen, not the whole log
+  // (diff review MINOR-11 — an operator who sets a January window and
+  // exports gets only the January rows that fell in the fetched page).
+  function exportName(kind: string): string {
+    if (rows.length === 0) return `harness-audit-page.${kind}`;
+    const newest = fmtTime(rows[0].at_ms).slice(0, 10);
+    const oldest = fmtTime(rows[rows.length - 1].at_ms).slice(0, 10);
+    return `harness-audit-page-${oldest}_${newest}.${kind}`;
+  }
+
   function download(kind: 'json' | 'csv') {
     const body = kind === 'json' ? toJson(rows) : toCsv(rows);
     const blob = new Blob([body], {
@@ -111,12 +143,17 @@
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `harness-audit.${kind}`;
+    a.download = exportName(kind);
     a.click();
     URL.revokeObjectURL(url);
   }
 
-  let banner = $derived(verificationSummary(page?.verification));
+  let banner = $derived(
+    verificationSummary(
+      page?.verification,
+      maxSeqForNode(page?.entries ?? [], page?.verification?.node),
+    ),
+  );
   let detailText = (d: unknown) => (d === null || d === undefined ? '' : JSON.stringify(d));
 </script>
 
@@ -213,12 +250,12 @@
         <button
           class="rounded border border-zinc-300 px-2 py-1 hover:bg-zinc-100 disabled:opacity-40 dark:border-zinc-600 dark:hover:bg-zinc-800"
           disabled={rows.length === 0}
-          onclick={() => download('json')}>export JSON</button
+          onclick={() => download('json')}>export page (JSON)</button
         >
         <button
           class="rounded border border-zinc-300 px-2 py-1 hover:bg-zinc-100 disabled:opacity-40 dark:border-zinc-600 dark:hover:bg-zinc-800"
           disabled={rows.length === 0}
-          onclick={() => download('csv')}>export CSV</button
+          onclick={() => download('csv')}>export page (CSV)</button
         >
       </div>
     </div>
@@ -226,7 +263,10 @@
     {#if loading && rows.length === 0}
       <p class="text-sm text-zinc-400">loading…</p>
     {:else if rows.length === 0}
-      <p class="text-sm text-zinc-400">no entries match</p>
+      <p class="text-sm text-zinc-400">
+        no entries on this page match — the actor and time filters apply to the fetched
+        page, so try <span class="font-medium">older →</span>
+      </p>
     {:else}
       <table class="w-full text-left text-xs">
         <thead class="text-zinc-500">
@@ -274,6 +314,15 @@
         </tbody>
       </table>
 
+    {/if}
+
+    <!-- Outside the empty-state branch on purpose (diff review
+         MAJOR-6 / Codex P2): the server's cursor is the last row of
+         the page, so "older →" is live on the final page and yields
+         an empty one — and client-side actor/time filters can empty a
+         page whose successors have matches. Hiding the pager there
+         strands the operator with no way back. -->
+    {#if page}
       <div class="flex items-center gap-2 text-xs">
         <button
           class="rounded border border-zinc-300 px-2 py-1 disabled:opacity-40 dark:border-zinc-600"
@@ -282,11 +331,11 @@
         >
         <button
           class="rounded border border-zinc-300 px-2 py-1 disabled:opacity-40 dark:border-zinc-600"
-          disabled={!page?.next_cursor}
+          disabled={!page.next_cursor}
           onclick={nextPage}>older →</button
         >
         <span class="text-zinc-400">
-          {rows.length} shown{#if page && rows.length !== page.entries.length}
+          {rows.length} shown{#if rows.length !== page.entries.length}
             &nbsp;of {page.entries.length} fetched (actor/time filtered here){/if}
         </span>
       </div>

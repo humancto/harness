@@ -4,6 +4,7 @@ import {
   applyFilters,
   auditQuery,
   isNotable,
+  maxSeqForNode,
   toCsv,
   toJson,
   verificationSummary,
@@ -132,5 +133,86 @@ describe("export", () => {
   it("round-trips JSON", () => {
     const rows = [entry()];
     expect(JSON.parse(toJson(rows))).toEqual(rows);
+  });
+});
+
+describe("csv injection", () => {
+  it("neutralizes a formula a remote peer got into the log", () => {
+    // A denial's `subject` IS the command the peer submitted, so a
+    // paired peer can plant a formula by having it DENIED. Quoting
+    // alone does not help — spreadsheets evaluate the unquoted cell
+    // content (diff review MAJOR-5 on #65).
+    const csv = toCsv([
+      entry({ action: "shell.denied", subject: "=cmd|'/c calc'!A1" }),
+    ]);
+    const row = csv.split("\n")[1];
+    expect(row).toContain("\"'=cmd");
+    expect(row).not.toContain('"=cmd');
+  });
+
+  it("neutralizes every formula trigger, not just equals", () => {
+    for (const lead of ["=", "+", "-", "@", "\t", "\r"]) {
+      const csv = toCsv([entry({ subject: `${lead}danger` })]);
+      expect(csv.split("\n")[1]).toContain(`"'${lead}danger"`);
+    }
+  });
+
+  it("leaves an ordinary subject alone", () => {
+    const csv = toCsv([entry({ subject: "task-42" })]);
+    expect(csv.split("\n")[1]).toContain('"task-42"');
+    expect(csv).not.toContain("'task-42");
+  });
+});
+
+describe("verification coverage", () => {
+  const NODE = "aabbccddeeff00112233445566778899";
+
+  it("warns when the walk stopped below the newest row on the page", () => {
+    // The server walks a bounded number of ROWS up from the lowest
+    // local seq. With sparse local rows the walk can end below what
+    // is on screen; painting those green would be the overstatement
+    // the ADR refuses (diff review MAJOR-7 on #65).
+    const entries = [
+      entry({ node: NODE, seq: 900 }),
+      entry({ node: NODE, seq: 500 }),
+    ];
+    const s = verificationSummary(
+      {
+        scope: "page",
+        node: NODE,
+        checked: true,
+        verified: true,
+        from_seq: 500,
+        through_seq: 599,
+      },
+      maxSeqForNode(entries, NODE),
+    );
+    expect(s.tone).toBe("warn");
+    expect(s.text).toContain("NOT checked");
+  });
+
+  it("stays green when the walk covers the page", () => {
+    const entries = [entry({ node: NODE, seq: 550 })];
+    const s = verificationSummary(
+      {
+        scope: "page",
+        node: NODE,
+        checked: true,
+        verified: true,
+        from_seq: 500,
+        through_seq: 599,
+      },
+      maxSeqForNode(entries, NODE),
+    );
+    expect(s.tone).toBe("ok");
+  });
+
+  it("ignores other nodes' rows when measuring coverage", () => {
+    const entries = [
+      entry({ node: "ff".repeat(16), seq: 99_999 }),
+      entry({ node: NODE, seq: 510 }),
+    ];
+    expect(maxSeqForNode(entries, NODE)).toBe(510);
+    expect(maxSeqForNode(entries, undefined)).toBeUndefined();
   });
 });

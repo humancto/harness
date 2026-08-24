@@ -118,24 +118,45 @@ choose. ADR-0006's promise is retired, not deferred again.
   Until 5.13c replicates, an operator's node sees only its own
   dispatch/cancel/resume rows — the API says which node's chain its
   `verified` flag covers.
-- **Denials are attacker-triggerable.** `rate_limit` is declared in
-  manifests but enforced nowhere in the workspace, so a peer that can
-  assign tasks appends one `shell.denied` row per attempt at submit
-  rate. Retention (100k entries per node, pruned on the hourly
-  housekeeping tick, through a marker so the survivor still verifies)
-  bounds the disk cost — but it means flooding can push older
-  entries out of the window. **5.13b adds per-attempt coalescing**
-  for floodable actions (today: `shell.denied` only): within a
-  60s window a repeat of the same `(action, subject, actor)` is
-  dropped and counted, and the count is written as
-  `suppressed_repeats` into the next entry that does append. The
-  count cannot be added to the row it repeats — that row is already
-  hashed into the chain — so the log reads "N suppressed" on the
-  following entry rather than losing the fact. The window map lives
-  in memory and is bounded at 1024 keys, so a flooder that varies
-  `subject` cannot turn the bookkeeping into its own leak; a restart
-  resets it, erring toward recording rather than dropping. Actions
-  that are not floodable are never dropped, however repetitive.
+- **Denials are attacker-triggerable, so 5.13b rate-limits them.**
+  `rate_limit` is declared in manifests but enforced nowhere in the
+  workspace, so a peer that can assign tasks appends one
+  `shell.denied` row per attempt at submit rate. Retention (100k
+  entries per node, pruned on the hourly housekeeping tick, through a
+  marker so the survivor still verifies) bounds the disk cost — but on
+  its own it means flooding pushes older entries out of the window.
+  `StoreAuditSink` therefore rate-limits floodable actions (today:
+  `shell.denied`) in a 60s window keyed **`(action, actor)`**.
+
+  The key is deliberately subject-free. Keying on `subject` — the
+  first thing one reaches for, and what the first draft of 5.13b
+  did — is worse than doing nothing: a denial's subject IS the
+  submitted command, so `/bin/x1`, `/bin/x2`, … mints a fresh key per
+  attempt and the flood passes untouched, while the only records
+  dropped are a real operator's repeated denials of one command. The
+  trade is exactly backwards, and a reviewer caught it before merge.
+
+  Within a window the first `BURST_ALLOWANCE` (10) records append IN
+  FULL, so distinct denials keep their own argv, reason and task id at
+  any rate a person produces. Past the allowance a record is dropped
+  and counted, along with a bounded sample of the distinct subjects
+  dropped (8 subjects, truncated; distinct counted exactly to 64, then
+  reported as a floor). When the window CLOSES, a summary entry is
+  appended carrying those counts, the sample and the window's own
+  start — as its own entry, not folded into an existing row, because
+  an existing row is already hashed into the chain and rewriting it is
+  precisely what verification exists to catch. Closing runs on the
+  housekeeping tick as well as inline: a burst that simply STOPS must
+  still be recorded, or a completed flood shows its first ten rows and
+  no trace of the rest.
+
+  Costs, stated: past the allowance, per-attempt argv and reason are
+  NOT retained — only the count and the sample. The window map is in
+  memory (a restart resets it, erring toward recording) and bounded at
+  1024 open windows; hitting the bound CLOSES windows, emitting their
+  summaries, rather than discarding counts — an eviction that dropped
+  pending counts would let a flooder erase the record of its own
+  attempts.
 - **`peer.approved` is wired but dormant.** The auditor subscribes to
   the trust store's broadcast, which only `TrustStore::add` emits —
   and pairing's QUIC leg is still stubbed, so nothing calls it in

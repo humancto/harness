@@ -52,6 +52,10 @@ pub(crate) struct DaemonOrchestrator {
     /// 5.13a (ADR-0041): the audit chain's sink, kept so the run
     /// phase can spawn the trust auditor.
     audit_sink: std::sync::Arc<dyn harness_core::AuditSink>,
+    /// The same sink, concretely: the housekeeping tick flushes its
+    /// closed suppression windows (5.13b), which is not part of the
+    /// `AuditSink` boundary.
+    store_audit_sink: std::sync::Arc<harness_store::StoreAuditSink>,
     /// Local executor for running tasks the daemon picks up. Phase 3.3a.
     executor: crate::executor::LocalExecutor,
     /// Per-peer connection registry + channel router. Phase 3.3-fanout.
@@ -185,9 +189,14 @@ impl DaemonOrchestrator {
         // 5.13a (ADR-0041): the audit chain's sink. Built here because
         // everything downstream — capabilities, the trust auditor, the
         // dispatcher — records through it.
-        let audit_sink: std::sync::Arc<dyn harness_core::AuditSink> = std::sync::Arc::new(
-            harness_store::StoreAuditSink::new(store.clone(), identity.node_id()),
-        );
+        // Held concretely as well as behind the trait: the
+        // housekeeping tick calls `flush_suppressed` on it (5.13b),
+        // which is not part of the `AuditSink` boundary.
+        let store_audit_sink = std::sync::Arc::new(harness_store::StoreAuditSink::new(
+            store.clone(),
+            identity.node_id(),
+        ));
+        let audit_sink: std::sync::Arc<dyn harness_core::AuditSink> = store_audit_sink.clone();
 
         // 4.7 (ADR-0029): the shared backpressure switch — heartbeat
         // producer, API surface, and local dispatch view all consult
@@ -735,6 +744,7 @@ impl DaemonOrchestrator {
             election,
             persistent_trust,
             audit_sink,
+            store_audit_sink,
             executor,
             peer_net,
             dispatch: dispatch_runtime,
@@ -816,6 +826,7 @@ impl DaemonOrchestrator {
             let handle = tokio::spawn(spawn_checkpoint_sweeper(
                 store,
                 self.api_state.local_node_id,
+                self.store_audit_sink.clone(),
                 self.shutdown_tx.subscribe(),
             ));
             self.tasks.lock().push(handle);
@@ -1119,13 +1130,16 @@ fn cloud_planner_model_if_allowed(planning: &harness_policy::PlanningPolicy) -> 
     }
 }
 
-/// 5.11/5.13a: periodic store housekeeping on an hourly tick — the
-/// checkpoint sweeps the daemon also runs at boot, plus the audit
+/// 5.11/5.13a/5.13b: periodic store housekeeping on an hourly tick —
+/// the checkpoint sweeps the daemon also runs at boot, the audit
 /// log's retention prune (which appends its truncation marker before
-/// deleting, so the surviving chain still verifies).
+/// deleting, so the surviving chain still verifies), and the flush of
+/// closed suppression windows (a denial burst that stopped must still
+/// be recorded, even on an otherwise idle node).
 async fn spawn_checkpoint_sweeper(
     store: harness_store::Store,
     node: harness_core::NodeId,
+    audit_sink: std::sync::Arc<harness_store::StoreAuditSink>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(3600));
@@ -1134,6 +1148,10 @@ async fn spawn_checkpoint_sweeper(
         tokio::select! {
             _ = tick.tick() => {
                 crate::executor::sweep_stale_checkpoints(&store);
+                // 5.13b: a denial burst that STOPPED leaves its count
+                // in an open window; a quiet daemon would otherwise
+                // never record it (Codex P1 on #65).
+                audit_sink.flush_suppressed();
                 crate::executor::prune_audit_log(&store, node);
             }
             _ = shutdown.changed() => return,
