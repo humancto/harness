@@ -175,8 +175,14 @@ choose. ADR-0006's promise is retired, not deferred again.
   itself, NOT on the housekeeping task's shutdown arm: `shutdown()`
   aborts every spawned task synchronously before its first await, so
   such an arm is racy on a multi-thread runtime and unreachable on the
-  current-thread one the daemon uses. An UNGRACEFUL exit (SIGKILL,
-  power loss) still loses the open window's count: that residual is
+  current-thread one the daemon uses. An exit that does not run `shutdown()`
+  still loses the open window's count — SIGKILL and power loss, but
+  also **SIGTERM**, which is the normal production stop
+  (`systemctl stop`, `docker stop`): `run_until_signal` awaits
+  `tokio::signal::ctrl_c()`, which is SIGINT only, and no SIGTERM
+  handler exists in the daemon. Handling SIGTERM is a daemon-lifecycle
+  change affecting every subsystem's shutdown, so it is carried as its
+  own item rather than widened into this one: that residual is
   irreducible for an in-memory map and is stated rather than implied
   away. The window map is in
   memory (a restart resets it, erring toward recording) and bounded at

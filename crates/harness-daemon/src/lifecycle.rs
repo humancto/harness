@@ -799,8 +799,14 @@ impl DaemonOrchestrator {
             .expect("daemon always has a store")
     }
 
-    /// Spawn every loop and block until SIGINT/SIGTERM (or until a fatal
-    /// task panics).
+    /// Spawn every loop and block until SIGINT (or until a fatal task
+    /// panics).
+    ///
+    /// SIGINT only: `ctrl_c()` does not cover SIGTERM, so the normal
+    /// production stop (`systemctl stop`, `docker stop`) kills the
+    /// process at default disposition and [`Self::shutdown`] never
+    /// runs. Carried in STATE.md — it costs every shutdown-time
+    /// behavior, not just 5.13b's suppression flush.
     pub(crate) async fn run_until_signal(self) -> Result<()> {
         self.start_loops();
         tokio::signal::ctrl_c().await.ok();

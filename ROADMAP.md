@@ -109,6 +109,7 @@ When an item lands, flip its checkbox **in the same PR** as `STATE.md` is update
 
 **Demo:** end-to-end story from PRD §9–§20 working without manual intervention. CI scaling benchmarks pass at the targets in §17.9.
 
+- [ ] **6.0** Graceful shutdown on SIGTERM. `run_until_signal` awaits `tokio::signal::ctrl_c()` — SIGINT only — so `systemctl stop` / `docker stop`, the normal production stop, kills the daemon at default disposition and `shutdown()` never runs: peer connections are not closed, listeners are not drained, and 5.13b's suppression flush is skipped. Found in the 5.13b review round 4. Belongs before the self-updater, which restarts daemons for a living.
 - [ ] **6.1** Self-updater (rolling, version-negotiated, automatic rollback on health failure).
 - [ ] **6.2** Speculative execution (`redundancy=2`, first wins).
 - [ ] **6.3** Circuit breakers (5 consecutive failures → 60s bench).
