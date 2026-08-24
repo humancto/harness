@@ -205,3 +205,132 @@ choose. ADR-0006's promise is retired, not deferred again.
   real.
 - **`GET /api/v1/audit` pages by time, not `seq`**: `seq` is per-node
   and meaningless once two chains interleave.
+
+## Amendment — 5.13c-1: peer head pins
+
+5.13a's honest limit was that a node holds its own DB and its own key,
+so it can rebuild its chain end to end and it will verify. A local hash
+chain catches an edit made by something that is not the daemon; it does
+not catch the node itself lying.
+
+What a node cannot do is **un-tell a peer that already pinned
+`(seq, entry_hash)`** — and it cannot rewrite the entries BETWEEN two
+pins it cannot un-tell, because reproducing the later pinned hash over
+altered entries is a blake3 collision problem. That second clause is
+the mechanism. It needs entries, which 5.13c-2 supplies; 5.13c-1 builds
+the pins it will check against.
+
+**Decision 8 — pins are append-only, keyed `(node_id, seq)`.** The
+obvious design is one row per node with "higher seq replaces". That
+deletes the very pin the corroboration check needs: a node that
+truncates and regrows past the pin then reads as ordinary growth, and
+the ingest of the lie erases the only evidence of it. Supersession is a
+verification obligation, never a delete. The PK is also the fork
+detector — keying on the hash as well would store two conflicting
+histories as two ordinary pins and detect nothing.
+
+**Decision 9 — a lower-seq head is not evidence by itself.**
+`AuditSyncEnvelope` is not `Sequenced` (pins are idempotent, and a
+replayed head can only re-pin a position we hold), so any peer can
+rebroadcast a genuine old head forever. Treating "below a pin we hold"
+as a regression would turn that into a one-packet, permanent
+defamation of an honest node — and a node returning from a partition
+would trip it by accident. Only a contradiction AT a held position
+counts.
+
+**Decision 10 — head advertisement is on `harness.audit`, not the
+heartbeat.** The obvious move is a `audit_head` field on `Heartbeat`,
+on the `replica_head` precedent from ADR-0019. That precedent is
+unsound in the new→old direction: `Signable::canonical_bytes` re-encodes
+the DECODED struct, so a pre-5.13c node drops the unknown key,
+re-encodes without it, and **signature verification fails** — killing
+that connection's heartbeat channel permanently and aging the peer out
+of the mesh. That is a wire BREAK, not an addition. A new channel has
+no such failure mode: an unknown channel name is reset and the
+connection survives (the `TASK_LEASE` precedent). ADR-0019's
+`replica_head` got away with the same move only because nothing was
+deployed; the general fix is carried as ROADMAP 6.0-adjacent work.
+
+**Decision 11 — the inner key comes from our own trust store.** A head
+is verified against ITS OWN node's key, which is what makes it
+relayable: node C can hold A's head learned from B and it still proves
+A said it. The key must therefore come from `TrustStore` (or a received
+manifest), never from the relaying envelope — a relayer that supplied
+the key would mint a keypair and forge the entire history it claims to
+be reporting. A head for a node we cannot independently key is dropped,
+not stored: an unverifiable accusation is worse than none.
+
+**Decision 12 — thinning is status-aware and keys on `first_seen_ms`.**
+The pin table needs a bound, and a naive "newest K plus a thinned tail"
+sweep reaches Decision 8's failure by the back door: it eventually
+evicts a `contradicted` pin, which is the evidence. So only `unchecked`
+and `corroborated` pins are evictable, the oldest pin per node is
+always kept, and thinning buckets on when WE first saw a pin rather
+than on `seq` — a node that floods 100k entries must not be able to
+push honest historical pins into the tail. A store test asserts the
+Rust `evictable()` predicate and the thinning SQL agree, because they
+are two statements of the same rule.
+
+**Decision 13 — a low head is classified, not discarded.** The first
+version of `pin_peer_head` returned `StaleIgnored` *without inserting*.
+That let one validly-signed head at `u64::MAX` permanently immunize its
+sender: every genuine head afterwards compared below the poisoned
+maximum, was dropped, and no peer ever pinned that node again — with no
+log line and no removal path. Not treating a low head as EVIDENCE is
+correct and is Decision 9; not STORING it is a different thing, and it
+was the one that mattered. A below-newest head is now pinned and
+classified `StalePinned`, which costs one row and buys a position a
+later contradiction can fork against. Relatedly, an oversized `seq` is
+REJECTED rather than clamped to `i64::MAX`: clamping collides distinct
+signed heads onto one row (a fork manufactured by a lossy cast) and
+makes the relayed rebuild carry a seq the signer never signed, so it
+fails verification at every receiver.
+
+**Decision 14 — relays rank AND select on our clock, not the head's.**
+`at_ms` is stamped by the head's own signer, so ordering the relay
+window by it lets a node stamp `u64::MAX` and hold a slot forever,
+pushing honest heads out on any mesh larger than the window. Ranking
+uses `observed_at_ms`, which is ours.
+
+The first version of this decision fixed only the cross-node ranking
+and left the within-node selection on `ORDER BY seq DESC` — and `seq`
+is exactly as attacker-chosen as `at_ms` was. `RejectedSeq` stops only
+values above `i64::MAX`, so a head signed at exactly `i64::MAX` would
+be selected as that node's newest pin forever, and every honest peer
+would relay that garbage on its behalf permanently. Selection now
+orders on `observed_at_ms` first. The general rule, which 5.13c-2
+inherits for entry ordering: **no ordering decision may key on a field
+the subject of that ordering controls.**
+
+### What 5.13c-1 does NOT yet give you
+
+Pins alone detect two things: two signed heads at one position, and a
+first-party head contradicting a pin we hold. They do **not** detect
+the dominant rewrite shape — truncate, re-append, grow past the pin —
+because linking pin `(100, h100)` to pin `(200, h200)` requires walking
+entries 101..200. Until 5.13c-2 pulls entries, every pin sits at
+`unchecked`, and the UI must render that as what it is rather than as
+corroboration.
+
+Three further gaps, named so they are not mistaken for coverage:
+
+- **Detection of an in-place rewrite is racy against the push
+  cadence.** The newest pin sits at the subject's current head, so a
+  rewrite that leaves `seq` unchanged forks on the next push — but a
+  node that appends one entry first lands its new head at an unpinned
+  position, which reads as ordinary growth. Pin density is the
+  mitigation, and it is a 30s timer, not a guarantee.
+- **A node that never advertises is invisible.** Nothing consumes
+  `observed_at_ms` to age a peer out or flag silence.
+- **Ingest is unrated.** A trusted peer can insert pin rows faster
+  than the hourly sweep reclaims them; thinning bounds the steady
+  state but not the interval. This is the only unbounded-work path a
+  trusted peer controls today. It lands in 5.13c-2 beside the
+  entry-serving rate limit, where the request/response primitive it
+  shares lives.
+- **A detected fork has no reader.** `head_conflicts`,
+  `peer_head_pins` and `set_pin_status` have no non-test callers: a
+  fork surfaces as one `tracing::error!` and a database row. The
+  History UI shipped in 5.13b shows nothing. Surfacing it is 5.13c-3
+  work, and until then the loudest signal this feature produces is a
+  log line.

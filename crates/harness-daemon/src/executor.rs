@@ -522,6 +522,29 @@ pub(crate) fn prune_audit_log(store: &Store, node: NodeId) {
     }
 }
 
+/// 5.13c-1: how many recent pins per node survive thinning, and the
+/// bucket width for the thinned tail. A pin every 30s would otherwise
+/// grow `audit_peer_heads` without bound on a long-running node
+/// (Codex P1 on #66 — the sweep existed with no caller, the same
+/// defect `audit_prune` shipped with in 5.13a).
+pub(crate) const PIN_KEEP_RECENT: usize = 64;
+pub(crate) const PIN_LADDER_MS: u64 = 6 * 60 * 60 * 1000;
+
+/// Thin the peer-head pin table. Status-aware: `contradicted` and
+/// `unverifiable` pins are never evicted, because they ARE the
+/// evidence.
+pub(crate) fn thin_peer_head_pins(store: &Store) {
+    match store.thin_peer_head_pins(PIN_KEEP_RECENT, PIN_LADDER_MS) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            target: "harness.executor",
+            rows = n,
+            "thinned peer audit head pins"
+        ),
+        Err(e) => tracing::warn!(target: "harness.executor", ?e, "peer head pin thinning"),
+    }
+}
+
 pub(crate) fn sweep_stale_checkpoints(store: &Store) {
     // Plans whose own result row is durably written need no
     // checkpoints (Codex P1 on #62): the driver cannot do this itself

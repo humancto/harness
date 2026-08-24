@@ -2,6 +2,9 @@
 //! surface into a real `harness` binary.
 #![forbid(unsafe_code)]
 
+mod audit_sync;
+#[cfg(test)]
+mod audit_sync_tests;
 mod audit_wiring;
 mod cost_gate;
 mod dispatch;

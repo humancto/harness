@@ -15,6 +15,7 @@ pub mod leases;
 pub mod manifests;
 mod migrations;
 pub mod open;
+pub mod peer_heads;
 pub mod replica;
 pub mod results;
 pub mod scopes;
@@ -28,6 +29,7 @@ pub use crate::checkpoints::{aggregate_is_complete, MAX_CHECKPOINT_OUTPUT_BYTES}
 pub use crate::error::StoreError;
 pub use crate::leases::{Lease, LeaseId, LeaseState};
 pub use crate::open::{Store, StoreConfig};
+pub use crate::peer_heads::{HeadConflict, PeerHeadPin, PinOutcome, PinStatus};
 pub use crate::replica::StoreReplicaApplier;
 pub use crate::results::TaskResult;
 pub use crate::tasks::{CancelOutcome, TaskRow, TaskState};

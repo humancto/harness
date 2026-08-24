@@ -20,7 +20,7 @@ pub use crate::replica::{
 };
 pub use audit::{
     audit_entry_hash, hash_hex, AuditAction, AuditActor, AuditHead, AuditRecord, AuditSink,
-    NullAuditSink,
+    AuditSyncEnvelope, NullAuditSink, MAX_HEADS_PER_ENVELOPE,
 };
 pub use identity::{
     verify, Identity, KeyError, NodeId, ParseNodeIdError, PublicKey, Signature, VerifyError,
