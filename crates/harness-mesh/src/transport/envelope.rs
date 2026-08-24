@@ -83,6 +83,17 @@ pub mod channels {
     /// LWW replica sync envelopes (PR-B / 3.3-gossip).
     pub const GOSSIP_STATE: &str = "harness.gossip.state";
 
+    /// Signed audit heads (5.13c-1, ADR-0041; PRD §13.6). Additive:
+    /// an old node returns `None` from [`known`], resets the unknown
+    /// stream, and the connection survives — the `TASK_LEASE`
+    /// precedent. Head advertisement lives HERE and not on the
+    /// heartbeat: `Signable::canonical_bytes` re-encodes the DECODED
+    /// struct, so a new heartbeat field makes a pre-5.13c node drop
+    /// the unknown key, re-encode without it, and fail signature
+    /// verification — killing that connection's heartbeat channel
+    /// permanently. A new channel has no such failure mode.
+    pub const AUDIT: &str = "harness.audit";
+
     /// Map a wire-sourced name onto its static constant. `None` for
     /// anything we don't recognize — the stream gets reset.
     #[must_use]
@@ -96,6 +107,7 @@ pub mod channels {
             TASK_PARTIAL => Some(TASK_PARTIAL),
             TASK_LEASE => Some(TASK_LEASE),
             GOSSIP_STATE => Some(GOSSIP_STATE),
+            AUDIT => Some(AUDIT),
             _ => None,
         }
     }

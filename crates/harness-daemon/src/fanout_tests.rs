@@ -24,6 +24,8 @@ pub(crate) struct TestDaemon {
     pub(crate) peers: harness_mesh::heartbeat::PeerTable,
     pub(crate) mesh_addr: SocketAddr,
     pub(crate) partials: Arc<harness_api::PartialBuffers>,
+    /// 5.13c-1: needed to resolve a relayed head's signing key.
+    pub(crate) trust: TrustStore,
     pub(crate) stop_tx: watch::Sender<bool>,
     pub(crate) handle: tokio::task::JoinHandle<()>,
     pub(crate) root: tempfile::TempDir,
@@ -103,7 +105,7 @@ async fn boot_one(
         harness_root: root.path().to_path_buf(),
         max_queue_depth,
     };
-    let orch = DaemonOrchestrator::build(identity.clone(), trust, cfg)
+    let orch = DaemonOrchestrator::build(identity.clone(), trust.clone(), cfg)
         .await
         .expect("build daemon");
     let mesh_addr = orch.mesh_addr();
@@ -120,6 +122,7 @@ async fn boot_one(
         peers,
         mesh_addr,
         partials,
+        trust,
         stop_tx,
         handle,
         root,

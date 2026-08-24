@@ -205,3 +205,78 @@ choose. ADR-0006's promise is retired, not deferred again.
   real.
 - **`GET /api/v1/audit` pages by time, not `seq`**: `seq` is per-node
   and meaningless once two chains interleave.
+
+## Amendment — 5.13c-1: peer head pins
+
+5.13a's honest limit was that a node holds its own DB and its own key,
+so it can rebuild its chain end to end and it will verify. A local hash
+chain catches an edit made by something that is not the daemon; it does
+not catch the node itself lying.
+
+What a node cannot do is **un-tell a peer that already pinned
+`(seq, entry_hash)`** — and it cannot rewrite the entries BETWEEN two
+pins it cannot un-tell, because reproducing the later pinned hash over
+altered entries is a blake3 collision problem. That second clause is
+the mechanism. It needs entries, which 5.13c-2 supplies; 5.13c-1 builds
+the pins it will check against.
+
+**Decision 8 — pins are append-only, keyed `(node_id, seq)`.** The
+obvious design is one row per node with "higher seq replaces". That
+deletes the very pin the corroboration check needs: a node that
+truncates and regrows past the pin then reads as ordinary growth, and
+the ingest of the lie erases the only evidence of it. Supersession is a
+verification obligation, never a delete. The PK is also the fork
+detector — keying on the hash as well would store two conflicting
+histories as two ordinary pins and detect nothing.
+
+**Decision 9 — a lower-seq head is not evidence by itself.**
+`AuditSyncEnvelope` is not `Sequenced` (pins are idempotent, and a
+replayed head can only re-pin a position we hold), so any peer can
+rebroadcast a genuine old head forever. Treating "below a pin we hold"
+as a regression would turn that into a one-packet, permanent
+defamation of an honest node — and a node returning from a partition
+would trip it by accident. Only a contradiction AT a held position
+counts.
+
+**Decision 10 — head advertisement is on `harness.audit`, not the
+heartbeat.** The obvious move is a `audit_head` field on `Heartbeat`,
+on the `replica_head` precedent from ADR-0019. That precedent is
+unsound in the new→old direction: `Signable::canonical_bytes` re-encodes
+the DECODED struct, so a pre-5.13c node drops the unknown key,
+re-encodes without it, and **signature verification fails** — killing
+that connection's heartbeat channel permanently and aging the peer out
+of the mesh. That is a wire BREAK, not an addition. A new channel has
+no such failure mode: an unknown channel name is reset and the
+connection survives (the `TASK_LEASE` precedent). ADR-0019's
+`replica_head` got away with the same move only because nothing was
+deployed; the general fix is carried as ROADMAP 6.0-adjacent work.
+
+**Decision 11 — the inner key comes from our own trust store.** A head
+is verified against ITS OWN node's key, which is what makes it
+relayable: node C can hold A's head learned from B and it still proves
+A said it. The key must therefore come from `TrustStore` (or a received
+manifest), never from the relaying envelope — a relayer that supplied
+the key would mint a keypair and forge the entire history it claims to
+be reporting. A head for a node we cannot independently key is dropped,
+not stored: an unverifiable accusation is worse than none.
+
+**Decision 12 — thinning is status-aware and keys on `first_seen_ms`.**
+The pin table needs a bound, and a naive "newest K plus a thinned tail"
+sweep reaches Decision 8's failure by the back door: it eventually
+evicts a `contradicted` pin, which is the evidence. So only `unchecked`
+and `corroborated` pins are evictable, the oldest pin per node is
+always kept, and thinning buckets on when WE first saw a pin rather
+than on `seq` — a node that floods 100k entries must not be able to
+push honest historical pins into the tail. A store test asserts the
+Rust `evictable()` predicate and the thinning SQL agree, because they
+are two statements of the same rule.
+
+### What 5.13c-1 does NOT yet give you
+
+Pins alone detect two things: two signed heads at one position, and a
+first-party head contradicting a pin we hold. They do **not** detect
+the dominant rewrite shape — truncate, re-append, grow past the pin —
+because linking pin `(100, h100)` to pin `(200, h200)` requires walking
+entries 101..200. Until 5.13c-2 pulls entries, every pin sits at
+`unchecked`, and the UI must render that as what it is rather than as
+corroboration.

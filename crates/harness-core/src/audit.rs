@@ -239,6 +239,51 @@ impl Signable for AuditHead {
     }
 }
 
+/// Signed envelope carrying audit heads over `harness.audit`
+/// (5.13c-1, ADR-0041).
+///
+/// The envelope signature commits to the batch and is checked against
+/// the CONNECTION peer, so a trusted peer cannot replay another node's
+/// traffic as its own. Each [`AuditHead`] inside carries its OWN
+/// signature and is verified against ITS OWN node's key — which is
+/// what makes a head relayable: node C can hold A's head learned from
+/// B and it still proves A said it.
+///
+/// The key for that inner check comes from the local trust store or a
+/// received manifest, NEVER from the relaying envelope. Taking it from
+/// the relay would let B mint a keypair and forge A's entire history.
+/// A head for a node we cannot independently key is dropped, not
+/// stored.
+///
+/// Not `Sequenced`: heads are idempotent and a replayed one can only
+/// re-pin a position we already hold. That does mean a genuine old
+/// head can be rebroadcast forever, which is exactly why a lower-seq
+/// head is never treated as evidence on its own — see
+/// `Store::pin_peer_head`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditSyncEnvelope {
+    pub source: NodeId,
+    /// Unix milliseconds when this envelope was assembled.
+    pub assembled_at: u64,
+    /// The sender's own head, plus any third-party heads it is
+    /// relaying. Bounded by the sender; the receiver bounds it again.
+    pub heads: Vec<AuditHead>,
+    pub sig: Signature,
+}
+
+impl Signable for AuditSyncEnvelope {
+    fn sig_field_mut(&mut self) -> &mut Signature {
+        &mut self.sig
+    }
+    fn sig_field(&self) -> &Signature {
+        &self.sig
+    }
+}
+
+/// Most heads one envelope may carry. A sender that exceeds this is
+/// misbehaving; the receiver truncates rather than trusting the count.
+pub const MAX_HEADS_PER_ENVELOPE: usize = 64;
+
 /// Recording side of the audit log, implemented by `harness-store`.
 ///
 /// Exists so `harness-capabilities` and `harness-mesh` — which are

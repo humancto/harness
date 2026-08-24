@@ -64,6 +64,8 @@ pub(crate) struct DaemonOrchestrator {
     dispatch: Arc<DispatchRuntime>,
     /// Replica gossip service. Phase 3.3-gossip (ADR-0019).
     gossip: Arc<crate::gossip::GossipService>,
+    /// Audit head exchange. 5.13c-1 (ADR-0041).
+    audit_sync: Arc<crate::audit_sync::AuditSyncService>,
     /// Frame router + wire coalescer for streaming partial output.
     /// Phase 3.2-stream (ADR-0020).
     partial_streamer: Arc<crate::partial_stream::PartialStreamer>,
@@ -717,6 +719,17 @@ impl DaemonOrchestrator {
         gossip.attach_net(&peer_net);
         peer_net.attach_gossip(&gossip);
 
+        // 5.13c-1 (ADR-0041): signed audit head exchange over
+        // `harness.audit`. Pins are what make the chain evidence
+        // rather than a local integrity check.
+        let audit_sync = crate::audit_sync::AuditSyncService::new(
+            store.clone(),
+            identity.clone(),
+            persistent_trust.clone(),
+        );
+        audit_sync.attach_net(&peer_net);
+        peer_net.attach_audit_sync(&audit_sync);
+
         let api_state =
             harness_api::ApiStateBuilder::new(identity.clone(), config.mesh_name.clone())
                 .with_node_name(config.node_name.clone())
@@ -749,6 +762,7 @@ impl DaemonOrchestrator {
             peer_net,
             dispatch: dispatch_runtime,
             gossip,
+            audit_sync,
             partial_streamer,
             pause,
             max_queue_depth: config.max_queue_depth,
@@ -983,6 +997,14 @@ impl DaemonOrchestrator {
 
         // Phase 3.3-gossip: periodic replica delta push (head-triggered
         // full syncs fire from the heartbeat recv path).
+        // 5.13c-1: push our signed head on a timer. Pin DENSITY is the
+        // security parameter — a rewrite is only detectable between
+        // positions someone pinned — so this runs on a schedule, not
+        // only on change.
+        let audit_sync_handle =
+            tokio::spawn(self.audit_sync.clone().run(self.shutdown_tx.subscribe()));
+        self.tasks.lock().push(audit_sync_handle);
+
         let gossip_handle = tokio::spawn(
             self.gossip
                 .clone()

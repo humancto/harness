@@ -62,6 +62,14 @@ pub(crate) trait TaskChannelHandlers: Send + Sync + 'static {
     fn on_partial(&self, from: NodeId, msg: PartialResult) {
         let _ = (from, msg);
     }
+    /// Signed audit heads arrived over `harness.audit` (5.13c-1). The
+    /// recv loop verified the ENVELOPE against `from`; the heads
+    /// inside are the implementation's to verify, each against its own
+    /// node's key. Default no-op so handler impls that predate audit
+    /// replication keep compiling.
+    fn on_audit_heads(&self, from: NodeId, env: harness_core::AuditSyncEnvelope) {
+        let _ = (from, env);
+    }
     /// An enqueued `TaskAssign` could not be delivered (queue full, send
     /// error after retry, or no live connection). The dispatcher resets
     /// the lease so the task re-routes.
@@ -137,6 +145,10 @@ pub(crate) enum OutboundMsg {
     /// Lease extension (4.6, ADR-0028). Fire-and-forget like Partial:
     /// a lost extension degrades to the pre-4.6 timeout bound.
     LeaseExtend(LeaseExtend),
+    /// Signed audit heads (5.13c-1, ADR-0041). Fire-and-forget: a lost
+    /// head just means the pin is taken on a later tick, and pins are
+    /// idempotent.
+    AuditHeads(harness_core::AuditSyncEnvelope),
 }
 
 impl OutboundMsg {
@@ -150,6 +162,7 @@ impl OutboundMsg {
             OutboundMsg::Gossip(_) => channels::GOSSIP_STATE,
             OutboundMsg::Partial(_) => channels::TASK_PARTIAL,
             OutboundMsg::LeaseExtend(_) => channels::TASK_LEASE,
+            OutboundMsg::AuditHeads(_) => channels::AUDIT,
         }
     }
 }
@@ -201,6 +214,9 @@ pub(crate) struct PeerNet {
     /// an `Arc<PeerNet>`, so this back-reference is `Weak` to avoid the
     /// cycle). Unset in unit tests that don't exercise gossip.
     gossip: std::sync::OnceLock<std::sync::Weak<crate::gossip::GossipService>>,
+    /// 5.13c-1: the audit head sync service, for the recv arm to
+    /// hand verified envelopes to.
+    audit_sync: std::sync::OnceLock<std::sync::Weak<crate::audit_sync::AuditSyncService>>,
 }
 
 impl PeerNet {
@@ -223,6 +239,7 @@ impl PeerNet {
             self_manifest,
             peers: ParkingMutex::new(HashMap::new()),
             gossip: std::sync::OnceLock::new(),
+            audit_sync: std::sync::OnceLock::new(),
         })
     }
 
@@ -233,6 +250,15 @@ impl PeerNet {
 
     fn gossip(&self) -> Option<Arc<crate::gossip::GossipService>> {
         self.gossip.get().and_then(std::sync::Weak::upgrade)
+    }
+
+    /// Wire the audit-sync back-reference after `AuditSyncService::new`.
+    pub(crate) fn attach_audit_sync(&self, svc: &Arc<crate::audit_sync::AuditSyncService>) {
+        let _ = self.audit_sync.set(Arc::downgrade(svc));
+    }
+
+    fn audit_sync(&self) -> Option<Arc<crate::audit_sync::AuditSyncService>> {
+        self.audit_sync.get().and_then(std::sync::Weak::upgrade)
     }
 
     #[cfg_attr(not(test), allow(dead_code))] // PR-A2 dispatch runtime reads these
@@ -488,6 +514,9 @@ impl PeerNet {
                 ch.send(&r).await
             }
             OutboundMsg::Gossip(g) => ch.send(g).await,
+            // Signed at assembly like Gossip: the envelope is not
+            // Sequenced, because pins are idempotent.
+            OutboundMsg::AuditHeads(a) => ch.send(a).await,
             OutboundMsg::Partial(p) => {
                 let mut p = p.clone();
                 p.seq = ch.next_seq();
@@ -688,6 +717,38 @@ impl PeerNet {
                                     peer = %peer_id,
                                     "gossip received but no store configured; dropped"
                                 );
+                            }
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                n if n == channels::AUDIT => {
+                    match ch.recv::<harness_core::AuditSyncEnvelope>().await {
+                        // `recv` verified the envelope signature
+                        // against the connection peer's pubkey; the
+                        // `source` cross-check stops a trusted peer
+                        // replaying another node's envelope as its own
+                        // channel traffic. The heads INSIDE are
+                        // verified separately, against their own
+                        // nodes' keys — that is what makes a head
+                        // relayable.
+                        Ok(env) => {
+                            if env.source != peer_id {
+                                tracing::warn!(
+                                    target: "harness.audit.sync",
+                                    peer = %peer_id,
+                                    claimed = %env.source,
+                                    "audit envelope source does not match connection peer; dropped"
+                                );
+                            } else if let Some(svc) = self.audit_sync() {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                                    .unwrap_or(0);
+                                svc.ingest(peer_id, &env, now);
+                            } else {
+                                self.handlers.on_audit_heads(peer_id, env);
                             }
                             Ok(())
                         }
