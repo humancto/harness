@@ -129,7 +129,9 @@ pub async fn list_handler(
 
     let next_cursor = rows.last().map(|r| {
         serde_json::json!({
-            "before_ms": r.at_ms,
+            // The cursor must key on the same value the feed is
+            // ORDERED by, or paging skips or repeats ingested rows.
+            "before_ms": r.feed_ms,
             "before_node": r.node_id.to_string(),
             "before_seq": r.seq,
         })
@@ -239,4 +241,99 @@ fn parse_node(raw: &str) -> Result<harness_core::NodeId, ()> {
         bytes[i] = u8::from_str_radix(hex, 16).map_err(|_| ())?;
     }
     Ok(harness_core::NodeId::from_bytes(bytes))
+}
+
+/// `POST /api/v1/audit/verify/:node` — ask the mesh to walk a peer's
+/// entries so its newest pin can be corroborated (5.13c-2).
+///
+/// Returns 202: the pull crosses the network and settles
+/// asynchronously, so this reports that a walk was STARTED and the
+/// caller re-reads the pin's status. Claiming a verdict here would be
+/// the same overstatement the History banner refuses.
+// Axum requires a handler future; nothing here awaits, because the
+// pull itself is fire-and-forget into the mesh.
+#[allow(clippy::unused_async)]
+pub async fn verify_node_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    axum::extract::Path(node): axum::extract::Path<String>,
+) -> axum::response::Response {
+    if !is_authenticated(&state.auth, &headers) {
+        return unauthorized();
+    }
+    let Ok(node) = parse_node(&node) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "bad_node" })),
+        )
+            .into_response();
+    };
+    let Some(store) = state.store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "store_not_configured" })),
+        )
+            .into_response();
+    };
+    let Some(puller) = state.audit_puller.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "mesh_not_configured" })),
+        )
+            .into_response();
+    };
+    if node == state.local_node_id {
+        // Our own chain is verified locally; asking a peer to vouch
+        // for it would be asking the subject to corroborate itself.
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "own_chain" })),
+        )
+            .into_response();
+    }
+
+    let pins = match store.peer_head_pins(node) {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::error!(target: "harness.api.audit", ?err, "peer_head_pins");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "pins_failed" })),
+            )
+                .into_response();
+        }
+    };
+    let Some(target) = pins.last() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no_pin_for_node" })),
+        )
+            .into_response();
+    };
+
+    // Walk from just past the PREVIOUS pin we hold, so the run is
+    // anchored on evidence we took earlier rather than on the subject's
+    // own say-so (diff review MAJOR-8).
+    //
+    // The first version asked for `[target.seq, target.seq]` whenever
+    // we already held that row — a one-row "walk" that re-read
+    // something we had and proved nothing.
+    let from_seq = pins
+        .iter()
+        .filter(|p| p.seq < target.seq)
+        .map(|p| p.seq)
+        .max()
+        .map_or(1, |prev| prev.saturating_add(1));
+    let started = puller.request_range(node, node, from_seq, target.seq);
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "started": started,
+            "node": node.to_string(),
+            "target_seq": target.seq,
+            "from_seq": from_seq,
+            "status": target.status.as_str(),
+        })),
+    )
+        .into_response()
 }

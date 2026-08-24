@@ -31,7 +31,8 @@ pub use dto::{LocalDto, PeerDto, PeersSnapshot, ResourcesDto, StatusDto};
 pub use event::{MeshEvent, TableEventBridge};
 pub use partials::{PartialBuffers, PartialFrame};
 pub use state::{
-    ApiState, ApiStateBuilder, LocalStatus, PauseControl, ServerHandle, MESH_EVENT_CAPACITY,
+    ApiState, ApiStateBuilder, AuditPuller, LocalStatus, PauseControl, ServerHandle,
+    MESH_EVENT_CAPACITY,
 };
 
 use axum::Router;

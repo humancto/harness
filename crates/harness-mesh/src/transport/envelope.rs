@@ -127,7 +127,11 @@ pub mod channels {
     #[must_use]
     pub fn frame_cap(channel: &'static str) -> usize {
         match channel {
-            TASK_ASSIGN => 1024 * 1024,
+            // 5.13c-2 shares assign's 1 MiB: the store bounds a served
+            // entry batch to MAX_SERVE_BYTES (768 KiB), so this leaves
+            // headroom for CBOR framing without inviting an oversized
+            // frame.
+            TASK_ASSIGN | AUDIT => 1024 * 1024,
             TASK_RESULT => 8 * 1024 * 1024,
             ANNOUNCE | GOSSIP_STATE => 256 * 1024,
             TASK_PARTIAL => 64 * 1024,

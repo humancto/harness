@@ -94,6 +94,14 @@ pub struct AuditRow {
     pub actor: String,
     pub prev_hash: [u8; 32],
     pub entry_hash: [u8; 32],
+    /// The timestamp the merged feed ORDERS by: our receive time for
+    /// an ingested peer row, the row's own `at_ms` for a local one
+    /// (5.13c-2, Codex P2 on #67).
+    ///
+    /// A peer's `at_ms` is inside its own hash preimage and therefore
+    /// chosen by that peer, so ordering the feed on it lets an
+    /// ingested row pick its own position in every node's History.
+    pub feed_ms: u64,
 }
 
 /// Keyset cursor for [`Store::audit_recent`] — the full ordering key,
@@ -126,7 +134,17 @@ fn row_to_audit(r: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRow> {
     let node_raw: Vec<u8> = r.get(0)?;
     let prev: Vec<u8> = r.get(7)?;
     let entry: Vec<u8> = r.get(8)?;
+    let at_ms = u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0);
+    // Queries that do not select the effective column fall back to
+    // `at_ms`, which is correct for local rows.
+    let feed_ms = r
+        .get::<_, Option<i64>>(9)
+        .ok()
+        .flatten()
+        .and_then(|v| u64::try_from(v).ok())
+        .unwrap_or(at_ms);
     Ok(AuditRow {
+        feed_ms,
         node_id: NodeId::from_bytes(<[u8; 16]>::try_from(node_raw.as_slice()).unwrap_or([0u8; 16])),
         seq: u64::try_from(r.get::<_, i64>(1)?).unwrap_or(0),
         at_ms: u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
@@ -309,6 +327,82 @@ impl Store {
         }))
     }
 
+    /// Public wrapper: the stored hash at one position, for callers
+    /// outside this crate (the API's verify endpoint).
+    ///
+    /// # Errors
+    /// Underlying sqlite errors.
+    pub fn audit_entry_hash_at_pub(
+        &self,
+        node_id: NodeId,
+        seq: u64,
+    ) -> Result<Option<[u8; 32]>, StoreError> {
+        self.audit_entry_hash_at(node_id, seq)
+    }
+
+    /// Rows for one node from `from_seq`, ascending, bounded.
+    pub(crate) fn audit_rows_from(
+        &self,
+        node_id: NodeId,
+        from_seq: u64,
+        max_rows: usize,
+    ) -> Result<Vec<AuditRow>, StoreError> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT node_id, seq, at_ms, action, subject, detail, actor,
+                        prev_hash, entry_hash
+                   FROM audit_log
+                  WHERE node_id = ?1 AND seq >= ?2
+               ORDER BY seq ASC
+                  LIMIT ?3",
+            )?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        node_id.as_bytes(),
+                        i64::try_from(from_seq).unwrap_or(i64::MAX),
+                        i64::try_from(max_rows).unwrap_or(i64::MAX),
+                    ],
+                    row_to_audit,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// One stored row's `prev_hash`.
+    pub(crate) fn entry_prev_hash_at(
+        &self,
+        node_id: NodeId,
+        seq: u64,
+    ) -> Result<Option<[u8; 32]>, StoreError> {
+        self.with_conn(|c| {
+            let raw: Option<Vec<u8>> = c
+                .query_row(
+                    "SELECT prev_hash FROM audit_log WHERE node_id = ?1 AND seq = ?2",
+                    params![node_id.as_bytes(), i64::try_from(seq).unwrap_or(i64::MAX)],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(raw.map(|b| to_hash(&b)))
+        })
+    }
+
+    /// Walk rows from `from_seq` WITHOUT re-checking the anchor — the
+    /// caller has established one (5.13c-2 anchors on a pin).
+    pub(crate) fn audit_verify_from_anchor(
+        &self,
+        node_id: NodeId,
+        from_seq: u64,
+        max_rows: usize,
+    ) -> Result<ChainStatus, StoreError> {
+        let rows = self.audit_rows_from(node_id, from_seq, max_rows)?;
+        if rows.is_empty() {
+            return Ok(ChainStatus::Empty);
+        }
+        Ok(verify_rows(node_id, &rows))
+    }
+
     /// The signed head of this node's chain — what a peer pins so a
     /// later rewrite is detectable (5.13c gossips it).
     ///
@@ -401,7 +495,7 @@ impl Store {
         })
     }
 
-    fn audit_entry_hash_at(
+    pub(crate) fn audit_entry_hash_at(
         &self,
         node_id: NodeId,
         seq: u64,
@@ -445,17 +539,21 @@ impl Store {
         };
         self.with_conn(|c| {
             let mut stmt = c.prepare(
+                // Ordered and paged on the EFFECTIVE timestamp — our
+                // receive time for ingested rows — so a peer cannot
+                // choose where its entries land in our History
+                // (Codex P2 on #67). The V0011 index covers this.
                 "SELECT node_id, seq, at_ms, action, subject, detail, actor,
-                        prev_hash, entry_hash
+                        prev_hash, entry_hash, COALESCE(received_at_ms, at_ms) AS feed_ms
                    FROM audit_log
                   WHERE (?1 IS NULL
-                         OR at_ms < ?1
-                         OR (at_ms = ?1
+                         OR COALESCE(received_at_ms, at_ms) < ?1
+                         OR (COALESCE(received_at_ms, at_ms) = ?1
                              AND (node_id < ?2
                                   OR (node_id = ?2 AND seq < ?3))))
                     AND (?4 IS NULL OR action = ?4)
                     AND (?5 IS NULL OR node_id = ?5)
-               ORDER BY at_ms DESC, node_id DESC, seq DESC
+               ORDER BY feed_ms DESC, node_id DESC, seq DESC
                   LIMIT ?6",
             )?;
             let rows = stmt
@@ -477,7 +575,7 @@ impl Store {
 }
 
 /// Walk an ascending run of one node's entries.
-fn verify_rows(node_id: NodeId, rows: &[AuditRow]) -> ChainStatus {
+pub(crate) fn verify_rows(node_id: NodeId, rows: &[AuditRow]) -> ChainStatus {
     let Some(first) = rows.first() else {
         return ChainStatus::Empty;
     };
@@ -524,7 +622,7 @@ fn verify_rows(node_id: NodeId, rows: &[AuditRow]) -> ChainStatus {
 /// and reproduce its hash — so rewriting a `task.dispatched` row's
 /// action to anything unrecognized would display the forged action
 /// while the chain reported "verified".
-fn action_from_str(s: &str) -> Option<AuditAction> {
+pub(crate) fn action_from_str(s: &str) -> Option<AuditAction> {
     Some(match s {
         "task.dispatched" => AuditAction::TaskDispatched,
         "task.cancelled" => AuditAction::TaskCancelled,

@@ -280,7 +280,7 @@ fn t07_v0006_migrates_populated_v0005_database() {
     // with provenance None, cost None, and intact output.
     let cfg = harness_store::StoreConfig::at(&path);
     let s = Store::open(&cfg).expect("open migrates");
-    assert_eq!(s.schema_version().expect("version"), "10");
+    assert_eq!(s.schema_version().expect("version"), "11");
     let loaded = s
         .load_task_result(TaskId(uuid::Uuid::from_bytes([5; 16])))
         .expect("load")

@@ -40,10 +40,51 @@ const BACKOFF_AFTER_FAILURES: u32 = 3;
 /// Ticks skipped once a peer is in backoff.
 const BACKOFF_TICKS: u32 = 10;
 
+/// Outstanding entry requests we will track at once.
+///
+/// This mesh has no request/response primitive — `OutboundMsg` is
+/// fire-and-forget — so a response is matched by an explicit `req_id`
+/// against this table. Bounded because the table is fed by our own
+/// requests but *keyed* against replies a peer controls the timing of.
+const MAX_INFLIGHT_REQUESTS: usize = 32;
+
+/// How long an unanswered request stays matchable. A reply arriving
+/// after this is dropped: its `req_id` is gone, so it cannot be
+/// mistaken for the answer to a later question.
+const REQUEST_TIMEOUT_MS: u64 = 30_000;
+
+/// Entry batches one peer may ask us for per minute. Serving reads
+/// rows under the single process-wide connection mutex, and a
+/// `RangeReq` is replayable, so the only thing between a trusted peer
+/// and unbounded read work is this.
+const SERVE_BATCHES_PER_MINUTE: u32 = 20;
+const SERVE_WINDOW_MS: u64 = 60_000;
+
+/// Follow-up rounds allowed per walk. `MAX_INGEST_ROWS_PER_PULL`
+/// (5000) rows per round covers any realistic chain well inside this.
+const MAX_FOLLOWUP_ROUNDS: u32 = 64;
+
 #[derive(Default)]
 struct PeerSyncState {
     consecutive_failures: u32,
     skip_ticks: u32,
+    /// Serve-side rate limiting: window start and batches served in it.
+    serve_window_start_ms: u64,
+    served_in_window: u32,
+}
+
+/// A request we sent and are still waiting on.
+#[derive(Debug, Clone, Copy)]
+struct InFlight {
+    peer: NodeId,
+    subject: NodeId,
+    target_seq: u64,
+    from_seq: u64,
+    sent_at_ms: u64,
+    /// Follow-ups already issued for this walk. A server that always
+    /// sets `truncated` and returns one row per reply would otherwise
+    /// keep us asking forever (diff review MAJOR-6).
+    round: u32,
 }
 
 pub(crate) struct AuditSyncService {
@@ -53,6 +94,11 @@ pub(crate) struct AuditSyncService {
     trust: TrustStore,
     net: OnceLock<Weak<PeerNet>>,
     peers: ParkingMutex<HashMap<NodeId, PeerSyncState>>,
+    inflight: ParkingMutex<HashMap<[u8; 16], InFlight>>,
+    /// Monotonic counter feeding request ids. Ids need to be unique,
+    /// not unpredictable — they never authorize anything, and the
+    /// reply is validated on content regardless.
+    next_req: std::sync::atomic::AtomicU64,
 }
 
 impl AuditSyncService {
@@ -65,6 +111,11 @@ impl AuditSyncService {
             trust,
             net: OnceLock::new(),
             peers: ParkingMutex::new(HashMap::new()),
+            inflight: ParkingMutex::new(HashMap::new()),
+            // Seeded from the clock, not 1: a counter that resets on
+            // every boot lets a peer replay an old reply against a
+            // same-numbered new request (diff review MINOR).
+            next_req: std::sync::atomic::AtomicU64::new(now_unix_ms()),
         })
     }
 
@@ -103,6 +154,12 @@ impl AuditSyncService {
         env: &AuditSyncEnvelope,
         now_ms: u64,
     ) -> Vec<(NodeId, PinOutcome)> {
+        if let Some(req) = &env.range_req {
+            self.serve_range(from, req, now_ms);
+        }
+        if let Some(resp) = &env.range_resp {
+            self.consume_range(from, resp, now_ms);
+        }
         let mut out = Vec::new();
         let keys = self.pubkey_map();
         for head in env.heads.iter().take(harness_core::MAX_HEADS_PER_ENVELOPE) {
@@ -228,6 +285,34 @@ impl AuditSyncService {
         relayed.into_iter().map(|(head, _)| head).collect()
     }
 
+    /// Register an in-flight request without sending it, so a test
+    /// can deliver a crafted response without a live peer racing it
+    /// with the honest answer.
+    #[cfg(test)]
+    pub(crate) fn track_inflight_for_test(
+        &self,
+        peer: NodeId,
+        subject: NodeId,
+        from_seq: u64,
+        target_seq: u64,
+        now_ms: u64,
+    ) -> [u8; 16] {
+        let round = 0;
+        let req_id = self.mint_req_id();
+        self.inflight.lock().insert(
+            req_id,
+            InFlight {
+                peer,
+                subject,
+                target_seq,
+                from_seq,
+                sent_at_ms: now_ms,
+                round,
+            },
+        );
+        req_id
+    }
+
     #[cfg(test)]
     pub(crate) fn relayable_heads_for_test(&self) -> Vec<AuditHead> {
         self.relayable_heads()
@@ -250,6 +335,8 @@ impl AuditSyncService {
             source: self.local_id,
             assembled_at: now_ms,
             heads,
+            range_req: None,
+            range_resp: None,
             sig: harness_core::Signature::from_bytes([0u8; 64]),
         };
         if let Err(e) = env.sign(&self.identity) {
@@ -280,6 +367,273 @@ impl AuditSyncService {
                 self.note_send_failed(peer);
             }
         }
+    }
+
+    /// Ask `peer` for a run of `subject`'s chain, walking toward the
+    /// pin at `target_seq`.
+    ///
+    /// Returns false if the request could not be sent or the in-flight
+    /// table is full — pulls are best-effort and retried on a later
+    /// tick, because a pin that stays `unchecked` is honest.
+    pub(crate) fn request_range(
+        &self,
+        peer: NodeId,
+        subject: NodeId,
+        from_seq: u64,
+        target_seq: u64,
+        now_ms: u64,
+    ) -> bool {
+        self.request_range_round(peer, subject, from_seq, target_seq, 0, now_ms)
+    }
+
+    fn request_range_round(
+        &self,
+        peer: NodeId,
+        subject: NodeId,
+        from_seq: u64,
+        target_seq: u64,
+        round: u32,
+        now_ms: u64,
+    ) -> bool {
+        if round > MAX_FOLLOWUP_ROUNDS {
+            tracing::warn!(
+                target: "harness.audit.sync",
+                subject = %subject,
+                round,
+                "audit walk exceeded its follow-up budget; abandoned"
+            );
+            return false;
+        }
+        let Some(net) = self.net.get().and_then(Weak::upgrade) else {
+            return false;
+        };
+        let req_id = self.mint_req_id();
+        {
+            let mut inflight = self.inflight.lock();
+            inflight.retain(|_, f| now_ms.saturating_sub(f.sent_at_ms) < REQUEST_TIMEOUT_MS);
+            if inflight.len() >= MAX_INFLIGHT_REQUESTS {
+                return false;
+            }
+            inflight.insert(
+                req_id,
+                InFlight {
+                    peer,
+                    subject,
+                    target_seq,
+                    from_seq,
+                    sent_at_ms: now_ms,
+                    round,
+                },
+            );
+        }
+        let to_seq = target_seq;
+        let mut env = AuditSyncEnvelope {
+            source: self.local_id,
+            assembled_at: now_ms,
+            heads: Vec::new(),
+            range_req: Some(harness_core::AuditRangeReq {
+                req_id,
+                node_id: subject,
+                from_seq,
+                to_seq,
+            }),
+            range_resp: None,
+            sig: harness_core::Signature::from_bytes([0u8; 64]),
+        };
+        if env.sign(&self.identity).is_err() {
+            self.inflight.lock().remove(&req_id);
+            return false;
+        }
+        if net.send_to(peer, OutboundMsg::AuditHeads(env)).is_err() {
+            self.inflight.lock().remove(&req_id);
+            return false;
+        }
+        true
+    }
+
+    fn mint_req_id(&self) -> [u8; 16] {
+        let n = self
+            .next_req
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut id = [0u8; 16];
+        id[..8].copy_from_slice(&self.local_id.as_bytes()[..8]);
+        id[8..].copy_from_slice(&n.to_be_bytes());
+        id
+    }
+
+    /// Serve a peer's request for entries, rate-limited per peer.
+    ///
+    /// Reading rows holds the single process-wide connection mutex and
+    /// a `RangeReq` is replayable, so without this a trusted peer can
+    /// stall dispatch by asking repeatedly.
+    fn serve_range(&self, peer: NodeId, req: &harness_core::AuditRangeReq, now_ms: u64) {
+        // Trust gate BEFORE the budget, so a refused Guest does not
+        // burn the allowance of a peer we would have served (diff
+        // review MINOR).
+        //
+        // `peers.toml` membership IS the trust boundary in this build:
+        // nothing constructs `TrustTier::Trusted` outside tests and
+        // pairing's QUIC leg is stubbed, so gating on Trusted would
+        // ship this path inert.
+        if self.trust.tier(&peer) == harness_mesh::trust::TrustTier::Guest {
+            return;
+        }
+        if !self.may_serve(peer, now_ms) {
+            tracing::debug!(
+                target: "harness.audit.sync",
+                peer = %peer,
+                "audit range request rate-limited"
+            );
+            return;
+        }
+        let Some(net) = self.net.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        let (entries, truncated) =
+            match self
+                .store
+                .audit_entries_for_range(req.node_id, req.from_seq, req.to_seq)
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(target: "harness.audit.sync", ?e, "serving audit range");
+                    return;
+                }
+            };
+        if entries.is_empty() {
+            return;
+        }
+        let mut env = AuditSyncEnvelope {
+            source: self.local_id,
+            assembled_at: now_ms,
+            heads: Vec::new(),
+            range_req: None,
+            range_resp: Some(harness_core::AuditRangeResp {
+                req_id: req.req_id,
+                node_id: req.node_id,
+                entries,
+                truncated,
+            }),
+            sig: harness_core::Signature::from_bytes([0u8; 64]),
+        };
+        if env.sign(&self.identity).is_err() {
+            return;
+        }
+        let _ = net.send_to(peer, OutboundMsg::AuditHeads(env));
+    }
+
+    fn may_serve(&self, peer: NodeId, now_ms: u64) -> bool {
+        let mut states = self.peers.lock();
+        let state = states.entry(peer).or_default();
+        if now_ms.saturating_sub(state.serve_window_start_ms) >= SERVE_WINDOW_MS {
+            state.serve_window_start_ms = now_ms;
+            state.served_in_window = 0;
+        }
+        if state.served_in_window >= SERVE_BATCHES_PER_MINUTE {
+            return false;
+        }
+        state.served_in_window += 1;
+        true
+    }
+
+    /// Consume a batch of entries answering one of our requests.
+    ///
+    /// Returns the ingest outcome for tests and logging.
+    fn consume_range(
+        &self,
+        peer: NodeId,
+        resp: &harness_core::AuditRangeResp,
+        now_ms: u64,
+    ) -> Option<Result<harness_store::IngestProgress, harness_store::IngestRefusal>> {
+        // An unmatched or expired id is dropped: it cannot be mistaken
+        // for the answer to a later question.
+        let flight = {
+            let mut inflight = self.inflight.lock();
+            inflight.retain(|_, f| now_ms.saturating_sub(f.sent_at_ms) < REQUEST_TIMEOUT_MS);
+            inflight.remove(&resp.req_id)?
+        };
+        if flight.peer != peer || flight.subject != resp.node_id {
+            tracing::warn!(
+                target: "harness.audit.sync",
+                peer = %peer,
+                "audit range response does not match its request; dropped"
+            );
+            return None;
+        }
+        // The batch must START where we asked (Codex P1 on #67).
+        // Without this, a malicious subject answers a request for
+        // 1..target with ONLY its valid entry at `target`: a fresh run
+        // accepts that arbitrary starting point, the final hash equals
+        // the pin, and the pin is marked corroborated without a single
+        // preceding entry being walked — which is the entire guarantee.
+        match resp.entries.first() {
+            Some(first) if first.seq == flight.from_seq => {}
+            Some(first) => {
+                tracing::warn!(
+                    target: "harness.audit.sync",
+                    peer = %peer,
+                    subject = %resp.node_id,
+                    asked_from = flight.from_seq,
+                    got_from = first.seq,
+                    "audit range response does not start where we asked; dropped"
+                );
+                return None;
+            }
+            None => return None,
+        }
+        let outcome = match self.store.audit_ingest_range(
+            self.local_id,
+            resp.node_id,
+            flight.target_seq,
+            &resp.entries,
+            now_ms,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(target: "harness.audit.sync", ?e, "ingesting audit range");
+                return None;
+            }
+        };
+        match &outcome {
+            Ok(progress) => {
+                if progress.reached_pin {
+                    match self
+                        .store
+                        .settle_pin_from_run(resp.node_id, flight.target_seq)
+                    {
+                        Ok(status) => tracing::info!(
+                            target: "harness.audit.sync",
+                            subject = %resp.node_id,
+                            seq = flight.target_seq,
+                            status = status.as_str(),
+                            "audit pin settled from an entry walk"
+                        ),
+                        Err(e) => {
+                            tracing::warn!(target: "harness.audit.sync", ?e, "settling pin");
+                        }
+                    }
+                } else if resp.truncated {
+                    // More to come: ask for the next slice.
+                    self.request_range_round(
+                        peer,
+                        resp.node_id,
+                        progress.through_seq.saturating_add(1),
+                        flight.target_seq,
+                        flight.round.saturating_add(1),
+                        now_ms,
+                    );
+                }
+            }
+            Err(refusal) => tracing::warn!(
+                target: "harness.audit.sync",
+                peer = %peer,
+                subject = %resp.node_id,
+                ?refusal,
+                "audit range refused"
+            ),
+        }
+        let _ = flight.from_seq;
+        Some(outcome)
     }
 
     /// A push to `peer` failed on the wire.
@@ -336,4 +690,25 @@ fn now_unix_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+/// 5.13c-2: the API's narrow view of entry pulling.
+///
+/// Kept here rather than in `harness-api` because the service is a
+/// daemon concern; the API sees only the trait (the `PauseControl`
+/// precedent). Without this impl the endpoint would answer
+/// `mesh_not_configured` forever — a route that exists and never works
+/// is the inertness defect this project has hit repeatedly.
+impl harness_api::AuditPuller for AuditSyncService {
+    fn request_range(&self, peer: NodeId, subject: NodeId, from_seq: u64, target_seq: u64) -> bool {
+        AuditSyncService::request_range(self, peer, subject, from_seq, target_seq, now_unix_ms())
+    }
+}
+
+impl std::fmt::Debug for AuditSyncService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditSyncService")
+            .field("local_id", &self.local_id)
+            .finish_non_exhaustive()
+    }
 }

@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+pub mod audit_ingest;
 pub mod capabilities;
 pub mod checkpoints;
 pub mod error;
@@ -23,6 +24,9 @@ pub mod tasks;
 
 pub use crate::audit::{
     AuditCursor, AuditRow, ChainStatus, StoreAuditSink, BURST_ALLOWANCE, MAX_AUDIT_DETAIL_BYTES,
+};
+pub use crate::audit_ingest::{
+    IngestProgress, IngestRefusal, MAX_INGEST_ROWS_PER_PULL, MAX_INGEST_SKEW_MS, MAX_SERVE_BYTES,
 };
 pub use crate::capabilities::nodes_for_versioned_capability;
 pub use crate::checkpoints::{aggregate_is_complete, MAX_CHECKPOINT_OUTPUT_BYTES};

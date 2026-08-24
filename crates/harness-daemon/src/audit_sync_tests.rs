@@ -12,7 +12,7 @@ use std::time::Duration;
 use harness_core::{AuditAction, AuditActor, AuditRecord, AuditSink, Signable, Signature};
 use harness_store::{PinStatus, StoreAuditSink};
 
-use crate::fanout_tests::{boot_pair, wait_for_mesh, TestDaemon};
+use crate::fanout_tests::{boot_pair, now_ms, wait_for_mesh, TestDaemon};
 
 fn append_entries(daemon: &TestDaemon, n: usize) {
     let sink = StoreAuditSink::new(daemon.store.clone(), daemon.node_id());
@@ -134,6 +134,8 @@ async fn m03_a_rewritten_chain_is_caught_as_a_fork() {
         source: a.node_id(),
         assembled_at: 10_000_000,
         heads: vec![forged],
+        range_req: None,
+        range_resp: None,
         sig: Signature::from_bytes([0u8; 64]),
     };
     env.sign(a.identity.as_ref()).expect("sign envelope");
@@ -200,6 +202,8 @@ async fn m04_a_head_from_an_unknown_node_is_dropped() {
         source: a.node_id(),
         assembled_at: 1_000,
         heads: vec![head],
+        range_req: None,
+        range_resp: None,
         sig: Signature::from_bytes([0u8; 64]),
     };
     env.sign(a.identity.as_ref()).expect("sign");
@@ -236,6 +240,8 @@ async fn m05_a_forged_signature_is_rejected_even_from_a_trusted_relay() {
         source: a.node_id(),
         assembled_at: 1_000,
         heads: vec![head],
+        range_req: None,
+        range_resp: None,
         sig: Signature::from_bytes([0u8; 64]),
     };
     env.sign(a.identity.as_ref()).expect("sign");
@@ -383,6 +389,8 @@ fn envelope(
         source: from.node_id(),
         assembled_at: 1_000,
         heads,
+        range_req: None,
+        range_resp: None,
         sig: Signature::from_bytes([0u8; 64]),
     };
     env.sign(from).expect("sign envelope");
@@ -585,4 +593,196 @@ fn m11_relay_ranks_on_our_clock_and_selects_our_newest_observation() {
         "most recently OBSERVED first — B's u64::MAX at_ms buys nothing, got {order:?}"
     );
     assert!(order.contains(&[0xB1; 32]), "B's head is still relayed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m12_a_pin_is_corroborated_from_entries_over_the_wire() {
+    // The 5.13c-2 property, end to end: B pins A's head, asks A for
+    // the entries behind it, walks them, and upgrades the pin from
+    // `unchecked` to `corroborated`. Nothing here reaches into a
+    // store directly — the request and the batch both cross QUIC.
+    let (a, b) = boot_pair(None).await;
+    wait_for_mesh(&a, &b).await;
+
+    append_entries(&a, 12);
+    let target = wait_for_pin(&b, a.node_id(), "b to pin a's head").await;
+
+    let pins = b.store.peer_head_pins(a.node_id()).expect("pins");
+    assert_eq!(
+        pins.last().expect("pin").status,
+        PinStatus::Unchecked,
+        "a fresh pin claims nothing until the entries are walked"
+    );
+
+    // b asks a for everything up to the pinned position.
+    let svc = b.audit_sync.clone();
+    assert!(
+        svc.request_range(a.node_id(), a.node_id(), 1, target, now_ms()),
+        "request sent"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if b.store
+            .audit_run_corroborates(a.node_id(), target)
+            .expect("check")
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for corroboration"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let settled = b
+        .store
+        .peer_head_pins(a.node_id())
+        .expect("pins")
+        .into_iter()
+        .find(|p| p.seq == target)
+        .expect("pin");
+    assert_eq!(settled.status, PinStatus::Corroborated);
+
+    // And the entries really landed, stamped with OUR receive clock.
+    let rows = b
+        .store
+        .audit_entries_for_range(a.node_id(), 1, target)
+        .expect("read")
+        .0;
+    assert_eq!(u64::try_from(rows.len()).unwrap_or(0), target);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m13_an_unmatched_response_is_dropped() {
+    // No request/response primitive exists in this mesh, so a reply is
+    // matched by an explicit req_id. An unsolicited batch — or one
+    // answering a question we never asked — must not be ingested.
+    let (a, b) = boot_pair(None).await;
+    wait_for_mesh(&a, &b).await;
+    append_entries(&a, 5);
+
+    let (entries, _) = a
+        .store
+        .audit_entries_for_range(a.node_id(), 1, 5)
+        .expect("serve");
+    let mut env = harness_core::AuditSyncEnvelope {
+        source: a.node_id(),
+        assembled_at: now_ms(),
+        heads: Vec::new(),
+        range_req: None,
+        range_resp: Some(harness_core::AuditRangeResp {
+            req_id: [0xAB; 16],
+            node_id: a.node_id(),
+            entries,
+            truncated: false,
+        }),
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    env.sign(a.identity.as_ref()).expect("sign");
+
+    let svc = crate::audit_sync::AuditSyncService::new(
+        b.store.clone(),
+        b.identity.clone(),
+        b.trust.clone(),
+    );
+    svc.ingest(a.node_id(), &env, now_ms());
+
+    let (rows, _) = b
+        .store
+        .audit_entries_for_range(a.node_id(), 1, 5)
+        .expect("read");
+    assert!(
+        rows.is_empty(),
+        "an unsolicited batch must not be ingested, got {} rows",
+        rows.len()
+    );
+}
+
+#[test]
+fn m14_a_response_must_start_where_we_asked() {
+    // Codex P1 on #67. A malicious subject answers a request for
+    // 1..target with ONLY its valid entry at `target`. Without this
+    // check a fresh run accepts that starting point, the final hash
+    // equals the pin, and the pin is marked corroborated without one
+    // preceding entry being walked — the whole guarantee, gone.
+    //
+    // Deliberately not a two-daemon test: a live peer answers the
+    // request honestly before a crafted reply can land, which would
+    // corroborate the pin for the RIGHT reason and hide the bug.
+    let (store, me, trust, _b, c, _tmp) = trio();
+    let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me, trust);
+
+    // Build a real chain for C and pin its head.
+    let subject_store = harness_store::Store::open_memory().expect("subject store");
+    let sink = StoreAuditSink::new(subject_store.clone(), c.node_id());
+    for i in 0..10 {
+        sink.record(
+            AuditRecord::new(AuditAction::TaskDispatched, AuditActor::System)
+                .with_subject(format!("task-{i}")),
+        );
+    }
+    let (all, _) = subject_store
+        .audit_entries_for_range(c.node_id(), 1, 10)
+        .expect("serve");
+    let head = all.last().expect("entries");
+    let mut pin_head = harness_core::AuditHead {
+        node_id: c.node_id(),
+        seq: head.seq,
+        entry_hash: head.entry_hash,
+        at_ms: now_ms(),
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    pin_head.sign(&c).expect("sign");
+    store
+        .pin_peer_head(&pin_head, c.node_id(), now_ms())
+        .expect("pin");
+
+    // Also pin the PREDECESSOR, so the store's own anchor check would
+    // accept a batch starting at 10. That leaves the daemon's
+    // start-position guard as the only thing standing between a
+    // one-row answer and a corroborated pin — without it this test
+    // would pass for the wrong reason.
+    let prev = &all[8];
+    let mut pin_prev = harness_core::AuditHead {
+        node_id: c.node_id(),
+        seq: prev.seq,
+        entry_hash: prev.entry_hash,
+        at_ms: now_ms(),
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    pin_prev.sign(&c).expect("sign");
+    store
+        .pin_peer_head(&pin_prev, c.node_id(), now_ms())
+        .expect("pin");
+
+    // We asked for 1..=10; the answer contains only entry 10.
+    let req_id = svc.track_inflight_for_test(c.node_id(), c.node_id(), 1, head.seq, now_ms());
+    let mut env = harness_core::AuditSyncEnvelope {
+        source: c.node_id(),
+        assembled_at: now_ms(),
+        heads: Vec::new(),
+        range_req: None,
+        range_resp: Some(harness_core::AuditRangeResp {
+            req_id,
+            node_id: c.node_id(),
+            entries: vec![head.clone()],
+            truncated: false,
+        }),
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    env.sign(&c).expect("sign");
+    svc.ingest(c.node_id(), &env, now_ms());
+
+    assert!(
+        !store
+            .audit_run_corroborates(c.node_id(), head.seq)
+            .expect("check"),
+        "a truncated answer must not corroborate the pin"
+    );
+    let (rows, _) = store
+        .audit_entries_for_range(c.node_id(), 1, head.seq)
+        .expect("read");
+    assert!(rows.is_empty(), "and nothing was ingested");
 }

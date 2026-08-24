@@ -26,6 +26,9 @@ pub(crate) struct TestDaemon {
     pub(crate) partials: Arc<harness_api::PartialBuffers>,
     /// 5.13c-1: needed to resolve a relayed head's signing key.
     pub(crate) trust: TrustStore,
+    /// 5.13c-2: the daemon's OWN sync service, so a pull test drives
+    /// the wired instance rather than a detached copy.
+    pub(crate) audit_sync: Arc<crate::audit_sync::AuditSyncService>,
     pub(crate) stop_tx: watch::Sender<bool>,
     pub(crate) handle: tokio::task::JoinHandle<()>,
     pub(crate) root: tempfile::TempDir,
@@ -112,6 +115,7 @@ async fn boot_one(
     let store = orch.store();
     let peers = orch.peer_table();
     let partials = orch.partial_buffers();
+    let audit_sync = orch.audit_sync();
     let (stop_tx, stop_rx) = watch::channel(false);
     let handle = tokio::spawn(async move {
         let _ = orch.run_until(stop_rx).await;
@@ -123,6 +127,7 @@ async fn boot_one(
         mesh_addr,
         partials,
         trust,
+        audit_sync,
         stop_tx,
         handle,
         root,
