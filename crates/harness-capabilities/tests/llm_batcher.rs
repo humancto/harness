@@ -39,6 +39,7 @@ fn ctx_with_tags(tags: Vec<String>) -> ExecutionContext {
         task_id: TaskId::new_v7(),
         tags: Arc::from(tags),
         frame_sink: None,
+        audit: None,
     }
 }
 

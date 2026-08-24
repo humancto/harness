@@ -195,7 +195,17 @@ pub(crate) fn mint_task_guarded(
         trace_ctx: TraceContext::default(),
         issued_by: state.local_node_id,
         issued_at: now_ms,
-        tags: req.tags,
+        // 5.13a (Codex P2 on #64): provenance rides the envelope, so a
+        // capability executing this task can record WHO asked. Webhook
+        // mints already tag their channel; everything else through
+        // this path is an authenticated submission.
+        tags: {
+            let mut tags = req.tags;
+            if !tags.iter().any(|t| t == "webhook") && !tags.iter().any(|t| t == "api") {
+                tags.push("api".to_string());
+            }
+            tags
+        },
         sig: Signature::from_bytes([0u8; 64]),
     };
 
@@ -563,6 +573,16 @@ pub async fn cancel_handler(
             if let Err(err) = store.replica_apply_local(&mirror) {
                 tracing::warn!(target: "harness.api.tasks", ?err, "replica_apply_local (cancel)");
             }
+            // 5.13a (ADR-0041): an operator stop is privileged (§10.6).
+            audit(
+                store,
+                state.local_node_id,
+                &harness_core::AuditRecord::new(
+                    harness_core::AuditAction::TaskCancelled,
+                    harness_core::AuditActor::LocalAdmin,
+                )
+                .with_subject(task_id.0.to_string()),
+            );
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "state": "cancelled" })),
@@ -765,27 +785,58 @@ fn mint_resumed_plan(
             })),
         )
             .into_response(),
-        Ok(MintOutcome::Minted(new_id)) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "task_id": format!("{}", new_id.0.as_hyphenated()),
-                "plan_id": format!("{}", point.plan_id.0.as_hyphenated()),
-                // Checkpoints live on the node that RAN the plan, and a
-                // resumed plan.execute is placed by the scheduler
-                // (Cardinality::Anyone, no pin) — so this counts what
-                // THIS node holds, which may not be where the resumed
-                // run lands (diff review MINOR-4).
-                "replayable_local": replayable,
-                "unscheduled": point.unscheduled,
-                "in_flight": point.in_flight,
-            })),
-        )
-            .into_response(),
+        Ok(MintOutcome::Minted(new_id)) => {
+            audit(
+                store,
+                state.local_node_id,
+                &harness_core::AuditRecord::new(
+                    harness_core::AuditAction::PlanResumed,
+                    harness_core::AuditActor::LocalAdmin,
+                )
+                .with_subject(point.plan_id.0.to_string())
+                .with_detail(&serde_json::json!({
+                    "task_id": new_id.0.to_string(),
+                    "replayable_local": replayable,
+                })),
+            );
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "task_id": format!("{}", new_id.0.as_hyphenated()),
+                    "plan_id": format!("{}", point.plan_id.0.as_hyphenated()),
+                    // Checkpoints live on the node that RAN the plan, and a
+                    // resumed plan.execute is placed by the scheduler
+                    // (Cardinality::Anyone, no pin) — so this counts what
+                    // THIS node holds, which may not be where the resumed
+                    // run lands (diff review MINOR-4).
+                    "replayable_local": replayable,
+                    "unscheduled": point.unscheduled,
+                    "in_flight": point.in_flight,
+                })),
+            )
+                .into_response()
+        }
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": err })),
         )
             .into_response(),
+    }
+}
+
+/// 5.13a: record a privileged API action on this node's chain.
+/// Best-effort — a failure to record never fails the action.
+fn audit(
+    store: &harness_store::Store,
+    node_id: harness_core::NodeId,
+    record: &harness_core::AuditRecord,
+) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    if let Err(err) = store.audit_append(node_id, record, now) {
+        tracing::warn!(target: "harness.api.tasks", ?err, "audit append");
     }
 }
 

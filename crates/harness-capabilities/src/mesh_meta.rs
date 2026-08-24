@@ -792,6 +792,7 @@ mod tests {
             task_id: TaskId::new_v7(),
             tags: Arc::from(Vec::<String>::new()),
             frame_sink: None,
+            audit: None,
         }
     }
 

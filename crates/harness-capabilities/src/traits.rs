@@ -37,6 +37,60 @@ pub struct ExecutionContext {
     /// partial-stream sink here so any capability can emit `Progress`
     /// frames without bespoke plumbing. `None` disables emission.
     pub frame_sink: Option<FrameSink>,
+    /// 5.13a (ADR-0041): where privileged actions are recorded. The
+    /// executor stamps the daemon's store-backed sink here, so a
+    /// capability can audit without depending on `harness-store`
+    /// (this crate is core-only by design — plan review BLOCKER-1).
+    /// `None` records nothing: bare fixtures and the validation-only
+    /// API context have no chain to append to.
+    pub audit: Option<std::sync::Arc<dyn harness_core::AuditSink>>,
+}
+
+/// 5.13a: who asked for an execution, read from the task envelope.
+///
+/// Provenance has to travel WITH the task (Codex P2 on #64): every
+/// API and webhook mint sets `issued_by` to the local node, so
+/// inferring the actor from node identity alone would record every
+/// operator submission and every webhook-driven execution as
+/// `system`, and the closed actor set would be decorative.
+///
+/// The webhook adapters already tag their mints `["webhook",
+/// <channel>]`, and `mint_task` tags authenticated submissions
+/// `"api"` — so the envelope carries what is needed without any new
+/// field, and without any caller-supplied text (the channel names are
+/// compile-time constants).
+#[must_use]
+pub fn audit_actor(ctx: &ExecutionContext) -> harness_core::AuditActor {
+    if ctx.issued_by != ctx.local_node {
+        return harness_core::AuditActor::Peer {
+            node: ctx.issued_by,
+        };
+    }
+    if ctx.tags.iter().any(|t| t == "webhook") {
+        // The channel tag sits beside the marker; fall back to the
+        // marker alone rather than inventing a name.
+        let channel = ctx
+            .tags
+            .iter()
+            .find(|t| *t != "webhook" && matches!(t.as_str(), "whatsapp" | "sms" | "shortcuts"))
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        return harness_core::AuditActor::Webhook { channel };
+    }
+    if ctx.tags.iter().any(|t| t == "api") {
+        return harness_core::AuditActor::LocalAdmin;
+    }
+    // Internal mints: plan steps, federated sub-tasks, sweeps.
+    harness_core::AuditActor::System
+}
+
+impl ExecutionContext {
+    /// Record a privileged action, if this context has a sink.
+    pub fn audit(&self, record: harness_core::AuditRecord) {
+        if let Some(sink) = &self.audit {
+            sink.record(record);
+        }
+    }
 }
 
 impl std::fmt::Debug for ExecutionContext {
@@ -50,6 +104,7 @@ impl std::fmt::Debug for ExecutionContext {
             .field("task_id", &self.task_id)
             .field("tags", &self.tags)
             .field("frame_sink", &self.frame_sink.is_some())
+            .field("audit", &self.audit.is_some())
             .finish()
     }
 }
@@ -165,4 +220,104 @@ pub trait Capability: Send + Sync + 'static {
         ctx: &ExecutionContext,
         input: JsonValue,
     ) -> Result<JsonValue, CapabilityError>;
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod audit_actor_tests {
+    use super::*;
+    use harness_core::{AuditActor, NodeId, TaskId};
+
+    fn ctx(issued_by: NodeId, local: NodeId, tags: &[&str]) -> ExecutionContext {
+        ExecutionContext {
+            local_node: local,
+            local_node_name: Arc::from("self"),
+            issued_by,
+            issued_by_name: Arc::from("peer"),
+            task_id: TaskId::new_v7(),
+            tags: Arc::from(tags.iter().map(|s| (*s).to_string()).collect::<Vec<_>>()),
+            frame_sink: None,
+            audit: None,
+        }
+    }
+
+    #[test]
+    fn provenance_comes_from_the_envelope_not_node_identity() {
+        // Codex P2 on #64: every API and webhook mint sets issued_by to
+        // the LOCAL node, so inferring from node identity alone would
+        // record operator and webhook work alike as `system` and leave
+        // the closed actor set decorative.
+        let local = NodeId::from_bytes([1u8; 16]);
+        let peer = NodeId::from_bytes([2u8; 16]);
+
+        assert_eq!(
+            audit_actor(&ctx(peer, local, &[])),
+            AuditActor::Peer { node: peer }
+        );
+        assert_eq!(
+            audit_actor(&ctx(local, local, &["api"])),
+            AuditActor::LocalAdmin
+        );
+        assert_eq!(
+            audit_actor(&ctx(local, local, &["webhook", "sms"])),
+            AuditActor::Webhook {
+                channel: "sms".to_string()
+            }
+        );
+        // An internal mint (a plan step) is the daemon's own work.
+        assert_eq!(audit_actor(&ctx(local, local, &[])), AuditActor::System);
+    }
+
+    #[test]
+    fn a_webhook_actor_never_takes_caller_text() {
+        // The channel is matched against known adapter names, so a
+        // caller-supplied tag cannot land in the actor column.
+        let local = NodeId::from_bytes([1u8; 16]);
+        assert_eq!(
+            audit_actor(&ctx(local, local, &["webhook", "+15551234567"])),
+            AuditActor::Webhook {
+                channel: "unknown".to_string()
+            },
+            "an unrecognized tag is not a channel name"
+        );
+    }
+}
+
+/// 5.13a: a capturing [`harness_core::AuditSink`] for tests — the
+/// record sites' privacy claims are only real if something asserts
+/// them (diff review MAJOR-5). Compiled unconditionally: gating it
+/// behind a feature would mean the plain workspace test run cannot
+/// build the tests that need it, which is where CI runs them.
+#[derive(Debug, Default)]
+pub struct CapturingAuditSink {
+    records: parking_lot::Mutex<Vec<harness_core::AuditRecord>>,
+}
+
+impl CapturingAuditSink {
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Every record captured so far, as `(action, subject, detail)`.
+    #[must_use]
+    pub fn seen(&self) -> Vec<(String, Option<String>, Option<String>)> {
+        self.records
+            .lock()
+            .iter()
+            .map(|r| {
+                (
+                    r.action.as_str().to_string(),
+                    r.subject.clone(),
+                    r.detail.clone(),
+                )
+            })
+            .collect()
+    }
+}
+
+impl harness_core::AuditSink for CapturingAuditSink {
+    fn record(&self, record: harness_core::AuditRecord) {
+        self.records.lock().push(record);
+    }
 }

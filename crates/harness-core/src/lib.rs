@@ -6,6 +6,7 @@
 //! - **1.2** (in progress): [`protocol`] — wire types from PRD §13.
 //! - **1.3+**: mDNS, QUIC, gossip, election (in `harness-mesh`).
 
+pub mod audit;
 pub mod error;
 pub mod identity;
 pub mod ids;
@@ -16,6 +17,10 @@ pub use crate::error::ProtocolError;
 pub use crate::ids::{PlanId, SemVer, TaskId};
 pub use crate::replica::{
     ReplicaApplier, ReplicaError, ReplicaSyncEnvelope, ReplicatedState, ReplicatedTaskState,
+};
+pub use audit::{
+    audit_entry_hash, hash_hex, AuditAction, AuditActor, AuditHead, AuditRecord, AuditSink,
+    NullAuditSink,
 };
 pub use identity::{
     verify, Identity, KeyError, NodeId, ParseNodeIdError, PublicKey, Signature, VerifyError,

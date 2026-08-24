@@ -238,6 +238,8 @@ impl LoadView for StoreLoadView<'_> {
 
 pub(crate) struct DispatchRuntime {
     store: Store,
+    /// 5.13a (ADR-0041): dispatch is a §10.6 privileged action.
+    audit: Arc<dyn harness_core::AuditSink>,
     identity: Arc<Identity>,
     local_id: NodeId,
     registry: CapabilityRegistry,
@@ -381,6 +383,7 @@ impl DispatchRuntime {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         store: Store,
         identity: Arc<Identity>,
@@ -389,12 +392,14 @@ impl DispatchRuntime {
         trust: TrustStore,
         peers: PeerTable,
         secrets: Arc<dyn harness_vault::SecretsStore>,
+        audit: Arc<dyn harness_core::AuditSink>,
     ) -> Arc<Self> {
         let local_id = identity.node_id();
         let federated =
             crate::federated::FederatedCoordinator::new(store.clone(), identity.clone());
         Arc::new(Self {
             store,
+            audit,
             identity,
             local_id,
             federated,
@@ -770,6 +775,14 @@ impl DispatchRuntime {
                 return;
             }
         }
+        crate::audit_wiring::audit_dispatch(
+            &self.audit,
+            task.id,
+            &task.capability,
+            node,
+            task.issued_by,
+            self.local_id,
+        );
         if node == self.local_id {
             // Local: the executor picks it up from Dispatched(self).
             return;
@@ -1750,6 +1763,7 @@ mod tests {
             trust,
             peers.clone(),
             Arc::new(harness_vault::PlaintextStore::empty()),
+            std::sync::Arc::new(harness_core::NullAuditSink),
         );
         Fixture {
             runtime,

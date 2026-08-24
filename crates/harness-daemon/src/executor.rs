@@ -67,6 +67,10 @@ pub(crate) struct LocalExecutor {
     /// every `ExecutionContext` so capabilities emit Progress frames
     /// without per-trait plumbing. None in bare test fixtures.
     frame_sink: Option<harness_capabilities::FrameSink>,
+    /// 5.13a (ADR-0041): the store-backed audit sink, stamped into
+    /// every `ExecutionContext` so capabilities record privileged
+    /// actions without a store dependency. None in bare fixtures.
+    audit: Option<Arc<dyn harness_core::AuditSink>>,
     /// 4.6 (ADR-0028): worker-side lease-extension hook, called every
     /// `EXTEND_INTERVAL_MS` while a REMOTE-issued task executes. The
     /// dispatch runtime resolves the live lease per call (a
@@ -108,6 +112,7 @@ impl LocalExecutor {
             terminal_tx,
             success: None,
             frame_sink: None,
+            audit: None,
             lease_extender: None,
             pause: None,
         }
@@ -132,6 +137,12 @@ impl LocalExecutor {
     /// `ExecutionContext` (4.6, ADR-0028).
     pub(crate) fn with_frame_sink(mut self, sink: harness_capabilities::FrameSink) -> Self {
         self.frame_sink = Some(sink);
+        self
+    }
+
+    /// Attach the audit sink (5.13a, ADR-0041).
+    pub(crate) fn with_audit(mut self, sink: Arc<dyn harness_core::AuditSink>) -> Self {
+        self.audit = Some(sink);
         self
     }
 
@@ -313,6 +324,7 @@ impl LocalExecutor {
         let local_node_name = self.local_node_name.clone();
         let terminal_tx = self.terminal_tx.clone();
         let frame_sink = self.frame_sink.clone();
+        let audit = self.audit.clone();
         // 4.6: spawn the extender ONLY for remote-issued rows — locally
         // issued tasks have no lease to extend.
         let extender = if task.issued_by == self.local_node {
@@ -355,6 +367,7 @@ impl LocalExecutor {
                 task_id: id,
                 tags,
                 frame_sink,
+                audit,
             };
 
             let extender_task = spawn_extender(extender, id);
@@ -487,6 +500,27 @@ impl LocalExecutor {
 /// point, outside the plan driver — and (b) rows older than the
 /// retention window, for plans nobody ever resubmits.
 pub(crate) const CHECKPOINT_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// 5.13a: how many audit entries a node keeps. The log is the one
+/// table meant to persist, but it is not unbounded: denied
+/// `shell.exec` appends one row per attempt and is
+/// attacker-triggerable, so an unreaped chain is a disk-exhaustion
+/// vector. Pruning goes THROUGH a marker, so what survives still
+/// verifies.
+pub(crate) const AUDIT_RETENTION_ENTRIES: u64 = 100_000;
+
+pub(crate) fn prune_audit_log(store: &Store, node: NodeId) {
+    let now = now_unix_ms();
+    match store.audit_prune(node, AUDIT_RETENTION_ENTRIES, now) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            target: "harness.executor",
+            rows = n,
+            "pruned audit entries past the retention bound"
+        ),
+        Err(e) => tracing::warn!(target: "harness.executor", ?e, "audit prune"),
+    }
+}
 
 pub(crate) fn sweep_stale_checkpoints(store: &Store) {
     // Plans whose own result row is durably written need no

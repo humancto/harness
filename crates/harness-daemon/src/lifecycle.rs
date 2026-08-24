@@ -49,6 +49,9 @@ pub(crate) struct DaemonOrchestrator {
     heartbeat: Arc<HeartbeatService>,
     election: Arc<Election>,
     persistent_trust: TrustStore,
+    /// 5.13a (ADR-0041): the audit chain's sink, kept so the run
+    /// phase can spawn the trust auditor.
+    audit_sink: std::sync::Arc<dyn harness_core::AuditSink>,
     /// Local executor for running tasks the daemon picks up. Phase 3.3a.
     executor: crate::executor::LocalExecutor,
     /// Per-peer connection registry + channel router. Phase 3.3-fanout.
@@ -179,6 +182,13 @@ impl DaemonOrchestrator {
         // still resume from.
         crate::executor::sweep_stale_checkpoints(&store);
 
+        // 5.13a (ADR-0041): the audit chain's sink. Built here because
+        // everything downstream — capabilities, the trust auditor, the
+        // dispatcher — records through it.
+        let audit_sink: std::sync::Arc<dyn harness_core::AuditSink> = std::sync::Arc::new(
+            harness_store::StoreAuditSink::new(store.clone(), identity.node_id()),
+        );
+
         // 4.7 (ADR-0029): the shared backpressure switch — heartbeat
         // producer, API surface, and local dispatch view all consult
         // this one instance.
@@ -216,6 +226,10 @@ impl DaemonOrchestrator {
             }
         };
         let policy_engine = std::sync::Arc::new(policy_engine);
+        // 5.13a (ADR-0041): §10.6 names a policy change privileged.
+        // Recorded at load, so a chain reader can tell which ruleset
+        // was in force when a later denial (or allowance) happened.
+        crate::audit_wiring::audit_policy_loaded(&audit_sink, &policy_path.display().to_string());
 
         // Phase 3.6-encrypted (ADR-0021): open `~/.harness/secrets.enc`,
         // encrypted under a key derived from the node identity secret.
@@ -246,8 +260,14 @@ impl DaemonOrchestrator {
             harness_vault::VaultOrigin::Encrypted
             | harness_vault::VaultOrigin::MigratedFromPlaintext => {}
         }
+        // 5.13a: every secret read — present and future consumers —
+        // is recorded BY TAG at the access site (plan review MINOR-2:
+        // the routing-side SecretAwareLiveSet is not it).
         let secrets: std::sync::Arc<dyn harness_vault::SecretsStore> =
-            std::sync::Arc::new(enc_store);
+            crate::audit_wiring::AuditingSecrets::new(
+                std::sync::Arc::new(enc_store),
+                audit_sink.clone(),
+            );
 
         // Phase 3.10a: load `~/.harness/scopes.toml` if present. Missing
         // file → empty registry (`fs.*` advertise no scopes; calls fail
@@ -609,7 +629,11 @@ impl DaemonOrchestrator {
             identity.node_id(),
             local_node_name.clone(),
         )
-        .with_frame_sink(partial_streamer.sink());
+        .with_frame_sink(partial_streamer.sink())
+        // 5.13a: stamped into every ExecutionContext so capabilities
+        // record shell denials, secret reads and cloud escalations
+        // without a store dependency.
+        .with_audit(audit_sink.clone());
 
         // Phase 3.3-fanout (PR-A1): the per-peer connection registry +
         // channel router. Announces our signed manifest on every adopted
@@ -646,6 +670,7 @@ impl DaemonOrchestrator {
             persistent_trust.clone(),
             heartbeat.peers(),
             secrets.clone(),
+            audit_sink.clone(),
         );
         let peer_net = PeerNet::new(
             identity.clone(),
@@ -709,6 +734,7 @@ impl DaemonOrchestrator {
             heartbeat,
             election,
             persistent_trust,
+            audit_sink,
             executor,
             peer_net,
             dispatch: dispatch_runtime,
@@ -780,6 +806,31 @@ impl DaemonOrchestrator {
 
     /// Spawn every long-running loop (idempotence not required — called
     /// exactly once from the run entrypoints).
+    /// 5.13a: peer approvals are recorded by subscribing to the trust
+    /// store's existing broadcast — cheaper and harder to forget than
+    /// editing every approval path.
+    /// 5.11/5.13a: the periodic store housekeeping task (checkpoint
+    /// sweeps + audit retention), when this daemon has a store.
+    fn spawn_housekeeping(&self) {
+        if let Some(store) = self.api_state.store.clone() {
+            let handle = tokio::spawn(spawn_checkpoint_sweeper(
+                store,
+                self.api_state.local_node_id,
+                self.shutdown_tx.subscribe(),
+            ));
+            self.tasks.lock().push(handle);
+        }
+    }
+
+    fn spawn_audit_loops(&self) {
+        let handle = tokio::spawn(crate::audit_wiring::run_trust_auditor(
+            self.persistent_trust.subscribe(),
+            self.audit_sink.clone(),
+            self.shutdown_tx.subscribe(),
+        ));
+        self.tasks.lock().push(handle);
+    }
+
     fn start_loops(&self) {
         // Heartbeat broadcaster: per-tick snapshot pulls fresh local
         // metadata. For 1.11 the snapshot is static (no resource
@@ -896,16 +947,11 @@ impl DaemonOrchestrator {
                 .run_expire_loop(self.shutdown_tx.subscribe()),
         );
         self.tasks.lock().push(expire_handle);
+        self.spawn_audit_loops();
         // 5.11 (ADR-0039): checkpoint housekeeping on a slow tick, so a
         // long-running daemon does not carry completed plans' rows
         // until its next restart.
-        if let Some(store) = self.api_state.store.clone() {
-            let checkpoint_handle = tokio::spawn(spawn_checkpoint_sweeper(
-                store,
-                self.shutdown_tx.subscribe(),
-            ));
-            self.tasks.lock().push(checkpoint_handle);
-        }
+        self.spawn_housekeeping();
         let reply_handle = tokio::spawn(self.dispatch.clone().run_reply_pump(
             self.executor.subscribe_terminal(),
             self.shutdown_tx.subscribe(),
@@ -1073,18 +1119,23 @@ fn cloud_planner_model_if_allowed(planning: &harness_policy::PlanningPolicy) -> 
     }
 }
 
-/// 5.11 (ADR-0039): periodic checkpoint housekeeping — the same sweep
-/// the daemon runs at boot, on an hourly tick. Cheap (two indexed
-/// deletes) and never in the plan driver's crash window.
+/// 5.11/5.13a: periodic store housekeeping on an hourly tick — the
+/// checkpoint sweeps the daemon also runs at boot, plus the audit
+/// log's retention prune (which appends its truncation marker before
+/// deleting, so the surviving chain still verifies).
 async fn spawn_checkpoint_sweeper(
     store: harness_store::Store,
+    node: harness_core::NodeId,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(3600));
     tick.tick().await; // the boot sweep already ran
     loop {
         tokio::select! {
-            _ = tick.tick() => crate::executor::sweep_stale_checkpoints(&store),
+            _ = tick.tick() => {
+                crate::executor::sweep_stale_checkpoints(&store);
+                crate::executor::prune_audit_log(&store, node);
+            }
             _ = shutdown.changed() => return,
         }
     }

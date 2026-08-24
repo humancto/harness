@@ -64,6 +64,7 @@ fn ctx() -> ExecutionContext {
         task_id: TaskId::new_v7(),
         tags: Arc::from(Vec::<String>::new()),
         frame_sink: None,
+        audit: None,
     }
 }
 
@@ -76,6 +77,7 @@ fn ctx_interactive() -> ExecutionContext {
         task_id: TaskId::new_v7(),
         tags: Arc::from(vec!["interactive".to_string()]),
         frame_sink: None,
+        audit: None,
     }
 }
 

@@ -70,8 +70,10 @@ pub use fs::{
     FsGrepCapability, FsListCapability, FsReadCapability, FsSearchCapability, ScopeConfig,
     ScopeError, ScopeRegistry,
 };
+pub use traits::CapturingAuditSink;
 pub use traits::{
-    Capability, CapabilityError, ExecutionClass, ExecutionContext, FrameSink, LogFrame, StreamKind,
+    audit_actor, Capability, CapabilityError, ExecutionClass, ExecutionContext, FrameSink,
+    LogFrame, StreamKind,
 };
 
 #[cfg(feature = "echo")]
