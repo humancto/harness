@@ -401,7 +401,7 @@ impl Store {
         })
     }
 
-    fn audit_entry_hash_at(
+    pub(crate) fn audit_entry_hash_at(
         &self,
         node_id: NodeId,
         seq: u64,
@@ -524,7 +524,7 @@ fn verify_rows(node_id: NodeId, rows: &[AuditRow]) -> ChainStatus {
 /// and reproduce its hash — so rewriting a `task.dispatched` row's
 /// action to anything unrecognized would display the forged action
 /// while the chain reported "verified".
-fn action_from_str(s: &str) -> Option<AuditAction> {
+pub(crate) fn action_from_str(s: &str) -> Option<AuditAction> {
     Some(match s {
         "task.dispatched" => AuditAction::TaskDispatched,
         "task.cancelled" => AuditAction::TaskCancelled,

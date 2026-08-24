@@ -239,6 +239,51 @@ impl Signable for AuditHead {
     }
 }
 
+/// One audit entry as it crosses the wire (5.13c-2).
+///
+/// Carries exactly the fields `audit_entry_hash` covers, so the
+/// receiver can recompute the hash rather than trusting the sender's.
+/// `detail` travels as the STORED string, never re-serialized — the
+/// hash is over the bytes as stored, and a round-trip through a JSON
+/// value would reorder or reformat them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditEntryWire {
+    pub seq: u64,
+    pub at_ms: u64,
+    pub action: String,
+    pub subject: Option<String>,
+    pub detail: Option<String>,
+    pub actor: String,
+    pub prev_hash: [u8; 32],
+    pub entry_hash: [u8; 32],
+}
+
+/// A request for a contiguous run of one node's chain (5.13c-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditRangeReq {
+    /// Correlates the response. This mesh has no request/response
+    /// primitive — `OutboundMsg` is fire-and-forget — so the id is
+    /// carried explicitly and matched against a bounded in-flight
+    /// table on the requester.
+    pub req_id: [u8; 16],
+    pub node_id: NodeId,
+    /// Inclusive.
+    pub from_seq: u64,
+    /// Inclusive. The server clamps this to its own row cap.
+    pub to_seq: u64,
+}
+
+/// The answer to an [`AuditRangeReq`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditRangeResp {
+    pub req_id: [u8; 16],
+    pub node_id: NodeId,
+    pub entries: Vec<AuditEntryWire>,
+    /// True when the server stopped at its cap rather than at
+    /// `to_seq`, so the requester knows to ask again.
+    pub truncated: bool,
+}
+
 /// Signed envelope carrying audit heads over `harness.audit`
 /// (5.13c-1, ADR-0041).
 ///
@@ -268,6 +313,13 @@ pub struct AuditSyncEnvelope {
     /// The sender's own head, plus any third-party heads it is
     /// relaying. Bounded by the sender; the receiver bounds it again.
     pub heads: Vec<AuditHead>,
+    /// 5.13c-2: a request for entries. `#[serde(default)]` so a
+    /// 5.13c-1 node's envelope still decodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_req: Option<AuditRangeReq>,
+    /// 5.13c-2: the answer to someone's request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_resp: Option<AuditRangeResp>,
     pub sig: Signature,
 }
 

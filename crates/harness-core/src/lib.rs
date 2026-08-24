@@ -19,8 +19,9 @@ pub use crate::replica::{
     ReplicaApplier, ReplicaError, ReplicaSyncEnvelope, ReplicatedState, ReplicatedTaskState,
 };
 pub use audit::{
-    audit_entry_hash, hash_hex, AuditAction, AuditActor, AuditHead, AuditRecord, AuditSink,
-    AuditSyncEnvelope, NullAuditSink, MAX_HEADS_PER_ENVELOPE,
+    audit_entry_hash, hash_hex, AuditAction, AuditActor, AuditEntryWire, AuditHead, AuditRangeReq,
+    AuditRangeResp, AuditRecord, AuditSink, AuditSyncEnvelope, NullAuditSink,
+    MAX_HEADS_PER_ENVELOPE,
 };
 pub use identity::{
     verify, Identity, KeyError, NodeId, ParseNodeIdError, PublicKey, Signature, VerifyError,

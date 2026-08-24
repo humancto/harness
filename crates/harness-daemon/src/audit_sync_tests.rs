@@ -134,6 +134,8 @@ async fn m03_a_rewritten_chain_is_caught_as_a_fork() {
         source: a.node_id(),
         assembled_at: 10_000_000,
         heads: vec![forged],
+        range_req: None,
+        range_resp: None,
         sig: Signature::from_bytes([0u8; 64]),
     };
     env.sign(a.identity.as_ref()).expect("sign envelope");
@@ -200,6 +202,8 @@ async fn m04_a_head_from_an_unknown_node_is_dropped() {
         source: a.node_id(),
         assembled_at: 1_000,
         heads: vec![head],
+        range_req: None,
+        range_resp: None,
         sig: Signature::from_bytes([0u8; 64]),
     };
     env.sign(a.identity.as_ref()).expect("sign");
@@ -236,6 +240,8 @@ async fn m05_a_forged_signature_is_rejected_even_from_a_trusted_relay() {
         source: a.node_id(),
         assembled_at: 1_000,
         heads: vec![head],
+        range_req: None,
+        range_resp: None,
         sig: Signature::from_bytes([0u8; 64]),
     };
     env.sign(a.identity.as_ref()).expect("sign");
@@ -383,6 +389,8 @@ fn envelope(
         source: from.node_id(),
         assembled_at: 1_000,
         heads,
+        range_req: None,
+        range_resp: None,
         sig: Signature::from_bytes([0u8; 64]),
     };
     env.sign(from).expect("sign envelope");

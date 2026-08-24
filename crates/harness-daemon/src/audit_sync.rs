@@ -250,6 +250,8 @@ impl AuditSyncService {
             source: self.local_id,
             assembled_at: now_ms,
             heads,
+            range_req: None,
+            range_resp: None,
             sig: harness_core::Signature::from_bytes([0u8; 64]),
         };
         if let Err(e) = env.sign(&self.identity) {
