@@ -2,7 +2,7 @@
 
 - **Status:** accepted
 - **Date:** 2026-08-24
-- **Roadmap:** 5.13a (5.13b History UI, 5.13c replication)
+- **Roadmap:** 5.13a, 5.13b (5.13c replication)
 - **PRD:** v2 §10.6 — *"Every privileged action (dispatch, shell exec,
   secret access, peer approval, policy change, cloud escalation) →
   append-only audit log replicated to every node. Tamper-evident via
@@ -124,9 +124,18 @@ choose. ADR-0006's promise is retired, not deferred again.
   rate. Retention (100k entries per node, pruned on the hourly
   housekeeping tick, through a marker so the survivor still verifies)
   bounds the disk cost — but it means flooding can push older
-  entries out of the window. Per-attempt coalescing is **not**
-  implemented; it is 5.13b work, and neither the code nor these docs
-  should read as though a suppression window exists today.
+  entries out of the window. **5.13b adds per-attempt coalescing**
+  for floodable actions (today: `shell.denied` only): within a
+  60s window a repeat of the same `(action, subject, actor)` is
+  dropped and counted, and the count is written as
+  `suppressed_repeats` into the next entry that does append. The
+  count cannot be added to the row it repeats — that row is already
+  hashed into the chain — so the log reads "N suppressed" on the
+  following entry rather than losing the fact. The window map lives
+  in memory and is bounded at 1024 keys, so a flooder that varies
+  `subject` cannot turn the bookkeeping into its own leak; a restart
+  resets it, erring toward recording rather than dropping. Actions
+  that are not floodable are never dropped, however repetitive.
 - **`peer.approved` is wired but dormant.** The auditor subscribes to
   the trust store's broadcast, which only `TrustStore::add` emits —
   and pairing's QUIC leg is still stubbed, so nothing calls it in

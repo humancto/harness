@@ -26,6 +26,26 @@ use crate::open::Store;
 /// are hashes and identifiers, never payloads.
 pub const MAX_AUDIT_DETAIL_BYTES: usize = 4096;
 
+/// 5.13b (ADR-0041 follow-up): how long an identical repeat of a
+/// FLOODABLE action is folded into one row.
+///
+/// `shell.denied` is appended once per attempt and is
+/// attacker-triggerable at submit rate — `rate_limit` is declared in
+/// capability manifests but enforced nowhere — so an unbounded
+/// append lets a peer push genuine entries out of the retention
+/// window. Within the window, a repeat of the same
+/// `(action, subject, actor)` bumps a counter on the CURRENT head
+/// instead of appending... which would break the chain. So instead
+/// the repeat is DROPPED and counted, and the count is written into
+/// the next entry that does get appended. The log then reads "N
+/// suppressed" rather than losing the fact.
+pub const SUPPRESSION_WINDOW_MS: u64 = 60_000;
+
+/// Actions that are cheap for an adversary to trigger.
+fn is_floodable(action: AuditAction) -> bool {
+    matches!(action, AuditAction::ShellDenied)
+}
+
 /// One row of the log, as read back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditRow {
@@ -492,12 +512,58 @@ fn action_from_str(s: &str) -> Option<AuditAction> {
 pub struct StoreAuditSink {
     store: Store,
     node_id: NodeId,
+    /// 5.13b: `(action, subject, actor)` → (window start, suppressed
+    /// count) for floodable actions. In memory deliberately: a
+    /// restart resets the window, which errs toward RECORDING rather
+    /// than silently dropping.
+    recent: parking_lot::Mutex<std::collections::HashMap<String, (u64, u64)>>,
 }
 
 impl StoreAuditSink {
     #[must_use]
     pub fn new(store: Store, node_id: NodeId) -> Self {
-        Self { store, node_id }
+        Self {
+            store,
+            node_id,
+            recent: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Should this record append, and how many identical repeats did
+    /// the window swallow since the last one that did?
+    ///
+    /// Returns `None` to drop. Only floodable actions are ever
+    /// dropped; everything else always appends.
+    fn admit(&self, record: &AuditRecord, now_ms: u64) -> Option<u64> {
+        if !is_floodable(record.action) {
+            return Some(0);
+        }
+        let key = format!(
+            "{}|{}|{}",
+            record.action.as_str(),
+            record.subject.as_deref().unwrap_or(""),
+            record.actor.as_string()
+        );
+        let mut recent = self.recent.lock();
+        // Bound the map: a flooder varying `subject` must not turn
+        // suppression bookkeeping into its own memory leak.
+        if recent.len() > 1024 {
+            recent.retain(|_, (start, _)| now_ms.saturating_sub(*start) < SUPPRESSION_WINDOW_MS);
+            if recent.len() > 1024 {
+                recent.clear();
+            }
+        }
+        match recent.get_mut(&key) {
+            Some((start, count)) if now_ms.saturating_sub(*start) < SUPPRESSION_WINDOW_MS => {
+                *count += 1;
+                None
+            }
+            slot => {
+                let swallowed = slot.map_or(0, |(_, count)| *count);
+                recent.insert(key, (now_ms, 0));
+                Some(swallowed)
+            }
+        }
     }
 }
 
@@ -515,6 +581,35 @@ impl AuditSink for StoreAuditSink {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0);
+        // 5.13b: fold a burst of identical floodable entries into one
+        // row plus a count, so an adversary cannot push genuine
+        // entries out of the retention window one denial at a time.
+        let Some(suppressed) = self.admit(&record, now) else {
+            return;
+        };
+        let record = if suppressed > 0 {
+            let parsed: Option<serde_json::Value> = record
+                .detail
+                .as_deref()
+                .and_then(|d| serde_json::from_str(d).ok());
+            // A non-object detail (`with_detail` accepts any value)
+            // is nested rather than replaced: the count is never
+            // written at the cost of losing what was recorded.
+            let mut detail = match parsed {
+                Some(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
+                Some(other) => serde_json::json!({ "detail": other }),
+                None => serde_json::json!({}),
+            };
+            if let Some(obj) = detail.as_object_mut() {
+                obj.insert("suppressed_repeats".into(), serde_json::json!(suppressed));
+            }
+            AuditRecord {
+                detail: serde_json::to_string(&detail).ok(),
+                ..record
+            }
+        } else {
+            record
+        };
         if let Err(e) = self.store.audit_append(self.node_id, &record, now) {
             tracing::warn!(
                 target: "harness.store.audit",
@@ -799,5 +894,114 @@ mod tests {
             .expect("recent");
         assert_eq!(older.len(), 2);
         assert!(older.iter().all(|r| r.at_ms < 30));
+    }
+
+    #[test]
+    fn a09_a_denial_burst_appends_once_and_carries_the_count() {
+        // 5.13b / ADR-0041: `shell.denied` is attacker-triggerable at
+        // submit rate, so an unbounded append would let a peer push
+        // genuine entries out of the retention window one denial at a
+        // time. The burst folds into one row; the count is not lost.
+        let s = Store::open_memory().expect("store");
+        let sink = StoreAuditSink::new(s.clone(), node());
+        let denial = || {
+            AuditRecord::new(AuditAction::ShellDenied, AuditActor::System).with_subject("rm -rf /")
+        };
+
+        assert_eq!(sink.admit(&denial(), 1_000), Some(0), "first one appends");
+        for t in 1..=9u64 {
+            assert_eq!(
+                sink.admit(&denial(), 1_000 + t),
+                None,
+                "repeat inside the window is dropped"
+            );
+        }
+        // Window expires: the next one appends AND reports the nine
+        // it swallowed.
+        assert_eq!(
+            sink.admit(&denial(), 1_000 + SUPPRESSION_WINDOW_MS),
+            Some(9)
+        );
+        // The count is consumed, not re-reported.
+        assert_eq!(
+            sink.admit(&denial(), 1_000 + SUPPRESSION_WINDOW_MS * 2),
+            Some(0)
+        );
+
+        // End to end through the sink: a burst leaves one row.
+        for _ in 0..25 {
+            sink.record(denial());
+        }
+        let rows = s.audit_recent(None, None, None, 100).expect("recent");
+        assert_eq!(rows.len(), 1, "25 identical denials, one row");
+        assert_eq!(
+            s.audit_verify_chain(node(), 1, 1_000).expect("verify"),
+            ChainStatus::Verified { through_seq: 1 },
+            "suppression must not break the chain"
+        );
+    }
+
+    #[test]
+    fn a09b_suppression_is_scoped_and_never_drops_other_actions() {
+        let s = Store::open_memory().expect("store");
+        let sink = StoreAuditSink::new(s.clone(), node());
+
+        // A different subject is a different key: not suppressed.
+        let a = AuditRecord::new(AuditAction::ShellDenied, AuditActor::System).with_subject("a");
+        let b = AuditRecord::new(AuditAction::ShellDenied, AuditActor::System).with_subject("b");
+        assert_eq!(sink.admit(&a, 10), Some(0));
+        assert_eq!(sink.admit(&b, 11), Some(0));
+        assert_eq!(sink.admit(&a, 12), None);
+
+        // Non-floodable actions are never dropped, however repetitive:
+        // suppression exists for the flood surface, not for the log.
+        for t in 0..50u64 {
+            assert_eq!(
+                sink.admit(&rec(1), t),
+                Some(0),
+                "task.dispatched always appends"
+            );
+        }
+        for _ in 0..5 {
+            sink.record(rec(1));
+        }
+        let rows = s.audit_recent(None, None, None, 100).expect("recent");
+        assert_eq!(rows.len(), 5);
+    }
+
+    #[test]
+    fn a09c_the_carried_count_lands_in_the_next_stored_detail() {
+        let s = Store::open_memory().expect("store");
+        let sink = StoreAuditSink::new(s.clone(), node());
+        let denial = || {
+            AuditRecord::new(AuditAction::ShellDenied, AuditActor::System)
+                .with_subject("rm -rf /")
+                .with_detail(&serde_json::json!({ "reason": "policy" }))
+        };
+        // Prime the window and swallow two, then force the window to
+        // expire by reaching past it on the shared `recent` map.
+        sink.record(denial());
+        sink.record(denial());
+        sink.record(denial());
+        sink.recent.lock().values_mut().for_each(|(start, _)| {
+            *start = 0;
+        });
+        sink.record(denial());
+
+        let rows = s.audit_recent(None, None, None, 100).expect("recent");
+        assert_eq!(rows.len(), 2, "four denials, two rows");
+        let newest: serde_json::Value =
+            serde_json::from_str(rows[0].detail.as_deref().expect("detail")).expect("json");
+        assert_eq!(newest["suppressed_repeats"], serde_json::json!(2));
+        assert_eq!(
+            newest["reason"],
+            serde_json::json!("policy"),
+            "the original detail survives the fold"
+        );
+        assert_eq!(
+            s.audit_verify_chain(node(), 1, 1_000).expect("verify"),
+            ChainStatus::Verified { through_seq: 2 },
+            "the rewritten detail is what was hashed"
+        );
     }
 }
