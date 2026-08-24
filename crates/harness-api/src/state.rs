@@ -53,6 +53,27 @@ pub trait PauseControl: Send + Sync + std::fmt::Debug {
     fn set_operator(&self, paused: bool);
 }
 
+/// 5.13c-2 (ADR-0041): asking the mesh to pull a peer's audit entries,
+/// seen through a narrow trait for the same reason as
+/// [`PauseControl`] — `harness-daemon` depends on `harness-api`, not
+/// the reverse, and `ApiState` holds only a liveness `PeerTable`.
+///
+/// The call is a REQUEST, not a result: entry pulls cross the network
+/// and settle asynchronously, so the handler reports that a walk was
+/// started and the caller re-reads the pin's status.
+pub trait AuditPuller: Send + Sync + std::fmt::Debug {
+    /// Ask `peer` for `subject`'s entries up to `target_seq`.
+    /// Returns false if no request could be sent (no connection, or
+    /// too many already in flight).
+    fn request_range(
+        &self,
+        peer: harness_core::NodeId,
+        subject: harness_core::NodeId,
+        from_seq: u64,
+        target_seq: u64,
+    ) -> bool;
+}
+
 /// Capacity of the mesh-event broadcast feeding `WS /events`. A slow
 /// WebSocket consumer that lags past this is closed with 1011
 /// ("lagged") and reconnects to resync from a fresh snapshot — the
@@ -90,6 +111,8 @@ pub struct ApiState {
     /// 4.7 (ADR-0029): pause switch. `None` in bare test fixtures —
     /// status reports `paused: false` and the admin endpoints 503.
     pub pause: Option<Arc<dyn PauseControl>>,
+    /// 5.13c-2: entry-pull requests into the mesh.
+    pub audit_puller: Option<Arc<dyn AuditPuller>>,
     /// 5.5 (ADR-0033): webhook adapter runtime (sender allowlist,
     /// public-URL override, driver semaphore, outbound Twilio base).
     /// Built from the environment by default; tests inject their own.
@@ -147,6 +170,7 @@ pub struct ApiStateBuilder {
     secrets: Option<Arc<dyn SecretsStore>>,
     partials: Option<Arc<crate::partials::PartialBuffers>>,
     pause: Option<Arc<dyn PauseControl>>,
+    audit_puller: Option<Arc<dyn AuditPuller>>,
     webhook: Option<Arc<crate::routes::webhook::WebhookRuntime>>,
 }
 
@@ -166,6 +190,7 @@ impl ApiStateBuilder {
             secrets: None,
             partials: None,
             pause: None,
+            audit_puller: None,
             webhook: None,
         }
     }
@@ -234,6 +259,13 @@ impl ApiStateBuilder {
         self
     }
 
+    /// Wire the mesh's audit entry puller (5.13c-2, ADR-0041).
+    #[must_use]
+    pub fn with_audit_puller(mut self, puller: Arc<dyn AuditPuller>) -> Self {
+        self.audit_puller = Some(puller);
+        self
+    }
+
     /// 5.5: inject a webhook runtime (tests point the Twilio base at
     /// wiremock and set an explicit allowlist). Default: from env.
     #[must_use]
@@ -275,6 +307,7 @@ impl ApiStateBuilder {
             .webhook
             .unwrap_or_else(|| Arc::new(crate::routes::webhook::WebhookRuntime::from_env()));
         ApiState {
+            audit_puller: self.audit_puller,
             identity: self.identity,
             local_node_id,
             local_status: Arc::new(RwLock::new(status)),

@@ -334,3 +334,83 @@ Three further gaps, named so they are not mistaken for coverage:
   History UI shipped in 5.13b shows nothing. Surfacing it is 5.13c-3
   work, and until then the loudest signal this feature produces is a
   log line.
+
+## Amendment — 5.13c-2: entries, and what a pin is worth
+
+5.13c-1 built pins. A pin catches a fork at one position: two signed
+heads at the same seq. It does not catch the rewrite shape that
+matters — truncate, re-append, grow past the pin — because the
+rewritten node's new head lands at a position nobody pinned and reads
+as ordinary growth.
+
+Linking pin `(100, h100)` to pin `(200, h200)` means walking entries
+101..200 and checking that each hashes to the next one's `prev_hash`.
+Reproducing `h200` over altered entries is then a blake3 collision
+problem. **That walk is the guarantee**; the pins are what make it
+meaningful. This amendment adds the walk.
+
+**Decision 15 — batches commit as they link; a run marker tracks the
+rest.** Two constraints in the plan contradicted each other: "ingest is
+all-or-nothing" and "cap the rows per pull". With a cap, every batch
+but the last ends short of the pin, so all-or-nothing makes the last
+batch unreachable. Resolution: a batch commits when it links to the
+last row we committed for that run, and `audit_ingest_runs` records
+that the walk is incomplete. Only a run that reaches its target pin
+with a matching hash corroborates it — so a half-finished pull is
+never mistaken for evidence, which was the real thing all-or-nothing
+was protecting.
+
+**Decision 16 — `audit_verify_range` is a separate function.**
+`audit_verify_chain`'s `anchor_holds` accepts three anchors: seq 1
+with a zero `prev_hash`, a locally stored predecessor, or a truncation
+marker in that node's chain. A legitimate partial pull of 500..600 has
+none of them and reports `Broken { at_seq: 500 }` — honest replication
+flagged as tampering. The fourth anchor is a pin WE took at
+`first.seq - 1` whose hash matches the first row's `prev_hash`. It must
+be a pin already held, never a head carried in the same message that
+delivered the rows: otherwise the sender supplies both the claim and
+its own corroboration.
+
+**Decision 17 — the receive clock governs ordering, and skew is
+refused.** A peer's `at_ms` sits inside its own hash preimage, so it is
+chosen by the peer, and `audit_recent` orders by it — one ingested row
+stamped `u64::MAX` would occupy page 1 of every node's History
+forever. Ingested rows carry `received_at_ms` (ours), the merged feed
+orders on `COALESCE(received_at_ms, at_ms)`, and a row implausibly far
+ahead of our clock is refused outright. This is 5.13c-1's rule applied
+again: **no ordering decision may key on a field the subject of that
+ordering controls.**
+
+**Decision 18 — serving is rate-limited, and gated on
+`tier != Guest`.** Reading rows holds the single process-wide
+connection mutex and a `RangeReq` is replayable, so an unlimited
+server lets a trusted peer stall dispatch by asking repeatedly; the
+limit is 20 batches per peer per minute, and it also closes the
+"ingest is unrated" gap 5.13c-1 recorded. The tier gate says
+`!= Guest` rather than `== Trusted` because nothing in this build
+constructs `TrustTier::Trusted` outside tests and pairing's QUIC leg is
+stubbed — gating on Trusted would ship the entire pull path inert.
+**`peers.toml` membership is the trust boundary in this build**, and
+that is a statement about what exists, not an aspiration.
+
+**Decision 19 — a served batch is bounded by bytes as well as rows.**
+`detail` is capped at 4 KiB per row, so a 5000-row cap alone permits a
+20 MB frame. The budget is 768 KiB against a 1 MiB channel cap;
+truncation is reported so the requester resumes where the server
+stopped.
+
+### What 5.13c-2 does NOT give you
+
+- **The pull is manual or opportunistic, not eager.** A pin is
+  corroborated when something asks for it — the endpoint, or a
+  follow-up after a truncated batch. Peers prune at 100k entries, so a
+  pin never walked before its owner pruned past it becomes permanently
+  unverifiable. Background corroboration is 5.13c-3, and it is a
+  requirement rather than a nicety for exactly that reason.
+- **`unverifiable` is defined but never set.** Nothing yet detects
+  "the owner pruned through this position", so the status exists for
+  5.13c-3 to use.
+- **Still no reader.** `audit_verify_range`, the run table and the
+  corroborated status have no UI. A fork or a failed corroboration
+  surfaces as a log line, a database row, and a 202 from the verify
+  endpoint. 5.13c-3 owns the operator surface.

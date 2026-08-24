@@ -604,3 +604,24 @@ fn now_unix_ms() -> u64 {
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
 }
+
+/// 5.13c-2: the API's narrow view of entry pulling.
+///
+/// Kept here rather than in `harness-api` because the service is a
+/// daemon concern; the API sees only the trait (the `PauseControl`
+/// precedent). Without this impl the endpoint would answer
+/// `mesh_not_configured` forever — a route that exists and never works
+/// is the inertness defect this project has hit repeatedly.
+impl harness_api::AuditPuller for AuditSyncService {
+    fn request_range(&self, peer: NodeId, subject: NodeId, from_seq: u64, target_seq: u64) -> bool {
+        AuditSyncService::request_range(self, peer, subject, from_seq, target_seq, now_unix_ms())
+    }
+}
+
+impl std::fmt::Debug for AuditSyncService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditSyncService")
+            .field("local_id", &self.local_id)
+            .finish_non_exhaustive()
+    }
+}

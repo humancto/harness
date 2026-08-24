@@ -730,8 +730,7 @@ impl DaemonOrchestrator {
         audit_sync.attach_net(&peer_net);
         peer_net.attach_audit_sync(&audit_sync);
 
-        let api_state =
-            harness_api::ApiStateBuilder::new(identity.clone(), config.mesh_name.clone())
+        let api_state = harness_api::ApiStateBuilder::new(identity.clone(), config.mesh_name.clone())
                 .with_node_name(config.node_name.clone())
                 .with_peers(heartbeat.peers())
                 .with_capabilities(cap_ids)
@@ -741,6 +740,9 @@ impl DaemonOrchestrator {
                 .with_secrets(secrets.clone())
                 .with_partials(partial_buffers)
                 .with_pause(pause.clone())
+                // 5.13c-2: without this the verify endpoint answers
+                // `mesh_not_configured` forever.
+                .with_audit_puller(audit_sync.clone())
                 .build();
         let api_handle = harness_api::serve(config.api_bind, api_state.clone())
             .await

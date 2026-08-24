@@ -193,6 +193,52 @@ impl Store {
         })
     }
 
+    /// Verify a run of an INGESTED peer chain.
+    ///
+    /// `audit_verify_chain` cannot do this. Its `anchor_holds` accepts
+    /// only three anchors — seq 1 with a zero `prev_hash`, a locally
+    /// stored predecessor, or a truncation marker in that node's own
+    /// chain — so a legitimate partial pull of 500..600 reports
+    /// `Broken { at_seq: 500 }`, flagging honest replication as
+    /// tampering.
+    ///
+    /// The fourth legitimate anchor is a pin WE took at
+    /// `first.seq - 1` whose hash matches `first.prev_hash`. It must
+    /// be a pin we already held — never a head carried in the same
+    /// message that delivered these rows, which would let the sender
+    /// supply both the claim and its own corroboration.
+    ///
+    /// # Errors
+    /// Underlying sqlite errors.
+    pub fn audit_verify_range(
+        &self,
+        node: NodeId,
+        from_seq: u64,
+        max_rows: usize,
+    ) -> Result<crate::audit::ChainStatus, StoreError> {
+        // Try the ordinary anchors first: an ingested run that happens
+        // to start at seq 1, or to sit directly on rows we already
+        // hold, is verifiable the normal way.
+        match self.audit_verify_chain(node, from_seq, max_rows)? {
+            crate::audit::ChainStatus::Broken { at_seq } if at_seq == from_seq => {}
+            other => return Ok(other),
+        }
+        // Otherwise the run is anchored on a pin, if we hold one that
+        // matches the first row's predecessor.
+        let Some(first_prev) = self.entry_prev_hash_at(node, from_seq)? else {
+            return Ok(crate::audit::ChainStatus::Empty);
+        };
+        if from_seq == 0 {
+            return Ok(crate::audit::ChainStatus::Broken { at_seq: from_seq });
+        }
+        match self.pinned_hash_at(node, from_seq - 1)? {
+            Some(pinned) if pinned == first_prev => {
+                self.audit_verify_from_anchor(node, from_seq, max_rows)
+            }
+            _ => Ok(crate::audit::ChainStatus::Broken { at_seq: from_seq }),
+        }
+    }
+
     /// The hash we pinned at `seq`, if any.
     fn pinned_hash_at(&self, node: NodeId, seq: u64) -> Result<Option<[u8; 32]>, StoreError> {
         self.with_conn(|c| {
@@ -679,6 +725,89 @@ mod tests {
                 .iter()
                 .all(|v| *v == Some(i64::try_from(received).unwrap_or(i64::MAX))),
             "every ingested row carries OUR receive time, got {stamped:?}"
+        );
+    }
+
+    #[test]
+    fn i11_a_partial_pull_verifies_when_anchored_on_a_pin() {
+        // `audit_verify_chain` reports Broken for a run that does not
+        // start at seq 1 and has no stored predecessor — which is
+        // every legitimate partial pull, so honest replication would
+        // read as tampering. `audit_verify_range` accepts a pin WE
+        // took as the fourth anchor.
+        let (_src, entries) = chain_of(20);
+        let dst = Store::open_memory().expect("dst");
+
+        // We hold a pin at seq 9 — the predecessor of the run.
+        let anchor = &entries[8];
+        pin(&dst, anchor.seq, anchor.entry_hash, now());
+        let last = entries.last().expect("entries");
+        pin(&dst, last.seq, last.entry_hash, now());
+
+        // Ingest only 10..20.
+        dst.audit_ingest_range(node(9), node(1), last.seq, &entries[9..], now())
+            .expect("ingest")
+            .expect("accepted");
+
+        assert_eq!(
+            dst.audit_verify_chain(node(1), 10, 1_000).expect("verify"),
+            crate::audit::ChainStatus::Broken { at_seq: 10 },
+            "the old function cannot anchor a partial pull"
+        );
+        assert_eq!(
+            dst.audit_verify_range(node(1), 10, 1_000).expect("verify"),
+            crate::audit::ChainStatus::Verified { through_seq: 20 },
+            "anchored on the pin we hold at seq 9"
+        );
+    }
+
+    #[test]
+    fn i12_a_partial_pull_without_a_matching_pin_stays_broken() {
+        // The anchor must be a pin we ALREADY held. Without one, an
+        // unanchored run is exactly the prefix-deletion case 5.13a's
+        // review established, and must not verify.
+        let (_src, entries) = chain_of(20);
+        let dst = Store::open_memory().expect("dst");
+        let last = entries.last().expect("entries");
+        pin(&dst, last.seq, last.entry_hash, now());
+
+        dst.audit_ingest_range(node(9), node(1), last.seq, &entries[9..], now())
+            .expect("ingest")
+            .expect("accepted");
+
+        assert_eq!(
+            dst.audit_verify_range(node(1), 10, 1_000).expect("verify"),
+            crate::audit::ChainStatus::Broken { at_seq: 10 },
+            "no pin at seq 9, so nothing anchors the run"
+        );
+    }
+
+    #[test]
+    fn i13_a_tampered_ingested_row_breaks_the_anchored_walk() {
+        let (_src, entries) = chain_of(20);
+        let dst = Store::open_memory().expect("dst");
+        let anchor = &entries[8];
+        pin(&dst, anchor.seq, anchor.entry_hash, now());
+        let last = entries.last().expect("entries");
+        pin(&dst, last.seq, last.entry_hash, now());
+        dst.audit_ingest_range(node(9), node(1), last.seq, &entries[9..], now())
+            .expect("ingest")
+            .expect("accepted");
+
+        // Edit a stored peer row out from under us.
+        dst.with_conn(|c| {
+            c.execute(
+                "UPDATE audit_log SET subject = 'tampered'
+                  WHERE node_id = ?1 AND seq = 15",
+                params![node(1).as_bytes()],
+            )?;
+            Ok(())
+        })
+        .expect("tamper");
+
+        assert_eq!(
+            dst.audit_verify_range(node(1), 10, 1_000).expect("verify"),
+            crate::audit::ChainStatus::Broken { at_seq: 15 }
         );
     }
 }

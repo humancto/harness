@@ -309,6 +309,82 @@ impl Store {
         }))
     }
 
+    /// Public wrapper: the stored hash at one position, for callers
+    /// outside this crate (the API's verify endpoint).
+    ///
+    /// # Errors
+    /// Underlying sqlite errors.
+    pub fn audit_entry_hash_at_pub(
+        &self,
+        node_id: NodeId,
+        seq: u64,
+    ) -> Result<Option<[u8; 32]>, StoreError> {
+        self.audit_entry_hash_at(node_id, seq)
+    }
+
+    /// Rows for one node from `from_seq`, ascending, bounded.
+    pub(crate) fn audit_rows_from(
+        &self,
+        node_id: NodeId,
+        from_seq: u64,
+        max_rows: usize,
+    ) -> Result<Vec<AuditRow>, StoreError> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT node_id, seq, at_ms, action, subject, detail, actor,
+                        prev_hash, entry_hash
+                   FROM audit_log
+                  WHERE node_id = ?1 AND seq >= ?2
+               ORDER BY seq ASC
+                  LIMIT ?3",
+            )?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        node_id.as_bytes(),
+                        i64::try_from(from_seq).unwrap_or(i64::MAX),
+                        i64::try_from(max_rows).unwrap_or(i64::MAX),
+                    ],
+                    row_to_audit,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// One stored row's `prev_hash`.
+    pub(crate) fn entry_prev_hash_at(
+        &self,
+        node_id: NodeId,
+        seq: u64,
+    ) -> Result<Option<[u8; 32]>, StoreError> {
+        self.with_conn(|c| {
+            let raw: Option<Vec<u8>> = c
+                .query_row(
+                    "SELECT prev_hash FROM audit_log WHERE node_id = ?1 AND seq = ?2",
+                    params![node_id.as_bytes(), i64::try_from(seq).unwrap_or(i64::MAX)],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(raw.map(|b| to_hash(&b)))
+        })
+    }
+
+    /// Walk rows from `from_seq` WITHOUT re-checking the anchor — the
+    /// caller has established one (5.13c-2 anchors on a pin).
+    pub(crate) fn audit_verify_from_anchor(
+        &self,
+        node_id: NodeId,
+        from_seq: u64,
+        max_rows: usize,
+    ) -> Result<ChainStatus, StoreError> {
+        let rows = self.audit_rows_from(node_id, from_seq, max_rows)?;
+        if rows.is_empty() {
+            return Ok(ChainStatus::Empty);
+        }
+        Ok(verify_rows(node_id, &rows))
+    }
+
     /// The signed head of this node's chain — what a peer pins so a
     /// later rewrite is detectable (5.13c gossips it).
     ///
@@ -477,7 +553,7 @@ impl Store {
 }
 
 /// Walk an ascending run of one node's entries.
-fn verify_rows(node_id: NodeId, rows: &[AuditRow]) -> ChainStatus {
+pub(crate) fn verify_rows(node_id: NodeId, rows: &[AuditRow]) -> ChainStatus {
     let Some(first) = rows.first() else {
         return ChainStatus::Empty;
     };

@@ -240,3 +240,90 @@ fn parse_node(raw: &str) -> Result<harness_core::NodeId, ()> {
     }
     Ok(harness_core::NodeId::from_bytes(bytes))
 }
+
+/// `POST /api/v1/audit/verify/:node` — ask the mesh to walk a peer's
+/// entries so its newest pin can be corroborated (5.13c-2).
+///
+/// Returns 202: the pull crosses the network and settles
+/// asynchronously, so this reports that a walk was STARTED and the
+/// caller re-reads the pin's status. Claiming a verdict here would be
+/// the same overstatement the History banner refuses.
+// Axum requires a handler future; nothing here awaits, because the
+// pull itself is fire-and-forget into the mesh.
+#[allow(clippy::unused_async)]
+pub async fn verify_node_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    axum::extract::Path(node): axum::extract::Path<String>,
+) -> axum::response::Response {
+    if !is_authenticated(&state.auth, &headers) {
+        return unauthorized();
+    }
+    let Ok(node) = parse_node(&node) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "bad_node" })),
+        )
+            .into_response();
+    };
+    let Some(store) = state.store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "store_not_configured" })),
+        )
+            .into_response();
+    };
+    let Some(puller) = state.audit_puller.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "mesh_not_configured" })),
+        )
+            .into_response();
+    };
+    if node == state.local_node_id {
+        // Our own chain is verified locally; asking a peer to vouch
+        // for it would be asking the subject to corroborate itself.
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "own_chain" })),
+        )
+            .into_response();
+    }
+
+    let pins = match store.peer_head_pins(node) {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::error!(target: "harness.api.audit", ?err, "peer_head_pins");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "pins_failed" })),
+            )
+                .into_response();
+        }
+    };
+    let Some(target) = pins.last() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no_pin_for_node" })),
+        )
+            .into_response();
+    };
+
+    // Walk from just past whatever contiguous run we already hold.
+    let from_seq = match store.audit_entry_hash_at_pub(node, target.seq) {
+        Ok(Some(_)) => target.seq,
+        _ => 1,
+    };
+    let started = puller.request_range(node, node, from_seq, target.seq);
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "started": started,
+            "node": node.to_string(),
+            "target_seq": target.seq,
+            "from_seq": from_seq,
+            "status": target.status.as_str(),
+        })),
+    )
+        .into_response()
+}
