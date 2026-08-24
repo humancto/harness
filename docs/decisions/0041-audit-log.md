@@ -399,6 +399,35 @@ that is a statement about what exists, not an aspiration.
 truncation is reported so the requester resumes where the server
 stopped.
 
+**Decision 20 — the walk must be anchored, and the answer must start
+where we asked.** Review found the headline property was not actually
+delivered: `consume_range` never checked that a batch begins at the
+requested `from_seq`, and `audit_ingest_range` required contiguity only
+when a run row already existed. A malicious subject could answer
+"give me 1..200" with **only** entry 200 — it self-hashes, it is the
+pinned hash, `reached_pin` is true, and the pin is marked corroborated
+without a single preceding entry being walked. Three guards now stand
+between a reply and a corroborated pin: the response must start at the
+requested seq; a fresh run above seq 1 must anchor on a stored
+predecessor or a pin we already hold whose hash matches; and a
+continuing batch must hash-link to the last row committed, not merely
+follow it numerically.
+
+**Decision 21 — corroboration is re-derived, and the verifier has the
+last word.** `audit_run_corroborates` consults `audit_verify_range`
+rather than trusting the run marker. The two used to disagree with
+nothing reconciling them: a run stitched from two different histories
+reported corroboration while the verifier called the same rows broken.
+Nothing is cached — tampering after a completed walk revokes
+corroboration on the next read.
+
+**Decision 22 — a same-seq disagreement is evidence, not a duplicate.**
+Ingest used `INSERT OR IGNORE`, which silently kept our existing row,
+reported rows it had not written, and threw away the fact that a peer
+offered a *different* entry at a position we already held — which is
+precisely the fork 5.13c-1 exists to detect. It is now an explicit
+refusal, and `committed` counts rows actually written.
+
 ### What 5.13c-2 does NOT give you
 
 - **The pull is manual or opportunistic, not eager.** A pin is
@@ -410,6 +439,15 @@ stopped.
 - **`unverifiable` is defined but never set.** Nothing yet detects
   "the owner pruned through this position", so the status exists for
   5.13c-3 to use.
+- **Ingested peer rows have no retention and no repair path.**
+  `prune_audit_log` runs only for the local node, and
+  `audit_forget_peer_range` is 5.13c-3. A peer that rebuilt its
+  database from seq 1 will collide with rows we already hold and be
+  refused (Decision 22) with no way to clear them until then — the
+  refusal is correct, the missing remedy is the gap.
+- **`audit_ingest_runs` is not thinned.** One row per
+  `(node, target_seq)`; it grows with pin density and the pin sweep
+  does not touch it.
 - **Still no reader.** `audit_verify_range`, the run table and the
   corroborated status have no UI. A fork or a failed corroboration
   surfaces as a log line, a database row, and a 202 from the verify

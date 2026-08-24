@@ -94,6 +94,14 @@ pub struct AuditRow {
     pub actor: String,
     pub prev_hash: [u8; 32],
     pub entry_hash: [u8; 32],
+    /// The timestamp the merged feed ORDERS by: our receive time for
+    /// an ingested peer row, the row's own `at_ms` for a local one
+    /// (5.13c-2, Codex P2 on #67).
+    ///
+    /// A peer's `at_ms` is inside its own hash preimage and therefore
+    /// chosen by that peer, so ordering the feed on it lets an
+    /// ingested row pick its own position in every node's History.
+    pub feed_ms: u64,
 }
 
 /// Keyset cursor for [`Store::audit_recent`] — the full ordering key,
@@ -126,7 +134,17 @@ fn row_to_audit(r: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRow> {
     let node_raw: Vec<u8> = r.get(0)?;
     let prev: Vec<u8> = r.get(7)?;
     let entry: Vec<u8> = r.get(8)?;
+    let at_ms = u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0);
+    // Queries that do not select the effective column fall back to
+    // `at_ms`, which is correct for local rows.
+    let feed_ms = r
+        .get::<_, Option<i64>>(9)
+        .ok()
+        .flatten()
+        .and_then(|v| u64::try_from(v).ok())
+        .unwrap_or(at_ms);
     Ok(AuditRow {
+        feed_ms,
         node_id: NodeId::from_bytes(<[u8; 16]>::try_from(node_raw.as_slice()).unwrap_or([0u8; 16])),
         seq: u64::try_from(r.get::<_, i64>(1)?).unwrap_or(0),
         at_ms: u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
@@ -521,17 +539,21 @@ impl Store {
         };
         self.with_conn(|c| {
             let mut stmt = c.prepare(
+                // Ordered and paged on the EFFECTIVE timestamp — our
+                // receive time for ingested rows — so a peer cannot
+                // choose where its entries land in our History
+                // (Codex P2 on #67). The V0011 index covers this.
                 "SELECT node_id, seq, at_ms, action, subject, detail, actor,
-                        prev_hash, entry_hash
+                        prev_hash, entry_hash, COALESCE(received_at_ms, at_ms) AS feed_ms
                    FROM audit_log
                   WHERE (?1 IS NULL
-                         OR at_ms < ?1
-                         OR (at_ms = ?1
+                         OR COALESCE(received_at_ms, at_ms) < ?1
+                         OR (COALESCE(received_at_ms, at_ms) = ?1
                              AND (node_id < ?2
                                   OR (node_id = ?2 AND seq < ?3))))
                     AND (?4 IS NULL OR action = ?4)
                     AND (?5 IS NULL OR node_id = ?5)
-               ORDER BY at_ms DESC, node_id DESC, seq DESC
+               ORDER BY feed_ms DESC, node_id DESC, seq DESC
                   LIMIT ?6",
             )?;
             let rows = stmt

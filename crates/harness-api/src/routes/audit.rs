@@ -129,7 +129,9 @@ pub async fn list_handler(
 
     let next_cursor = rows.last().map(|r| {
         serde_json::json!({
-            "before_ms": r.at_ms,
+            // The cursor must key on the same value the feed is
+            // ORDERED by, or paging skips or repeats ingested rows.
+            "before_ms": r.feed_ms,
             "before_node": r.node_id.to_string(),
             "before_seq": r.seq,
         })
@@ -309,11 +311,19 @@ pub async fn verify_node_handler(
             .into_response();
     };
 
-    // Walk from just past whatever contiguous run we already hold.
-    let from_seq = match store.audit_entry_hash_at_pub(node, target.seq) {
-        Ok(Some(_)) => target.seq,
-        _ => 1,
-    };
+    // Walk from just past the PREVIOUS pin we hold, so the run is
+    // anchored on evidence we took earlier rather than on the subject's
+    // own say-so (diff review MAJOR-8).
+    //
+    // The first version asked for `[target.seq, target.seq]` whenever
+    // we already held that row — a one-row "walk" that re-read
+    // something we had and proved nothing.
+    let from_seq = pins
+        .iter()
+        .filter(|p| p.seq < target.seq)
+        .map(|p| p.seq)
+        .max()
+        .map_or(1, |prev| prev.saturating_add(1));
     let started = puller.request_range(node, node, from_seq, target.seq);
     (
         StatusCode::ACCEPTED,

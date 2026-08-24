@@ -60,6 +60,10 @@ const REQUEST_TIMEOUT_MS: u64 = 30_000;
 const SERVE_BATCHES_PER_MINUTE: u32 = 20;
 const SERVE_WINDOW_MS: u64 = 60_000;
 
+/// Follow-up rounds allowed per walk. `MAX_INGEST_ROWS_PER_PULL`
+/// (5000) rows per round covers any realistic chain well inside this.
+const MAX_FOLLOWUP_ROUNDS: u32 = 64;
+
 #[derive(Default)]
 struct PeerSyncState {
     consecutive_failures: u32,
@@ -77,6 +81,10 @@ struct InFlight {
     target_seq: u64,
     from_seq: u64,
     sent_at_ms: u64,
+    /// Follow-ups already issued for this walk. A server that always
+    /// sets `truncated` and returns one row per reply would otherwise
+    /// keep us asking forever (diff review MAJOR-6).
+    round: u32,
 }
 
 pub(crate) struct AuditSyncService {
@@ -104,7 +112,10 @@ impl AuditSyncService {
             net: OnceLock::new(),
             peers: ParkingMutex::new(HashMap::new()),
             inflight: ParkingMutex::new(HashMap::new()),
-            next_req: std::sync::atomic::AtomicU64::new(1),
+            // Seeded from the clock, not 1: a counter that resets on
+            // every boot lets a peer replay an old reply against a
+            // same-numbered new request (diff review MINOR).
+            next_req: std::sync::atomic::AtomicU64::new(now_unix_ms()),
         })
     }
 
@@ -274,6 +285,34 @@ impl AuditSyncService {
         relayed.into_iter().map(|(head, _)| head).collect()
     }
 
+    /// Register an in-flight request without sending it, so a test
+    /// can deliver a crafted response without a live peer racing it
+    /// with the honest answer.
+    #[cfg(test)]
+    pub(crate) fn track_inflight_for_test(
+        &self,
+        peer: NodeId,
+        subject: NodeId,
+        from_seq: u64,
+        target_seq: u64,
+        now_ms: u64,
+    ) -> [u8; 16] {
+        let round = 0;
+        let req_id = self.mint_req_id();
+        self.inflight.lock().insert(
+            req_id,
+            InFlight {
+                peer,
+                subject,
+                target_seq,
+                from_seq,
+                sent_at_ms: now_ms,
+                round,
+            },
+        );
+        req_id
+    }
+
     #[cfg(test)]
     pub(crate) fn relayable_heads_for_test(&self) -> Vec<AuditHead> {
         self.relayable_heads()
@@ -344,6 +383,27 @@ impl AuditSyncService {
         target_seq: u64,
         now_ms: u64,
     ) -> bool {
+        self.request_range_round(peer, subject, from_seq, target_seq, 0, now_ms)
+    }
+
+    fn request_range_round(
+        &self,
+        peer: NodeId,
+        subject: NodeId,
+        from_seq: u64,
+        target_seq: u64,
+        round: u32,
+        now_ms: u64,
+    ) -> bool {
+        if round > MAX_FOLLOWUP_ROUNDS {
+            tracing::warn!(
+                target: "harness.audit.sync",
+                subject = %subject,
+                round,
+                "audit walk exceeded its follow-up budget; abandoned"
+            );
+            return false;
+        }
         let Some(net) = self.net.get().and_then(Weak::upgrade) else {
             return false;
         };
@@ -362,6 +422,7 @@ impl AuditSyncService {
                     target_seq,
                     from_seq,
                     sent_at_ms: now_ms,
+                    round,
                 },
             );
         }
@@ -406,19 +467,23 @@ impl AuditSyncService {
     /// a `RangeReq` is replayable, so without this a trusted peer can
     /// stall dispatch by asking repeatedly.
     fn serve_range(&self, peer: NodeId, req: &harness_core::AuditRangeReq, now_ms: u64) {
+        // Trust gate BEFORE the budget, so a refused Guest does not
+        // burn the allowance of a peer we would have served (diff
+        // review MINOR).
+        //
+        // `peers.toml` membership IS the trust boundary in this build:
+        // nothing constructs `TrustTier::Trusted` outside tests and
+        // pairing's QUIC leg is stubbed, so gating on Trusted would
+        // ship this path inert.
+        if self.trust.tier(&peer) == harness_mesh::trust::TrustTier::Guest {
+            return;
+        }
         if !self.may_serve(peer, now_ms) {
             tracing::debug!(
                 target: "harness.audit.sync",
                 peer = %peer,
                 "audit range request rate-limited"
             );
-            return;
-        }
-        // `peers.toml` membership IS the trust boundary in this build:
-        // nothing constructs `TrustTier::Trusted` outside tests and
-        // pairing's QUIC leg is stubbed, so gating on Trusted would
-        // ship this path inert. Guests are refused.
-        if self.trust.tier(&peer) == harness_mesh::trust::TrustTier::Guest {
             return;
         }
         let Some(net) = self.net.get().and_then(Weak::upgrade) else {
@@ -495,6 +560,27 @@ impl AuditSyncService {
             );
             return None;
         }
+        // The batch must START where we asked (Codex P1 on #67).
+        // Without this, a malicious subject answers a request for
+        // 1..target with ONLY its valid entry at `target`: a fresh run
+        // accepts that arbitrary starting point, the final hash equals
+        // the pin, and the pin is marked corroborated without a single
+        // preceding entry being walked — which is the entire guarantee.
+        match resp.entries.first() {
+            Some(first) if first.seq == flight.from_seq => {}
+            Some(first) => {
+                tracing::warn!(
+                    target: "harness.audit.sync",
+                    peer = %peer,
+                    subject = %resp.node_id,
+                    asked_from = flight.from_seq,
+                    got_from = first.seq,
+                    "audit range response does not start where we asked; dropped"
+                );
+                return None;
+            }
+            None => return None,
+        }
         let outcome = match self.store.audit_ingest_range(
             self.local_id,
             resp.node_id,
@@ -528,11 +614,12 @@ impl AuditSyncService {
                     }
                 } else if resp.truncated {
                     // More to come: ask for the next slice.
-                    self.request_range(
+                    self.request_range_round(
                         peer,
                         resp.node_id,
                         progress.through_seq.saturating_add(1),
                         flight.target_seq,
+                        flight.round.saturating_add(1),
                         now_ms,
                     );
                 }

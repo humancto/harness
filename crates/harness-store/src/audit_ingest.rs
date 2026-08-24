@@ -62,6 +62,20 @@ pub enum IngestRefusal {
     NotContiguous { have_through: u64, offered: u64 },
     /// More rows than [`MAX_INGEST_ROWS_PER_PULL`].
     TooMany { got: usize },
+    /// A continuing batch does not hash-link to the row we already
+    /// committed at `through_seq` — only its sequence number lined up.
+    BrokenRunLink { at_seq: u64 },
+    /// A run starting above seq 1 with nothing to anchor it: no stored
+    /// predecessor and no pin at `seq - 1` matching its `prev_hash`.
+    UnanchoredStart { seq: u64 },
+    /// A row we already hold at this position has a DIFFERENT hash.
+    /// Two entries at one `(node_id, seq)` is the fork 5.13c-1 exists
+    /// to detect, so it is refused loudly rather than swallowed.
+    Conflict { seq: u64 },
+    /// `detail` exceeds what a locally appended row may carry.
+    DetailTooLarge { seq: u64 },
+    /// Rows past the pin this run is walking toward.
+    PastTarget { seq: u64 },
 }
 
 /// What one accepted batch did.
@@ -115,7 +129,7 @@ impl Store {
             }));
         };
 
-        if let Err(refusal) = validate_batch(node, entries, now_ms) {
+        if let Err(refusal) = validate_batch(node, entries, target_seq, now_ms) {
             return Ok(Err(refusal));
         }
         let last = entries.last().unwrap_or(first);
@@ -132,21 +146,34 @@ impl Store {
                 )
                 .optional()?;
 
-            // A continuing run must pick up exactly where it left off.
-            if let Some((_, through)) = run {
-                let want = u64::try_from(through).unwrap_or(0).saturating_add(1);
-                if first.seq != want {
-                    tx.rollback()?;
-                    return Ok(Err(IngestRefusal::NotContiguous {
-                        have_through: u64::try_from(through).unwrap_or(0),
-                        offered: first.seq,
-                    }));
-                }
+            if let Err(refusal) = check_run_anchor(&tx, node, run, first)? {
+                tx.rollback()?;
+                return Ok(Err(refusal));
             }
 
+            let mut committed = 0usize;
             for e in entries {
-                tx.execute(
-                    "INSERT OR IGNORE INTO audit_log(
+                // A row already here with a DIFFERENT hash is not a
+                // duplicate to skip — it is two entries at one
+                // position, the fork 5.13c-1 exists to detect.
+                // `INSERT OR IGNORE` swallowed it and then reported
+                // progress it had not made (diff review MAJOR-5).
+                let existing: Option<Vec<u8>> = tx
+                    .query_row(
+                        "SELECT entry_hash FROM audit_log WHERE node_id = ?1 AND seq = ?2",
+                        params![node.as_bytes(), i64c(e.seq)],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(raw) = existing {
+                    if <[u8; 32]>::try_from(raw.as_slice()).unwrap_or([0u8; 32]) != e.entry_hash {
+                        tx.rollback()?;
+                        return Ok(Err(IngestRefusal::Conflict { seq: e.seq }));
+                    }
+                    continue;
+                }
+                committed += tx.execute(
+                    "INSERT INTO audit_log(
                          node_id, seq, at_ms, action, subject, detail,
                          actor, prev_hash, entry_hash, received_at_ms)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
@@ -186,7 +213,8 @@ impl Store {
             )?;
             tx.commit()?;
             Ok(Ok(IngestProgress {
-                committed: entries.len(),
+                // Rows actually WRITTEN, not rows offered.
+                committed,
                 through_seq: last.seq,
                 reached_pin: reached,
             }))
@@ -225,12 +253,15 @@ impl Store {
         }
         // Otherwise the run is anchored on a pin, if we hold one that
         // matches the first row's predecessor.
-        let Some(first_prev) = self.entry_prev_hash_at(node, from_seq)? else {
-            return Ok(crate::audit::ChainStatus::Empty);
-        };
+        // Guard BEFORE the lookup: no row has seq 0, so asking for the
+        // predecessor of 0 would return Empty and make this
+        // unreachable (diff review MINOR).
         if from_seq == 0 {
             return Ok(crate::audit::ChainStatus::Broken { at_seq: from_seq });
         }
+        let Some(first_prev) = self.entry_prev_hash_at(node, from_seq)? else {
+            return Ok(crate::audit::ChainStatus::Empty);
+        };
         match self.pinned_hash_at(node, from_seq - 1)? {
             Some(pinned) if pinned == first_prev => {
                 self.audit_verify_from_anchor(node, from_seq, max_rows)
@@ -269,22 +300,37 @@ impl Store {
     ) -> Result<bool, StoreError> {
         let pin = self.pinned_hash_at(node, target_seq)?;
         let Some(pin) = pin else { return Ok(false) };
-        let row: Option<(i64, i64)> = self.with_conn(|c| {
+        let row: Option<(i64, i64, i64)> = self.with_conn(|c| {
             Ok(c.query_row(
-                "SELECT through_seq, complete FROM audit_ingest_runs
+                "SELECT through_seq, complete, from_seq FROM audit_ingest_runs
                   WHERE node_id = ?1 AND target_seq = ?2",
                 params![node.as_bytes(), i64c(target_seq)],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?)
         })?;
-        let Some((through, complete)) = row else {
+        let Some((through, complete, from)) = row else {
             return Ok(false);
         };
         if complete == 0 || u64::try_from(through).unwrap_or(0) != target_seq {
             return Ok(false);
         }
-        Ok(self.audit_entry_hash_at(node, target_seq)? == Some(pin))
+        if self.audit_entry_hash_at(node, target_seq)? != Some(pin) {
+            return Ok(false);
+        }
+        // The run bookkeeping says the walk finished; the VERIFIER says
+        // whether what it walked is actually a chain (diff review
+        // BLOCKER-3). Without this the two disagreed and nothing
+        // reconciled them: a run stitched from two different histories
+        // reported `corroborates = true` while `audit_verify_range`
+        // called the same rows Broken.
+        let from_seq = u64::try_from(from).unwrap_or(1).max(1);
+        let span = usize::try_from(target_seq.saturating_sub(from_seq).saturating_add(1))
+            .unwrap_or(usize::MAX);
+        Ok(matches!(
+            self.audit_verify_range(node, from_seq, span)?,
+            crate::audit::ChainStatus::Verified { .. }
+        ))
     }
 
     /// Mark a pin from the run that reached it.
@@ -380,6 +426,7 @@ impl Store {
 fn validate_batch(
     node: NodeId,
     entries: &[AuditEntryWire],
+    target_seq: u64,
     now_ms: u64,
 ) -> Result<(), IngestRefusal> {
     let Some(first) = entries.first() else {
@@ -395,6 +442,18 @@ fn validate_batch(
         }
         if e.at_ms > now_ms.saturating_add(MAX_INGEST_SKEW_MS) {
             return Err(IngestRefusal::Skew { seq: e.seq });
+        }
+        // Locally appended rows are capped; ingest checked nothing, so
+        // a peer could plant ~1 MiB per row and it would render into
+        // the History feed (diff review MAJOR-6).
+        if e.detail
+            .as_ref()
+            .is_some_and(|d| d.len() > crate::audit::MAX_AUDIT_DETAIL_BYTES)
+        {
+            return Err(IngestRefusal::DetailTooLarge { seq: e.seq });
+        }
+        if e.seq > target_seq {
+            return Err(IngestRefusal::PastTarget { seq: e.seq });
         }
         let Some(action) = action_from_str(&e.action) else {
             return Err(IngestRefusal::UnknownAction { seq: e.seq });
@@ -419,6 +478,64 @@ fn validate_batch(
         expect_seq = expect_seq.saturating_add(1);
     }
     Ok(())
+}
+
+/// A batch must continue the run it claims to continue — by SEQUENCE
+/// and by HASH — or, for a fresh run above seq 1, be anchored on
+/// something we already hold.
+///
+/// Checking only the sequence number (Codex P1 on #67) lets a peer
+/// submit individually valid but disconnected batches and finish on
+/// the pinned hash. Accepting an unanchored fresh start lets a peer
+/// answer "give me 1..target" with only the entry at `target`, so the
+/// pin is corroborated without a single preceding entry being walked.
+fn check_run_anchor(
+    tx: &rusqlite::Transaction<'_>,
+    node: NodeId,
+    run: Option<(i64, i64)>,
+    first: &AuditEntryWire,
+) -> Result<Result<(), IngestRefusal>, StoreError> {
+    let stored_hash = |seq: u64| -> Result<Option<[u8; 32]>, StoreError> {
+        let raw: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT entry_hash FROM audit_log WHERE node_id = ?1 AND seq = ?2",
+                params![node.as_bytes(), i64c(seq)],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw.map(|b| <[u8; 32]>::try_from(b.as_slice()).unwrap_or([0u8; 32])))
+    };
+
+    if let Some((_, through)) = run {
+        let have_through = u64::try_from(through).unwrap_or(0);
+        if first.seq != have_through.saturating_add(1) {
+            return Ok(Err(IngestRefusal::NotContiguous {
+                have_through,
+                offered: first.seq,
+            }));
+        }
+        if stored_hash(have_through)? != Some(first.prev_hash) {
+            return Ok(Err(IngestRefusal::BrokenRunLink { at_seq: first.seq }));
+        }
+        return Ok(Ok(()));
+    }
+
+    if first.seq > 1 {
+        let pinned: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT entry_hash FROM audit_peer_heads WHERE node_id = ?1 AND seq = ?2",
+                params![node.as_bytes(), i64c(first.seq - 1)],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let pinned = pinned.map(|b| <[u8; 32]>::try_from(b.as_slice()).unwrap_or([0u8; 32]));
+        let anchored =
+            stored_hash(first.seq - 1)? == Some(first.prev_hash) || pinned == Some(first.prev_hash);
+        if !anchored {
+            return Ok(Err(IngestRefusal::UnanchoredStart { seq: first.seq }));
+        }
+    }
+    Ok(Ok(()))
 }
 
 fn i64c(v: u64) -> i64 {
@@ -500,18 +617,21 @@ mod tests {
     }
 
     #[test]
-    fn i02_a_truncate_and_regrow_past_the_pin_is_contradicted() {
-        // THE property of 5.13c-2. 5.13c-1 catches a same-seq fork; it
-        // cannot catch this, because the rewritten node's new head
-        // lands at an unpinned position and reads as ordinary growth.
-        // Linking the old pin to the new head requires the walk.
+    fn i02_a_rewritten_chain_cannot_corroborate_the_pin_it_replaced() {
+        // THE property of 5.13c-2, asserted for the right reason.
+        //
+        // The first version of this test queried
+        // `audit_run_corroborates(node, 5)` when the run targeted 12,
+        // so it returned false at the "no run row" early-out before
+        // any hash was compared — it would have passed against a
+        // gutted implementation (diff review BLOCKER-4).
         let (_src, entries) = chain_of(10);
         let dst = Store::open_memory().expect("dst");
-        let pinned = &entries[4]; // pin at seq 5
+        let pinned = &entries[4]; // we pinned the honest hash at seq 5
         pin(&dst, pinned.seq, pinned.entry_hash, now());
 
-        // The node rewrites history from seq 5 on and regrows. Its own
-        // chain is internally consistent and verifies locally.
+        // The node rewrites from the start and regrows. Its own chain
+        // is internally consistent and verifies locally.
         let (_src2, rewritten) = {
             let src = Store::open_memory().expect("store");
             let sink = crate::audit::StoreAuditSink::new(src.clone(), node(1));
@@ -524,35 +644,144 @@ mod tests {
             let (e, _) = src.audit_entries_for_range(node(1), 1, 12).expect("serve");
             (src, e)
         };
-        let new_head = rewritten.last().expect("rewritten");
-
-        // The rewritten chain is internally sound — every hash and
-        // link checks out — so ingest ACCEPTS it.
-        let out = dst
-            .audit_ingest_range(node(9), node(1), new_head.seq, &rewritten, now())
-            .expect("ingest")
-            .expect("internally consistent");
-        assert_eq!(out.committed, 12);
-
-        // But the pin we already hold at seq 5 is not in it.
-        let held = dst
-            .peer_head_pins(node(1))
-            .expect("pins")
-            .into_iter()
-            .find(|p| p.seq == pinned.seq)
-            .expect("pin");
-        let ingested_at_5 = dst
-            .audit_entry_hash_at(node(1), pinned.seq)
-            .expect("read")
-            .expect("row");
         assert_ne!(
-            ingested_at_5, held.entry_hash,
+            rewritten[4].entry_hash, pinned.entry_hash,
             "the rewrite really changed seq 5"
         );
+
+        // Walking the rewritten chain toward the pin we hold at seq 5
+        // hits the position we already pinned and the hashes disagree.
+        let refusal = dst
+            .audit_ingest_range(node(9), node(1), pinned.seq, &rewritten[..5], now())
+            .expect("ingest");
         assert!(
             !dst.audit_run_corroborates(node(1), pinned.seq)
                 .expect("check"),
-            "a chain that does not contain our pin cannot corroborate it"
+            "a chain that does not contain our pin cannot corroborate it (ingest said {refusal:?})"
+        );
+    }
+
+    #[test]
+    fn i02b_a_walk_that_lands_on_the_wrong_hash_does_not_corroborate() {
+        // Pins the comparison itself: the run completes, reaches
+        // `target_seq`, and the stored hash there is NOT what we
+        // pinned. Deleting either pin-hash check makes this pass
+        // (diff review BLOCKER-4, mutants M1 and M2).
+        let (_src, entries) = chain_of(8);
+        let dst = Store::open_memory().expect("dst");
+        let last = entries.last().expect("entries");
+
+        // A pin at the right position carrying the WRONG hash.
+        pin(&dst, last.seq, [0x5A; 32], now());
+
+        let out = dst
+            .audit_ingest_range(node(9), node(1), last.seq, &entries, now())
+            .expect("ingest")
+            .expect("the chain itself is sound");
+        assert_eq!(out.through_seq, last.seq, "the walk did reach the target");
+        assert!(
+            !out.reached_pin,
+            "but it did not land on the hash we pinned"
+        );
+        assert!(
+            !dst.audit_run_corroborates(node(1), last.seq)
+                .expect("check"),
+            "and corroboration must say so"
+        );
+        assert_eq!(
+            dst.settle_pin_from_run(node(1), last.seq).expect("settle"),
+            PinStatus::Unchecked
+        );
+    }
+
+    #[test]
+    fn i02c_an_anchor_pin_with_the_wrong_hash_does_not_verify() {
+        // The third surviving mutant (M3): `audit_verify_range`
+        // accepting any pin at `from_seq - 1` rather than one whose
+        // hash matches the run's first `prev_hash`.
+        let (_src, entries) = chain_of(20);
+        let dst = Store::open_memory().expect("dst");
+        let last = entries.last().expect("entries");
+        pin(&dst, last.seq, last.entry_hash, now());
+        // Anchor pin at seq 9, wrong hash.
+        pin(&dst, 9, [0x77; 32], now());
+
+        assert_eq!(
+            dst.audit_ingest_range(node(9), node(1), last.seq, &entries[9..], now())
+                .expect("ingest")
+                .expect_err("refuse"),
+            IngestRefusal::UnanchoredStart { seq: 10 },
+            "a mismatched anchor is not an anchor"
+        );
+
+        // Force the rows in and check the verifier independently.
+        for e in &entries[9..] {
+            dst.with_conn(|c| {
+                c.execute(
+                    "INSERT INTO audit_log(node_id, seq, at_ms, action, subject,
+                                           detail, actor, prev_hash, entry_hash,
+                                           received_at_ms)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                    params![
+                        node(1).as_bytes(),
+                        i64c(e.seq),
+                        i64c(e.at_ms),
+                        e.action,
+                        e.subject,
+                        e.detail,
+                        e.actor,
+                        e.prev_hash.as_slice(),
+                        e.entry_hash.as_slice(),
+                        i64c(now()),
+                    ],
+                )?;
+                Ok(())
+            })
+            .expect("force insert");
+        }
+        assert_eq!(
+            dst.audit_verify_range(node(1), 10, 1_000).expect("verify"),
+            crate::audit::ChainStatus::Broken { at_seq: 10 },
+            "the pin at seq 9 does not match the run's prev_hash"
+        );
+    }
+
+    #[test]
+    fn i02d_tampering_after_a_walk_revokes_corroboration() {
+        // Corroboration is re-derived on every read, not cached. A run
+        // that once completed must stop corroborating the moment the
+        // rows it walked stop hashing up to the pin.
+        let (_src, entries) = chain_of(8);
+        let dst = Store::open_memory().expect("dst");
+        let last = entries.last().expect("entries");
+        pin(&dst, last.seq, last.entry_hash, now());
+
+        dst.audit_ingest_range(node(9), node(1), last.seq, &entries, now())
+            .expect("ingest")
+            .expect("accepted");
+        assert!(dst
+            .audit_run_corroborates(node(1), last.seq)
+            .expect("check"));
+
+        // Edit a walked row out from under the completed run.
+        dst.with_conn(|c| {
+            c.execute(
+                "UPDATE audit_log SET subject = 'tampered'
+                  WHERE node_id = ?1 AND seq = 4",
+                params![node(1).as_bytes()],
+            )?;
+            Ok(())
+        })
+        .expect("tamper");
+
+        assert!(
+            !dst.audit_run_corroborates(node(1), last.seq)
+                .expect("check"),
+            "the run marker still says complete; the rows no longer verify"
+        );
+        assert_eq!(
+            dst.settle_pin_from_run(node(1), last.seq).expect("settle"),
+            PinStatus::Unchecked
         );
     }
 
@@ -762,23 +991,55 @@ mod tests {
     }
 
     #[test]
-    fn i12_a_partial_pull_without_a_matching_pin_stays_broken() {
-        // The anchor must be a pin we ALREADY held. Without one, an
-        // unanchored run is exactly the prefix-deletion case 5.13a's
-        // review established, and must not verify.
+    fn i12_an_unanchored_run_is_refused_and_would_not_verify_anyway() {
+        // Two layers, both required. Ingest refuses a fresh run above
+        // seq 1 with nothing anchoring it (i15) — and if rows reach
+        // the table by some other route, `audit_verify_range` still
+        // refuses to verify them, because the pin that would anchor
+        // the walk is not there.
         let (_src, entries) = chain_of(20);
         let dst = Store::open_memory().expect("dst");
         let last = entries.last().expect("entries");
         pin(&dst, last.seq, last.entry_hash, now());
 
-        dst.audit_ingest_range(node(9), node(1), last.seq, &entries[9..], now())
-            .expect("ingest")
-            .expect("accepted");
+        assert_eq!(
+            dst.audit_ingest_range(node(9), node(1), last.seq, &entries[9..], now())
+                .expect("ingest")
+                .expect_err("refuse"),
+            IngestRefusal::UnanchoredStart { seq: 10 },
+            "no pin or row at seq 9 to anchor the run"
+        );
 
+        // Force the rows in behind ingest's back, then check the
+        // verifier independently.
+        for e in &entries[9..] {
+            dst.with_conn(|c| {
+                c.execute(
+                    "INSERT INTO audit_log(node_id, seq, at_ms, action, subject,
+                                           detail, actor, prev_hash, entry_hash,
+                                           received_at_ms)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                    params![
+                        node(1).as_bytes(),
+                        i64c(e.seq),
+                        i64c(e.at_ms),
+                        e.action,
+                        e.subject,
+                        e.detail,
+                        e.actor,
+                        e.prev_hash.as_slice(),
+                        e.entry_hash.as_slice(),
+                        i64c(now()),
+                    ],
+                )?;
+                Ok(())
+            })
+            .expect("force insert");
+        }
         assert_eq!(
             dst.audit_verify_range(node(1), 10, 1_000).expect("verify"),
             crate::audit::ChainStatus::Broken { at_seq: 10 },
-            "no pin at seq 9, so nothing anchors the run"
+            "nothing anchors the run, so it cannot verify"
         );
     }
 
@@ -808,6 +1069,121 @@ mod tests {
         assert_eq!(
             dst.audit_verify_range(node(1), 10, 1_000).expect("verify"),
             crate::audit::ChainStatus::Broken { at_seq: 15 }
+        );
+    }
+
+    #[test]
+    fn i14_a_batch_must_link_by_hash_not_just_by_number() {
+        // Codex P1 on #67: checking only `seq == through + 1` lets a
+        // peer submit individually valid but DISCONNECTED batches and
+        // finish on the pinned hash. Each batch verifies internally,
+        // the numbers line up, and the run reports corroboration for a
+        // chain that is broken across the seams.
+        let (_src, entries) = chain_of(20);
+        let dst = Store::open_memory().expect("dst");
+        let last = entries.last().expect("entries");
+        pin(&dst, last.seq, last.entry_hash, now());
+
+        dst.audit_ingest_range(node(9), node(1), last.seq, &entries[..10], now())
+            .expect("ingest")
+            .expect("accepted");
+
+        // A second chain, valid on its own, whose seq 11 does not
+        // follow the seq 10 we committed.
+        let (_other, foreign) = chain_of(20);
+        let refusal = dst
+            .audit_ingest_range(node(9), node(1), last.seq, &foreign[10..], now())
+            .expect("ingest")
+            .expect_err("must refuse");
+        assert_eq!(refusal, IngestRefusal::BrokenRunLink { at_seq: 11 });
+        assert!(
+            !dst.audit_run_corroborates(node(1), last.seq)
+                .expect("check"),
+            "the stitched run must not corroborate"
+        );
+    }
+
+    #[test]
+    fn i15_a_fresh_run_above_seq_one_needs_an_anchor() {
+        // The other half of the same attack (Codex P1 on #67): a
+        // malicious subject answers a request for 1..target with ONLY
+        // the entry at target. With no anchor requirement the final
+        // hash matches the pin and the pin is corroborated without a
+        // single preceding entry being walked.
+        let (_src, entries) = chain_of(20);
+        let dst = Store::open_memory().expect("dst");
+        let last = entries.last().expect("entries");
+        pin(&dst, last.seq, last.entry_hash, now());
+
+        let refusal = dst
+            .audit_ingest_range(node(9), node(1), last.seq, &entries[19..], now())
+            .expect("ingest")
+            .expect_err("must refuse");
+        assert_eq!(refusal, IngestRefusal::UnanchoredStart { seq: 20 });
+        assert!(!dst
+            .audit_run_corroborates(node(1), last.seq)
+            .expect("check"));
+
+        // With a pin at the predecessor, the same batch anchors.
+        pin(&dst, entries[18].seq, entries[18].entry_hash, now());
+        let out = dst
+            .audit_ingest_range(node(9), node(1), last.seq, &entries[19..], now())
+            .expect("ingest")
+            .expect("anchored on the pin at seq 19");
+        assert!(out.reached_pin);
+    }
+
+    #[test]
+    fn i16_the_feed_orders_ingested_rows_by_our_receive_time() {
+        // Codex P2 on #67: `received_at_ms` and its index existed but
+        // `audit_recent` still ordered on `at_ms`, so an ingested row
+        // could choose its own position in every node's History.
+        let dst = Store::open_memory().expect("dst");
+
+        // A peer row whose own at_ms is nearly a day ahead — inside
+        // the skew allowance, so it is accepted — but received now.
+        let (_src, mut entries) = chain_of(1);
+        entries[0].at_ms = now() + MAX_INGEST_SKEW_MS - 60_000;
+        // Re-hash so the doctored row is internally valid.
+        let action = crate::audit::action_from_str(&entries[0].action).expect("action");
+        entries[0].entry_hash = harness_core::audit_entry_hash(
+            node(1),
+            entries[0].seq,
+            entries[0].at_ms,
+            action,
+            entries[0].subject.as_deref(),
+            entries[0].detail.as_deref(),
+            &entries[0].actor,
+            &entries[0].prev_hash,
+        )
+        .expect("hash");
+
+        dst.audit_ingest_range(node(9), node(1), 1, &entries, now())
+            .expect("ingest")
+            .expect("accepted");
+
+        // Recorded AFTER the peer row was received, so on our clock it
+        // is genuinely newer — while the peer's own stamp is a day
+        // ahead of both.
+        let sink = crate::audit::StoreAuditSink::new(dst.clone(), node(5));
+        sink.record(
+            AuditRecord::new(AuditAction::TaskDispatched, AuditActor::System)
+                .with_subject("local-now"),
+        );
+
+        let rows = dst.audit_recent(None, None, None, 10).expect("recent");
+        assert_eq!(
+            rows[0].node_id,
+            node(5),
+            "the local row stays on top; the peer's future at_ms buys nothing"
+        );
+        let peer_row = rows
+            .iter()
+            .find(|r| r.node_id == node(1))
+            .expect("peer row");
+        assert!(
+            peer_row.feed_ms < peer_row.at_ms,
+            "the peer row is ordered by our receive time, not its own stamp"
         );
     }
 }

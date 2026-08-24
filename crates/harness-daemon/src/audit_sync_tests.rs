@@ -699,3 +699,90 @@ async fn m13_an_unmatched_response_is_dropped() {
         rows.len()
     );
 }
+
+#[test]
+fn m14_a_response_must_start_where_we_asked() {
+    // Codex P1 on #67. A malicious subject answers a request for
+    // 1..target with ONLY its valid entry at `target`. Without this
+    // check a fresh run accepts that starting point, the final hash
+    // equals the pin, and the pin is marked corroborated without one
+    // preceding entry being walked — the whole guarantee, gone.
+    //
+    // Deliberately not a two-daemon test: a live peer answers the
+    // request honestly before a crafted reply can land, which would
+    // corroborate the pin for the RIGHT reason and hide the bug.
+    let (store, me, trust, _b, c, _tmp) = trio();
+    let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me, trust);
+
+    // Build a real chain for C and pin its head.
+    let subject_store = harness_store::Store::open_memory().expect("subject store");
+    let sink = StoreAuditSink::new(subject_store.clone(), c.node_id());
+    for i in 0..10 {
+        sink.record(
+            AuditRecord::new(AuditAction::TaskDispatched, AuditActor::System)
+                .with_subject(format!("task-{i}")),
+        );
+    }
+    let (all, _) = subject_store
+        .audit_entries_for_range(c.node_id(), 1, 10)
+        .expect("serve");
+    let head = all.last().expect("entries");
+    let mut pin_head = harness_core::AuditHead {
+        node_id: c.node_id(),
+        seq: head.seq,
+        entry_hash: head.entry_hash,
+        at_ms: now_ms(),
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    pin_head.sign(&c).expect("sign");
+    store
+        .pin_peer_head(&pin_head, c.node_id(), now_ms())
+        .expect("pin");
+
+    // Also pin the PREDECESSOR, so the store's own anchor check would
+    // accept a batch starting at 10. That leaves the daemon's
+    // start-position guard as the only thing standing between a
+    // one-row answer and a corroborated pin — without it this test
+    // would pass for the wrong reason.
+    let prev = &all[8];
+    let mut pin_prev = harness_core::AuditHead {
+        node_id: c.node_id(),
+        seq: prev.seq,
+        entry_hash: prev.entry_hash,
+        at_ms: now_ms(),
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    pin_prev.sign(&c).expect("sign");
+    store
+        .pin_peer_head(&pin_prev, c.node_id(), now_ms())
+        .expect("pin");
+
+    // We asked for 1..=10; the answer contains only entry 10.
+    let req_id = svc.track_inflight_for_test(c.node_id(), c.node_id(), 1, head.seq, now_ms());
+    let mut env = harness_core::AuditSyncEnvelope {
+        source: c.node_id(),
+        assembled_at: now_ms(),
+        heads: Vec::new(),
+        range_req: None,
+        range_resp: Some(harness_core::AuditRangeResp {
+            req_id,
+            node_id: c.node_id(),
+            entries: vec![head.clone()],
+            truncated: false,
+        }),
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    env.sign(&c).expect("sign");
+    svc.ingest(c.node_id(), &env, now_ms());
+
+    assert!(
+        !store
+            .audit_run_corroborates(c.node_id(), head.seq)
+            .expect("check"),
+        "a truncated answer must not corroborate the pin"
+    );
+    let (rows, _) = store
+        .audit_entries_for_range(c.node_id(), 1, head.seq)
+        .expect("read");
+    assert!(rows.is_empty(), "and nothing was ingested");
+}
