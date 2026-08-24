@@ -9,6 +9,7 @@
     isNotable,
     maxSeqForNode,
     shortNode,
+    suppressionOf,
     toCsv,
     toJson,
     verificationSummary,
@@ -281,6 +282,7 @@
         </thead>
         <tbody class="divide-y divide-zinc-100 dark:divide-zinc-800">
           {#each rows as row (row.node + row.seq)}
+            {@const suppressed = suppressionOf(row)}
             <tr class={isNotable(row.action) ? 'bg-amber-50/60 dark:bg-amber-950/30' : ''}>
               <td class="whitespace-nowrap py-1 pr-2 tabular-nums text-zinc-500"
                 >{fmtTime(row.at_ms)}</td
@@ -295,13 +297,20 @@
                       : row.action === 'secret.accessed'
                         ? 'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300'
                         : 'bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300'}"
-                  >{actionLabel(row.action)}</span
+                  >{actionLabel(row.action)}{#if suppressed}
+                    &nbsp;· {suppressed.repeats} suppressed{/if}</span
                 >
               </td>
               <td class="py-1 pr-2 font-mono">{row.actor}</td>
-              <td class="max-w-40 truncate py-1 pr-2 font-mono" title={row.subject ?? ''}
-                >{row.subject ?? ''}</td
-              >
+              <td class="max-w-40 truncate py-1 pr-2 font-mono" title={row.subject ?? ''}>
+                {#if suppressed}
+                  <span class="font-sans italic text-zinc-400">
+                    {suppressed.distinct} distinct{#if suppressed.sinceMs}, from {fmtTime(
+                        suppressed.sinceMs,
+                      )}{/if}
+                  </span>
+                {:else}{row.subject ?? ''}{/if}
+              </td>
               <td
                 class="max-w-64 truncate py-1 pr-2 text-zinc-500"
                 title={detailText(row.detail)}>{detailText(row.detail)}</td

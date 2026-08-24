@@ -5,6 +5,7 @@ import {
   auditQuery,
   isNotable,
   maxSeqForNode,
+  suppressionOf,
   toCsv,
   toJson,
   verificationSummary,
@@ -214,5 +215,41 @@ describe("verification coverage", () => {
     ];
     expect(maxSeqForNode(entries, NODE)).toBe(510);
     expect(maxSeqForNode(entries, undefined)).toBeUndefined();
+  });
+});
+
+describe("suppression summaries", () => {
+  it("recognizes a summary row and reads its counts", () => {
+    const s = suppressionOf(
+      entry({
+        action: "shell.denied",
+        subject: undefined,
+        detail: {
+          suppressed_repeats: 4990,
+          distinct_subjects: 64,
+          window_start_ms: 1_700_000_000_000,
+        },
+      }),
+    );
+    expect(s).not.toBeNull();
+    expect(s?.repeats).toBe(4990);
+    expect(s?.distinct).toBe(64);
+    expect(s?.sinceMs).toBe(1_700_000_000_000);
+  });
+
+  it("does not mistake a real denial for a summary", () => {
+    // A genuine denial carries argv_hash and reason, never a count —
+    // otherwise the page would label real denials as suppressions.
+    expect(
+      suppressionOf(
+        entry({
+          action: "shell.denied",
+          subject: "rm -rf /",
+          detail: { argv_hash: "ab", reason: "policy" },
+        }),
+      ),
+    ).toBeNull();
+    expect(suppressionOf(entry({ detail: undefined }))).toBeNull();
+    expect(suppressionOf(entry({ detail: "not an object" }))).toBeNull();
   });
 });

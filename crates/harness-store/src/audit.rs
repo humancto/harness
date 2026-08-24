@@ -551,7 +551,14 @@ struct Window {
     /// Distinct subjects seen among the DROPPED records, capped at
     /// [`DISTINCT_CAP`]; `distinct_overflow` marks that the real
     /// number is higher.
-    distinct: std::collections::HashSet<String>,
+    ///
+    /// Keyed on a hash of the UNTRUNCATED subject (re-review MINOR-4
+    /// on #65): keying on the truncated form collapses 1000 commands
+    /// sharing a 128-byte prefix into `distinct_subjects: 1` with
+    /// `distinct_subjects_capped: false` — a flag that says "exact"
+    /// when it is not, which is the same species of overstatement
+    /// this item just removed from the History banner.
+    distinct: std::collections::HashSet<[u8; 32]>,
     distinct_overflow: bool,
     /// Up to [`SAMPLE_SUBJECTS`] of those subjects, kept in the order
     /// first seen.
@@ -603,12 +610,12 @@ impl Window {
     fn note_dropped(&mut self, subject: Option<&str>) {
         self.suppressed += 1;
         let Some(subject) = subject else { return };
-        let subject = sampled(subject);
+        let id = *blake3::hash(subject.as_bytes()).as_bytes();
         if self.distinct.len() < DISTINCT_CAP {
-            if self.distinct.insert(subject.clone()) && self.sample.len() < SAMPLE_SUBJECTS {
-                self.sample.push(subject);
+            if self.distinct.insert(id) && self.sample.len() < SAMPLE_SUBJECTS {
+                self.sample.push(sampled(subject));
             }
-        } else if !self.distinct.contains(&subject) {
+        } else if !self.distinct.contains(&id) {
             self.distinct_overflow = true;
         }
     }
@@ -687,6 +694,26 @@ impl StoreAuditSink {
     /// of the rest.
     pub fn flush_suppressed(&self) {
         self.flush_at(now_ms());
+    }
+
+    /// Close EVERY open window, elapsed or not, and append what they
+    /// owe. Called on daemon shutdown: [`Self::close_expired`] closes
+    /// only windows whose interval has passed, so a burst that was
+    /// still in progress would otherwise take its count to the grave
+    /// (re-review MAJOR-2 on #65 — an operator restarting the daemon
+    /// 30s into a flood is the expected reaction to a flood).
+    ///
+    /// An UNGRACEFUL exit still loses the open window's count. That
+    /// residual is irreducible for an in-memory map and is stated in
+    /// ADR-0041 rather than implied away.
+    pub fn close_all_windows(&self) {
+        let now = now_ms();
+        let drained: Vec<(BurstKey, Window)> = self.bursts.lock().drain().collect();
+        for (key, window) in drained {
+            if let Some(summary) = window.into_summary(key) {
+                self.append(&summary, now);
+            }
+        }
     }
 
     fn flush_at(&self, now_ms: u64) {
@@ -1364,6 +1391,91 @@ mod tests {
             ChainStatus::Verified {
                 through_seq: BURST_ALLOWANCE + 1
             }
+        );
+    }
+
+    #[test]
+    fn a09i_shutdown_closes_an_in_progress_window() {
+        // Re-review MAJOR-2 on #65: restarting the daemon mid-flood
+        // is the natural reaction to a flood, and an unexpired window
+        // is exactly the one holding the count.
+        let s = Store::open_memory().expect("store");
+        let sink = StoreAuditSink::new(s.clone(), node());
+        for _ in 0..BURST_ALLOWANCE + 7 {
+            sink.record(denial("rm -rf /"));
+        }
+        // The window is seconds old: the expiry-based flush is a no-op.
+        sink.flush_suppressed();
+        assert_eq!(
+            s.audit_recent(None, None, None, 100).expect("recent").len(),
+            allowance(),
+            "an unexpired window is not closed by the periodic flush"
+        );
+
+        sink.close_all_windows();
+        let rows = s.audit_recent(None, None, None, 100).expect("recent");
+        assert_eq!(rows.len(), allowance() + 1);
+        assert_eq!(
+            detail_of(&rows[0])["suppressed_repeats"],
+            serde_json::json!(7)
+        );
+        assert!(sink.bursts.lock().is_empty());
+    }
+
+    #[test]
+    fn a09j_distinct_subjects_is_not_collapsed_by_truncation() {
+        // Re-review MINOR-4 on #65: keying the distinct set on the
+        // TRUNCATED subject collapsed commands sharing a long prefix
+        // into `distinct_subjects: 1` with `capped: false` — a flag
+        // claiming exactness it does not have.
+        let s = Store::open_memory().expect("store");
+        let sink = StoreAuditSink::new(s.clone(), node());
+        for _ in 0..BURST_ALLOWANCE {
+            sink.record(denial("warmup"));
+        }
+        let prefix = "x".repeat(SAMPLE_SUBJECT_BYTES * 2);
+        for i in 0..5 {
+            sink.record(denial(&format!("{prefix}{i}")));
+        }
+        sink.flush_at(now_ms() + SUPPRESSION_WINDOW_MS + 1);
+        let rows = s
+            .audit_recent(None, Some("shell.denied"), None, 100)
+            .expect("recent");
+        let summary = detail_of(&rows[0]);
+        assert_eq!(
+            summary["distinct_subjects"],
+            serde_json::json!(5),
+            "five commands differing past the truncation point are five"
+        );
+        assert_eq!(
+            summary["distinct_subjects_capped"],
+            serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn a09k_a_summary_survives_with_no_samples_at_all() {
+        // The counts must be unlosable: there must be no input for
+        // which the numeric-only detail exceeds the cap.
+        let s = Store::open_memory().expect("store");
+        let sink = StoreAuditSink::new(s.clone(), node());
+        for _ in 0..=BURST_ALLOWANCE {
+            // No subject at all — nothing to sample.
+            sink.record(AuditRecord::new(
+                AuditAction::ShellDenied,
+                AuditActor::System,
+            ));
+        }
+        sink.close_all_windows();
+        let rows = s
+            .audit_recent(None, Some("shell.denied"), None, 100)
+            .expect("recent");
+        let summary = detail_of(&rows[0]);
+        assert_eq!(summary["suppressed_repeats"], serde_json::json!(1));
+        assert_eq!(summary["sample_subjects"], serde_json::json!([]));
+        assert!(
+            rows[0].detail.as_deref().expect("detail").len() < MAX_AUDIT_DETAIL_BYTES / 4,
+            "the numeric-only detail is nowhere near the cap"
         );
     }
 }

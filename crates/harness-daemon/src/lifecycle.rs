@@ -1154,7 +1154,15 @@ async fn spawn_checkpoint_sweeper(
                 audit_sink.flush_suppressed();
                 crate::executor::prune_audit_log(&store, node);
             }
-            _ = shutdown.changed() => return,
+            _ = shutdown.changed() => {
+                // 5.13b re-review MAJOR-2: an operator restarting the
+                // daemon mid-flood is the expected reaction to a
+                // flood, and `close_expired` skips a window that has
+                // not elapsed — so the in-progress burst's count
+                // would go with it.
+                audit_sink.close_all_windows();
+                return;
+            }
         }
     }
 }

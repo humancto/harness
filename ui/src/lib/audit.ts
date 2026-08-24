@@ -188,6 +188,30 @@ export function fmtTime(ms: number): string {
   return new Date(ms).toISOString().replace("T", " ").slice(0, 19);
 }
 
+/**
+ * A suppression summary, if this row is one.
+ *
+ * The summary carries the action it stands for (`shell.denied`), so
+ * without this the History page renders it as a denial of nothing —
+ * an empty subject under a red DENIED chip, ~1440 of them a day under
+ * a sustained flood (re-review MINOR-3 on #65).
+ */
+export function suppressionOf(
+  entry: AuditEntry,
+): { repeats: number; distinct: number; sinceMs?: number } | null {
+  const d = entry.detail;
+  if (!d || typeof d !== "object") return null;
+  const rec = d as Record<string, unknown>;
+  const repeats = rec.suppressed_repeats;
+  if (typeof repeats !== "number") return null;
+  return {
+    repeats,
+    distinct: typeof rec.distinct_subjects === "number" ? rec.distinct_subjects : 0,
+    sinceMs:
+      typeof rec.window_start_ms === "number" ? rec.window_start_ms : undefined,
+  };
+}
+
 /** Short node id for display. */
 export function shortNode(node: string): string {
   return node.length > 12 ? `${node.slice(0, 12)}…` : node;

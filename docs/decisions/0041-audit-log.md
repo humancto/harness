@@ -160,8 +160,21 @@ choose. ADR-0006's promise is retired, not deferred again.
   and samples are admitted one at a time against a byte budget, so
   the counts are written first and can never be crowded out.
 
-  Costs, stated: past the allowance, per-attempt argv and reason are
-  NOT retained — only the count and the sample. The window map is in
+  Costs and residuals, stated plainly. Past the allowance, per-attempt
+  argv and reason are NOT retained — only the count and the sample.
+  The flood threat is **mitigated, not closed**: 10 rows plus one
+  summary per actor per minute is still ~15.8k rows/day/actor against
+  the 100k bound, so a handful of flooding peers evicts history in
+  days rather than minutes. The periodic close runs on the HOURLY
+  housekeeping tick, so on an otherwise idle node a stopped burst can
+  go unrecorded for up to an hour; the summary row's `at_ms` is its
+  flush time, and the burst's real time is in `window_start_ms`
+  (which the History page renders). Daemon shutdown force-closes
+  every open window, elapsed or not — an operator restarting mid-flood
+  is the expected reaction to a flood. An UNGRACEFUL exit (SIGKILL,
+  power loss) still loses the open window's count: that residual is
+  irreducible for an in-memory map and is stated rather than implied
+  away. The window map is in
   memory (a restart resets it, erring toward recording) and bounded at
   1024 open windows; hitting the bound CLOSES windows, emitting their
   summaries, rather than discarding counts — an eviction that dropped
