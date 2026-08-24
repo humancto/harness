@@ -195,7 +195,17 @@ pub(crate) fn mint_task_guarded(
         trace_ctx: TraceContext::default(),
         issued_by: state.local_node_id,
         issued_at: now_ms,
-        tags: req.tags,
+        // 5.13a (Codex P2 on #64): provenance rides the envelope, so a
+        // capability executing this task can record WHO asked. Webhook
+        // mints already tag their channel; everything else through
+        // this path is an authenticated submission.
+        tags: {
+            let mut tags = req.tags;
+            if !tags.iter().any(|t| t == "webhook") && !tags.iter().any(|t| t == "api") {
+                tags.push("api".to_string());
+            }
+            tags
+        },
         sig: Signature::from_bytes([0u8; 64]),
     };
 

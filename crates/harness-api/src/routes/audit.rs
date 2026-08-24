@@ -28,8 +28,11 @@ const MAX_LIMIT: usize = 500;
 
 #[derive(Debug, Deserialize)]
 pub struct AuditQuery {
-    /// Keyset cursor: entries strictly older than this unix-ms.
+    /// Keyset cursor, all three parts together (a bare timestamp
+    /// would skip rows sharing the boundary millisecond).
     pub before_ms: Option<u64>,
+    pub before_node: Option<String>,
+    pub before_seq: Option<u64>,
     /// Exact action filter (`shell.denied`, `cloud.escalated`, …).
     pub action: Option<String>,
     /// Restrict to one node's chain (hex node id).
@@ -79,7 +82,37 @@ pub async fn list_handler(
         None => None,
     };
 
-    let rows = match store.audit_recent(query.before_ms, query.action.as_deref(), node, limit) {
+    let cursor = match (
+        query.before_ms,
+        query.before_node.as_deref(),
+        query.before_seq,
+    ) {
+        (Some(at_ms), Some(raw), Some(seq)) => match parse_node(raw) {
+            Ok(n) => Some(harness_store::AuditCursor {
+                at_ms,
+                node: n,
+                seq,
+            }),
+            Err(()) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "bad_cursor" })),
+                )
+                    .into_response()
+            }
+        },
+        // A bare `before_ms` means STRICTLY older than that instant:
+        // the low sentinel makes the same-millisecond arm of the
+        // keyset predicate unsatisfiable. Callers paging a burst pass
+        // the full cursor the response hands back.
+        (Some(at_ms), _, _) => Some(harness_store::AuditCursor {
+            at_ms,
+            node: harness_core::NodeId::from_bytes([0u8; 16]),
+            seq: 0,
+        }),
+        _ => None,
+    };
+    let rows = match store.audit_recent(cursor, query.action.as_deref(), node, limit) {
         Ok(rows) => rows,
         Err(err) => {
             tracing::error!(target: "harness.api.audit", ?err, "audit_recent");
@@ -91,27 +124,16 @@ pub async fn list_handler(
         }
     };
 
-    // Verify this node's own chain from the oldest seq ON THIS PAGE —
-    // bounded work, and the answer a reader of this page needs.
     let local = state.local_node_id;
-    let from_seq = rows
-        .iter()
-        .filter(|r| r.node_id == local)
-        .map(|r| r.seq)
-        .min()
-        .unwrap_or(1);
-    let (verified, broken_at) = match store.audit_verify_chain(local, from_seq) {
-        Ok(harness_store::ChainStatus::Verified { .. } | harness_store::ChainStatus::Empty) => {
-            (true, None)
-        }
-        Ok(harness_store::ChainStatus::Broken { at_seq }) => (false, Some(at_seq)),
-        Err(err) => {
-            tracing::error!(target: "harness.api.audit", ?err, "verify_chain");
-            (false, None)
-        }
-    };
+    let verification = verify_page(store, local, &rows, limit);
 
-    let next_before_ms = rows.last().map(|r| r.at_ms);
+    let next_cursor = rows.last().map(|r| {
+        serde_json::json!({
+            "before_ms": r.at_ms,
+            "before_node": r.node_id.to_string(),
+            "before_seq": r.seq,
+        })
+    });
     let entries: Vec<AuditEntryDto> = rows
         .into_iter()
         .map(|r| AuditEntryDto {
@@ -132,17 +154,79 @@ pub async fn list_handler(
         StatusCode::OK,
         Json(serde_json::json!({
             "entries": entries,
-            // Keyset cursor for the next page (entries are newest-first).
-            "next_before_ms": next_before_ms,
-            // Covers THIS node's chain only: every other node's entries
-            // arrive by replication in 5.13c, and their chains are
-            // verified by their own nodes until then.
-            "verified": verified,
-            "broken_at_seq": broken_at,
-            "verified_node": local.to_string(),
+            // Keyset cursor for the next page (entries are
+            // newest-first) — pass all three parts back.
+            "next_cursor": next_cursor,
+            // Scoped deliberately (diff review MAJOR-3): this covers
+            // the local rows ON THIS PAGE and their anchor, nothing
+            // more. `checked: false` means nothing was verified — a
+            // page of purely remote entries proves nothing about them,
+            // and reporting "verified" there would be a lie. Other
+            // nodes' chains are verified by their own nodes until
+            // 5.13c replicates.
+            "verification": verification,
         })),
     )
         .into_response()
+}
+
+/// Verify the local rows on one page plus their anchor.
+///
+/// Bounded by ROW COUNT, not seq span (diff review MAJOR-2): with an
+/// `action` filter a page's rows are contiguous in time but scattered
+/// across the chain, so a span bound would put the full-chain walk
+/// straight back — inside the single store mutex, from an async
+/// handler, reachable by any authenticated session.
+fn verify_page(
+    store: &harness_store::Store,
+    local: harness_core::NodeId,
+    rows: &[harness_store::AuditRow],
+    limit: usize,
+) -> serde_json::Value {
+    let Some(from_seq) = rows
+        .iter()
+        .filter(|r| r.node_id == local)
+        .map(|r| r.seq)
+        .min()
+    else {
+        return serde_json::json!({
+            "scope": "none",
+            "node": local.to_string(),
+            "checked": false,
+        });
+    };
+    match store.audit_verify_chain(local, from_seq, limit) {
+        Ok(harness_store::ChainStatus::Verified { through_seq }) => serde_json::json!({
+            "scope": "page",
+            "node": local.to_string(),
+            "checked": true,
+            "verified": true,
+            "from_seq": from_seq,
+            "through_seq": through_seq,
+        }),
+        Ok(harness_store::ChainStatus::Empty) => serde_json::json!({
+            "scope": "none",
+            "node": local.to_string(),
+            "checked": false,
+        }),
+        Ok(harness_store::ChainStatus::Broken { at_seq }) => serde_json::json!({
+            "scope": "page",
+            "node": local.to_string(),
+            "checked": true,
+            "verified": false,
+            "from_seq": from_seq,
+            "broken_at_seq": at_seq,
+        }),
+        Err(err) => {
+            tracing::error!(target: "harness.api.audit", ?err, "verify_chain");
+            serde_json::json!({
+                "scope": "page",
+                "node": local.to_string(),
+                "checked": false,
+                "error": "verify_failed",
+            })
+        }
+    }
 }
 
 fn parse_node(raw: &str) -> Result<harness_core::NodeId, ()> {

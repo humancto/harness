@@ -20,7 +20,9 @@ pub mod results;
 pub mod scopes;
 pub mod tasks;
 
-pub use crate::audit::{AuditRow, ChainStatus, StoreAuditSink, MAX_AUDIT_DETAIL_BYTES};
+pub use crate::audit::{
+    AuditCursor, AuditRow, ChainStatus, StoreAuditSink, MAX_AUDIT_DETAIL_BYTES,
+};
 pub use crate::capabilities::nodes_for_versioned_capability;
 pub use crate::checkpoints::{aggregate_is_complete, MAX_CHECKPOINT_OUTPUT_BYTES};
 pub use crate::error::StoreError;

@@ -70,6 +70,7 @@ pub use fs::{
     FsGrepCapability, FsListCapability, FsReadCapability, FsSearchCapability, ScopeConfig,
     ScopeError, ScopeRegistry,
 };
+pub use traits::CapturingAuditSink;
 pub use traits::{
     audit_actor, Capability, CapabilityError, ExecutionClass, ExecutionContext, FrameSink,
     LogFrame, StreamKind,

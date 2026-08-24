@@ -17,31 +17,47 @@ use crate::protocol::Signable;
 /// The privileged actions PRD §10.6 enumerates, plus the log's own
 /// housekeeping entry. Serialized `snake_case` with a dot path, so a
 /// reader can filter by prefix (`task.`, `secret.`, …).
+/// NOTE: the serde form and [`AuditAction::as_str`] MUST agree — the
+/// `as_str` form is what gets stored AND hashed, so if 5.13c gossips
+/// entries through serde, a divergent rename would make replicated
+/// rows re-verify against a different preimage than the origin's
+/// (diff review MINOR-6). A test asserts they match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum AuditAction {
     /// A task was routed to a node.
+    #[serde(rename = "task.dispatched")]
     TaskDispatched,
     /// An operator stopped a task (5.10).
+    #[serde(rename = "task.cancelled")]
     TaskCancelled,
     /// A stopped plan was resumed (5.12).
+    #[serde(rename = "plan.resumed")]
     PlanResumed,
     /// `shell.exec` passed its policy gate on the executing node.
+    #[serde(rename = "shell.allowed")]
     ShellAllowed,
-    /// `shell.exec` was refused by policy. Attacker-triggerable, so
-    /// these are suppression-windowed (see the store's `append`).
+    /// `shell.exec` was refused by policy. Attacker-triggerable at
+    /// submit rate: retention prunes the chain, but per-attempt
+    /// coalescing is NOT implemented (5.13b follow-up) — this is not
+    /// a rate limit, and the ADR says so.
+    #[serde(rename = "shell.denied")]
     ShellDenied,
     /// A secret was read by TAG on the executing node.
+    #[serde(rename = "secret.accessed")]
     SecretAccessed,
     /// A peer was approved into the trust store.
+    #[serde(rename = "peer.approved")]
     PeerApproved,
     /// `policy.toml` was loaded or reloaded.
+    #[serde(rename = "policy.loaded")]
     PolicyLoaded,
     /// Planning escalated to a cloud backend (§15, 5.2/5.3).
+    #[serde(rename = "cloud.escalated")]
     CloudEscalated,
     /// Retention pruned entries `<= through_seq`; carries the anchor
     /// hash so the chain still verifies across the gap.
+    #[serde(rename = "audit.truncated")]
     AuditTruncated,
 }
 
@@ -360,5 +376,64 @@ mod tests {
             !peer.contains('+') && !peer.contains('@'),
             "no address material can reach the actor column"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod vector_tests {
+    use super::*;
+
+    /// A known-answer vector (diff review MAJOR-6).
+    ///
+    /// The differential tests above would pass under ANY key ordering.
+    /// This one pins the actual bytes: `serde_json`'s map is a
+    /// `BTreeMap` in this workspace, but feature unification is
+    /// workspace-wide, so a future dependency enabling
+    /// `serde_json/preserve_order` would silently reorder the preimage
+    /// and every stored chain would stop verifying on upgrade. This
+    /// test fails in CI instead.
+    #[test]
+    fn entry_hash_is_stable_across_versions() {
+        let hash = audit_entry_hash(
+            NodeId::from_bytes([0x11; 16]),
+            42,
+            1_700_000_000_000,
+            AuditAction::ShellDenied,
+            Some("rm"),
+            Some(r#"{"reason":"denied"}"#),
+            "local_admin",
+            &[0x22; 32],
+        )
+        .expect("hash");
+        assert_eq!(
+            hash_hex(&hash),
+            "73f9ee069b2976154b27de77785cc188add68c6947bd2220f531505e130a7c39",
+            "the entry preimage changed — every stored chain stops verifying"
+        );
+    }
+
+    /// The stored/hashed form and the serde form must not diverge.
+    #[test]
+    fn action_wire_form_matches_the_hashed_form() {
+        for action in [
+            AuditAction::TaskDispatched,
+            AuditAction::TaskCancelled,
+            AuditAction::PlanResumed,
+            AuditAction::ShellAllowed,
+            AuditAction::ShellDenied,
+            AuditAction::SecretAccessed,
+            AuditAction::PeerApproved,
+            AuditAction::PolicyLoaded,
+            AuditAction::CloudEscalated,
+            AuditAction::AuditTruncated,
+        ] {
+            let serde_form = serde_json::to_string(&action).expect("serialize");
+            assert_eq!(
+                serde_form.trim_matches('"'),
+                action.as_str(),
+                "serde and as_str must agree or replicated rows re-verify wrong"
+            );
+        }
     }
 }

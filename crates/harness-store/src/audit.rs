@@ -40,6 +40,16 @@ pub struct AuditRow {
     pub entry_hash: [u8; 32],
 }
 
+/// Keyset cursor for [`Store::audit_recent`] — the full ordering key,
+/// so a page boundary inside a same-millisecond burst does not skip
+/// rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuditCursor {
+    pub at_ms: u64,
+    pub node: NodeId,
+    pub seq: u64,
+}
+
 /// Outcome of walking a chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainStatus {
@@ -164,6 +174,7 @@ impl Store {
         &self,
         node_id: NodeId,
         from_seq: u64,
+        max_rows: usize,
     ) -> Result<ChainStatus, StoreError> {
         let rows = self.with_conn(|c| {
             let mut stmt = c.prepare(
@@ -171,20 +182,75 @@ impl Store {
                         prev_hash, entry_hash
                    FROM audit_log
                   WHERE node_id = ?1 AND seq >= ?2
-               ORDER BY seq ASC",
+               ORDER BY seq ASC
+                  LIMIT ?3",
             )?;
             let rows = stmt
                 .query_map(
                     params![
                         node_id.as_bytes(),
-                        i64::try_from(from_seq).unwrap_or(i64::MAX)
+                        i64::try_from(from_seq).unwrap_or(i64::MAX),
+                        i64::try_from(max_rows).unwrap_or(i64::MAX),
                     ],
                     row_to_audit,
                 )?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })?;
+        let Some(first) = rows.first() else {
+            return Ok(ChainStatus::Empty);
+        };
+        // Anchor the run before walking it (Codex P1 on #64). Without
+        // this, deleting the chain's PREFIX verifies clean: the oldest
+        // surviving row supplies both its own `prev_hash` and the
+        // expected seq, so the walk starts wherever the deletion left
+        // off — exactly the case the truncation marker exists to
+        // distinguish from legitimate pruning.
+        if !self.anchor_holds(node_id, first)? {
+            return Ok(ChainStatus::Broken { at_seq: first.seq });
+        }
         Ok(verify_rows(node_id, &rows))
+    }
+
+    /// Is this row a legitimate start for a verification run?
+    ///
+    /// Three ways it can be: it is the genesis entry (`seq` 1 linked to
+    /// the zero hash); its immediate predecessor is still stored and
+    /// its hash matches (the caller simply started mid-chain); or a
+    /// truncation marker states that the chain was pruned through
+    /// exactly this predecessor. Anything else means rows are missing
+    /// with nothing accounting for them.
+    ///
+    /// A locally-forged marker satisfies this, of course — that is the
+    /// limit ADR-0041 states: the chain is evidence only once peers
+    /// have pinned a head.
+    fn anchor_holds(&self, node_id: NodeId, first: &AuditRow) -> Result<bool, StoreError> {
+        if first.seq == 1 {
+            return Ok(first.prev_hash == [0u8; 32]);
+        }
+        if let Some(prev) = self.audit_entry_hash_at(node_id, first.seq - 1)? {
+            return Ok(prev == first.prev_hash);
+        }
+        let want_hex = harness_core::hash_hex(&first.prev_hash);
+        let markers = self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT detail FROM audit_log
+                  WHERE node_id = ?1 AND action = 'audit.truncated'",
+            )?;
+            let rows = stmt
+                .query_map(params![node_id.as_bytes()], |r| {
+                    r.get::<_, Option<String>>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        Ok(markers.into_iter().flatten().any(|detail| {
+            serde_json::from_str::<serde_json::Value>(&detail).is_ok_and(|d| {
+                d.get("through_seq").and_then(serde_json::Value::as_u64) == Some(first.seq - 1)
+                    && d.get("through_hash").and_then(serde_json::Value::as_str)
+                        == Some(want_hex.as_str())
+            })
+        }))
     }
 
     /// The signed head of this node's chain — what a peer pins so a
@@ -304,26 +370,44 @@ impl Store {
     /// Underlying sqlite errors.
     pub fn audit_recent(
         &self,
-        before_at_ms: Option<u64>,
+        cursor: Option<AuditCursor>,
         action: Option<&str>,
         node: Option<NodeId>,
         limit: usize,
     ) -> Result<Vec<AuditRow>, StoreError> {
+        // The cursor carries the WHOLE ordering key (Codex P2 on #64).
+        // `at_ms` alone silently drops every row sharing the last
+        // row's millisecond once a burst exceeds one page — and
+        // millisecond precision makes such bursts ordinary.
+        let (cur_ms, cur_node, cur_seq) = match cursor {
+            Some(c) => (
+                Some(i64::try_from(c.at_ms).unwrap_or(i64::MAX)),
+                Some(c.node.as_bytes().to_vec()),
+                Some(i64::try_from(c.seq).unwrap_or(i64::MAX)),
+            ),
+            None => (None, None, None),
+        };
         self.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT node_id, seq, at_ms, action, subject, detail, actor,
                         prev_hash, entry_hash
                    FROM audit_log
-                  WHERE (?1 IS NULL OR at_ms < ?1)
-                    AND (?2 IS NULL OR action = ?2)
-                    AND (?3 IS NULL OR node_id = ?3)
+                  WHERE (?1 IS NULL
+                         OR at_ms < ?1
+                         OR (at_ms = ?1
+                             AND (node_id < ?2
+                                  OR (node_id = ?2 AND seq < ?3))))
+                    AND (?4 IS NULL OR action = ?4)
+                    AND (?5 IS NULL OR node_id = ?5)
                ORDER BY at_ms DESC, node_id DESC, seq DESC
-                  LIMIT ?4",
+                  LIMIT ?6",
             )?;
             let rows = stmt
                 .query_map(
                     params![
-                        before_at_ms.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                        cur_ms,
+                        cur_node,
+                        cur_seq,
                         action,
                         node.map(|n| n.as_bytes().to_vec()),
                         i64::try_from(limit).unwrap_or(i64::MAX),
@@ -350,11 +434,14 @@ fn verify_rows(node_id: NodeId, rows: &[AuditRow]) -> ChainStatus {
         if row.prev_hash != expected_prev {
             return ChainStatus::Broken { at_seq: row.seq };
         }
+        let Some(action) = action_from_str(&row.action) else {
+            return ChainStatus::Broken { at_seq: row.seq };
+        };
         let Ok(recomputed) = audit_entry_hash(
             node_id,
             row.seq,
             row.at_ms,
-            action_from_str(&row.action),
+            action,
             row.subject.as_deref(),
             row.detail.as_deref(),
             &row.actor,
@@ -373,11 +460,17 @@ fn verify_rows(node_id: NodeId, rows: &[AuditRow]) -> ChainStatus {
     }
 }
 
-/// Stored action text → the typed action. An unknown string cannot be
-/// rehashed identically, so it verifies as broken — which is the
-/// honest outcome for a row nobody in this build wrote.
-fn action_from_str(s: &str) -> AuditAction {
-    match s {
+/// Stored action text → the typed action, or `None` for a string this
+/// build never writes.
+///
+/// `None` must break verification (Codex P1 on #64): falling back to a
+/// valid variant would rehash an edited row under the ORIGINAL action
+/// and reproduce its hash — so rewriting a `task.dispatched` row's
+/// action to anything unrecognized would display the forged action
+/// while the chain reported "verified".
+fn action_from_str(s: &str) -> Option<AuditAction> {
+    Some(match s {
+        "task.dispatched" => AuditAction::TaskDispatched,
         "task.cancelled" => AuditAction::TaskCancelled,
         "plan.resumed" => AuditAction::PlanResumed,
         "shell.allowed" => AuditAction::ShellAllowed,
@@ -387,8 +480,8 @@ fn action_from_str(s: &str) -> AuditAction {
         "policy.loaded" => AuditAction::PolicyLoaded,
         "cloud.escalated" => AuditAction::CloudEscalated,
         "audit.truncated" => AuditAction::AuditTruncated,
-        _ => AuditAction::TaskDispatched,
-    }
+        _ => return None,
+    })
 }
 
 /// The store-backed [`AuditSink`] handed to capabilities and the mesh.
@@ -452,7 +545,7 @@ mod tests {
     fn a01_appends_form_a_gapless_verified_chain() {
         let s = Store::open_memory().expect("store");
         assert_eq!(
-            s.audit_verify_chain(node(), 1).expect("verify"),
+            s.audit_verify_chain(node(), 1, 1_000).expect("verify"),
             ChainStatus::Empty
         );
         for n in 1..=5u32 {
@@ -463,7 +556,7 @@ mod tests {
             );
         }
         assert_eq!(
-            s.audit_verify_chain(node(), 1).expect("verify"),
+            s.audit_verify_chain(node(), 1, 1_000).expect("verify"),
             ChainStatus::Verified { through_seq: 5 }
         );
     }
@@ -486,7 +579,7 @@ mod tests {
         })
         .expect("tamper");
         assert_eq!(
-            s.audit_verify_chain(node(), 1).expect("verify"),
+            s.audit_verify_chain(node(), 1, 1_000).expect("verify"),
             ChainStatus::Broken { at_seq: 3 }
         );
     }
@@ -507,9 +600,75 @@ mod tests {
         })
         .expect("delete");
         assert_eq!(
-            s.audit_verify_chain(node(), 1).expect("verify"),
+            s.audit_verify_chain(node(), 1, 1_000).expect("verify"),
             ChainStatus::Broken { at_seq: 3 },
             "seq 3 no longer follows seq 1"
+        );
+    }
+
+    #[test]
+    fn a03b_a_deleted_prefix_does_not_pass_as_verified() {
+        // Codex P1 on #64: the oldest surviving row would otherwise
+        // supply both its own prev_hash and the expected seq, so the
+        // walk would start wherever the deletion left off and report
+        // clean — precisely the case the truncation marker exists to
+        // tell apart from legitimate pruning.
+        let s = Store::open_memory().expect("store");
+        for n in 1..=4u32 {
+            s.audit_append(node(), &rec(n), u64::from(n))
+                .expect("append");
+        }
+        s.with_conn(|c| {
+            c.execute(
+                "DELETE FROM audit_log WHERE node_id = ?1 AND seq = 1",
+                params![node().as_bytes()],
+            )?;
+            Ok(())
+        })
+        .expect("delete prefix");
+        assert_eq!(
+            s.audit_verify_chain(node(), 1, 1_000).expect("verify"),
+            ChainStatus::Broken { at_seq: 2 },
+            "nothing accounts for the missing genesis entry"
+        );
+
+        // A rewritten genesis is caught the same way: seq 1 must link
+        // to the zero hash.
+        let s2 = Store::open_memory().expect("store");
+        s2.audit_append(node(), &rec(1), 1).expect("append");
+        s2.with_conn(|c| {
+            c.execute(
+                "UPDATE audit_log SET prev_hash = ?2 WHERE node_id = ?1 AND seq = 1",
+                params![node().as_bytes(), &[7u8; 32][..]],
+            )?;
+            Ok(())
+        })
+        .expect("tamper");
+        assert_eq!(
+            s2.audit_verify_chain(node(), 1, 1_000).expect("verify"),
+            ChainStatus::Broken { at_seq: 1 }
+        );
+    }
+
+    #[test]
+    fn a03c_an_unknown_action_breaks_verification() {
+        // Codex P1 on #64: mapping an unrecognized action back to a
+        // valid variant rehashes the row under its ORIGINAL action and
+        // reproduces the hash — so a forged action would display while
+        // the chain reported verified.
+        let s = Store::open_memory().expect("store");
+        s.audit_append(node(), &rec(1), 1).expect("append");
+        s.with_conn(|c| {
+            c.execute(
+                "UPDATE audit_log SET action = 'totally.made.up' WHERE node_id = ?1 AND seq = 1",
+                params![node().as_bytes()],
+            )?;
+            Ok(())
+        })
+        .expect("tamper");
+        assert_eq!(
+            s.audit_verify_chain(node(), 1, 1_000).expect("verify"),
+            ChainStatus::Broken { at_seq: 1 }
         );
     }
 
@@ -541,7 +700,7 @@ mod tests {
 
         // What remains still verifies from the surviving head.
         assert_eq!(
-            s.audit_verify_chain(node(), 7).expect("verify"),
+            s.audit_verify_chain(node(), 7, 1_000).expect("verify"),
             ChainStatus::Verified { through_seq: 11 }
         );
     }
@@ -558,7 +717,7 @@ mod tests {
         );
         assert_eq!(s.audit_append(node(), &rec(2), 2).expect("append"), 2);
         assert_eq!(
-            s.audit_verify_chain(other, 1).expect("verify"),
+            s.audit_verify_chain(other, 1, 1_000).expect("verify"),
             ChainStatus::Verified { through_seq: 1 }
         );
         assert_eq!(
@@ -581,7 +740,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "the entry is still recorded");
         assert!(rows[0].detail.is_none(), "the payload is not");
         assert_eq!(
-            s.audit_verify_chain(node(), 1).expect("verify"),
+            s.audit_verify_chain(node(), 1, 1_000).expect("verify"),
             ChainStatus::Verified { through_seq: 1 }
         );
     }
@@ -626,7 +785,18 @@ mod tests {
         assert_eq!(denied.len(), 1);
 
         // Keyset page: everything strictly older than 30.
-        let older = s.audit_recent(Some(30), None, None, 100).expect("recent");
+        let older = s
+            .audit_recent(
+                Some(AuditCursor {
+                    at_ms: 30,
+                    node: node(),
+                    seq: 0,
+                }),
+                None,
+                None,
+                100,
+            )
+            .expect("recent");
         assert_eq!(older.len(), 2);
         assert!(older.iter().all(|r| r.at_ms < 30));
     }

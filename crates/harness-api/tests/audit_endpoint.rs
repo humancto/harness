@@ -86,8 +86,13 @@ async fn audit_feed_lists_filters_and_pages() {
     let entries = body["entries"].as_array().expect("entries");
     assert_eq!(entries.len(), 3);
     assert_eq!(entries[0]["action"], "cloud.escalated", "newest first");
-    assert_eq!(body["verified"], true);
-    assert_eq!(body["broken_at_seq"], serde_json::Value::Null);
+    // The verification block says exactly what it covered — a bare
+    // "verified" would overstate a page-scoped check.
+    assert_eq!(body["verification"]["checked"], true);
+    assert_eq!(body["verification"]["verified"], true);
+    assert_eq!(body["verification"]["scope"], "page");
+    assert_eq!(body["verification"]["from_seq"], 1);
+    assert_eq!(body["verification"]["through_seq"], 3);
     assert!(entries[0]["entry_hash"].as_str().expect("hash").len() == 64);
 
     // Filter, then keyset-page by time.
@@ -95,8 +100,24 @@ async fn audit_feed_lists_filters_and_pages() {
         body_json(get(&app, Some(&token), "/api/v1/audit?action=shell.denied").await).await;
     assert_eq!(filtered["entries"].as_array().expect("a").len(), 1);
 
-    let page = body_json(get(&app, Some(&token), "/api/v1/audit?before_ms=20").await).await;
-    let ids = page["entries"].as_array().expect("a");
+    // Page with the FULL cursor the response hands back — a bare
+    // timestamp would skip rows sharing the boundary millisecond.
+    let cursor = &body["next_cursor"];
+    let uri = format!(
+        "/api/v1/audit?before_ms={}&before_node={}&before_seq={}",
+        cursor["before_ms"].as_u64().expect("ms"),
+        cursor["before_node"].as_str().expect("node"),
+        cursor["before_seq"].as_u64().expect("seq"),
+    );
+    let page = body_json(get(&app, Some(&token), &uri).await).await;
+    assert_eq!(
+        page["entries"].as_array().expect("a").len(),
+        0,
+        "the first page already covered every entry"
+    );
+
+    let older = body_json(get(&app, Some(&token), "/api/v1/audit?before_ms=20").await).await;
+    let ids = older["entries"].as_array().expect("a");
     assert_eq!(ids.len(), 1);
     assert_eq!(ids[0]["at_ms"], 10);
 
@@ -125,7 +146,7 @@ async fn a_tampered_row_shows_as_broken_in_the_feed() {
             .expect("append");
     }
     let body = body_json(get(&app, Some(&token), "/api/v1/audit").await).await;
-    assert_eq!(body["verified"], true);
+    assert_eq!(body["verification"]["verified"], true);
 
     store
         .with_conn(|c| {
@@ -138,9 +159,9 @@ async fn a_tampered_row_shows_as_broken_in_the_feed() {
         .expect("tamper");
 
     let body = body_json(get(&app, Some(&token), "/api/v1/audit").await).await;
-    assert_eq!(body["verified"], false);
-    assert_eq!(body["broken_at_seq"], 2);
-    assert_eq!(body["verified_node"], node.to_string());
+    assert_eq!(body["verification"]["verified"], false);
+    assert_eq!(body["verification"]["broken_at_seq"], 2);
+    assert_eq!(body["verification"]["node"], node.to_string());
 }
 
 #[tokio::test]

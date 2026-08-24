@@ -501,6 +501,27 @@ impl LocalExecutor {
 /// retention window, for plans nobody ever resubmits.
 pub(crate) const CHECKPOINT_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
+/// 5.13a: how many audit entries a node keeps. The log is the one
+/// table meant to persist, but it is not unbounded: denied
+/// `shell.exec` appends one row per attempt and is
+/// attacker-triggerable, so an unreaped chain is a disk-exhaustion
+/// vector. Pruning goes THROUGH a marker, so what survives still
+/// verifies.
+pub(crate) const AUDIT_RETENTION_ENTRIES: u64 = 100_000;
+
+pub(crate) fn prune_audit_log(store: &Store, node: NodeId) {
+    let now = now_unix_ms();
+    match store.audit_prune(node, AUDIT_RETENTION_ENTRIES, now) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            target: "harness.executor",
+            rows = n,
+            "pruned audit entries past the retention bound"
+        ),
+        Err(e) => tracing::warn!(target: "harness.executor", ?e, "audit prune"),
+    }
+}
+
 pub(crate) fn sweep_stale_checkpoints(store: &Store) {
     // Plans whose own result row is durably written need no
     // checkpoints (Codex P1 on #62): the driver cannot do this itself

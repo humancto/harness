@@ -133,3 +133,92 @@ pub(crate) fn audit_dispatch(
             })),
     );
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use harness_core::AuditRecord;
+    use parking_lot::Mutex as PMutex;
+
+    #[derive(Default)]
+    struct Capture(PMutex<Vec<AuditRecord>>);
+
+    impl AuditSink for Capture {
+        fn record(&self, record: AuditRecord) {
+            self.0.lock().push(record);
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeSecrets;
+
+    impl SecretsStore for FakeSecrets {
+        fn get(&self, tag: &str) -> Option<SecretValue> {
+            (tag == "claude-api-key")
+                .then(|| SecretValue::from_bytes(b"sk-super-secret-value".to_vec()))
+        }
+        fn tags(&self) -> Vec<String> {
+            vec!["claude-api-key".to_string()]
+        }
+    }
+
+    #[test]
+    fn secret_reads_record_the_tag_and_never_the_value() {
+        // 5.13a (diff review MAJOR-5): the decorator's whole promise.
+        let sink = Arc::new(Capture::default());
+        let store = AuditingSecrets::new(Arc::new(FakeSecrets), sink.clone());
+
+        let found = store.get("claude-api-key").expect("hit");
+        assert_eq!(found.as_bytes(), b"sk-super-secret-value", "still works");
+        // A miss is routing noise, not a privileged action.
+        assert!(store.get("nope").is_none());
+        // `tags()` is routing, not access — it must not append.
+        assert_eq!(store.tags().len(), 1);
+
+        let seen = sink.0.lock();
+        assert_eq!(seen.len(), 1, "exactly one access recorded");
+        assert_eq!(seen[0].action.as_str(), "secret.accessed");
+        assert_eq!(seen[0].subject.as_deref(), Some("claude-api-key"));
+        let blob = format!("{:?}", seen[0]);
+        assert!(
+            !blob.contains("sk-super-secret-value"),
+            "the value must never reach the log: {blob}"
+        );
+    }
+
+    #[test]
+    fn dispatch_records_the_shape_not_the_input() {
+        let sink: Arc<dyn AuditSink> = Arc::new(Capture::default());
+        let local = NodeId::from_bytes([1u8; 16]);
+        let peer = NodeId::from_bytes([2u8; 16]);
+        let task = harness_core::TaskId::new_v7();
+        audit_dispatch(&sink, task, "shell.exec", peer, peer, local);
+
+        // Downcast-free assertion: re-record into a fresh capture.
+        let capture = Arc::new(Capture::default());
+        audit_dispatch(
+            &(capture.clone() as Arc<dyn AuditSink>),
+            task,
+            "shell.exec",
+            peer,
+            local,
+            local,
+        );
+        let seen = capture.0.lock();
+        assert_eq!(seen[0].action.as_str(), "task.dispatched");
+        assert_eq!(
+            seen[0].subject.as_deref(),
+            Some(task.0.to_string()).as_deref()
+        );
+        let detail = seen[0].detail.as_deref().expect("detail");
+        assert!(detail.contains("shell.exec"), "capability recorded");
+        assert!(
+            !detail.contains("input"),
+            "the task input never enters the record: {detail}"
+        );
+        // A locally-issued task is the daemon's own work; a
+        // peer-issued one names the peer.
+        assert_eq!(seen[0].actor.as_string(), "system");
+    }
+}

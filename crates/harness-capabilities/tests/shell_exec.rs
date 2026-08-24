@@ -668,3 +668,68 @@ fn tempdir() -> Tempdir {
     std::fs::create_dir_all(&dir).unwrap();
     Tempdir(dir)
 }
+
+/// 5.13a (diff review MAJOR-5): the §10.6 record sites' privacy
+/// claims are only real if something asserts them. These pin that
+/// `shell.exec` records the command and a hash of its arguments —
+/// and NEVER argv, which routinely carries credentials.
+#[tokio::test]
+async fn audit_records_allow_and_deny_without_argv() {
+    let sink = harness_capabilities::CapturingAuditSink::new();
+    let mut c = ctx();
+    c.audit = Some(sink.clone());
+
+    // Allowed.
+    let cap = cap_with(
+        r#"
+[shell]
+allow = [{ cmd = "/bin/echo", any_args = true }]
+"#,
+    );
+    let secret_arg = "hunter2-should-never-be-logged";
+    cap.execute(&c, input("/bin/echo", &[secret_arg]))
+        .await
+        .expect("allowed");
+
+    // Denied.
+    // Nothing allows `curl`, so the deny-by-default path fires.
+    let err = cap
+        .execute(
+            &c,
+            input("curl", &["-H", "Authorization: Bearer topsecret"]),
+        )
+        .await
+        .expect_err("denied");
+    assert!(format!("{err}").contains("policy denied"), "{err}");
+
+    let seen = sink.seen();
+    let actions: Vec<&str> = seen.iter().map(|(a, ..)| a.as_str()).collect();
+    assert!(actions.contains(&"shell.allowed"), "{actions:?}");
+    assert!(actions.contains(&"shell.denied"), "{actions:?}");
+
+    // The command name is the subject; the arguments are only ever a
+    // hash, and nothing anywhere carries the argument text.
+    let allowed = seen
+        .iter()
+        .find(|(a, ..)| a == "shell.allowed")
+        .expect("allow row");
+    assert_eq!(allowed.1.as_deref(), Some("/bin/echo"));
+    let denied = seen
+        .iter()
+        .find(|(a, ..)| a == "shell.denied")
+        .expect("deny row");
+    assert_eq!(denied.1.as_deref(), Some("curl"));
+    assert!(
+        denied.2.as_deref().expect("detail").contains("reason"),
+        "the deny reason is recorded"
+    );
+    for (action, subject, detail) in &seen {
+        let blob = format!("{action}{subject:?}{detail:?}");
+        assert!(
+            !blob.contains(secret_arg)
+                && !blob.contains("topsecret")
+                && !blob.contains("Authorization"),
+            "argv must never reach the audit log: {blob}"
+        );
+    }
+}

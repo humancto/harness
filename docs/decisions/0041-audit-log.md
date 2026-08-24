@@ -75,8 +75,13 @@ tags. Only the channel is recorded.
 
 Retention appends an `audit.truncated` entry carrying
 `{through_seq, through_hash}` **first**, then deletes the rows it
-names, in the same transaction. Verification seeds from the marker
-instead of a missing row.
+names. Verification anchors on that marker instead of a missing row.
+
+The two steps are separate transactions, not one: `audit_append`
+commits its own. The crash window between them is benign — a marker
+with nothing deleted still verifies — and separate transactions also
+avoid nesting `with_conn`, whose mutex is not reentrant. A prune
+racing an append simply prunes slightly less than asked.
 
 The naive alternative — prune, then note it — leaves entry `N+1`
 pointing at a row that no longer exists, so **every node that ever hit
@@ -98,20 +103,42 @@ choose. ADR-0006's promise is retired, not deferred again.
 
 ## Consequences
 
-- **Verification is cached, not per-request.** Walking a chain is
-  O(N) inside the single store mutex; doing it on every History page
-  load would let any authenticated caller stall the 100 ms dispatch
-  poll. The endpoint verifies only the page it returns.
+- **Verification is bounded per request, and says what it covered.**
+  Walking a whole chain is O(N) inside the single store mutex, so the
+  endpoint verifies at most one page's worth of local rows plus their
+  anchor, and the response reports `from_seq`/`through_seq` rather
+  than a bare "verified". The bound is a ROW count, not a seq span: a
+  filtered page's rows are contiguous in time but scattered across
+  the chain, so a span bound would restore the full walk. A page with
+  no local rows reports `checked: false` — it proves nothing, and
+  saying otherwise would be a lie. There is no verification cache;
+  bounding the work was the simpler correct answer.
 - **Because policy is evaluated on the executing node**, denials,
   secret reads and cloud escalations land on the *worker's* chain.
   Until 5.13c replicates, an operator's node sees only its own
   dispatch/cancel/resume rows — the API says which node's chain its
   `verified` flag covers.
-- **Denials are attacker-triggerable**, and `rate_limit` is declared
-  in manifests but enforced nowhere in the workspace, so a peer that
-  can assign tasks can append at submit rate. Retention is by row
-  count, so flooding can evict older entries. Coalescing denials into
-  a suppression window is recorded as follow-up work in 5.13b rather
-  than left unsaid.
+- **Denials are attacker-triggerable.** `rate_limit` is declared in
+  manifests but enforced nowhere in the workspace, so a peer that can
+  assign tasks appends one `shell.denied` row per attempt at submit
+  rate. Retention (100k entries per node, pruned on the hourly
+  housekeeping tick, through a marker so the survivor still verifies)
+  bounds the disk cost — but it means flooding can push older
+  entries out of the window. Per-attempt coalescing is **not**
+  implemented; it is 5.13b work, and neither the code nor these docs
+  should read as though a suppression window exists today.
+- **`peer.approved` is wired but dormant.** The auditor subscribes to
+  the trust store's broadcast, which only `TrustStore::add` emits —
+  and pairing's QUIC leg is still stubbed, so nothing calls it in
+  this build. Peers loaded from `peers.toml` at open emit nothing.
+  The subscription is the right shape for when pairing lands; until
+  then this action cannot fire.
+- **`argv_hash` protects argv from disclosure, not confirmation.**
+  Once 5.13c replicates these rows, anyone holding the log can test
+  candidate arguments offline. High-entropy secrets are safe;
+  low-entropy ones (an internal hostname, a short password) are
+  guessable. Keying the digest with the node's identity secret is the
+  fix, and belongs with the replication PR that makes the exposure
+  real.
 - **`GET /api/v1/audit` pages by time, not `seq`**: `seq` is per-node
   and meaningless once two chains interleave.

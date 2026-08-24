@@ -809,6 +809,19 @@ impl DaemonOrchestrator {
     /// 5.13a: peer approvals are recorded by subscribing to the trust
     /// store's existing broadcast — cheaper and harder to forget than
     /// editing every approval path.
+    /// 5.11/5.13a: the periodic store housekeeping task (checkpoint
+    /// sweeps + audit retention), when this daemon has a store.
+    fn spawn_housekeeping(&self) {
+        if let Some(store) = self.api_state.store.clone() {
+            let handle = tokio::spawn(spawn_checkpoint_sweeper(
+                store,
+                self.api_state.local_node_id,
+                self.shutdown_tx.subscribe(),
+            ));
+            self.tasks.lock().push(handle);
+        }
+    }
+
     fn spawn_audit_loops(&self) {
         let handle = tokio::spawn(crate::audit_wiring::run_trust_auditor(
             self.persistent_trust.subscribe(),
@@ -938,13 +951,7 @@ impl DaemonOrchestrator {
         // 5.11 (ADR-0039): checkpoint housekeeping on a slow tick, so a
         // long-running daemon does not carry completed plans' rows
         // until its next restart.
-        if let Some(store) = self.api_state.store.clone() {
-            let checkpoint_handle = tokio::spawn(spawn_checkpoint_sweeper(
-                store,
-                self.shutdown_tx.subscribe(),
-            ));
-            self.tasks.lock().push(checkpoint_handle);
-        }
+        self.spawn_housekeeping();
         let reply_handle = tokio::spawn(self.dispatch.clone().run_reply_pump(
             self.executor.subscribe_terminal(),
             self.shutdown_tx.subscribe(),
@@ -1112,18 +1119,23 @@ fn cloud_planner_model_if_allowed(planning: &harness_policy::PlanningPolicy) -> 
     }
 }
 
-/// 5.11 (ADR-0039): periodic checkpoint housekeeping — the same sweep
-/// the daemon runs at boot, on an hourly tick. Cheap (two indexed
-/// deletes) and never in the plan driver's crash window.
+/// 5.11/5.13a: periodic store housekeeping on an hourly tick — the
+/// checkpoint sweeps the daemon also runs at boot, plus the audit
+/// log's retention prune (which appends its truncation marker before
+/// deleting, so the surviving chain still verifies).
 async fn spawn_checkpoint_sweeper(
     store: harness_store::Store,
+    node: harness_core::NodeId,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(3600));
     tick.tick().await; // the boot sweep already ran
     loop {
         tokio::select! {
-            _ = tick.tick() => crate::executor::sweep_stale_checkpoints(&store),
+            _ = tick.tick() => {
+                crate::executor::sweep_stale_checkpoints(&store);
+                crate::executor::prune_audit_log(&store, node);
+            }
             _ = shutdown.changed() => return,
         }
     }
