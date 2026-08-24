@@ -38,9 +38,12 @@ pub enum AuditAction {
     #[serde(rename = "shell.allowed")]
     ShellAllowed,
     /// `shell.exec` was refused by policy. Attacker-triggerable at
-    /// submit rate: retention prunes the chain, but per-attempt
-    /// coalescing is NOT implemented (5.13b follow-up) — this is not
-    /// a rate limit, and the ADR says so.
+    /// submit rate, so 5.13b rate-limits it in `StoreAuditSink`:
+    /// the first `BURST_ALLOWANCE` denials per `(action, actor)` per
+    /// minute append in full, the rest are counted into a summary
+    /// entry. The limit is per ACTOR and never keyed on the
+    /// subject — the subject is the submitted command, which the
+    /// adversary chooses.
     #[serde(rename = "shell.denied")]
     ShellDenied,
     /// A secret was read by TAG on the executing node.

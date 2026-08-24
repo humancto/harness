@@ -2,7 +2,7 @@
 
 - **Status:** accepted
 - **Date:** 2026-08-24
-- **Roadmap:** 5.13a (5.13b History UI, 5.13c replication)
+- **Roadmap:** 5.13a, 5.13b (5.13c replication)
 - **PRD:** v2 §10.6 — *"Every privileged action (dispatch, shell exec,
   secret access, peer approval, policy change, cloud escalation) →
   append-only audit log replicated to every node. Tamper-evident via
@@ -118,15 +118,78 @@ choose. ADR-0006's promise is retired, not deferred again.
   Until 5.13c replicates, an operator's node sees only its own
   dispatch/cancel/resume rows — the API says which node's chain its
   `verified` flag covers.
-- **Denials are attacker-triggerable.** `rate_limit` is declared in
-  manifests but enforced nowhere in the workspace, so a peer that can
-  assign tasks appends one `shell.denied` row per attempt at submit
-  rate. Retention (100k entries per node, pruned on the hourly
-  housekeeping tick, through a marker so the survivor still verifies)
-  bounds the disk cost — but it means flooding can push older
-  entries out of the window. Per-attempt coalescing is **not**
-  implemented; it is 5.13b work, and neither the code nor these docs
-  should read as though a suppression window exists today.
+- **Denials are attacker-triggerable, so 5.13b rate-limits them.**
+  `rate_limit` is declared in manifests but enforced nowhere in the
+  workspace, so a peer that can assign tasks appends one
+  `shell.denied` row per attempt at submit rate. Retention (100k
+  entries per node, pruned on the hourly housekeeping tick, through a
+  marker so the survivor still verifies) bounds the disk cost — but on
+  its own it means flooding pushes older entries out of the window.
+  `StoreAuditSink` therefore rate-limits floodable actions (today:
+  `shell.denied`) in a 60s window keyed **`(action, actor)`**.
+
+  The key is deliberately subject-free. Keying on `subject` — the
+  first thing one reaches for, and what the first draft of 5.13b
+  did — is worse than doing nothing: a denial's subject IS the
+  submitted command, so `/bin/x1`, `/bin/x2`, … mints a fresh key per
+  attempt and the flood passes untouched, while the only records
+  dropped are a real operator's repeated denials of one command. The
+  trade is exactly backwards, and a reviewer caught it before merge.
+
+  Within a window the first `BURST_ALLOWANCE` (10) records append IN
+  FULL, so distinct denials keep their own argv, reason and task id at
+  any rate a person produces. Past the allowance a record is dropped
+  and counted, along with a bounded sample of the distinct subjects
+  dropped (8 subjects, truncated; distinct counted exactly to 64, then
+  reported as a floor). When the window CLOSES, a summary entry is
+  appended carrying those counts, the sample and the window's own
+  start — as its own entry, not folded into an existing row, because
+  an existing row is already hashed into the chain and rewriting it is
+  precisely what verification exists to catch. Closing runs on the
+  housekeeping tick as well as inline: a burst that simply STOPS must
+  still be recorded, or a completed flood shows its first ten rows and
+  no trace of the rest.
+
+  The summary's own detail is bounded by ENCODED size, not by the
+  sample count: `audit_append` drops a detail WHOLE once its stored
+  JSON passes `MAX_AUDIT_DETAIL_BYTES`, and the sampled subjects come
+  from commands the adversary chose — a control character escapes to
+  six bytes, so eight samples of them would blow the cap and take the
+  suppressed count with them, erasing exactly the record the summary
+  exists to keep. Control characters are folded out before sampling
+  and samples are admitted one at a time against a byte budget, so
+  the counts are written first and can never be crowded out.
+
+  Costs and residuals, stated plainly. Past the allowance, per-attempt
+  argv and reason are NOT retained — only the count and the sample.
+  The flood threat is **mitigated, not closed**: 10 rows plus one
+  summary per actor per minute is still ~15.8k rows/day/actor against
+  the 100k bound, so a handful of flooding peers evicts history in
+  days rather than minutes. The periodic close runs on the HOURLY
+  housekeeping tick, so on an otherwise idle node a stopped burst can
+  go unrecorded for up to an hour; the summary row's `at_ms` is its
+  flush time, and the burst's real time is in `window_start_ms`
+  (which the History page renders). Daemon shutdown force-closes
+  every open window, elapsed or not — an operator restarting mid-flood
+  is the expected reaction to a flood. That flush runs in `shutdown()`
+  itself, NOT on the housekeeping task's shutdown arm: `shutdown()`
+  aborts every spawned task synchronously before its first await, so
+  such an arm is racy on a multi-thread runtime and unreachable on the
+  current-thread one the daemon uses. An exit that does not run `shutdown()`
+  still loses the open window's count — SIGKILL and power loss, but
+  also **SIGTERM**, which is the normal production stop
+  (`systemctl stop`, `docker stop`): `run_until_signal` awaits
+  `tokio::signal::ctrl_c()`, which is SIGINT only, and no SIGTERM
+  handler exists in the daemon. Handling SIGTERM is a daemon-lifecycle
+  change affecting every subsystem's shutdown, so it is carried as its
+  own item rather than widened into this one: that residual is
+  irreducible for an in-memory map and is stated rather than implied
+  away. The window map is in
+  memory (a restart resets it, erring toward recording) and bounded at
+  1024 open windows; hitting the bound CLOSES windows, emitting their
+  summaries, rather than discarding counts — an eviction that dropped
+  pending counts would let a flooder erase the record of its own
+  attempts.
 - **`peer.approved` is wired but dormant.** The auditor subscribes to
   the trust store's broadcast, which only `TrustStore::add` emits —
   and pairing's QUIC leg is still stubbed, so nothing calls it in
