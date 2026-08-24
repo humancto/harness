@@ -215,27 +215,54 @@ impl AuditSyncService {
                     continue;
                 }
             }
-            let sent = net.send_to(peer, OutboundMsg::AuditHeads(env.clone()));
-            let mut states = self.peers.lock();
-            let state = states.entry(peer).or_default();
-            if sent.is_ok() {
-                state.consecutive_failures = 0;
-            } else {
-                state.consecutive_failures += 1;
-                if state.consecutive_failures >= BACKOFF_AFTER_FAILURES {
-                    // Most likely a pre-5.13c peer resetting the
-                    // unknown channel. Back off rather than opening
-                    // and resetting a stream every tick.
-                    state.skip_ticks = BACKOFF_TICKS;
-                    state.consecutive_failures = 0;
-                    tracing::debug!(
-                        target: "harness.audit.sync",
-                        peer = %peer,
-                        "backing off audit head pushes (peer may predate 5.13c)"
-                    );
-                }
+            // A local-queue failure counts too, but the one that
+            // matters arrives later through `note_send_failed`: the
+            // wire send is asynchronous, so `send_to` returning Ok
+            // means only that the message was queued.
+            if net
+                .send_to(peer, OutboundMsg::AuditHeads(env.clone()))
+                .is_err()
+            {
+                self.note_send_failed(peer);
             }
         }
+    }
+
+    /// A push to `peer` failed on the wire.
+    ///
+    /// Called from `PeerNet::sender_task` after its retries, because
+    /// that is where the failure actually surfaces (Codex P2 on #66):
+    /// `send_to` reports only that the message reached the local
+    /// queue, so a backoff driven from the push loop would never fire
+    /// and a pre-5.13c peer would get its unknown channel opened and
+    /// reset on every tick, forever.
+    pub(crate) fn note_send_failed(&self, peer: NodeId) {
+        let mut states = self.peers.lock();
+        let state = states.entry(peer).or_default();
+        state.consecutive_failures += 1;
+        if state.consecutive_failures >= BACKOFF_AFTER_FAILURES {
+            state.skip_ticks = BACKOFF_TICKS;
+            state.consecutive_failures = 0;
+            tracing::debug!(
+                target: "harness.audit.sync",
+                peer = %peer,
+                "backing off audit head pushes (peer may predate 5.13c)"
+            );
+        }
+    }
+
+    /// A push to `peer` reached the wire. Clears the failure streak.
+    pub(crate) fn note_send_ok(&self, peer: NodeId) {
+        let mut states = self.peers.lock();
+        states.entry(peer).or_default().consecutive_failures = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_backing_off(&self, peer: NodeId) -> bool {
+        self.peers
+            .lock()
+            .get(&peer)
+            .is_some_and(|s| s.skip_ticks > 0)
     }
 
     pub(crate) async fn run(self: Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {

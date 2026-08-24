@@ -312,6 +312,7 @@ impl PeerNet {
             self.identity.clone(),
             self.handlers.clone(),
             peer_id,
+            Arc::downgrade(self),
         ));
         let router = tokio::spawn(self.clone().router_task(conn.clone(), peer_id));
         let entry = PeerEntry {
@@ -454,6 +455,7 @@ impl PeerNet {
         identity: Arc<Identity>,
         handlers: Arc<dyn TaskChannelHandlers>,
         peer_id: NodeId,
+        net: std::sync::Weak<PeerNet>,
     ) {
         while let Some(msg) = rx.recv().await {
             let name = msg.channel_name();
@@ -478,9 +480,32 @@ impl PeerNet {
                     }
                 }
             };
-            if !sent {
-                if let OutboundMsg::Assign(assign) = &msg {
-                    handlers.on_assign_send_failed(peer_id, assign.lease_id);
+            if sent {
+                // Symmetric with the failure path: a peer that starts
+                // accepting the channel clears its streak, so a
+                // transient outage cannot leave it backed off forever.
+                if matches!(msg, OutboundMsg::AuditHeads(_)) {
+                    if let Some(svc) = net.upgrade().and_then(|n| n.audit_sync()) {
+                        svc.note_send_ok(peer_id);
+                    }
+                }
+            } else {
+                match &msg {
+                    OutboundMsg::Assign(assign) => {
+                        handlers.on_assign_send_failed(peer_id, assign.lease_id);
+                    }
+                    // 5.13c-1 (Codex P2 on #66): the wire failure is
+                    // asynchronous — `send_to` only reports that the
+                    // message reached the local queue — so backoff has
+                    // to be driven from HERE or a pre-5.13c peer gets
+                    // its unknown channel opened and reset every tick
+                    // forever.
+                    OutboundMsg::AuditHeads(_) => {
+                        if let Some(svc) = net.upgrade().and_then(|n| n.audit_sync()) {
+                            svc.note_send_failed(peer_id);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1233,6 +1258,9 @@ mod tests {
             a.identity.clone(),
             handlers,
             b.identity.node_id(),
+            // No PeerNet in this unit test: the audit backoff hook is
+            // exercised by audit_sync_tests::m06.
+            std::sync::Weak::new(),
         ));
         let lease_id = LeaseId::new_v7();
         tx.send(OutboundMsg::Assign(test_assign(&a.identity, lease_id)))

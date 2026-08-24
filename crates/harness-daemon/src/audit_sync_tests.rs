@@ -238,3 +238,91 @@ async fn m05_a_forged_signature_is_rejected_even_from_a_trusted_relay() {
         "nothing pinned from a forged head"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m06_wire_failures_drive_the_backoff() {
+    // Codex P2 on #66: `send_to` reports only that the message reached
+    // the local queue — the wire send is asynchronous — so a backoff
+    // driven from the push loop never fires, and a pre-5.13c peer gets
+    // its unknown channel opened and reset on every tick forever.
+    // Failures are reported from `sender_task`, where they surface.
+    let (a, b) = boot_pair(None).await;
+    wait_for_mesh(&a, &b).await;
+
+    let svc = crate::audit_sync::AuditSyncService::new(
+        a.store.clone(),
+        a.identity.clone(),
+        a.trust.clone(),
+    );
+    assert!(!svc.is_backing_off(b.node_id()), "starts clear");
+
+    for _ in 0..3 {
+        svc.note_send_failed(b.node_id());
+    }
+    assert!(
+        svc.is_backing_off(b.node_id()),
+        "three wire failures back the peer off"
+    );
+
+    // And a peer that starts working again clears its streak, so a
+    // transient outage cannot strand it.
+    let fresh = crate::audit_sync::AuditSyncService::new(
+        a.store.clone(),
+        a.identity.clone(),
+        a.trust.clone(),
+    );
+    fresh.note_send_failed(b.node_id());
+    fresh.note_send_failed(b.node_id());
+    fresh.note_send_ok(b.node_id());
+    fresh.note_send_failed(b.node_id());
+    assert!(
+        !fresh.is_backing_off(b.node_id()),
+        "a success reset the streak, so the next failure is not the third"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m07_housekeeping_actually_thins_the_pin_table() {
+    // Codex P1 on #66: `thin_peer_head_pins` had no production caller
+    // — the same defect `audit_prune` shipped with in 5.13a, where the
+    // ADR described live retention that never ran. This drives the
+    // housekeeping entry point, not the store method directly.
+    let store = harness_store::Store::open_memory().expect("store");
+    let subject = harness_core::NodeId::from_bytes([7u8; 16]);
+    let reporter = harness_core::NodeId::from_bytes([8u8; 16]);
+
+    for i in 1..=400u64 {
+        let head = harness_core::AuditHead {
+            node_id: subject,
+            seq: i,
+            entry_hash: [u8::try_from(i % 251).unwrap_or(0); 32],
+            at_ms: i,
+            sig: Signature::from_bytes([1u8; 64]),
+        };
+        store
+            .pin_peer_head(&head, reporter, i * 60_000)
+            .expect("pin");
+    }
+    // One piece of evidence deep in the tail.
+    store
+        .set_pin_status(subject, 3, PinStatus::Contradicted)
+        .expect("status");
+    assert_eq!(store.peer_head_pins(subject).expect("pins").len(), 400);
+
+    crate::executor::thin_peer_head_pins(&store);
+
+    let after = store.peer_head_pins(subject).expect("pins");
+    assert!(
+        after.len() < 400,
+        "housekeeping thinned, kept {}",
+        after.len()
+    );
+    assert!(
+        after.iter().any(|p| p.seq == 3),
+        "the contradicted pin survived — it IS the evidence"
+    );
+    assert!(
+        after.iter().any(|p| p.seq == 1),
+        "the oldest pin still anchors the range"
+    );
+}

@@ -299,6 +299,12 @@ impl Store {
     /// - Thinning keys on `first_seen_ms`, never on `seq`. A node that
     ///   floods 100k entries would otherwise push every honest
     ///   historical pin into the thinned tail.
+    /// - Ties on `first_seen_ms` break by `rowid` (Codex P1 on #66).
+    ///   Every head in one envelope is pinned at the same receiver-side
+    ///   instant, so without a tie-breaker the "newest N" count sees
+    ///   zero newer rows for ALL of them and exempts every one — a
+    ///   peer sending 64 signed heads per envelope would defeat the
+    ///   bound outright.
     ///
     /// The OLDEST pin per node is always kept — it anchors the
     /// furthest back we can prove anything about.
@@ -319,7 +325,9 @@ impl Store {
                         SELECT rowid FROM audit_peer_heads a
                          WHERE (SELECT COUNT(*) FROM audit_peer_heads b
                                  WHERE b.node_id = a.node_id
-                                   AND b.first_seen_ms > a.first_seen_ms) < ?1
+                                   AND (b.first_seen_ms > a.first_seen_ms
+                                        OR (b.first_seen_ms = a.first_seen_ms
+                                            AND b.rowid > a.rowid))) < ?1
                     )
                     AND rowid NOT IN (
                         -- one survivor per time bucket per node
@@ -658,5 +666,37 @@ mod tests {
         let c = &store.head_conflicts(1).expect("conflicts")[0];
         assert_eq!(c.held_sig.to_bytes(), h.sig.to_bytes());
         assert_eq!(c.other_sig.to_bytes(), forged.sig.to_bytes());
+    }
+
+    #[test]
+    fn p06c_pins_sharing_one_instant_are_still_thinnable() {
+        // Codex P1 on #66: every head in one envelope is pinned at the
+        // same receiver-side `now_ms`. Without a tie-breaker the
+        // "newest N" correlated count sees zero newer rows for all of
+        // them, exempts every one, and a peer sending 64 signed heads
+        // per envelope defeats the bound outright.
+        let s = Store::open_memory().expect("store");
+        for seq in 1..=40u64 {
+            s.pin_peer_head(
+                &head(1, seq, u8::try_from(seq).unwrap_or(0), seq),
+                node(2),
+                // One instant for all of them.
+                5_000,
+            )
+            .expect("pin");
+        }
+        assert_eq!(s.peer_head_pins(node(1)).expect("pins").len(), 40);
+
+        s.thin_peer_head_pins(5, 60_000).expect("thin");
+        let after = s.peer_head_pins(node(1)).expect("pins");
+        assert!(
+            after.len() < 40,
+            "tied pins must still be thinnable, kept {}",
+            after.len()
+        );
+        // The bound is honored: newest 5 + one bucket survivor + the
+        // oldest, with heavy overlap between those sets.
+        assert!(after.len() <= 7, "kept {} pins", after.len());
+        assert_eq!(after[0].seq, 1, "the oldest pin still anchors");
     }
 }
