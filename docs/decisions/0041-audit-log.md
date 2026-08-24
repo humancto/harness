@@ -150,6 +150,16 @@ choose. ADR-0006's promise is retired, not deferred again.
   still be recorded, or a completed flood shows its first ten rows and
   no trace of the rest.
 
+  The summary's own detail is bounded by ENCODED size, not by the
+  sample count: `audit_append` drops a detail WHOLE once its stored
+  JSON passes `MAX_AUDIT_DETAIL_BYTES`, and the sampled subjects come
+  from commands the adversary chose — a control character escapes to
+  six bytes, so eight samples of them would blow the cap and take the
+  suppressed count with them, erasing exactly the record the summary
+  exists to keep. Control characters are folded out before sampling
+  and samples are admitted one at a time against a byte budget, so
+  the counts are written first and can never be crowded out.
+
   Costs, stated: past the allowance, per-attempt argv and reason are
   NOT retained — only the count and the sample. The window map is in
   memory (a restart resets it, erring toward recording) and bounded at

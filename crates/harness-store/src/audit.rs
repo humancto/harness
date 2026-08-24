@@ -568,15 +568,34 @@ type BurstKey = (AuditAction, AuditActor);
 /// their summaries) rather than discarding counts.
 const MAX_OPEN_BURSTS: usize = 1024;
 
-fn truncated(subject: &str) -> String {
-    if subject.len() <= SAMPLE_SUBJECT_BYTES {
-        return subject.to_string();
+/// Budget for a summary's `sample_subjects`, leaving room for the
+/// counts. The counts are the part that must never be lost.
+const SAMPLE_BUDGET_BYTES: usize = MAX_AUDIT_DETAIL_BYTES / 2;
+
+/// Sample form of a subject: control characters folded out, then
+/// truncated.
+///
+/// Folding is not cosmetic. `audit_append` drops a detail WHOLE once
+/// its stored JSON passes [`MAX_AUDIT_DETAIL_BYTES`], and a control
+/// character escapes to `\uXXXX` — six bytes for one. A flooder
+/// choosing control-character command names could otherwise blow the
+/// cap with eight samples and erase the very count that records its
+/// attempts. The encoded budget in `into_summary` is the actual
+/// guarantee; this keeps samples readable and the common case
+/// nowhere near it.
+fn sampled(subject: &str) -> String {
+    let folded: String = subject
+        .chars()
+        .map(|c| if c.is_control() { '·' } else { c })
+        .collect();
+    if folded.len() <= SAMPLE_SUBJECT_BYTES {
+        return folded;
     }
     let mut end = SAMPLE_SUBJECT_BYTES;
-    while end > 0 && !subject.is_char_boundary(end) {
+    while end > 0 && !folded.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}…", &subject[..end])
+    format!("{}…", &folded[..end])
 }
 
 impl Window {
@@ -584,7 +603,7 @@ impl Window {
     fn note_dropped(&mut self, subject: Option<&str>) {
         self.suppressed += 1;
         let Some(subject) = subject else { return };
-        let subject = truncated(subject);
+        let subject = sampled(subject);
         if self.distinct.len() < DISTINCT_CAP {
             if self.distinct.insert(subject.clone()) && self.sample.len() < SAMPLE_SUBJECTS {
                 self.sample.push(subject);
@@ -603,12 +622,30 @@ impl Window {
             return None;
         }
         let (action, actor) = key;
+        // Samples are admitted one at a time against an ENCODED
+        // budget, so what an adversary put in a command name can
+        // never push the COUNTS past the detail cap — over the cap,
+        // `audit_append` drops the detail whole, which would erase
+        // exactly the record of the attempts.
+        let mut sample: Vec<String> = Vec::new();
+        let mut encoded = 2usize; // the `[]`
+        let mut sample_dropped = 0usize;
+        for subject in self.sample {
+            let cost = serde_json::to_string(&subject).map_or(usize::MAX, |s| s.len() + 1);
+            if encoded.saturating_add(cost) > SAMPLE_BUDGET_BYTES {
+                sample_dropped += 1;
+                continue;
+            }
+            encoded += cost;
+            sample.push(subject);
+        }
         Some(
             AuditRecord::new(action, actor).with_detail(&serde_json::json!({
                 "suppressed_repeats": self.suppressed,
                 "distinct_subjects": self.distinct.len(),
                 "distinct_subjects_capped": self.distinct_overflow,
-                "sample_subjects": self.sample,
+                "sample_subjects": sample,
+                "sample_dropped": sample_dropped,
                 "appended_before_suppressing": self.appended,
                 "window_start_ms": self.start_ms,
                 "window_ms": SUPPRESSION_WINDOW_MS,
@@ -1272,6 +1309,61 @@ mod tests {
             sample.len() <= SAMPLE_SUBJECT_BYTES + 4,
             "sampled subject truncated, got {} bytes",
             sample.len()
+        );
+    }
+
+    #[test]
+    fn a09h_a_hostile_command_name_cannot_erase_the_count() {
+        // The subjects sampled into a summary come from commands the
+        // ADVERSARY chose. `audit_append` drops a detail WHOLE once
+        // its stored JSON passes MAX_AUDIT_DETAIL_BYTES, and a
+        // control character escapes to six bytes — so eight samples
+        // of control characters could blow the cap and take the
+        // suppressed count with them, erasing the record of exactly
+        // the attempts the summary exists to record.
+        let s = Store::open_memory().expect("store");
+        let sink = StoreAuditSink::new(s.clone(), node());
+        for _ in 0..BURST_ALLOWANCE {
+            sink.record(denial("warmup"));
+        }
+        for i in 0..SAMPLE_SUBJECTS {
+            // Distinct (so each is sampled) and maximally expensive
+            // to encode.
+            let cmd = format!("{}{}", "\u{1}".repeat(300), i);
+            sink.record(
+                AuditRecord::new(AuditAction::ShellDenied, AuditActor::System).with_subject(cmd),
+            );
+        }
+        sink.flush_at(now_ms() + SUPPRESSION_WINDOW_MS + 1);
+
+        let rows = s
+            .audit_recent(None, Some("shell.denied"), None, 100)
+            .expect("recent");
+        assert_eq!(rows.len(), allowance() + 1);
+        let stored = rows[0]
+            .detail
+            .as_deref()
+            .expect("the summary kept its detail");
+        assert!(
+            stored.len() <= MAX_AUDIT_DETAIL_BYTES,
+            "summary detail must fit the cap, got {} bytes",
+            stored.len()
+        );
+        let summary: serde_json::Value = serde_json::from_str(stored).expect("json");
+        assert_eq!(
+            summary["suppressed_repeats"],
+            serde_json::json!(SAMPLE_SUBJECTS),
+            "the count survives whatever the attacker named the command"
+        );
+        assert!(
+            !stored.contains("\\u0001"),
+            "control characters are folded out before sampling"
+        );
+        assert_eq!(
+            s.audit_verify_chain(node(), 1, 1_000).expect("verify"),
+            ChainStatus::Verified {
+                through_seq: BURST_ALLOWANCE + 1
+            }
         );
     }
 }
