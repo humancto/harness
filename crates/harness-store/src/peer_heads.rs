@@ -389,9 +389,17 @@ impl Store {
         self.with_conn(|c| {
             let row: Option<PinRow> = c
                 .query_row(
+                    // Ordered by OUR clock first (diff review
+                    // re-review): `seq` is as attacker-chosen as
+                    // `at_ms` was, and `RejectedSeq` only stops values
+                    // above i64::MAX — so a head signed at exactly
+                    // i64::MAX would otherwise be selected forever and
+                    // every honest peer would relay that garbage for
+                    // the subject permanently.
                     "SELECT seq, entry_hash, at_ms, sig, observed_at_ms
                        FROM audit_peer_heads
-                      WHERE node_id = ?1 ORDER BY seq DESC LIMIT 1",
+                      WHERE node_id = ?1
+                      ORDER BY observed_at_ms DESC, seq DESC LIMIT 1",
                     params![node.as_bytes()],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )

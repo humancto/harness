@@ -286,12 +286,21 @@ signed heads onto one row (a fork manufactured by a lossy cast) and
 makes the relayed rebuild carry a seq the signer never signed, so it
 fails verification at every receiver.
 
-**Decision 14 — relays rank on our clock, not the head's.** `at_ms` is
-stamped by the head's own signer, so ordering the relay window by it
-lets a node stamp `u64::MAX` and hold a slot forever, pushing honest
-heads out on any mesh larger than the window. Ranking uses
-`observed_at_ms`, which is ours. The same rule applies to entry
-ordering in 5.13c-2.
+**Decision 14 — relays rank AND select on our clock, not the head's.**
+`at_ms` is stamped by the head's own signer, so ordering the relay
+window by it lets a node stamp `u64::MAX` and hold a slot forever,
+pushing honest heads out on any mesh larger than the window. Ranking
+uses `observed_at_ms`, which is ours.
+
+The first version of this decision fixed only the cross-node ranking
+and left the within-node selection on `ORDER BY seq DESC` — and `seq`
+is exactly as attacker-chosen as `at_ms` was. `RejectedSeq` stops only
+values above `i64::MAX`, so a head signed at exactly `i64::MAX` would
+be selected as that node's newest pin forever, and every honest peer
+would relay that garbage on its behalf permanently. Selection now
+orders on `observed_at_ms` first. The general rule, which 5.13c-2
+inherits for entry ordering: **no ordering decision may key on a field
+the subject of that ordering controls.**
 
 ### What 5.13c-1 does NOT yet give you
 
@@ -313,6 +322,12 @@ Three further gaps, named so they are not mistaken for coverage:
   mitigation, and it is a 30s timer, not a guarantee.
 - **A node that never advertises is invisible.** Nothing consumes
   `observed_at_ms` to age a peer out or flag silence.
+- **Ingest is unrated.** A trusted peer can insert pin rows faster
+  than the hourly sweep reclaims them; thinning bounds the steady
+  state but not the interval. This is the only unbounded-work path a
+  trusted peer controls today. It lands in 5.13c-2 beside the
+  entry-serving rate limit, where the request/response primitive it
+  shares lives.
 - **A detected fork has no reader.** `head_conflicts`,
   `peer_head_pins` and `set_pin_status` have no non-test callers: a
   fork surfaces as one `tracing::error!` and a database row. The

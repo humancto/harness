@@ -147,12 +147,26 @@ impl AuditSyncService {
                         // DB looks exactly like this — so it is not
                         // silent, even though it is not evidence
                         // (diff review 1(c)/1(d)).
-                        PinOutcome::StalePinned => tracing::warn!(
+                        // FIRST-PARTY only: a node offering a
+                        // position below one we hold for it is the
+                        // loudest signal available before entries
+                        // exist (a wiped or restored DB looks exactly
+                        // like this). A RELAYED head lagging ours is
+                        // the normal steady state in any mesh with
+                        // relays, and warning on it would drown the
+                        // signal the warn exists for.
+                        PinOutcome::StalePinned if from == head.node_id => tracing::warn!(
+                            target: "harness.audit.sync",
+                            subject = %head.node_id,
+                            offered_seq = head.seq,
+                            "node advertised a head below one we already hold for it"
+                        ),
+                        PinOutcome::StalePinned => tracing::debug!(
                             target: "harness.audit.sync",
                             subject = %head.node_id,
                             offered_seq = head.seq,
                             reported_by = %from,
-                            "audit head below a pin we already hold"
+                            "relayed head lags the pin we hold"
                         ),
                         PinOutcome::RejectedSeq => tracing::warn!(
                             target: "harness.audit.sync",
@@ -212,6 +226,11 @@ impl AuditSyncService {
         relayed.sort_by(|(_, a_seen), (_, b_seen)| b_seen.cmp(a_seen));
         relayed.truncate(RELAY_HEADS);
         relayed.into_iter().map(|(head, _)| head).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn relayable_heads_for_test(&self) -> Vec<AuditHead> {
+        self.relayable_heads()
     }
 
     /// One push round.

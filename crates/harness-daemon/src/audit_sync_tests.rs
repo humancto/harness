@@ -468,10 +468,14 @@ fn m10_one_huge_seq_cannot_immunize_a_node_from_further_pinning() {
     };
 
     svc.ingest(c.node_id(), &envelope(&c, vec![sign_head(10, 0x10)]), 1_000);
-    // The poison: signed, enormous.
+    // The poison: signed, enormous, but REPRESENTABLE — so it reaches
+    // the insert path rather than being filtered by `RejectedSeq`.
+    // An earlier version of this test used u64::MAX, which the seq
+    // rejection caught first, so it passed even with the always-insert
+    // fix reverted (re-review (c)).
     svc.ingest(
         c.node_id(),
-        &envelope(&c, vec![sign_head(u64::MAX, 0xFF)]),
+        &envelope(&c, vec![sign_head(1_000_000_000, 0xFF)]),
         2_000,
     );
     // Genuine growth afterwards.
@@ -492,7 +496,23 @@ fn m10_one_huge_seq_cannot_immunize_a_node_from_further_pinning() {
         );
     }
     assert!(
-        !seqs.contains(&u64::MAX),
+        seqs.contains(&1_000_000_000),
+        "the poison itself is stored — classification, not discard"
+    );
+    // And an UNrepresentable seq is rejected outright rather than
+    // clamped onto a real row.
+    let outcomes = svc.ingest(
+        c.node_id(),
+        &envelope(&c, vec![sign_head(u64::MAX, 0xAA)]),
+        8_000,
+    );
+    assert_eq!(outcomes[0].1, harness_store::PinOutcome::RejectedSeq);
+    assert!(
+        !store
+            .peer_head_pins(c.node_id())
+            .expect("pins")
+            .iter()
+            .any(|p| p.seq == u64::MAX || p.seq == i64::MAX as u64),
         "an unrepresentable seq is rejected, not clamped onto a real row"
     );
 
@@ -505,4 +525,64 @@ fn m10_one_huge_seq_cannot_immunize_a_node_from_further_pinning() {
         "fork detection survives the poison, got {:?}",
         outcomes[0].1
     );
+}
+
+#[test]
+fn m11_relay_ranks_on_our_clock_and_selects_our_newest_observation() {
+    // Two things the re-review found untested, both exploitable by a
+    // field the subject chooses:
+    //   - cross-node relay order used the head's own `at_ms`, so a
+    //     node stamping u64::MAX held a relay slot forever;
+    //   - within-node selection used `seq DESC`, so one head signed at
+    //     i64::MAX would be relayed for that node permanently.
+    let (store, me, trust, b, c, _tmp) = trio();
+    let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me.clone(), trust);
+
+    let head_of = |id: &harness_core::Identity, seq: u64, at_ms: u64, hash: u8| {
+        let mut h = harness_core::AuditHead {
+            node_id: id.node_id(),
+            seq,
+            entry_hash: [hash; 32],
+            at_ms,
+            sig: Signature::from_bytes([0u8; 64]),
+        };
+        h.sign(id).expect("sign");
+        h
+    };
+
+    // B stamps an enormous `at_ms` on its head — the field its own
+    // signer chooses — but we observed it EARLY. The two orderings
+    // must disagree, or the test proves nothing.
+    store
+        .pin_peer_head(&head_of(&b, 5, u64::MAX, 0xB1), b.node_id(), 1_000)
+        .expect("pin");
+    // C signs an enormous `seq`, observed early.
+    store
+        .pin_peer_head(&head_of(&c, i64::MAX as u64, 500, 0xC1), c.node_id(), 1_000)
+        .expect("pin");
+    // C's later, genuine head — smaller seq, but observed most recently.
+    store
+        .pin_peer_head(&head_of(&c, 7, 2_000, 0xC2), c.node_id(), 9_500)
+        .expect("pin");
+
+    // Within-node: our newest OBSERVATION wins, not the biggest seq.
+    let (selected, _) = store
+        .newest_pin_as_head(c.node_id())
+        .expect("read")
+        .expect("some");
+    assert_eq!(
+        selected.entry_hash, [0xC2; 32],
+        "the i64::MAX head must not be relayed for C forever"
+    );
+
+    // Cross-node: ranked by when WE saw them, so C's u64::MAX `at_ms`
+    // buys nothing.
+    let heads = svc.relayable_heads_for_test();
+    let order: Vec<[u8; 32]> = heads.iter().map(|h| h.entry_hash).collect();
+    assert_eq!(
+        order.first().copied(),
+        Some([0xC2; 32]),
+        "most recently OBSERVED first — B's u64::MAX at_ms buys nothing, got {order:?}"
+    );
+    assert!(order.contains(&[0xB1; 32]), "B's head is still relayed");
 }
