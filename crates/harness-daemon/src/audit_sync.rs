@@ -285,9 +285,9 @@ impl AuditSyncService {
         relayed.into_iter().map(|(head, _)| head).collect()
     }
 
-    /// Register an in-flight request without sending it, so a test
-    /// can deliver a crafted response without a live peer racing it
-    /// with the honest answer.
+    /// Drive one real request round, so a test can assert the
+    /// per-pull round bound and the in-flight bookkeeping that goes
+    /// with it.
     #[cfg(test)]
     pub(crate) fn request_range_round_for_test(
         &self,
@@ -306,6 +306,9 @@ impl AuditSyncService {
         self.inflight.lock().len()
     }
 
+    /// Register an in-flight request without sending it, so a test
+    /// can deliver a crafted response without a live peer racing it
+    /// with the honest answer.
     #[cfg(test)]
     pub(crate) fn track_inflight_for_test(
         &self,

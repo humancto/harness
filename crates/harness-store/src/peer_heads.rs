@@ -443,24 +443,56 @@ impl Store {
             // becomes sweepable — Decision 12's rule ("a contradicted
             // pin is the evidence") defeated through the back door.
             //
-            // `Unverifiable` is equally sticky: the owner pruned past
-            // it, and no later walk can change that.
+            // `Unverifiable` is deliberately NOT sticky (diff review
+            // MAJOR-5): ingest validates rows against the SUBJECT's
+            // hashes and cares only that they are not our own chain,
+            // so a third node that retained a range the owner pruned
+            // can serve it and legitimately corroborate. That is what
+            // relay is for. Only `contradicted` is terminal.
             let n = c.execute(
                 "UPDATE audit_peer_heads SET status = ?3
                   WHERE node_id = ?1 AND seq = ?2
-                    AND status NOT IN ('contradicted','unverifiable')",
+                    AND status <> 'contradicted'",
                 params![node.as_bytes(), seq, status.as_str()],
             )?;
             Ok(n > 0)
         })
     }
 
-    /// Force a pin's status, including out of a sticky state.
+    /// The stored status of one pin, if we hold it.
     ///
-    /// Only for paths that legitimately ESTABLISH evidence — fork
-    /// detection setting `Contradicted`, and 5.13c-3's operator
-    /// acknowledgement. Ordinary settle paths use
-    /// [`Self::set_pin_status`].
+    /// # Errors
+    /// Underlying sqlite errors.
+    pub fn pin_status(&self, node: NodeId, seq: u64) -> Result<Option<PinStatus>, StoreError> {
+        let seq = i64::try_from(seq).unwrap_or(i64::MAX);
+        self.with_conn(|c| {
+            let raw: Option<String> = c
+                .query_row(
+                    "SELECT status FROM audit_peer_heads WHERE node_id = ?1 AND seq = ?2",
+                    params![node.as_bytes(), seq],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(raw.map(|s| PinStatus::from_str(&s).unwrap_or(PinStatus::Unchecked)))
+        })
+    }
+
+    /// Force a pin's status, including out of `contradicted`.
+    ///
+    /// The ONLY intended caller is 5.13c-3's operator
+    /// acknowledgement — the one act that may legitimately retire a
+    /// fork verdict, and which records itself in the local chain so
+    /// the retirement is itself evidence.
+    ///
+    /// Fork detection does NOT use this and cannot (diff review
+    /// MAJOR-3): its `status = 'contradicted'` UPDATE runs inside
+    /// `pin_peer_head`'s own `with_conn` closure, and `with_conn`
+    /// takes the single process-wide mutex non-reentrantly, so
+    /// calling this from there would deadlock. An earlier version of
+    /// this doc named it as a caller, which was wrong.
+    ///
+    /// Ordinary settle paths use [`Self::set_pin_status`], which
+    /// refuses to leave `contradicted`.
     ///
     /// # Errors
     /// Underlying sqlite errors.

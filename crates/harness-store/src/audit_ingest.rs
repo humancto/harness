@@ -327,12 +327,15 @@ impl Store {
         let from_seq = u64::try_from(from).unwrap_or(1).max(1);
         let span = usize::try_from(target_seq.saturating_sub(from_seq).saturating_add(1))
             .unwrap_or(usize::MAX);
-        // Must reach the TARGET, not merely verify as far as it got
-        // (diff review on #67). Belt and braces with the direct
-        // stored-hash check above: that check is the load-bearing one
-        // — a truncated tail removes the pinned row, which only it
-        // sees — and this predicate covers the case where a walk
-        // stops short of a row that is still present.
+        // Belt and braces only, and unreachable as a sole detector
+        // (diff review MINOR-7): the direct stored-hash check above
+        // guarantees the row at `target_seq` exists, and
+        // `audit_verify_range` passes `span` straight to LIMIT with no
+        // internal cap, so a `Verified` result already implies
+        // contiguity from `from_seq` — which with the target row
+        // present forces `through_seq == target_seq`. The direct check
+        // is the one that catches a deleted tail. Kept because it
+        // costs nothing and pins the invariant explicitly.
         Ok(matches!(
             self.audit_verify_range(node, from_seq, span)?,
             crate::audit::ChainStatus::Verified { through_seq } if through_seq == target_seq
@@ -353,8 +356,21 @@ impl Store {
         } else {
             PinStatus::Unchecked
         };
-        self.set_pin_status(node, target_seq, status)?;
-        Ok(status)
+        // Report what is STORED, not what we computed (diff review
+        // MAJOR-2). `set_pin_status` refuses to leave `contradicted`,
+        // so walking the side of a fork we hold computes
+        // `Corroborated` for a pin the table keeps as `Contradicted`.
+        // Returning the computed value leaked that false verdict into
+        // the daemon's log line — the only operator-visible channel
+        // 5.13c-2 has — so the table said one thing and the operator
+        // was told another.
+        if self.set_pin_status(node, target_seq, status)? {
+            Ok(status)
+        } else {
+            Ok(self
+                .pin_status(node, target_seq)?
+                .unwrap_or(PinStatus::Unchecked))
+        }
     }
 
     /// Serve a contiguous run of one node's chain.
@@ -1254,8 +1270,11 @@ mod tests {
 
     #[test]
     fn i18_a_run_whose_tail_vanished_stops_corroborating() {
-        // Isolates the direct stored-hash-vs-pin check: the pinned row
-        // is gone, so only a lookup at the target position sees it.
+        // Behavioural: a completed run whose tail was deleted must
+        // stop corroborating. NOT an isolation of any single guard —
+        // the direct stored-hash check and the verifier consult both
+        // catch this, and `i18c` is what isolates the former (diff
+        // review MINOR-8).
         let (_src, entries) = chain_of(20);
         let dst = Store::open_memory().expect("dst");
         let last = entries.last().expect("entries");
@@ -1392,6 +1411,23 @@ mod tests {
         // and it would render into the History feed.
         let (_src, mut entries) = chain_of(2);
         entries[1].detail = Some("x".repeat(crate::audit::MAX_AUDIT_DETAIL_BYTES + 1));
+        // Re-hash over the oversized detail, so the row is internally
+        // VALID and the size cap is the only thing that can refuse it.
+        // Without this the row is also a HashMismatch and the test
+        // passes on guard ordering rather than on the cap (diff review
+        // MINOR-9).
+        let action = crate::audit::action_from_str(&entries[1].action).expect("action");
+        entries[1].entry_hash = harness_core::audit_entry_hash(
+            node(1),
+            entries[1].seq,
+            entries[1].at_ms,
+            action,
+            entries[1].subject.as_deref(),
+            entries[1].detail.as_deref(),
+            &entries[1].actor,
+            &entries[1].prev_hash,
+        )
+        .expect("hash");
         let dst = Store::open_memory().expect("dst");
         assert_eq!(
             dst.audit_ingest_range(node(9), node(1), 2, &entries, now())
@@ -1412,5 +1448,105 @@ mod tests {
             IngestRefusal::PastTarget { seq: 6 },
             "a walk toward seq 5 must not store rows beyond it"
         );
+    }
+
+    #[test]
+    fn i22_only_a_forced_write_can_retire_a_fork_verdict() {
+        // `force_pin_status` is the escape hatch the sticky rule
+        // depends on, and it had no test (diff review MAJOR-3) — it is
+        // `pub`, so nothing warned that it was dead. 5.13c-3's
+        // operator acknowledgement is its one intended caller.
+        let (_src, entries) = chain_of(4);
+        let dst = Store::open_memory().expect("dst");
+        let last = entries.last().expect("entries");
+        pin(&dst, last.seq, last.entry_hash, now());
+
+        let forked = AuditHead {
+            node_id: node(1),
+            seq: last.seq,
+            entry_hash: [0xAB; 32],
+            at_ms: now(),
+            sig: Signature::from_bytes([4u8; 64]),
+        };
+        assert!(matches!(
+            dst.pin_peer_head(&forked, node(3), now()).expect("pin"),
+            crate::peer_heads::PinOutcome::Fork { .. }
+        ));
+        assert_eq!(status_of(&dst, last.seq), PinStatus::Contradicted);
+
+        // The ordinary path cannot move it.
+        assert!(
+            !dst.set_pin_status(node(1), last.seq, PinStatus::Corroborated)
+                .expect("set"),
+            "set_pin_status reports that it changed nothing"
+        );
+        assert_eq!(status_of(&dst, last.seq), PinStatus::Contradicted);
+
+        // The forced path can, and that is the only thing that can.
+        assert!(dst
+            .force_pin_status(node(1), last.seq, PinStatus::Unchecked)
+            .expect("force"));
+        assert_eq!(status_of(&dst, last.seq), PinStatus::Unchecked);
+    }
+
+    #[test]
+    fn i23_unverifiable_is_not_terminal() {
+        // Narrowed from the first draft of the sticky rule (diff
+        // review MAJOR-5): ingest validates rows against the SUBJECT's
+        // hashes, so a third node that retained a range the owner
+        // pruned can serve it and legitimately corroborate. Only
+        // `contradicted` is terminal.
+        let (_src, entries) = chain_of(4);
+        let dst = Store::open_memory().expect("dst");
+        let last = entries.last().expect("entries");
+        pin(&dst, last.seq, last.entry_hash, now());
+
+        assert!(dst
+            .force_pin_status(node(1), last.seq, PinStatus::Unverifiable)
+            .expect("force"));
+        assert!(
+            dst.set_pin_status(node(1), last.seq, PinStatus::Corroborated)
+                .expect("set"),
+            "a retaining peer's walk may still corroborate it"
+        );
+        assert_eq!(status_of(&dst, last.seq), PinStatus::Corroborated);
+    }
+
+    #[test]
+    fn i24_settling_reports_the_stored_verdict_not_the_computed_one() {
+        // diff review MAJOR-2: the sticky guard kept the TABLE right
+        // while `settle_pin_from_run` returned the computed value, and
+        // the daemon logs that return — so the operator was told
+        // `corroborated` about a pin recorded as `contradicted`.
+        let (_src, entries) = chain_of(6);
+        let dst = Store::open_memory().expect("dst");
+        let last = entries.last().expect("entries");
+        pin(&dst, last.seq, last.entry_hash, now());
+
+        let forked = AuditHead {
+            node_id: node(1),
+            seq: last.seq,
+            entry_hash: [0xC3; 32],
+            at_ms: now(),
+            sig: Signature::from_bytes([5u8; 64]),
+        };
+        assert!(matches!(
+            dst.pin_peer_head(&forked, node(3), now()).expect("pin"),
+            crate::peer_heads::PinOutcome::Fork { .. }
+        ));
+
+        // Walk the side we hold: it completes and matches the pin.
+        let out = dst
+            .audit_ingest_range(node(9), node(1), last.seq, &entries, now())
+            .expect("ingest")
+            .expect("accepted");
+        assert!(out.reached_pin, "the walk itself succeeded");
+
+        assert_eq!(
+            dst.settle_pin_from_run(node(1), last.seq).expect("settle"),
+            PinStatus::Contradicted,
+            "settle reports the stored verdict, not the walk's opinion"
+        );
+        assert_eq!(status_of(&dst, last.seq), PinStatus::Contradicted);
     }
 }

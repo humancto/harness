@@ -439,6 +439,33 @@ and auto-recording a conflict would fire on the honest case. Promoting
 it to recorded evidence needs the operator surface and the repair path
 that 5.13c-3 brings.
 
+**Decision 23 — `contradicted` is terminal, and the only exit is an
+operator acknowledgement.** The second review round found that an
+ordinary entry walk could repaint fork evidence green, so
+`set_pin_status` now refuses to move a pin out of `contradicted`. That
+refusal is deliberately absolute rather than "unless the walk is
+convincing": the walk sees only the side of the fork we happen to
+hold, and both sides of a real fork walk cleanly — a fork is two
+internally consistent histories, which is exactly why the head
+collision and not the walk is the detector. A verdict a walk could
+retire would be a verdict an attacker retires by serving us its own
+branch.
+
+The consequence is that `contradicted` is a state the code cannot
+leave on its own, and 5.13c-1's benign cause (a peer that rebuilt its
+database) therefore sticks. That is accepted, not overlooked: a stuck
+amber state is recoverable by a human, a silently cleared one is not.
+`force_pin_status` exists for precisely one caller — 5.13c-3's
+conflict acknowledgement, where a human has seen both heads — and its
+doc comment names that caller and states that fork detection itself
+must not use it (fork detection writes the `contradicted` status
+inline, inside its own `with_conn` closure, because `with_conn` is
+non-reentrant and calling the setter from there would deadlock). Until
+5.13c-3 lands there is no repair path at all, and `i22` pins the
+behaviour so the exemption cannot quietly widen. `unverifiable`, by
+contrast, is **not** terminal (`i23`): it records an absence of
+evidence, and evidence arriving later should be allowed to settle it.
+
 ### What 5.13c-2 does NOT give you
 
 - **The pull is manual or opportunistic, not eager.** A pin is
@@ -460,13 +487,41 @@ that 5.13c-3 brings.
   `(node, target_seq)`; it grows with pin density and the pin sweep
   does not touch it.
 - **Corroboration is not cheap, and Decision 21 makes it uncached.**
-  Re-deriving it walks the run: roughly 107 ms (debug) for a
-  20k-row run, extrapolating to about half a second at the 100k
-  retention bound — all inside the single process-wide connection
-  mutex, on the QUIC receive path. Acceptable today because it runs
-  once per completed run, but 5.13c-3's per-pin UI will multiply it,
-  and a cache there must not become a way for a stale verdict to
-  outlive the rows it was derived from.
+  Re-deriving it walks the whole run. Measured on this machine, over a
+  chain built through the real sink and verified end to end:
+
+  | rows | debug | release |
+  |---|---|---|
+  | 20 000 | 422 ms | 64 ms |
+  | 100 000 | 2.12 s | 230 ms |
+
+  An earlier draft of this ADR said "roughly 107 ms (debug) for a
+  20k-row run … about half a second at the 100k retention bound"; the
+  diff review called the figure out and the measurement above
+  confirms it was understated about fourfold. The number that matters
+  for a shipped build is **230 ms at the 100k retention bound**.
+
+  That 230 ms is spent holding the single process-wide connection
+  mutex, inside the `harness.audit` recv arm — which is an ordinary
+  async task on a tokio worker. So one settle stalls both every other
+  store caller on the node and one runtime worker, on a path a peer
+  triggers by answering a request.
+
+  Wrapping the settle in `spawn_blocking` was considered and
+  rejected as this item's fix. It would free the worker thread and do
+  nothing at all about the mutex, which is the larger half; it would
+  single out the settle while leaving `audit_ingest_range`'s
+  up-to-5000-row write inline on the same task under the same mutex,
+  which is incoherent; and it would make the pin status land after
+  `ingest()` returns, turning every assertion about it into a race.
+  The coherent fix is to move the whole audit recv arm off the
+  runtime's workers, which is a change to `peer_net.rs`'s channel loop
+  and is out of this item's scope — ROADMAP **6.0a**. Until then the
+  stall is real and documented rather than hidden.
+
+  5.13c-3's per-pin UI will multiply this cost, and a cache there must
+  not become a way for a stale verdict to outlive the rows it was
+  derived from.
 - **Still no reader.** `audit_verify_range`, the run table and the
   corroborated status have no UI. A fork or a failed corroboration
   surfaces as a log line, a database row, and a 202 from the verify

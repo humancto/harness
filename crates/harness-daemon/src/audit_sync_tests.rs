@@ -787,38 +787,51 @@ fn m14_a_response_must_start_where_we_asked() {
     assert!(rows.is_empty(), "and nothing was ingested");
 }
 
-#[test]
-fn m15_the_follow_up_walk_is_bounded() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m15_the_follow_up_walk_is_bounded() {
     // A server that always sets `truncated` and returns one row per
     // reply would otherwise keep us asking forever. `may_serve` limits
-    // what WE serve; nothing limited what we chase (diff review
-    // MAJOR-6 on #67).
-    let (store, me, trust, _b, c, _tmp) = trio();
-    let svc = crate::audit_sync::AuditSyncService::new(store, me, trust);
+    // what WE serve; nothing limited what we chase.
+    //
+    // MUST use `boot_pair`, not `trio()` (diff review BLOCKER-1 on
+    // #67): `trio` wires no PeerNet, so `request_range_round` returns
+    // false at the net lookup regardless of `round` and the test was
+    // insensitive to the guard it is named for — it passed with the
+    // whole bound deleted. With a live net the two cases differ.
+    let (a, b) = boot_pair(None).await;
+    wait_for_mesh(&a, &b).await;
+    let svc = b.audit_sync.clone();
 
-    // At the budget the walk is still attempted (it fails only for
-    // want of a network, which is a different reason).
-    assert!(!svc.request_range_round_for_test(
-        c.node_id(),
-        c.node_id(),
-        1,
-        100,
-        crate::audit_sync::MAX_FOLLOWUP_ROUNDS,
-        now_ms(),
-    ));
-    // Past the budget it is abandoned outright — and crucially no
-    // in-flight slot is consumed.
-    assert!(!svc.request_range_round_for_test(
-        c.node_id(),
-        c.node_id(),
-        1,
-        100,
-        crate::audit_sync::MAX_FOLLOWUP_ROUNDS + 1,
-        now_ms(),
-    ));
+    // At the budget the request really goes out and takes a slot.
+    assert!(
+        svc.request_range_round_for_test(
+            a.node_id(),
+            a.node_id(),
+            1,
+            100,
+            crate::audit_sync::MAX_FOLLOWUP_ROUNDS,
+            now_ms(),
+        ),
+        "a walk at the budget is still attempted"
+    );
+    let at_budget = svc.inflight_len_for_test();
+    assert_eq!(at_budget, 1, "and holds an in-flight slot");
+
+    // Past the budget it is abandoned before anything is sent.
+    assert!(
+        !svc.request_range_round_for_test(
+            a.node_id(),
+            a.node_id(),
+            1,
+            100,
+            crate::audit_sync::MAX_FOLLOWUP_ROUNDS + 1,
+            now_ms(),
+        ),
+        "past the budget the walk is abandoned"
+    );
     assert_eq!(
         svc.inflight_len_for_test(),
-        0,
-        "an abandoned walk holds no slot"
+        at_budget,
+        "and takes no additional slot"
     );
 }
