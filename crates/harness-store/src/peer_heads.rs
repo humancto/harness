@@ -393,9 +393,32 @@ impl Store {
     /// for the relay path; this is the same rule for the verify path
     /// (diff review round 4 BLOCKER-2).
     ///
-    /// A bogus pin can still absorb ONE verify attempt while it is the
-    /// newest thing we saw. What it cannot do is hold that slot after
-    /// the subject's next honest head arrives.
+    /// Three rules together, because round 4's first attempt at this
+    /// only MOVED the subject's control into the tie-break (round 5
+    /// BLOCKER-1):
+    ///
+    /// 1. `observed_at_ms DESC` — our clock decides recency.
+    /// 2. `seq ASC` breaks a tie, not `seq DESC`. Ties are reachable:
+    ///    every head in one envelope is pinned with the same `now_ms`,
+    ///    and a subject can also send two envelopes inside one
+    ///    millisecond. `seq` is still the subject's field, but in THIS
+    ///    direction winning a tie means claiming a *lower* position,
+    ///    which is a reachable one — an inflated `i64::MAX` claim can
+    ///    never take the slot.
+    /// 3. Only `unchecked` pins are candidates. Without this a pin
+    ///    that wins a tie and then verifies keeps winning forever, and
+    ///    the newer honest pin is never reached.
+    ///
+    /// Falls back to the newest observation among ALL pins when
+    /// nothing is unchecked, so re-verification stays possible.
+    ///
+    /// Residual, stated rather than papered over: a subject offering a
+    /// LOW pin we cannot verify keeps the slot, because a failed walk
+    /// leaves the pin `unchecked`. Single-target selection is gameable
+    /// in principle — the subject generates the candidates. The
+    /// structural fix is 5.13c-3a's eager sweep over several unchecked
+    /// pins per tick, which does not depend on picking one right
+    /// target.
     pub fn newest_pin_by_observation(
         &self,
         node: NodeId,
@@ -406,7 +429,8 @@ impl Store {
                     "SELECT seq, entry_hash, at_ms, first_seen_ms, observed_at_ms, status
                        FROM audit_peer_heads
                       WHERE node_id = ?1
-                      ORDER BY observed_at_ms DESC, seq DESC LIMIT 1",
+                      ORDER BY (status <> 'unchecked'), observed_at_ms DESC,
+                               seq ASC LIMIT 1",
                     params![node.as_bytes()],
                     |r| {
                         Ok((
@@ -455,7 +479,7 @@ impl Store {
                     "SELECT seq, entry_hash, at_ms, sig, observed_at_ms
                        FROM audit_peer_heads
                       WHERE node_id = ?1
-                      ORDER BY observed_at_ms DESC, seq DESC LIMIT 1",
+                      ORDER BY observed_at_ms DESC, rowid DESC LIMIT 1",
                     params![node.as_bytes()],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )

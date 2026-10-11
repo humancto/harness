@@ -934,3 +934,156 @@ fn m17_a_guest_peer_is_not_served_and_does_not_spend_the_budget() {
         "a Guest is refused before the budget is consulted"
     );
 }
+
+#[test]
+fn m18_a_subject_cannot_own_the_verify_target_through_a_tie_break() {
+    // Round 5 BLOCKER-1: the fix for round 4's `MAX(seq)` defect moved
+    // the defect into the tie-break instead of removing it.
+    //
+    // Every head in one envelope is pinned with the SAME `now_ms`, so
+    // a subject that pairs its honest head with an inflated one makes
+    // `observed_at_ms` tie, and `ORDER BY ... seq DESC` then resolved
+    // the tie with a field the subject signed. Re-sending the pair
+    // each tick takes the `Refreshed` branch and re-stamps BOTH rows
+    // with the same new instant, so the tie never breaks: the verify
+    // endpoint aims past the honest chain forever, `reached_pin` never
+    // fires, and no pin for that node is ever corroborated.
+    let (store, me, trust, _b, c, _tmp) = trio();
+    let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me, trust);
+
+    let sign_head = |seq: u64, hash: u8| {
+        let mut h = harness_core::AuditHead {
+            node_id: c.node_id(),
+            seq,
+            entry_hash: [hash; 32],
+            at_ms: seq,
+            sig: Signature::from_bytes([0u8; 64]),
+        };
+        h.sign(&c).expect("sign");
+        h
+    };
+
+    // Both heads validly signed by the subject, both in ONE envelope,
+    // the inflated one representable so `RejectedSeq` does not catch
+    // it first (the trap m10 had to be rewritten to avoid).
+    let absurd = u64::try_from(i64::MAX).expect("i64::MAX fits u64");
+    let paired = envelope(&c, vec![sign_head(9, 0x09), sign_head(absurd, 0xFF)]);
+
+    // Re-sent every tick, which is what made the capture permanent.
+    for tick in 1..=4u64 {
+        svc.ingest(c.node_id(), &paired, tick * 1_000);
+        let target = store
+            .newest_pin_by_observation(c.node_id())
+            .expect("pin")
+            .expect("some pin");
+        assert_eq!(
+            target.seq, 9,
+            "tick {tick}: the verify target must be the honest head, not the subject's biggest number"
+        );
+    }
+
+    // The relay path must not be capturable either — this PR cites it
+    // as the precedent for the verify ordering, and the same envelope
+    // would make every honest peer relay the garbage head forever.
+    let (relayed, _seen) = store
+        .newest_pin_as_head(c.node_id())
+        .expect("relay")
+        .expect("some head");
+    assert_eq!(
+        relayed.seq, 9,
+        "the relayed head must be the honest one too"
+    );
+
+    // SECOND shape, which the per-envelope dedupe does NOT catch: two
+    // SEPARATE envelopes inside one millisecond. They tie on
+    // `observed_at_ms` just the same, so the tie-break itself has to
+    // be un-inflatable — this is the half that keeps `seq ASC` honest
+    // rather than relying on the dedupe alone.
+    let (store2, me2, trust2, _b2, c2, _tmp2) = trio();
+    let svc2 = crate::audit_sync::AuditSyncService::new(store2.clone(), me2, trust2);
+    let sign2 = |seq: u64, hash: u8| {
+        let mut h = harness_core::AuditHead {
+            node_id: c2.node_id(),
+            seq,
+            entry_hash: [hash; 32],
+            at_ms: seq,
+            sig: Signature::from_bytes([0u8; 64]),
+        };
+        h.sign(&c2).expect("sign");
+        h
+    };
+    for tick in 1..=3u64 {
+        // Honest first, inflated second — so insert order favours the
+        // attacker and only the VALUE comparison can save us.
+        svc2.ingest(
+            c2.node_id(),
+            &envelope(&c2, vec![sign2(9, 0x09)]),
+            tick * 1_000,
+        );
+        svc2.ingest(
+            c2.node_id(),
+            &envelope(&c2, vec![sign2(absurd, 0xFF)]),
+            tick * 1_000,
+        );
+        assert_eq!(
+            store2
+                .newest_pin_by_observation(c2.node_id())
+                .expect("pin")
+                .expect("some pin")
+                .seq,
+            9,
+            "tick {tick}: two envelopes in one millisecond must not hand the subject the slot"
+        );
+    }
+}
+
+#[test]
+fn m19_an_envelope_claiming_another_source_is_dropped() {
+    // Round 5 MAJOR-3: this cross-check sat in `channel_recv_loop`,
+    // where nothing could cheaply test it — neutralizing it to
+    // `if false` left all 128 daemon tests green. It now lives in the
+    // service, which is reachable from here.
+    //
+    // Both envelope types, because both carry a `source` the sending
+    // peer could lie about.
+    let (store, me, trust, b, c, _tmp) = trio();
+    let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me, trust);
+
+    let mut head = harness_core::AuditHead {
+        node_id: c.node_id(),
+        seq: 5,
+        entry_hash: [0x55; 32],
+        at_ms: 1_000,
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    head.sign(&c).expect("sign head");
+
+    // C signs an envelope naming itself as source, and B hands it to
+    // us as if it were B's own channel traffic. The head inside is
+    // genuine, so only the source check can refuse this.
+    let relayed_as_own = envelope(&c, vec![head]);
+    let out = svc.ingest(b.node_id(), &relayed_as_own, 2_000);
+    assert!(
+        out.is_empty(),
+        "an envelope whose source is not the sending peer is dropped, got {out:?}"
+    );
+    assert!(
+        store.peer_head_pins(c.node_id()).expect("pins").is_empty(),
+        "and nothing was pinned from it"
+    );
+
+    // Same for the entries channel: a request that claims to come from
+    // C while arriving from B must not be served.
+    let entries = range_req_envelope(&c, c.node_id(), [0x77; 16]);
+    svc.ingest_entries(b.node_id(), &entries, 3_000);
+    assert_eq!(
+        svc.served_in_window_for_test(b.node_id()),
+        0,
+        "a mismatched source is refused before the serve budget"
+    );
+    assert_eq!(
+        svc.served_in_window_for_test(c.node_id()),
+        0,
+        "and is not charged to the claimed source either"
+    );
+}

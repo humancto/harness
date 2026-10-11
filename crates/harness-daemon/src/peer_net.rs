@@ -808,14 +808,12 @@ impl PeerNet {
                         // exchange is relayable, so a mismatch is a
                         // replay of someone else's traffic.
                         Ok(env) => {
-                            if env.source != peer_id {
-                                tracing::warn!(
-                                    target: "harness.audit.sync",
-                                    peer = %peer_id,
-                                    claimed = %env.source,
-                                    "audit entries source does not match connection peer; dropped"
-                                );
-                            } else if let Some(svc) = self.audit_sync() {
+                            // The `source` cross-check lives in
+                            // `ingest_entries`, where a unit test can
+                            // reach it — a copy here survived deletion
+                            // with the whole daemon suite green
+                            // (round 5 MAJOR-3).
+                            if let Some(svc) = self.audit_sync() {
                                 let now = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))

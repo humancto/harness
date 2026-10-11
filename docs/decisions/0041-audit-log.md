@@ -568,8 +568,10 @@ never additive across versions in this codebase; a new channel is.
   for a shipped build is **230 ms at the 100k retention bound**.
 
   That 230 ms is spent holding the single process-wide connection
-  mutex, inside the `harness.audit` recv arm — which is an ordinary
-  async task on a tokio worker. So one settle stalls both every other
+  mutex, inside the `harness.audit.entries` recv arm — which is an
+  ordinary async task on a tokio worker. (The ENTRIES arm, not the head
+  arm: after Decision 24's split `harness.audit` carries only head
+  envelopes.) So one settle stalls both every other
   store caller on the node and one runtime worker, on a path a peer
   triggers by answering a request.
 
@@ -580,14 +582,23 @@ never additive across versions in this codebase; a new channel is.
   up-to-5000-row write inline on the same task under the same mutex,
   which is incoherent; and it would make the pin status land after
   `ingest()` returns, turning every assertion about it into a race.
-  The coherent fix is to move the whole audit recv arm off the
-  runtime's workers, which is a change to `peer_net.rs`'s channel loop
-  and is out of this item's scope — ROADMAP **6.0a**. Until then the
+  The coherent fix is to move the whole `harness.audit.entries` recv
+  arm off the runtime's workers, which is a change to `peer_net.rs`'s
+  channel loop and is out of this item's scope — ROADMAP **6.0a**. Until then the
   stall is real and documented rather than hidden.
 
   5.13c-3's per-pin UI will multiply this cost, and a cache there must
   not become a way for a stale verdict to outlive the rows it was
   derived from.
+- **A verify against a pre-5.13c-2 peer returns `202 started: true`
+  and then never settles.** Decision 24 buys that the connection and
+  its head pushes survive, but there is no version or capability
+  signal anywhere in this build, so the request opens
+  `harness.audit.entries`, that peer resets the unknown stream, and the
+  operator's only feedback is a pin that stays `unchecked` forever —
+  indistinguishable from a slow walk. A capability signal is the real
+  fix and belongs with 5.13c-3's operator surface, which is where the
+  distinction becomes visible.
 - **Still no reader.** `audit_verify_range`, the run table and the
   corroborated status have no UI. A fork or a failed corroboration
   surfaces as a log line, a database row, and a 202 from the verify

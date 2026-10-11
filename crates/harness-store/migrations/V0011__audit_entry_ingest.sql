@@ -47,5 +47,12 @@ CREATE TABLE IF NOT EXISTS audit_ingest_runs (
     PRIMARY KEY (node_id, target_seq)
 );
 
+-- Pre-placed for 5.13c-3's thinning sweep, which does not exist yet
+-- (round 5 MINOR-7). Nothing reads this index today: both live readers
+-- key on (node_id, target_seq), and there is no DELETE on this table at
+-- all -- its unbounded growth is recorded in ADR-0041's "does NOT give
+-- you" list. Kept rather than dropped so the sweep lands without a
+-- second migration, but the comment is here so the index is not read as
+-- evidence that a sweep already exists.
 CREATE INDEX IF NOT EXISTS idx_ingest_runs_stale
     ON audit_ingest_runs(complete, updated_at_ms);

@@ -295,6 +295,39 @@ impl Store {
     ///
     /// # Errors
     /// Underlying sqlite errors.
+    /// How far an in-progress walk toward `target_seq` has committed,
+    /// if a run row exists.
+    ///
+    /// The verify endpoint needs this to RESUME (round 5 MINOR-9).
+    /// Without it the endpoint always asked from `previous pin + 1`,
+    /// while `check_run_anchor` requires a continuing batch to start at
+    /// `through_seq + 1` — so once a multi-batch walk was interrupted
+    /// (the in-flight table drops a request after
+    /// `REQUEST_TIMEOUT_MS`), every retry against that target was
+    /// refused `NotContiguous` while the endpoint still answered
+    /// `202 {"started": true}`. That pin became permanently unwalkable
+    /// and the operator was told it had started.
+    ///
+    /// # Errors
+    /// Underlying sqlite errors.
+    pub fn audit_run_progress(
+        &self,
+        node: NodeId,
+        target_seq: u64,
+    ) -> Result<Option<u64>, StoreError> {
+        self.with_conn(|c| {
+            let row: Option<i64> = c
+                .query_row(
+                    "SELECT through_seq FROM audit_ingest_runs
+                      WHERE node_id = ?1 AND target_seq = ?2",
+                    params![node.as_bytes(), i64c(target_seq)],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(row.map(|v| u64::try_from(v).unwrap_or(0)))
+        })
+    }
+
     pub fn audit_run_corroborates(
         &self,
         node: NodeId,
@@ -1480,6 +1513,56 @@ mod tests {
                 .expect("ingest")
                 .expect_err("refuse"),
             IngestRefusal::SubjectTooLarge { seq: 2 }
+        );
+    }
+
+    #[test]
+    fn i26_a_broken_link_inside_one_batch_is_refused() {
+        // Round 5 MINOR-8: `BrokenLink` was constructed in exactly one
+        // place and asserted nowhere. It is reachable — a row whose
+        // `prev_hash` does not match its predecessor, re-hashed so it
+        // is internally valid and the link check is the only refusal
+        // that can fire.
+        let (_src, mut entries) = chain_of(3);
+        entries[2].prev_hash = [0x77u8; 32];
+        let action = crate::audit::action_from_str(&entries[2].action).expect("action");
+        entries[2].entry_hash = harness_core::audit_entry_hash(
+            node(1),
+            entries[2].seq,
+            entries[2].at_ms,
+            action,
+            entries[2].subject.as_deref(),
+            entries[2].detail.as_deref(),
+            &entries[2].actor,
+            &entries[2].prev_hash,
+        )
+        .expect("hash");
+        let dst = Store::open_memory().expect("dst");
+        assert_eq!(
+            dst.audit_ingest_range(node(9), node(1), 3, &entries, now())
+                .expect("ingest")
+                .expect_err("refuse"),
+            IngestRefusal::BrokenLink { seq: 3 }
+        );
+    }
+
+    #[test]
+    fn i27_a_batch_over_the_row_cap_is_refused() {
+        // Round 5 MINOR-8: `TooMany` had no test either. The cap is
+        // what stops one reply from costing unbounded write work, so
+        // it is checked before anything is hashed or written.
+        let (_src, entries) = chain_of(2);
+        let oversized: Vec<AuditEntryWire> = std::iter::repeat_with(|| entries[0].clone())
+            .take(MAX_INGEST_ROWS_PER_PULL + 1)
+            .collect();
+        let dst = Store::open_memory().expect("dst");
+        assert_eq!(
+            dst.audit_ingest_range(node(9), node(1), 10_000, &oversized, now())
+                .expect("ingest")
+                .expect_err("refuse"),
+            IngestRefusal::TooMany {
+                got: MAX_INGEST_ROWS_PER_PULL + 1
+            }
         );
     }
 

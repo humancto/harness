@@ -343,6 +343,21 @@ pub async fn verify_node_handler(
         .map(|p| p.seq)
         .max()
         .map_or(1, |prev| prev.saturating_add(1));
+    // Resume a walk already under way (round 5 MINOR-9). A multi-batch
+    // walk whose request timed out leaves a run committed to
+    // `through_seq`, and `check_run_anchor` requires a continuing batch
+    // to start at `through_seq + 1` — so asking from the previous pin
+    // again was refused `NotContiguous` on every retry while this
+    // endpoint still answered 202, leaving that pin permanently
+    // unwalkable and the operator told it had started.
+    let from_seq = match store.audit_run_progress(node, target.seq) {
+        Ok(Some(through)) => from_seq.max(through.saturating_add(1)),
+        Ok(None) => from_seq,
+        Err(err) => {
+            tracing::error!(target: "harness.api.audit", ?err, "audit_run_progress");
+            from_seq
+        }
+    };
     let started = puller.request_range(node, node, from_seq, target.seq);
     (
         StatusCode::ACCEPTED,

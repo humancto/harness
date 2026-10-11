@@ -62,9 +62,33 @@ const REQUEST_TIMEOUT_MS: u64 = 30_000;
 pub(crate) const SERVE_BATCHES_PER_MINUTE: u32 = 20;
 pub(crate) const SERVE_WINDOW_MS: u64 = 60_000;
 
-/// Follow-up rounds allowed per walk. `MAX_INGEST_ROWS_PER_PULL`
-/// (5000) rows per round covers any realistic chain well inside this.
-pub(crate) const MAX_FOLLOWUP_ROUNDS: u32 = 64;
+/// Follow-up rounds allowed per walk.
+///
+/// Derived from the BYTE cap, not the row cap (round 5 MAJOR-5). The
+/// earlier figure of 64 was justified by `MAX_INGEST_ROWS_PER_PULL`
+/// (5000 rows per round), but that limit never fires first:
+/// `MAX_SERVE_BYTES` (768 KiB) does. Using the server's own cost
+/// formula, an ordinary `shell.allowed` row is ~315 bytes before its
+/// `subject`, so a batch carries ~2500 rows with an empty subject but
+/// only ~1500 at a 200-byte command and ~1000 at 500 bytes. Against
+/// `AUDIT_RETENTION_ENTRIES` (`100_000`) — the bound the ADR explicitly
+/// reasons about — that is 41, 66 and 104 rounds. Two of those three
+/// exceeded 64, so an honest long chain of realistic shell rows had
+/// its walk abandoned partway.
+///
+/// The worst case that can actually be STORED is a row at
+/// `MAX_AUDIT_SUBJECT_BYTES` (4 KiB): ~4411 bytes per row, ~178 rows
+/// per batch, 562 rounds for a full 100_000-entry chain. 1024 covers
+/// that with margin and still bounds a server that sets `truncated`
+/// forever. (A first pass at this put it at 512, which the same
+/// arithmetic shows is below the 562 the worst storable row needs —
+/// worth recording, because deriving the number and then not checking
+/// it against the bound is how 64 got here in the first place.)
+///
+/// The loop is additionally safe because every round must start past
+/// what the last one committed, so a non-advancing server is refused
+/// rather than looped.
+pub(crate) const MAX_FOLLOWUP_ROUNDS: u32 = 1024;
 
 #[derive(Default)]
 struct PeerSyncState {
@@ -161,9 +185,66 @@ impl AuditSyncService {
         env: &AuditSyncEnvelope,
         now_ms: u64,
     ) -> Vec<(NodeId, PinOutcome)> {
+        if env.source != from {
+            tracing::warn!(
+                target: "harness.audit.sync",
+                peer = %from,
+                claimed = %env.source,
+                "audit envelope source does not match the sending peer; dropped"
+            );
+            return Vec::new();
+        }
         let mut out = Vec::new();
         let keys = self.pubkey_map();
+        // ONE head per subject per envelope, and when a sender breaks
+        // that, the LOWEST seq wins (round 5 BLOCKER-1).
+        //
+        // Every head in this loop is pinned with the same `now_ms`, so
+        // two heads for one subject in one envelope land at the same
+        // `observed_at_ms` — and whatever breaks that tie is a field
+        // the sender chose. A subject therefore used to pair its
+        // honest head at seq 9 with a garbage head at `i64::MAX`,
+        // re-send the pair every tick (which refreshes BOTH rows to
+        // the same new instant, so the tie never breaks), and own the
+        // verify target forever. That is the governing rule of this
+        // subsystem defeated through a tie-break: no ordering decision
+        // may key on a field the subject of that ordering controls.
+        //
+        // A sender legitimately holds one newest pin per node
+        // (`newest_pin_as_head` returns one row), so a duplicate is
+        // always anomalous rather than a choice between honest
+        // options. Keeping the lowest seq denies the inflated claim
+        // the slot. A RELAYER can still use this to keep a third
+        // party's newest relayed head out of one envelope, but not out
+        // of the subject's own direct push, where it is the only head
+        // for itself — and the low head it attaches would have been
+        // stored anyway as `StalePinned`.
+        let mut lowest: std::collections::HashMap<NodeId, &AuditHead> =
+            std::collections::HashMap::new();
         for head in env.heads.iter().take(harness_core::MAX_HEADS_PER_ENVELOPE) {
+            lowest
+                .entry(head.node_id)
+                .and_modify(|kept| {
+                    if head.seq < kept.seq {
+                        *kept = head;
+                    }
+                })
+                .or_insert(head);
+        }
+        if lowest.len() != env.heads.len().min(harness_core::MAX_HEADS_PER_ENVELOPE) {
+            tracing::warn!(
+                target: "harness.audit.sync",
+                relayer = %from,
+                heads = env.heads.len(),
+                subjects = lowest.len(),
+                "audit envelope repeats a subject; keeping the lowest seq per subject"
+            );
+        }
+        // Deterministic order, so the arrival ordinal the tie-break
+        // relies on does not depend on hash iteration order.
+        let mut deduped: Vec<&AuditHead> = lowest.into_values().collect();
+        deduped.sort_by_key(|h| (h.node_id.as_bytes().to_owned(), h.seq));
+        for head in deduped {
             // Our own chain is authoritative locally; a peer telling
             // us about ourselves proves nothing and a forged one would
             // be an accusation we cannot check.
@@ -252,6 +333,23 @@ impl AuditSyncService {
     /// The recv arm has already verified the envelope signature
     /// against the connection peer and cross-checked `source`.
     pub(crate) fn ingest_entries(&self, from: NodeId, env: &AuditEntriesEnvelope, now_ms: u64) {
+        // The cross-check lives HERE, not in the recv arm, so a unit
+        // test can reach it. Round 5 found the recv-arm copy surviving
+        // deletion with all 128 daemon tests green: a guard inside a
+        // QUIC read loop has no cheap test, and a guard with no test is
+        // a guard that disappears. Neither `serve_range` nor
+        // `consume_range` reads `env.source` today, so this is hygiene
+        // rather than a live hole — but the next change that does read
+        // it would inherit an unguarded field.
+        if env.source != from {
+            tracing::warn!(
+                target: "harness.audit.sync",
+                peer = %from,
+                claimed = %env.source,
+                "audit entries source does not match the sending peer; dropped"
+            );
+            return;
+        }
         if let Some(req) = &env.range_req {
             self.serve_range(from, req, now_ms);
         }

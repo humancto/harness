@@ -26,18 +26,28 @@ use crate::open::Store;
 /// are hashes and identifiers, never payloads.
 pub const MAX_AUDIT_DETAIL_BYTES: usize = 4096;
 
-/// Ceiling on an INGESTED row's `subject` (5.13c-2, diff review round
-/// 4 MINOR-5).
+/// Ceiling on a row's `subject`, on BOTH paths (5.13c-2; round 5
+/// MAJOR-4).
 ///
-/// Unlike `detail` there is no cap on the local append path: a local
-/// `subject` is bounded only by the 64 KiB exec frame that produced
-/// it. The ingest path inherits the 1 MiB `harness.audit.entries`
-/// frame instead, so without this a peer could plant ~16x more
-/// subject bytes per row than any honest local append can hold — and
-/// ingested rows are never pruned, because `prune_audit_log` runs
-/// only for the local node. Set to the local bound rather than to
-/// `MAX_AUDIT_DETAIL_BYTES`: a tighter cap would refuse honest rows.
-pub const MAX_AUDIT_SUBJECT_BYTES: usize = 64 * 1024;
+/// Round 4 added this as an ingest-only cap of 64 KiB, justified as
+/// "the local bound". That was wrong: `subject` had no cap on the
+/// local append path at all. `shell.rs` passes `input.cmd` straight
+/// to `with_subject`, `cmd` is length-checked nowhere, and a `Task`
+/// arrives over a 1 MiB `TASK_ASSIGN` frame or over HTTP under axum's
+/// 2 MB default — so the two paths disagreed in both directions: an
+/// honest local row above 64 KiB was REFUSED on ingest (killing the
+/// walk, since `validate_batch` stops at the first offending row and
+/// no follow-up is issued), and a row near 1 MiB could not be served
+/// inside the channel frame at all.
+///
+/// So the local path now caps too, at this same number, and the two
+/// agree by construction. Matched to `MAX_AUDIT_DETAIL_BYTES`: a
+/// command line or task id that needs more than 4 KiB is not a thing
+/// the feed should be rendering. Unlike `detail`, an over-cap
+/// `subject` is TRUNCATED rather than dropped — the subject is what
+/// makes a row identifiable, so losing it entirely would be worse
+/// than losing its tail.
+pub const MAX_AUDIT_SUBJECT_BYTES: usize = MAX_AUDIT_DETAIL_BYTES;
 
 /// 5.13b (ADR-0041 follow-up): how long an identical repeat of a
 /// FLOODABLE action is rate-limited per actor.
@@ -170,6 +180,29 @@ fn row_to_audit(r: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRow> {
     })
 }
 
+/// Clamp a `subject` to [`MAX_AUDIT_SUBJECT_BYTES`] on a char
+/// boundary.
+///
+/// Truncating mid-codepoint would panic on slicing, and a subject
+/// arrives from a peer-supplied command line, so the boundary walk is
+/// not optional.
+fn truncate_subject(raw: &str) -> String {
+    if raw.len() <= MAX_AUDIT_SUBJECT_BYTES {
+        return raw.to_owned();
+    }
+    let mut end = MAX_AUDIT_SUBJECT_BYTES;
+    while end > 0 && !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    tracing::warn!(
+        target: "harness.store.audit",
+        bytes = raw.len(),
+        kept = end,
+        "audit subject over cap; truncated"
+    );
+    raw[..end].to_owned()
+}
+
 impl Store {
     /// Append one entry to `node_id`'s chain.
     ///
@@ -200,7 +233,7 @@ impl Store {
             }
         });
         let action = record.action;
-        let subject = record.subject.clone();
+        let subject = record.subject.as_deref().map(truncate_subject);
         self.with_conn(move |c| {
             let tx = c.unchecked_transaction()?;
             let head: Option<(i64, Vec<u8>)> = tx
@@ -1639,5 +1672,33 @@ mod tests {
                 through_seq: BURST_ALLOWANCE + 1
             }
         );
+    }
+    #[test]
+    fn a10b_an_oversized_subject_is_truncated_on_a_char_boundary() {
+        // Round 5 MAJOR-4: `subject` was capped on INGEST but not
+        // locally, so an honest local row above the ingest cap was
+        // refused when a peer tried to replicate it — and the refusal
+        // stops the walk, because validate_batch returns on the first
+        // offending row and no follow-up is issued. The two paths now
+        // share one constant.
+        let store = Store::open_memory().expect("store");
+        let sink = StoreAuditSink::new(store.clone(), NodeId::from_bytes([1u8; 16]));
+        // Multi-byte chars straddling the cap: a naive byte slice here
+        // would panic rather than truncate.
+        let subject = "\u{00e9}".repeat(MAX_AUDIT_SUBJECT_BYTES);
+        sink.record(
+            AuditRecord::new(AuditAction::TaskDispatched, AuditActor::System).with_subject(subject),
+        );
+        let rows = store.audit_recent(None, None, None, 10).expect("recent");
+        let stored = rows[0].subject.as_deref().expect("subject");
+        assert!(
+            stored.len() <= MAX_AUDIT_SUBJECT_BYTES,
+            "stored {} bytes, cap {MAX_AUDIT_SUBJECT_BYTES}",
+            stored.len()
+        );
+        assert!(!stored.is_empty(), "truncated, not dropped");
+        // And what we store is exactly what ingest will accept, which
+        // is the property the two paths have to share.
+        assert!(stored.len() <= crate::audit::MAX_AUDIT_SUBJECT_BYTES);
     }
 }
