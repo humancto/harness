@@ -62,33 +62,48 @@ const REQUEST_TIMEOUT_MS: u64 = 30_000;
 pub(crate) const SERVE_BATCHES_PER_MINUTE: u32 = 20;
 pub(crate) const SERVE_WINDOW_MS: u64 = 60_000;
 
-/// Follow-up rounds allowed per walk.
+/// Follow-up rounds allowed per pull.
 ///
-/// Derived from the BYTE cap, not the row cap (round 5 MAJOR-5). The
-/// earlier figure of 64 was justified by `MAX_INGEST_ROWS_PER_PULL`
-/// (5000 rows per round), but that limit never fires first:
-/// `MAX_SERVE_BYTES` (768 KiB) does. Using the server's own cost
-/// formula, an ordinary `shell.allowed` row is ~315 bytes before its
-/// `subject`, so a batch carries ~2500 rows with an empty subject but
-/// only ~1500 at a 200-byte command and ~1000 at 500 bytes. Against
-/// `AUDIT_RETENTION_ENTRIES` (`100_000`) — the bound the ADR explicitly
-/// reasons about — that is 41, 66 and 104 rounds. Two of those three
-/// exceeded 64, so an honest long chain of realistic shell rows had
-/// its walk abandoned partway.
+/// Derived from the constraint that actually binds, which took three
+/// goes to identify (round 6 MAJOR-3):
 ///
-/// The worst case that can actually be STORED is a row at
-/// `MAX_AUDIT_SUBJECT_BYTES` (4 KiB): ~4411 bytes per row, ~178 rows
-/// per batch, 562 rounds for a full 100_000-entry chain. 1024 covers
-/// that with margin and still bounds a server that sets `truncated`
-/// forever. (A first pass at this put it at 512, which the same
-/// arithmetic shows is below the 562 the worst storable row needs —
-/// worth recording, because deriving the number and then not checking
-/// it against the bound is how 64 got here in the first place.)
+/// - 64, justified from `MAX_INGEST_ROWS_PER_PULL` (5000 rows). The
+///   row cap never fires first.
+/// - 1024, justified from `MAX_SERVE_BYTES` (768 KiB). Closer, but
+///   still not the binding limit.
+/// - The real one is [`SERVE_BATCHES_PER_MINUTE`]: rounds are strictly
+///   sequential (`consume_range` -> `request_range_round`), and an
+///   honest peer stops serving us after 20 batches in its window. Past
+///   that, `serve_range` returns without a reply, our in-flight entry
+///   times out after `REQUEST_TIMEOUT_MS`, and the pull ends. So a
+///   single pull could never exceed ~21 rounds whatever this constant
+///   said, and raising it to 1024 bought nothing for honest chains
+///   while giving a malicious peer that always sets `truncated` a 16x
+///   larger amplification — 1024 round trips and write transactions
+///   under the process-wide connection mutex, per request.
 ///
-/// The loop is additionally safe because every round must start past
-/// what the last one committed, so a non-advancing server is refused
-/// rather than looped.
-pub(crate) const MAX_FOLLOWUP_ROUNDS: u32 = 1024;
+/// `SERVE_BATCHES_PER_MINUTE + 12` leaves slack for a window that
+/// rolls over mid-pull without being a budget a hostile server can
+/// spend. A long chain legitimately needs SEVERAL pulls across several
+/// windows, which is what the resume path exists for and what
+/// 5.13c-3a's eager sweep will drive automatically; `p06c` pins the
+/// relationship so this cannot drift from the serve budget again.
+pub(crate) const MAX_FOLLOWUP_ROUNDS: u32 = SERVE_BATCHES_PER_MINUTE + 12;
+
+// The relationship IS the justification, so it is enforced at compile
+// time rather than by a test: round 6 found the value changed 64 ->
+// 1024 with every test green, because the one test that referenced it
+// did so symbolically and therefore tracked any value (round 6
+// MAJOR-3, mutation M9). A build that breaks the relationship now
+// fails to compile.
+const _: () = assert!(
+    MAX_FOLLOWUP_ROUNDS > SERVE_BATCHES_PER_MINUTE,
+    "a single pull must be able to use a full serve window"
+);
+const _: () = assert!(
+    MAX_FOLLOWUP_ROUNDS <= SERVE_BATCHES_PER_MINUTE * 2,
+    "and must not become a budget a hostile server can spend"
+);
 
 #[derive(Default)]
 struct PeerSyncState {
@@ -185,6 +200,14 @@ impl AuditSyncService {
         env: &AuditSyncEnvelope,
         now_ms: u64,
     ) -> Vec<(NodeId, PinOutcome)> {
+        // Also checked in the `harness.audit` recv arm, which keeps
+        // its copy because the `audit_sync() == None` fallback there
+        // hands the envelope to `handlers.on_audit_heads` without
+        // reaching this function. So for HEAD traffic this check is
+        // belt-and-braces and the recv-arm one is what production
+        // hits; it is here so `m19` can reach it at all (round 6
+        // MINOR-10 — round 5's claim that both checks "moved" was
+        // wrong for this one: it was duplicated).
         if env.source != from {
             tracing::warn!(
                 target: "harness.audit.sync",
@@ -196,55 +219,34 @@ impl AuditSyncService {
         }
         let mut out = Vec::new();
         let keys = self.pubkey_map();
-        // ONE head per subject per envelope, and when a sender breaks
-        // that, the LOWEST seq wins (round 5 BLOCKER-1).
+        // Dedupe EXACT duplicates only — never choose between two
+        // heads on `seq` (round 6 BLOCKER-1).
         //
-        // Every head in this loop is pinned with the same `now_ms`, so
-        // two heads for one subject in one envelope land at the same
-        // `observed_at_ms` — and whatever breaks that tie is a field
-        // the sender chose. A subject therefore used to pair its
-        // honest head at seq 9 with a garbage head at `i64::MAX`,
-        // re-send the pair every tick (which refreshes BOTH rows to
-        // the same new instant, so the tie never breaks), and own the
-        // verify target forever. That is the governing rule of this
-        // subsystem defeated through a tie-break: no ordering decision
-        // may key on a field the subject of that ordering controls.
+        // Round 5 deduped to one head per subject keeping the LOWEST
+        // seq, reasoning that a duplicate subject is anomalous. That
+        // was a regression, not a fix: a subject sending
+        // `{seq 9 honest, seq 1 bogus}` had its honest head DROPPED —
+        // never pinned at all, so not even `peer_head_pins` could see
+        // it. Round 4 at least stored both rows. Pin density is named
+        // at the top of this file as the security parameter of the
+        // whole design, and that change let any subject collapse its
+        // own to a position of its choosing, permanently, and poison
+        // every honest peer's relay slot for it. The accompanying
+        // comment claimed a subject's direct push was unaffected
+        // "where it is the only head for itself", which is false: the
+        // subject simply attaches a second head for itself.
         //
-        // A sender legitimately holds one newest pin per node
-        // (`newest_pin_as_head` returns one row), so a duplicate is
-        // always anomalous rather than a choice between honest
-        // options. Keeping the lowest seq denies the inflated claim
-        // the slot. A RELAYER can still use this to keep a third
-        // party's newest relayed head out of one envelope, but not out
-        // of the subject's own direct push, where it is the only head
-        // for itself — and the low head it attaches would have been
-        // stored anyway as `StalePinned`.
-        let mut lowest: std::collections::HashMap<NodeId, &AuditHead> =
-            std::collections::HashMap::new();
+        // So every distinct position a sender offers gets pinned, and
+        // the ordering problem is solved in the ORDERING
+        // (`newest_pin_by_observation`), not by discarding evidence.
+        // An exact repeat within one envelope is pure waste and is
+        // collapsed; anything else is stored and classified.
+        let mut seen: std::collections::HashSet<(NodeId, u64, [u8; 32])> =
+            std::collections::HashSet::new();
         for head in env.heads.iter().take(harness_core::MAX_HEADS_PER_ENVELOPE) {
-            lowest
-                .entry(head.node_id)
-                .and_modify(|kept| {
-                    if head.seq < kept.seq {
-                        *kept = head;
-                    }
-                })
-                .or_insert(head);
-        }
-        if lowest.len() != env.heads.len().min(harness_core::MAX_HEADS_PER_ENVELOPE) {
-            tracing::warn!(
-                target: "harness.audit.sync",
-                relayer = %from,
-                heads = env.heads.len(),
-                subjects = lowest.len(),
-                "audit envelope repeats a subject; keeping the lowest seq per subject"
-            );
-        }
-        // Deterministic order, so the arrival ordinal the tie-break
-        // relies on does not depend on hash iteration order.
-        let mut deduped: Vec<&AuditHead> = lowest.into_values().collect();
-        deduped.sort_by_key(|h| (h.node_id.as_bytes().to_owned(), h.seq));
-        for head in deduped {
+            if !seen.insert((head.node_id, head.seq, head.entry_hash)) {
+                continue;
+            }
             // Our own chain is authoritative locally; a peer telling
             // us about ourselves proves nothing and a forged one would
             // be an accusation we cannot check.
@@ -452,13 +454,19 @@ impl AuditSyncService {
     }
 
     /// One push round.
-    pub(crate) fn push_round(&self, now_ms: u64) {
-        let Some(net) = self.net.get().and_then(Weak::upgrade) else {
-            return;
-        };
+    /// Build and sign the head-push envelope.
+    ///
+    /// Extracted from [`Self::push_round`] so a test can assert on the
+    /// envelope PRODUCTION actually sends (round 6 MAJOR-2). The
+    /// cross-version guard used a hand-written fixture, and a fixture
+    /// co-varies with the snapshot beside it: adding a field and
+    /// populating it HERE while leaving the fixture at its default —
+    /// which is what the compiler nudges an author to do — left every
+    /// test green. A guard against a wire break has to read the wire.
+    pub(crate) fn assemble_push_envelope(&self, now_ms: u64) -> Option<AuditSyncEnvelope> {
         let mut heads = self.outgoing_heads(now_ms);
         if heads.is_empty() {
-            return;
+            return None;
         }
         // Structurally bounded at 1 + RELAY_HEADS, but pin the
         // contract on the send side too so a future change cannot
@@ -472,8 +480,18 @@ impl AuditSyncService {
         };
         if let Err(e) = env.sign(&self.identity) {
             tracing::warn!(target: "harness.audit.sync", ?e, "signing audit envelope");
-            return;
+            return None;
         }
+        Some(env)
+    }
+
+    pub(crate) fn push_round(&self, now_ms: u64) {
+        let Some(net) = self.net.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        let Some(env) = self.assemble_push_envelope(now_ms) else {
+            return;
+        };
 
         for peer in net.live_peers() {
             if peer == self.local_id {
@@ -609,10 +627,15 @@ impl AuditSyncService {
             return;
         }
         if !self.may_serve(peer, now_ms) {
-            tracing::debug!(
+            // Warn, not debug: this silently ends the requester's walk
+            // (no reply, in-flight slot times out, nothing retries
+            // until the next pull), so an operator wondering why a
+            // verify never settled needs to see it (round 6 MAJOR-3).
+            tracing::warn!(
                 target: "harness.audit.sync",
                 peer = %peer,
-                "audit range request rate-limited"
+                limit = SERVE_BATCHES_PER_MINUTE,
+                "audit range request rate-limited; the peer's walk ends here until its next pull"
             );
             return;
         }

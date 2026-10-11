@@ -26,28 +26,35 @@ use crate::open::Store;
 /// are hashes and identifiers, never payloads.
 pub const MAX_AUDIT_DETAIL_BYTES: usize = 4096;
 
-/// Ceiling on a row's `subject`, on BOTH paths (5.13c-2; round 5
-/// MAJOR-4).
+/// What a NEWLY APPENDED row's `subject` is truncated to.
 ///
-/// Round 4 added this as an ingest-only cap of 64 KiB, justified as
-/// "the local bound". That was wrong: `subject` had no cap on the
-/// local append path at all. `shell.rs` passes `input.cmd` straight
-/// to `with_subject`, `cmd` is length-checked nowhere, and a `Task`
-/// arrives over a 1 MiB `TASK_ASSIGN` frame or over HTTP under axum's
-/// 2 MB default — so the two paths disagreed in both directions: an
-/// honest local row above 64 KiB was REFUSED on ingest (killing the
-/// walk, since `validate_batch` stops at the first offending row and
-/// no follow-up is issued), and a row near 1 MiB could not be served
-/// inside the channel frame at all.
-///
-/// So the local path now caps too, at this same number, and the two
-/// agree by construction. Matched to `MAX_AUDIT_DETAIL_BYTES`: a
-/// command line or task id that needs more than 4 KiB is not a thing
-/// the feed should be rendering. Unlike `detail`, an over-cap
-/// `subject` is TRUNCATED rather than dropped — the subject is what
-/// makes a row identifiable, so losing it entirely would be worse
-/// than losing its tail.
+/// `subject` had no cap at all before 5.13c-2: `shell.rs` passes
+/// `input.cmd` straight to `with_subject`, `cmd` is length-checked
+/// nowhere, and a `Task` arrives over a 1 MiB `TASK_ASSIGN` frame or
+/// over HTTP under axum's 2 MB default. Capping it going forward is
+/// right — a command line needing more than this is not something the
+/// History feed should render.
 pub const MAX_AUDIT_SUBJECT_BYTES: usize = MAX_AUDIT_DETAIL_BYTES;
+
+/// What an INGESTED row's `subject` may carry — deliberately LOOSER
+/// than [`MAX_AUDIT_SUBJECT_BYTES`] (round 6 MAJOR-4).
+///
+/// The two caps differ, and the asymmetry is the point. Rows with a
+/// subject far above the local cap ALREADY EXIST on any node that ran
+/// a long command under a build before 5.13c-2, because there was no
+/// local cap then. `subject` is inside `entry_hash`, so such a row can
+/// never be truncated into acceptability — and by this module's own
+/// ingest rules the refusal is fatal, not cosmetic: `validate_batch`
+/// stops at the first offending row and no follow-up is issued, so one
+/// legacy row makes the whole chain past it permanently unverifiable.
+///
+/// Round 5 set the ingest cap to the local one and called it "the two
+/// paths now agree by construction". They agree only for rows appended
+/// after that commit; the migration case is the one that matters. So
+/// ingest keeps the 64 KiB ceiling: still a bound (the 1 MiB frame
+/// would otherwise admit ~16x this), but loose enough that honest
+/// history written by an older build still replicates.
+pub const MAX_INGESTED_SUBJECT_BYTES: usize = 64 * 1024;
 
 /// 5.13b (ADR-0041 follow-up): how long an identical repeat of a
 /// FLOODABLE action is rate-limited per actor.
@@ -1683,9 +1690,19 @@ mod tests {
         // share one constant.
         let store = Store::open_memory().expect("store");
         let sink = StoreAuditSink::new(store.clone(), NodeId::from_bytes([1u8; 16]));
-        // Multi-byte chars straddling the cap: a naive byte slice here
-        // would panic rather than truncate.
-        let subject = "\u{00e9}".repeat(MAX_AUDIT_SUBJECT_BYTES);
+        // The fixture has to STRADDLE the cap, or the boundary walk is
+        // never exercised (round 6 MINOR-8): an earlier version used a
+        // 2-byte char against a 4096-byte cap, where 4096 is always a
+        // boundary and a naive slice would not have panicked — so the
+        // test passed with the walk replaced by a bare slice.
+        // `MAX_AUDIT_SUBJECT_BYTES % 3 == 1`, so a 3-byte char lands
+        // mid-codepoint.
+        assert_eq!(
+            MAX_AUDIT_SUBJECT_BYTES % 3,
+            1,
+            "fixture assumes the cap is not a multiple of 3"
+        );
+        let subject = "\u{20ac}".repeat(MAX_AUDIT_SUBJECT_BYTES);
         sink.record(
             AuditRecord::new(AuditAction::TaskDispatched, AuditActor::System).with_subject(subject),
         );
@@ -1697,6 +1714,18 @@ mod tests {
             stored.len()
         );
         assert!(!stored.is_empty(), "truncated, not dropped");
+        // The real property: what we kept is still valid UTF-8 ending
+        // on a boundary, and is the largest such prefix.
+        assert_eq!(
+            stored.len() % 3,
+            0,
+            "truncated on a char boundary, kept {} bytes",
+            stored.len()
+        );
+        assert!(
+            stored.len() > MAX_AUDIT_SUBJECT_BYTES - 3,
+            "and kept the largest prefix that fits"
+        );
         // And what we store is exactly what ingest will accept, which
         // is the property the two paths have to share.
         assert!(stored.len() <= crate::audit::MAX_AUDIT_SUBJECT_BYTES);

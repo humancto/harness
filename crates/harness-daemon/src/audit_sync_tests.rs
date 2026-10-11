@@ -1087,3 +1087,181 @@ fn m19_an_envelope_claiming_another_source_is_dropped() {
         "and is not charged to the claimed source either"
     );
 }
+
+#[test]
+fn m21_a_replayed_old_head_cannot_take_the_verify_slot() {
+    // Round 6 BLOCKER-1(a). The envelope is deliberately NOT
+    // replay-protected, and `pin_peer_head`'s `Refreshed` branch
+    // re-stamps `observed_at_ms`. So ordering on `observed_at_ms`
+    // meant our clock stamped the row but the SUBJECT chose which row
+    // got stamped: re-push a genuine old head and it becomes "newest".
+    //
+    // `first_seen_ms` is written once on INSERT and never updated,
+    // which is why the ordering keys on it.
+    let (store, me, trust, b, c, _tmp) = trio();
+    let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me, trust);
+    let sign_head = |seq: u64, hash: u8| {
+        let mut h = harness_core::AuditHead {
+            node_id: c.node_id(),
+            seq,
+            entry_hash: [hash; 32],
+            at_ms: seq,
+            sig: Signature::from_bytes([0u8; 64]),
+        };
+        h.sign(&c).expect("sign");
+        h
+    };
+
+    // Both positions are known to us, oldest first — the ordinary
+    // case after a peer has been up for a while.
+    let old_head = envelope(&c, vec![sign_head(2, 0x02)]);
+    svc.ingest(c.node_id(), &old_head, 1_000);
+    svc.ingest(b.node_id(), &envelope(&b, vec![sign_head(50, 0x50)]), 2_000);
+    assert_eq!(
+        store
+            .newest_pin_by_observation(c.node_id())
+            .expect("pin")
+            .expect("some pin")
+            .seq,
+        50,
+        "the newest position we learned about is the target"
+    );
+
+    // Now the replay: C re-pushes the SAME old head it already got us
+    // to pin. `Refreshed` re-stamps `observed_at_ms` on that row, so
+    // an `observed_at_ms` ordering handed the slot straight back to
+    // seq 2 — our clock stamping it, the subject choosing what got
+    // stamped. `first_seen_ms` is written once and never updated.
+    for tick in 3..=6u64 {
+        svc.ingest(c.node_id(), &old_head, tick * 1_000);
+        assert_eq!(
+            store
+                .newest_pin_by_observation(c.node_id())
+                .expect("pin")
+                .expect("some pin")
+                .seq,
+            50,
+            "tick {tick}: re-pushing a head we already hold must not re-take the slot"
+        );
+    }
+
+    // Both rows exist — the fix is in the ORDERING, not in discarding
+    // evidence (round 5 dropped one of them, which was worse).
+    let seqs: Vec<u64> = store
+        .peer_head_pins(c.node_id())
+        .expect("pins")
+        .into_iter()
+        .map(|p| p.seq)
+        .collect();
+    assert!(seqs.contains(&2) && seqs.contains(&50), "have {seqs:?}");
+}
+
+#[test]
+fn m22_a_second_head_for_itself_cannot_delete_a_subjects_honest_head() {
+    // Round 6 BLOCKER-1(b): round 5's "keep the LOWEST seq per
+    // subject" dedupe DROPPED the honest head when a subject attached
+    // a lower bogus one — never pinned at all, so nothing downstream
+    // could see it, and every honest peer relayed the bogus position
+    // for it. Pin density is the security parameter of this design.
+    let (store, me, trust, _b, c, _tmp) = trio();
+    let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me, trust);
+    let sign_head = |seq: u64, hash: u8| {
+        let mut h = harness_core::AuditHead {
+            node_id: c.node_id(),
+            seq,
+            entry_hash: [hash; 32],
+            at_ms: seq,
+            sig: Signature::from_bytes([0u8; 64]),
+        };
+        h.sign(&c).expect("sign");
+        h
+    };
+
+    let paired = envelope(&c, vec![sign_head(9, 0x09), sign_head(1, 0xBB)]);
+    svc.ingest(c.node_id(), &paired, 1_000);
+
+    let seqs: Vec<u64> = store
+        .peer_head_pins(c.node_id())
+        .expect("pins")
+        .into_iter()
+        .map(|p| p.seq)
+        .collect();
+    assert!(
+        seqs.contains(&9),
+        "the honest head must be PINNED, not discarded; have {seqs:?}"
+    );
+    assert!(
+        seqs.contains(&1),
+        "and the low one is stored too; have {seqs:?}"
+    );
+
+    // An exact repeat is still collapsed — that is pure waste.
+    let repeated = envelope(&c, vec![sign_head(4, 0x04), sign_head(4, 0x04)]);
+    let out = svc.ingest(c.node_id(), &repeated, 2_000);
+    assert_eq!(out.len(), 1, "an exact duplicate is collapsed, got {out:?}");
+}
+
+/// The 5.13c-1 head-envelope shape, frozen. Do not add fields.
+///
+/// `deny_unknown_fields` so an added field is caught at DECODE, not
+/// only at signature verification.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenAuditSyncEnvelopeV1 {
+    source: harness_core::NodeId,
+    assembled_at: u64,
+    heads: Vec<harness_core::AuditHead>,
+    sig: Signature,
+}
+
+impl harness_core::Signable for FrozenAuditSyncEnvelopeV1 {
+    fn sig_field_mut(&mut self) -> &mut Signature {
+        &mut self.sig
+    }
+    fn sig_field(&self) -> &Signature {
+        &self.sig
+    }
+}
+
+#[test]
+fn m23_the_envelope_production_sends_is_still_verifiable_by_a_5_13c_1_node() {
+    // Round 6 MAJOR-2. ADR-0041 Decision 24 says a new field on a
+    // signed wire type is never additive across versions, and nothing
+    // enforced it: `wire_format.rs` pinned the gossip envelope but no
+    // audit type. Round 5 added snapshots plus a cross-version test,
+    // and round 6 showed BOTH miss the real defect — they are
+    // hand-written fixtures, so a field added to the struct and
+    // populated in `push_round` while the fixtures keep their defaults
+    // (what the compiler error nudges you to write) leaves every test
+    // green.
+    //
+    // So this reads the envelope PRODUCTION assembles, via the same
+    // `assemble_push_envelope` that `push_round` sends.
+    let (store, me, trust, _b, _c, _tmp) = trio();
+    let local = me.node_id();
+    let sink = harness_store::audit::StoreAuditSink::new(store.clone(), local);
+    sink.record(
+        harness_core::AuditRecord::new(
+            harness_core::AuditAction::TaskDispatched,
+            harness_core::AuditActor::System,
+        )
+        .with_subject("fixture"),
+    );
+    let svc = crate::audit_sync::AuditSyncService::new(store, me.clone(), trust);
+
+    let env = svc
+        .assemble_push_envelope(now_ms())
+        .expect("production assembles a head push");
+    assert!(
+        !env.heads.is_empty(),
+        "an empty envelope would verify against anything"
+    );
+
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&env, &mut buf).expect("serialize");
+    let old: FrozenAuditSyncEnvelopeV1 = ciborium::de::from_reader(buf.as_slice())
+        .expect("a 5.13c-1 node must be able to DECODE what we send");
+    harness_core::Signable::verify_signature(&old, me.public_key()).expect(
+        "and must verify its signature — otherwise it resets the stream and head pushes die",
+    );
+}

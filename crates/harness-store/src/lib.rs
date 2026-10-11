@@ -24,7 +24,7 @@ pub mod tasks;
 
 pub use crate::audit::{
     AuditCursor, AuditRow, ChainStatus, StoreAuditSink, BURST_ALLOWANCE, MAX_AUDIT_DETAIL_BYTES,
-    MAX_AUDIT_SUBJECT_BYTES,
+    MAX_AUDIT_SUBJECT_BYTES, MAX_INGESTED_SUBJECT_BYTES,
 };
 pub use crate::audit_ingest::{
     IngestProgress, IngestRefusal, MAX_INGEST_ROWS_PER_PULL, MAX_INGEST_SKEW_MS, MAX_SERVE_BYTES,

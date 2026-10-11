@@ -532,6 +532,61 @@ A consequence worth stating: this is now the shape any future field
 on either envelope must take. A new field on a signed wire type is
 never additive across versions in this codebase; a new channel is.
 
+**Decision 25 — choosing ONE verify target cannot be made
+adversary-proof, so the ordering is defensive and the operator gets an
+override.** This took four attempts, each keying on something the
+subject controls, and the sequence is worth keeping because the same
+mistake kept reappearing in a new costume:
+
+| attempt | rule | how the subject took it |
+|---|---|---|
+| 1 | `MAX(seq)` | a head signed at `i64::MAX` owns the slot forever |
+| 2 | `observed_at_ms DESC, seq DESC` | all heads in one envelope share `now_ms`, so the subject manufactures a tie and `seq DESC` resolves it |
+| 3 | + `seq ASC`, + `status <> 'unchecked'`, + dedupe keeping the lowest seq | the envelope is not replay-protected, so re-pushing a genuine OLD head re-stamps `observed_at_ms` on that row; `Contradicted` is also `<> 'unchecked'`, so self-forking the newest position hands the slot back to an older pin; and the dedupe DROPPED the honest head when the subject attached a lower one |
+| 4 | `first_seen_ms DESC, seq ASC`, pin every distinct head | — |
+
+Attempt 3 was worse than attempt 2, which is the part worth
+remembering: in trying to stop the subject *out-ranking* its honest
+head, it stopped the honest head from being *stored at all*, collapsing
+that node's pin density to a position of the subject's choosing and
+poisoning every honest peer's relay slot for it. Discarding evidence to
+fix an ordering problem is never the trade.
+
+The rule now: `first_seen_ms` is written once on INSERT and never
+touched by the `Refreshed` branch, so a replayed head cannot re-win.
+The tie breaks on `seq ASC` — still the subject's field, but in the
+only direction that cannot be inflated, since winning a tie requires
+claiming a *lower*, therefore reachable, position. Not `rowid`: inside
+one envelope `rowid` is the sender's `Vec` order, so `rowid DESC` just
+hands the slot to whichever head the sender listed last. Both the
+verify selector and the relay selector use this, because the relay slot
+is the same prize. `p09` pins both.
+
+**And it is still not enough, which is the honest part.** A subject can
+mint a fresh signed position whenever it likes, and any "newest" rule
+selects it; a subject determined to keep its honest head out of this one
+slot can push a new inflated head every tick. That is inherent to
+picking one target from candidates the subject generates. Two things
+answer it instead of pretending the ordering does: `POST
+/api/v1/audit/verify/:node?seq=N` lets an operator name the position —
+removing the adversary from the choice exactly when a node looks
+suspicious — and 5.13c-3a's eager sweep walks several unchecked pins per
+tick rather than one.
+
+**Decision 26 — the local and ingest `subject` caps differ, on
+purpose.** `subject` had no cap at all before 5.13c-2, so rows far above
+any new cap already exist on nodes that ran a long command under an
+older build, and `subject` is inside `entry_hash` — such a row can never
+be truncated into acceptability. Refusing one is fatal rather than
+cosmetic: `validate_batch` stops at the first offending row and no
+follow-up is issued, so a single legacy row makes the whole chain past
+it permanently unverifiable. So new local appends truncate at
+`MAX_AUDIT_SUBJECT_BYTES` (4 KiB, matching `detail`) while ingest admits
+up to `MAX_INGESTED_SUBJECT_BYTES` (64 KiB). An intermediate commit set
+them equal and called them "agreed by construction"; they agreed only
+for rows written after that commit, and the migration case is the one
+that matters.
+
 ### What 5.13c-2 does NOT give you
 
 - **The pull is manual or opportunistic, not eager.** A pin is
@@ -590,6 +645,11 @@ never additive across versions in this codebase; a new channel is.
   5.13c-3's per-pin UI will multiply this cost, and a cache there must
   not become a way for a stale verdict to outlive the rows it was
   derived from.
+- **A subject can keep its own honest head out of the default verify
+  target.** Decision 25 removes every *permanent* capture we found, but
+  not the general case: minting a fresh signed position each tick takes
+  whatever slot a "newest" rule picks. Use `?seq=` to name the pin, and
+  5.13c-3a's sweep removes the single-target dependency.
 - **A verify against a pre-5.13c-2 peer returns `202 started: true`
   and then never settles.** Decision 24 buys that the connection and
   its head pushes survive, but there is no version or capability

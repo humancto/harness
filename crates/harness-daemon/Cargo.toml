@@ -51,6 +51,10 @@ async-trait         = "0.1"
 assert_cmd  = { workspace = true }
 ciborium    = { workspace = true }
 predicates  = { workspace = true }
+# m23 declares a frozen copy of the 5.13c-1 wire shape and decodes the
+# envelope production assembles into it. Already a workspace crate; this
+# is a dev-only entry, not a new external dependency.
+serde       = { workspace = true }
 tempfile    = { workspace = true }
 # test-util enables tokio::test(start_paused) for the 4.5 federated
 # deadline/race tests.

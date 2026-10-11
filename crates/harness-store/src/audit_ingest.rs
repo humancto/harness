@@ -509,14 +509,16 @@ fn validate_batch(
         {
             return Err(IngestRefusal::DetailTooLarge { seq: e.seq });
         }
-        // `subject` has no cap on the local path at all — it is
-        // bounded only by the frame that produced it — so the cap here
-        // is the local bound, not the much tighter `detail` one
-        // (round 4 MINOR-5). Ingested rows are never pruned, so an
-        // uncapped field on this path is permanent.
+        // Bounded by the INGEST ceiling, which is deliberately looser
+        // than the local truncation cap: rows above the local cap
+        // already exist on nodes that ran a pre-5.13c-2 build, and
+        // `subject` is inside `entry_hash`, so they cannot be
+        // truncated into acceptability. Refusing one would strand the
+        // whole chain past it (round 6 MAJOR-4). Ingested rows are
+        // never pruned, so the ceiling still has to exist.
         if e.subject
             .as_ref()
-            .is_some_and(|sub| sub.len() > crate::audit::MAX_AUDIT_SUBJECT_BYTES)
+            .is_some_and(|sub| sub.len() > crate::audit::MAX_INGESTED_SUBJECT_BYTES)
         {
             return Err(IngestRefusal::SubjectTooLarge { seq: e.seq });
         }
@@ -1491,7 +1493,7 @@ mod tests {
         // admitted ~16x what an honest local append can hold, into
         // rows that are never pruned (round 4 MINOR-5).
         let (_src, mut entries) = chain_of(2);
-        entries[1].subject = Some("s".repeat(crate::audit::MAX_AUDIT_SUBJECT_BYTES + 1));
+        entries[1].subject = Some("s".repeat(crate::audit::MAX_INGESTED_SUBJECT_BYTES + 1));
         // Re-hash over the oversized subject, so the row is internally
         // VALID and the size cap is the only possible refusal — the
         // same reason i20 re-hashes.
@@ -1514,6 +1516,47 @@ mod tests {
                 .expect_err("refuse"),
             IngestRefusal::SubjectTooLarge { seq: 2 }
         );
+    }
+
+    #[test]
+    fn i28_a_legacy_row_above_the_local_cap_still_replicates() {
+        // Round 6 MAJOR-4: round 5 set the ingest cap equal to the
+        // local truncation cap and called the two "agreed by
+        // construction". They agree only for rows appended AFTER that
+        // commit. `subject` had no local cap before 5.13c-2, so rows
+        // far above it already exist — and because `subject` is inside
+        // `entry_hash` they cannot be truncated into acceptability.
+        // Refusing one is fatal rather than cosmetic: `validate_batch`
+        // stops at the first offending row and no follow-up is issued,
+        // so a single legacy row makes the whole chain past it
+        // permanently unverifiable.
+        let (_src, mut entries) = chain_of(2);
+        // Exactly what a pre-cap build would have written: well over
+        // the local cap, comfortably under the ingest ceiling.
+        let legacy = crate::audit::MAX_AUDIT_SUBJECT_BYTES * 4;
+        assert!(
+            legacy < crate::audit::MAX_INGESTED_SUBJECT_BYTES,
+            "the fixture has to sit between the two caps or it proves nothing"
+        );
+        entries[1].subject = Some("x".repeat(legacy));
+        let action = crate::audit::action_from_str(&entries[1].action).expect("action");
+        entries[1].entry_hash = harness_core::audit_entry_hash(
+            node(1),
+            entries[1].seq,
+            entries[1].at_ms,
+            action,
+            entries[1].subject.as_deref(),
+            entries[1].detail.as_deref(),
+            &entries[1].actor,
+            &entries[1].prev_hash,
+        )
+        .expect("hash");
+        let dst = Store::open_memory().expect("dst");
+        let out = dst
+            .audit_ingest_range(node(9), node(1), 2, &entries, now())
+            .expect("ingest")
+            .expect("a legacy row must be accepted, not refused");
+        assert_eq!(out.committed, 2);
     }
 
     #[test]

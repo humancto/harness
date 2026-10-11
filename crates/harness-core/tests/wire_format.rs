@@ -613,24 +613,26 @@ fn audit_entries_envelope_wire_format_is_stable() {
 // The REAL Decision 24 guard: cross-version verification.
 //
 // The snapshots above catch shape drift — a renamed field, a reordered one, a
-// changed type. They do NOT catch what actually went wrong in round 3 of #67:
-// an `Option` field with `skip_serializing_if = "Option::is_none"` encodes to
-// identical bytes while `None`, so a snapshot of a fixture that leaves it
-// unset passes happily. The break appears only once the field is populated in
-// real traffic — which is exactly why it survived review and a green build.
+// changed type. They do NOT catch an `Option` field with
+// `skip_serializing_if = "Option::is_none"`, which encodes to identical bytes
+// while `None`.
 //
-// So this test keeps a FROZEN copy of the 5.13c-1 `AuditSyncEnvelope` shape
-// and verifies a current-code-signed envelope against it. `canonical_bytes`
-// re-encodes the DECODED struct, so if the live type grows a field that head
-// pushes actually populate, the old struct drops it, re-encodes without it,
-// and `verify_signature` fails right here instead of in the field.
+// This test is a SECOND tripwire, not the primary one. Round 5 claimed it
+// caught what the snapshot missed; round 6 disproved that — both are
+// hand-written fixtures, so they co-vary. A field added to the struct and
+// populated in `push_round`, with the fixtures left at the default the
+// compiler nudges you to write, passes BOTH. The guard that actually reads
+// the wire is `m23` in `harness-daemon`, which decodes the envelope
+// `assemble_push_envelope` produces. This one stays because it is cheap and
+// catches the case where someone updates the fixtures too.
 //
-// If this test fails, the answer is a NEW CHANNEL (ADR-0041 Decision 24), not
-// a new frozen shape.
+// If either fails, the answer is a NEW CHANNEL (ADR-0041 Decision 24), not a
+// new frozen shape.
 // -----------------------------------------------------------------------------
 
 /// The 5.13c-1 wire shape, frozen. Do not add fields.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FrozenAuditSyncEnvelopeV1 {
     source: NodeId,
     assembled_at: u64,

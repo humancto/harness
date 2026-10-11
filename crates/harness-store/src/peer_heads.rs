@@ -393,32 +393,52 @@ impl Store {
     /// for the relay path; this is the same rule for the verify path
     /// (diff review round 4 BLOCKER-2).
     ///
-    /// Three rules together, because round 4's first attempt at this
-    /// only MOVED the subject's control into the tie-break (round 5
-    /// BLOCKER-1):
+    /// Order on `first_seen_ms DESC, rowid DESC` — when we FIRST saw
+    /// that position, then our own insert order.
     ///
-    /// 1. `observed_at_ms DESC` — our clock decides recency.
-    /// 2. `seq ASC` breaks a tie, not `seq DESC`. Ties are reachable:
-    ///    every head in one envelope is pinned with the same `now_ms`,
-    ///    and a subject can also send two envelopes inside one
-    ///    millisecond. `seq` is still the subject's field, but in THIS
-    ///    direction winning a tie means claiming a *lower* position,
-    ///    which is a reachable one — an inflated `i64::MAX` claim can
-    ///    never take the slot.
-    /// 3. Only `unchecked` pins are candidates. Without this a pin
-    ///    that wins a tie and then verifies keeps winning forever, and
-    ///    the newer honest pin is never reached.
+    /// Three attempts at this got it wrong, each time by keying on
+    /// something the subject controls:
     ///
-    /// Falls back to the newest observation among ALL pins when
-    /// nothing is unchecked, so re-verification stays possible.
+    /// - Round 4: `MAX(seq)`. A head signed at `i64::MAX` owned the
+    ///   slot forever.
+    /// - Round 5: `observed_at_ms DESC, seq DESC`. Every head in one
+    ///   envelope is pinned with the same `now_ms`, so the subject
+    ///   manufactured a tie and `seq DESC` resolved it in its favour.
+    /// - Round 5 again, `seq ASC` plus an unchecked-first clause. The
+    ///   envelope is deliberately NOT replay-protected, so the subject
+    ///   re-pushes a genuine OLD head and `Refreshed` re-stamps
+    ///   `observed_at_ms` on that row: our clock stamps it, but the
+    ///   subject chooses WHAT gets stamped. And `Contradicted` is also
+    ///   `<> 'unchecked'`, so a subject that self-forked its own
+    ///   newest position handed the slot back to an older, lower pin —
+    ///   the clause was a regression, so it is gone.
     ///
-    /// Residual, stated rather than papered over: a subject offering a
-    /// LOW pin we cannot verify keeps the slot, because a failed walk
-    /// leaves the pin `unchecked`. Single-target selection is gameable
-    /// in principle — the subject generates the candidates. The
-    /// structural fix is 5.13c-3a's eager sweep over several unchecked
-    /// pins per tick, which does not depend on picking one right
-    /// target.
+    /// `first_seen_ms` is stamped once on INSERT and never touched by
+    /// the `Refreshed` branch, so a replayed old head keeps its
+    /// original value and cannot re-win.
+    ///
+    /// The tie breaks on `seq ASC`, not `rowid`. `rowid` looks like
+    /// our own value, but within ONE envelope it is the sender's `Vec`
+    /// order — so `rowid DESC` just hands the slot to whichever head
+    /// the sender listed last, which `p09` demonstrates. `seq` is the
+    /// subject's field either way, but ASC is the direction that
+    /// cannot be inflated: to win a tie you must claim a LOWER,
+    /// therefore reachable, position.
+    ///
+    /// # What this still does NOT give you
+    ///
+    /// A subject can mint a fresh signed position whenever it likes,
+    /// and any "newest" rule selects it. So a subject determined to
+    /// keep its honest head out of this one slot can do so by pushing
+    /// a new inflated head every tick. That is not a tie-break bug —
+    /// it is inherent to choosing ONE target from candidates the
+    /// subject generates, and no ordering fixes it.
+    ///
+    /// Two things address it instead: an operator can name the target
+    /// explicitly (`?seq=` on the verify endpoint), and 5.13c-3a's
+    /// eager sweep walks several unchecked pins per tick rather than
+    /// one. This function is the default for the manual path, not a
+    /// defence.
     pub fn newest_pin_by_observation(
         &self,
         node: NodeId,
@@ -429,8 +449,7 @@ impl Store {
                     "SELECT seq, entry_hash, at_ms, first_seen_ms, observed_at_ms, status
                        FROM audit_peer_heads
                       WHERE node_id = ?1
-                      ORDER BY (status <> 'unchecked'), observed_at_ms DESC,
-                               seq ASC LIMIT 1",
+                      ORDER BY first_seen_ms DESC, seq ASC LIMIT 1",
                     params![node.as_bytes()],
                     |r| {
                         Ok((
@@ -465,6 +484,14 @@ impl Store {
     /// carries its own signature, so node C can learn A's head from B
     /// and still verify it against A's key. We are not re-signing
     /// anything — the stored signature is A's, returned verbatim.
+    ///
+    /// Ordered exactly like [`Self::newest_pin_by_observation`], and
+    /// for the same reasons: `first_seen_ms` so a replayed old head
+    /// cannot re-take the slot, then `seq ASC` so an inflated claim
+    /// cannot either. Round 5 changed this to `rowid DESC` silently,
+    /// with no test and no comment, and round 6 found both that the
+    /// change was undocumented and that `rowid` is the SENDER's
+    /// ordering inside one envelope. `p09` pins both selectors.
     pub fn newest_pin_as_head(&self, node: NodeId) -> Result<Option<(AuditHead, u64)>, StoreError> {
         self.with_conn(|c| {
             let row: Option<PinRow> = c
@@ -479,7 +506,7 @@ impl Store {
                     "SELECT seq, entry_hash, at_ms, sig, observed_at_ms
                        FROM audit_peer_heads
                       WHERE node_id = ?1
-                      ORDER BY observed_at_ms DESC, rowid DESC LIMIT 1",
+                      ORDER BY first_seen_ms DESC, seq ASC LIMIT 1",
                     params![node.as_bytes()],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )
@@ -904,5 +931,53 @@ mod tests {
         // oldest, with heavy overlap between those sets.
         assert!(after.len() <= 7, "kept {} pins", after.len());
         assert_eq!(after[0].seq, 1, "the oldest pin still anchors");
+    }
+    #[test]
+    fn p09_neither_selector_breaks_a_tie_on_the_subjects_seq() {
+        // Round 6 MINOR-9 / BLOCKER-1. Every head in one envelope is
+        // pinned at the same instant, so the tie-break decides, and
+        // `seq` is the SUBJECT's field — a `seq` tie-break let a
+        // subject choose both its own verify target and the head every
+        // honest peer relays for it. Both selectors key on our own
+        // insert order instead.
+        let s = Store::open_memory().expect("store");
+        let absurd = u64::try_from(i64::MAX).expect("fits");
+        // Honest first, inflated second, SAME instant — so insert
+        // order favours the attacker and only the key can save us.
+        s.pin_peer_head(&head(1, 9, 0x09, 9), node(2), 1_000)
+            .expect("pin honest");
+        s.pin_peer_head(&head(1, absurd, 0xFF, absurd), node(2), 1_000)
+            .expect("pin absurd");
+
+        // Both stored: the fix is in the ordering, never in discarding
+        // evidence.
+        let seqs: Vec<u64> = s
+            .peer_head_pins(node(1))
+            .expect("pins")
+            .into_iter()
+            .map(|p| p.seq)
+            .collect();
+        assert_eq!(seqs.len(), 2, "both positions are stored, have {seqs:?}");
+
+        // Verify target: newest position we FIRST saw, tie on rowid —
+        // never `MAX(seq)`.
+        let target = s
+            .newest_pin_by_observation(node(1))
+            .expect("target")
+            .expect("some pin");
+        assert_ne!(
+            target.seq, absurd,
+            "an inflated claim must not win the verify slot"
+        );
+
+        // Relay head: same rule.
+        let (relayed, _) = s
+            .newest_pin_as_head(node(1))
+            .expect("relay")
+            .expect("some head");
+        assert_ne!(
+            relayed.seq, absurd,
+            "nor the relay slot every honest peer propagates"
+        );
     }
 }
