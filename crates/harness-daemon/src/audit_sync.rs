@@ -62,7 +62,7 @@ const SERVE_WINDOW_MS: u64 = 60_000;
 
 /// Follow-up rounds allowed per walk. `MAX_INGEST_ROWS_PER_PULL`
 /// (5000) rows per round covers any realistic chain well inside this.
-const MAX_FOLLOWUP_ROUNDS: u32 = 64;
+pub(crate) const MAX_FOLLOWUP_ROUNDS: u32 = 64;
 
 #[derive(Default)]
 struct PeerSyncState {
@@ -288,6 +288,24 @@ impl AuditSyncService {
     /// Register an in-flight request without sending it, so a test
     /// can deliver a crafted response without a live peer racing it
     /// with the honest answer.
+    #[cfg(test)]
+    pub(crate) fn request_range_round_for_test(
+        &self,
+        peer: NodeId,
+        subject: NodeId,
+        from_seq: u64,
+        target_seq: u64,
+        round: u32,
+        now_ms: u64,
+    ) -> bool {
+        self.request_range_round(peer, subject, from_seq, target_seq, round, now_ms)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inflight_len_for_test(&self) -> usize {
+        self.inflight.lock().len()
+    }
+
     #[cfg(test)]
     pub(crate) fn track_inflight_for_test(
         &self,

@@ -432,6 +432,46 @@ impl Store {
     ) -> Result<bool, StoreError> {
         let seq = i64::try_from(seq).unwrap_or(i64::MAX);
         self.with_conn(|c| {
+            // A CONTRADICTED pin never moves back (diff review
+            // BLOCKER on #67). Two validly-signed heads at one
+            // position is the strongest evidence this feature
+            // produces, and an unconditional UPDATE let a later walk
+            // of whichever side we happen to hold repaint it green.
+            //
+            // Not merely a display bug: thinning evicts
+            // `unchecked`/`corroborated` pins, so a repainted pin
+            // becomes sweepable — Decision 12's rule ("a contradicted
+            // pin is the evidence") defeated through the back door.
+            //
+            // `Unverifiable` is equally sticky: the owner pruned past
+            // it, and no later walk can change that.
+            let n = c.execute(
+                "UPDATE audit_peer_heads SET status = ?3
+                  WHERE node_id = ?1 AND seq = ?2
+                    AND status NOT IN ('contradicted','unverifiable')",
+                params![node.as_bytes(), seq, status.as_str()],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    /// Force a pin's status, including out of a sticky state.
+    ///
+    /// Only for paths that legitimately ESTABLISH evidence — fork
+    /// detection setting `Contradicted`, and 5.13c-3's operator
+    /// acknowledgement. Ordinary settle paths use
+    /// [`Self::set_pin_status`].
+    ///
+    /// # Errors
+    /// Underlying sqlite errors.
+    pub fn force_pin_status(
+        &self,
+        node: NodeId,
+        seq: u64,
+        status: PinStatus,
+    ) -> Result<bool, StoreError> {
+        let seq = i64::try_from(seq).unwrap_or(i64::MAX);
+        self.with_conn(|c| {
             let n = c.execute(
                 "UPDATE audit_peer_heads SET status = ?3 WHERE node_id = ?1 AND seq = ?2",
                 params![node.as_bytes(), seq, status.as_str()],

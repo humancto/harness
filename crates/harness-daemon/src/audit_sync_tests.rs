@@ -786,3 +786,39 @@ fn m14_a_response_must_start_where_we_asked() {
         .expect("read");
     assert!(rows.is_empty(), "and nothing was ingested");
 }
+
+#[test]
+fn m15_the_follow_up_walk_is_bounded() {
+    // A server that always sets `truncated` and returns one row per
+    // reply would otherwise keep us asking forever. `may_serve` limits
+    // what WE serve; nothing limited what we chase (diff review
+    // MAJOR-6 on #67).
+    let (store, me, trust, _b, c, _tmp) = trio();
+    let svc = crate::audit_sync::AuditSyncService::new(store, me, trust);
+
+    // At the budget the walk is still attempted (it fails only for
+    // want of a network, which is a different reason).
+    assert!(!svc.request_range_round_for_test(
+        c.node_id(),
+        c.node_id(),
+        1,
+        100,
+        crate::audit_sync::MAX_FOLLOWUP_ROUNDS,
+        now_ms(),
+    ));
+    // Past the budget it is abandoned outright — and crucially no
+    // in-flight slot is consumed.
+    assert!(!svc.request_range_round_for_test(
+        c.node_id(),
+        c.node_id(),
+        1,
+        100,
+        crate::audit_sync::MAX_FOLLOWUP_ROUNDS + 1,
+        now_ms(),
+    ));
+    assert_eq!(
+        svc.inflight_len_for_test(),
+        0,
+        "an abandoned walk holds no slot"
+    );
+}

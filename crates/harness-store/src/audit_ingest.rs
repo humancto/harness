@@ -327,9 +327,15 @@ impl Store {
         let from_seq = u64::try_from(from).unwrap_or(1).max(1);
         let span = usize::try_from(target_seq.saturating_sub(from_seq).saturating_add(1))
             .unwrap_or(usize::MAX);
+        // Must reach the TARGET, not merely verify as far as it got
+        // (diff review on #67). Belt and braces with the direct
+        // stored-hash check above: that check is the load-bearing one
+        // — a truncated tail removes the pinned row, which only it
+        // sees — and this predicate covers the case where a walk
+        // stops short of a row that is still present.
         Ok(matches!(
             self.audit_verify_range(node, from_seq, span)?,
-            crate::audit::ChainStatus::Verified { .. }
+            crate::audit::ChainStatus::Verified { through_seq } if through_seq == target_seq
         ))
     }
 
@@ -577,6 +583,15 @@ mod tests {
             .audit_entries_for_range(node(1), 1, u64::from(len))
             .expect("serve");
         (src, entries)
+    }
+
+    fn status_of(dst: &Store, seq: u64) -> PinStatus {
+        dst.peer_head_pins(node(1))
+            .expect("pins")
+            .into_iter()
+            .find(|p| p.seq == seq)
+            .expect("pin")
+            .status
     }
 
     fn pin(dst: &Store, seq: u64, hash: [u8; 32], now: u64) {
@@ -1184,6 +1199,218 @@ mod tests {
         assert!(
             peer_row.feed_ms < peer_row.at_ms,
             "the peer row is ordered by our receive time, not its own stamp"
+        );
+    }
+
+    #[test]
+    fn i17_a_walk_cannot_repaint_a_contradicted_pin() {
+        // diff review BLOCKER on #67. Two validly-signed heads at one
+        // position is the strongest evidence this feature produces.
+        // `settle_pin_from_run` used an unconditional UPDATE, so a
+        // walk of whichever side we happen to hold turned the pin
+        // green — and thinning evicts `corroborated` pins, so the
+        // evidence then became sweepable.
+        let (_src, entries) = chain_of(8);
+        let dst = Store::open_memory().expect("dst");
+        let last = entries.last().expect("entries");
+        pin(&dst, last.seq, last.entry_hash, now());
+
+        let forked = AuditHead {
+            node_id: node(1),
+            seq: last.seq,
+            entry_hash: [0xDD; 32],
+            at_ms: now(),
+            sig: Signature::from_bytes([7u8; 64]),
+        };
+        assert!(matches!(
+            dst.pin_peer_head(&forked, node(3), now()).expect("pin"),
+            crate::peer_heads::PinOutcome::Fork { .. }
+        ));
+        assert_eq!(status_of(&dst, last.seq), PinStatus::Contradicted);
+
+        // Walk the side we hold. It completes and matches the ORIGINAL
+        // pin hash — and must still not clear the verdict.
+        let out = dst
+            .audit_ingest_range(node(9), node(1), last.seq, &entries, now())
+            .expect("ingest")
+            .expect("accepted");
+        assert!(out.reached_pin, "the walk itself succeeded");
+        assert_eq!(
+            status_of(&dst, last.seq),
+            PinStatus::Contradicted,
+            "the stored pin keeps the fork verdict"
+        );
+        let _ = dst.settle_pin_from_run(node(1), last.seq).expect("settle");
+        assert_eq!(
+            status_of(&dst, last.seq),
+            PinStatus::Contradicted,
+            "and settling does not repaint it"
+        );
+
+        // So it stays out of the thinning sweep's reach.
+        dst.thin_peer_head_pins(0, 1).expect("thin");
+        assert_eq!(status_of(&dst, last.seq), PinStatus::Contradicted);
+    }
+
+    #[test]
+    fn i18_a_run_whose_tail_vanished_stops_corroborating() {
+        // Isolates the direct stored-hash-vs-pin check: the pinned row
+        // is gone, so only a lookup at the target position sees it.
+        let (_src, entries) = chain_of(20);
+        let dst = Store::open_memory().expect("dst");
+        let last = entries.last().expect("entries");
+        pin(&dst, last.seq, last.entry_hash, now());
+        dst.audit_ingest_range(node(9), node(1), last.seq, &entries, now())
+            .expect("ingest")
+            .expect("accepted");
+        assert!(dst
+            .audit_run_corroborates(node(1), last.seq)
+            .expect("check"));
+
+        dst.with_conn(|c| {
+            c.execute(
+                "DELETE FROM audit_log WHERE node_id = ?1 AND seq >= 18",
+                params![node(1).as_bytes()],
+            )?;
+            Ok(())
+        })
+        .expect("delete tail");
+
+        assert!(
+            !dst.audit_run_corroborates(node(1), last.seq)
+                .expect("check"),
+            "the walk no longer reaches the pinned position"
+        );
+    }
+
+    #[test]
+    fn i18b_a_hole_mid_walk_stops_corroboration() {
+        // The row AT the pin survives and matches, so the direct
+        // stored-hash check passes — the chain walk is what catches a
+        // gap behind it.
+        let (_src, entries) = chain_of(20);
+        let dst = Store::open_memory().expect("dst");
+        let last = entries.last().expect("entries");
+        pin(&dst, last.seq, last.entry_hash, now());
+        dst.audit_ingest_range(node(9), node(1), last.seq, &entries, now())
+            .expect("ingest")
+            .expect("accepted");
+
+        dst.with_conn(|c| {
+            c.execute(
+                "DELETE FROM audit_log WHERE node_id = ?1 AND seq BETWEEN 5 AND 17",
+                params![node(1).as_bytes()],
+            )?;
+            Ok(())
+        })
+        .expect("punch a hole");
+
+        assert_eq!(
+            dst.audit_entry_hash_at(node(1), last.seq).expect("read"),
+            Some(last.entry_hash),
+            "the pinned row itself is untouched"
+        );
+        assert!(
+            !dst.audit_run_corroborates(node(1), last.seq)
+                .expect("check"),
+            "but the walk behind it is broken"
+        );
+    }
+
+    #[test]
+    fn i18c_a_pin_that_no_longer_matches_the_walked_row_stops_corroboration() {
+        // The chain is whole and reaches the target, so the walk
+        // passes — only comparing against the PIN catches a pin that
+        // no longer describes what we walked.
+        let (_src, entries) = chain_of(12);
+        let dst = Store::open_memory().expect("dst");
+        let last = entries.last().expect("entries");
+        pin(&dst, last.seq, last.entry_hash, now());
+        dst.audit_ingest_range(node(9), node(1), last.seq, &entries, now())
+            .expect("ingest")
+            .expect("accepted");
+        assert!(dst
+            .audit_run_corroborates(node(1), last.seq)
+            .expect("check"));
+
+        dst.with_conn(|c| {
+            c.execute(
+                "UPDATE audit_peer_heads SET entry_hash = ?3
+                  WHERE node_id = ?1 AND seq = ?2",
+                params![node(1).as_bytes(), i64c(last.seq), [0x3Cu8; 32].as_slice()],
+            )?;
+            Ok(())
+        })
+        .expect("repoint the pin");
+
+        assert_eq!(
+            dst.audit_verify_range(node(1), 1, 100).expect("verify"),
+            crate::audit::ChainStatus::Verified {
+                through_seq: last.seq
+            },
+            "the chain is still whole and reaches the target"
+        );
+        assert!(
+            !dst.audit_run_corroborates(node(1), last.seq)
+                .expect("check"),
+            "but it no longer matches the pin"
+        );
+    }
+
+    #[test]
+    fn i19_a_conflicting_row_at_a_held_position_is_refused() {
+        // Two different entries at one (node, seq). `INSERT OR IGNORE`
+        // swallowed this and reported progress it had not made.
+        let (_src, chain_a) = chain_of(10);
+        // A different length, so the second walk gets its OWN run row
+        // and reaches the conflict check rather than stopping at the
+        // contiguity guard for the first run.
+        let (_other, chain_b) = chain_of(12);
+        assert_ne!(chain_a[0].entry_hash, chain_b[0].entry_hash);
+
+        let dst = Store::open_memory().expect("dst");
+        let last_a = chain_a.last().expect("entries");
+        pin(&dst, last_a.seq, last_a.entry_hash, now());
+        dst.audit_ingest_range(node(9), node(1), last_a.seq, &chain_a, now())
+            .expect("ingest")
+            .expect("accepted");
+
+        let last_b = chain_b.last().expect("entries");
+        pin(&dst, last_b.seq, last_b.entry_hash, now());
+        assert_eq!(
+            dst.audit_ingest_range(node(9), node(1), last_b.seq, &chain_b, now())
+                .expect("ingest")
+                .expect_err("refuse"),
+            IngestRefusal::Conflict { seq: 1 }
+        );
+    }
+
+    #[test]
+    fn i20_an_oversized_detail_is_refused() {
+        // Locally appended rows are capped at MAX_AUDIT_DETAIL_BYTES;
+        // ingest checked nothing, so a peer could plant ~1 MiB per row
+        // and it would render into the History feed.
+        let (_src, mut entries) = chain_of(2);
+        entries[1].detail = Some("x".repeat(crate::audit::MAX_AUDIT_DETAIL_BYTES + 1));
+        let dst = Store::open_memory().expect("dst");
+        assert_eq!(
+            dst.audit_ingest_range(node(9), node(1), 2, &entries, now())
+                .expect("ingest")
+                .expect_err("refuse"),
+            IngestRefusal::DetailTooLarge { seq: 2 }
+        );
+    }
+
+    #[test]
+    fn i21_rows_past_the_target_are_refused() {
+        let (_src, entries) = chain_of(10);
+        let dst = Store::open_memory().expect("dst");
+        assert_eq!(
+            dst.audit_ingest_range(node(9), node(1), 5, &entries, now())
+                .expect("ingest")
+                .expect_err("refuse"),
+            IngestRefusal::PastTarget { seq: 6 },
+            "a walk toward seq 5 must not store rows beyond it"
         );
     }
 }

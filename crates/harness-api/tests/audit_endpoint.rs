@@ -209,3 +209,159 @@ async fn cancel_and_resume_are_recorded() {
     assert_eq!(rows[0].subject.as_deref(), Some(task_id.as_str()));
     assert_eq!(rows[0].actor, "local_admin", "an operator, not a peer");
 }
+
+/// A stub puller, so the verify endpoint can be driven without a mesh.
+#[derive(Debug, Default)]
+struct StubPuller {
+    calls: std::sync::Mutex<Vec<(harness_core::NodeId, u64, u64)>>,
+}
+
+impl harness_api::AuditPuller for StubPuller {
+    fn request_range(
+        &self,
+        _peer: harness_core::NodeId,
+        subject: harness_core::NodeId,
+        from_seq: u64,
+        target_seq: u64,
+    ) -> bool {
+        self.calls
+            .lock()
+            .expect("lock")
+            .push((subject, from_seq, target_seq));
+        true
+    }
+}
+
+async fn post(app: &axum::Router, token: Option<&str>, uri: &str) -> axum::http::Response<Body> {
+    let mut req = Request::builder().method("POST").uri(uri);
+    if let Some(t) = token {
+        req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
+    }
+    app.clone()
+        .oneshot(req.body(Body::empty()).expect("req"))
+        .await
+        .expect("resp")
+}
+
+/// 5.13c-2: `POST /api/v1/audit/verify/:node`.
+///
+/// This test exists because the route was NOT registered on the first
+/// push: the edit landed in a file with no route table, the handler
+/// was `pub` so nothing warned, the build passed, and the endpoint
+/// 404'd while the docs claimed it shipped. A route with no test is a
+/// route that can silently disappear.
+#[tokio::test]
+async fn audit_verify_endpoint_is_routed_and_walks_from_the_previous_pin() {
+    let (app, store, token, _first_local) = app_store_token().await;
+    let peer = harness_core::NodeId::from_bytes([9u8; 16]);
+
+    // Unauthenticated is refused before anything else.
+    assert_eq!(
+        post(&app, None, &format!("/api/v1/audit/verify/{peer}"))
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Wrong method on a real path is 405, not 404 — proof the path
+    // itself is registered.
+    assert_eq!(
+        get(&app, Some(&token), &format!("/api/v1/audit/verify/{peer}"))
+            .await
+            .status(),
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+
+    // No puller wired: service unavailable, not 404.
+    assert_eq!(
+        post(&app, Some(&token), &format!("/api/v1/audit/verify/{peer}"))
+            .await
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    // Rebuild with a puller.
+    let puller = Arc::new(StubPuller::default());
+    let identity = Arc::new(Identity::generate());
+    let local = identity.node_id();
+    let admin = AdminFile::from_password("hunter2").expect("hash");
+    let state = ApiStateBuilder::new(identity, "test")
+        .with_auth(Arc::new(AuthProvider::new(Some(admin))))
+        .with_store(store.clone())
+        .with_audit_puller(puller.clone())
+        .build();
+    let app2 = router(state);
+    let login = app2
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"password":"hunter2"}"#))
+                .expect("req"),
+        )
+        .await
+        .expect("login");
+    let token2 = body_json(login).await["token"]
+        .as_str()
+        .expect("token")
+        .to_string();
+
+    // No pin for that node yet.
+    assert_eq!(
+        post(
+            &app2,
+            Some(&token2),
+            &format!("/api/v1/audit/verify/{peer}")
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // Our own chain is never verified by asking someone else.
+    assert_eq!(
+        post(
+            &app2,
+            Some(&token2),
+            &format!("/api/v1/audit/verify/{local}")
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    // Pins at 5 and 9: the walk starts just past the PREVIOUS pin, not
+    // at the target and not always at 1.
+    for (seq, hash) in [(5u64, 0xAAu8), (9, 0xBB)] {
+        store
+            .pin_peer_head(
+                &harness_core::AuditHead {
+                    node_id: peer,
+                    seq,
+                    entry_hash: [hash; 32],
+                    at_ms: seq,
+                    sig: harness_core::Signature::from_bytes([1u8; 64]),
+                },
+                peer,
+                seq * 1_000,
+            )
+            .expect("pin");
+    }
+    let resp = post(
+        &app2,
+        Some(&token2),
+        &format!("/api/v1/audit/verify/{peer}"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = body_json(resp).await;
+    assert_eq!(body["target_seq"], serde_json::json!(9));
+    assert_eq!(body["from_seq"], serde_json::json!(6));
+    assert_eq!(body["started"], serde_json::json!(true));
+    assert_eq!(
+        puller.calls.lock().expect("lock").as_slice(),
+        &[(peer, 6, 9)]
+    );
+}
