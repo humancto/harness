@@ -34,13 +34,6 @@ pub(crate) const HEAD_PUSH_INTERVAL: Duration = Duration::from_millis(200);
 /// Third-party heads relayed alongside our own, newest first.
 const RELAY_HEADS: usize = 16;
 
-/// Pins relayed per third-party peer.
-///
-/// More than one so the relay slot is not a single prize a trusted
-/// peer can take with one genuine old head (round 7 BLOCKER-2); small
-/// enough that `RELAY_HEADS` still covers several peers.
-pub(crate) const RELAY_PINS_PER_PEER: usize = 3;
-
 /// Consecutive send failures to one peer before we back off. A
 /// pre-5.13c peer resets the unknown channel every time, so without
 /// this the loop opens and resets a stream against every old node on
@@ -68,26 +61,6 @@ const REQUEST_TIMEOUT_MS: u64 = 30_000;
 /// and unbounded read work is this.
 pub(crate) const SERVE_BATCHES_PER_MINUTE: u32 = 20;
 
-/// NEW pin positions one reporting peer may cause us to insert per
-/// window.
-///
-/// ADR-0041's 5.13c-1 residual list promised this for 5.13c-2 —
-/// *"Ingest is unrated. A trusted peer can insert pin rows faster than
-/// the hourly sweep reclaims them… It lands in 5.13c-2 beside the
-/// entry-serving rate limit"* — and round 7 found it had not been
-/// delivered, while this PR had made the flood 64x cheaper: storing
-/// every distinct head (the right fix for round 6's evidence-deletion
-/// bug) raised a relayer's reach from one pin row per subject per
-/// envelope to 64.
-///
-/// Each insert is its own write transaction plus an ed25519 verify
-/// under the process-wide store mutex, so this bounds real work and
-/// not just row count. Sized so an honest peer relaying its whole
-/// `RELAY_HEADS` window plus its own head on every tick never trips
-/// it, while a flood is throttled to something the hourly sweep
-/// outpaces. A REFRESH of a position we already hold is not counted:
-/// it writes one column and creates no row.
-pub(crate) const NEW_PINS_PER_PEER_PER_WINDOW: u32 = 24;
 pub(crate) const SERVE_WINDOW_MS: u64 = 60_000;
 
 /// Follow-up rounds allowed per pull.
@@ -117,12 +90,7 @@ pub(crate) const SERVE_WINDOW_MS: u64 = 60_000;
 /// 5.13c-3a's eager sweep will drive automatically; the `const
 /// assert!` pair below is what pins the relationship, so it cannot
 /// drift from the serve budget again.
-pub(crate) const MAX_FOLLOWUP_ROUNDS: u32 = SERVE_BATCHES_PER_MINUTE
-    + if SERVE_BATCHES_PER_MINUTE / 2 > 12 {
-        SERVE_BATCHES_PER_MINUTE / 2
-    } else {
-        12
-    };
+pub(crate) const MAX_FOLLOWUP_ROUNDS: u32 = SERVE_BATCHES_PER_MINUTE + SERVE_BATCHES_PER_MINUTE / 2;
 
 // The relationship IS the justification, so it is enforced at compile
 // time rather than by a test: round 6 found the value changed 64 ->
@@ -134,11 +102,12 @@ const _: () = assert!(
     MAX_FOLLOWUP_ROUNDS > SERVE_BATCHES_PER_MINUTE,
     "a single pull must be able to use a full serve window"
 );
-// NOTE: with a fixed +12 of slack this also requires
-// SERVE_BATCHES_PER_MINUTE >= 12, and would otherwise fail with a
-// message about hostile servers that does not describe the real
-// breach (round 7 MINOR-9). Deriving the slack keeps the two
-// independent.
+// The slack is a FRACTION of the serve budget, not a constant. The
+// previous form was independent of it in name only: `SERVE +
+// max(SERVE/2, 12)` equals `SERVE + 12` for every budget under 24, so
+// tightening the serve budget still broke this assert with a message
+// about hostile servers that did not describe the real breach (round 8
+// MINOR-14).
 const _: () = assert!(
     MAX_FOLLOWUP_ROUNDS <= SERVE_BATCHES_PER_MINUTE * 2,
     "the round budget must stay within twice the serve budget, or it becomes \
@@ -152,11 +121,6 @@ struct PeerSyncState {
     /// Serve-side rate limiting: window start and batches served in it.
     serve_window_start_ms: u64,
     served_in_window: u32,
-    /// Ingest-side rate limiting: window start and NEW pin positions
-    /// this peer caused us to insert in it (5.13c-1's recorded
-    /// residual, delivered here).
-    pin_window_start_ms: u64,
-    pins_in_window: u32,
 }
 
 /// A request we sent and are still waiting on.
@@ -316,21 +280,6 @@ impl AuditSyncService {
                 );
                 continue;
             }
-            // 5.13c-1's recorded residual, delivered: a peer cannot
-            // insert new pin positions faster than
-            // NEW_PINS_PER_PEER_PER_WINDOW. Checked BEFORE the write,
-            // so the bound is real rather than retrospective.
-            if self.pin_budget_spent(from, now_ms) {
-                tracing::warn!(
-                    target: "harness.audit.sync",
-                    relayer = %from,
-                    subject = %head.node_id,
-                    seq = head.seq,
-                    limit = NEW_PINS_PER_PEER_PER_WINDOW,
-                    "peer is over its new-pin budget for this window; head dropped"
-                );
-                continue;
-            }
             match self.store.pin_peer_head(head, from, now_ms) {
                 Ok(outcome) => {
                     match outcome {
@@ -376,16 +325,6 @@ impl AuditSyncService {
                             "audit head seq exceeds the representable range; rejected"
                         ),
                         PinOutcome::Pinned | PinOutcome::Refreshed => {}
-                    }
-                    // Charge only the outcomes that WROTE A ROW.
-                    // `StalePinned` is one of them — 5.13c-1 made it
-                    // always insert so a single huge-seq head could
-                    // not immunize a node, which means it is a row a
-                    // flooder can create. `Fork` collides on the
-                    // primary key and `Refreshed` updates one column,
-                    // so neither adds a row.
-                    if matches!(outcome, PinOutcome::Pinned | PinOutcome::StalePinned) {
-                        self.charge_pin(from);
                     }
                     out.push((head.node_id, outcome));
                 }
@@ -451,18 +390,11 @@ impl AuditSyncService {
             if peer.node_id == self.local_id {
                 continue;
             }
-            // A SET per peer, not one pin (round 7 BLOCKER-2): with
-            // one, any trusted peer could forward a genuine old head
-            // of a third party and own the position the mesh learns
-            // for it. With several, the honest high position travels
-            // alongside anything a captor adds.
-            match self
-                .store
-                .newest_pins_as_heads(peer.node_id, RELAY_PINS_PER_PEER)
-            {
-                Ok(pairs) => relayed.extend(pairs),
+            match self.store.newest_pin_as_head(peer.node_id) {
+                Ok(Some(pair)) => relayed.push(pair),
+                Ok(None) => {}
                 Err(e) => {
-                    tracing::debug!(target: "harness.audit.sync", ?e, "reading pins for relay");
+                    tracing::debug!(target: "harness.audit.sync", ?e, "reading pin for relay");
                 }
             }
         }
@@ -760,37 +692,6 @@ impl AuditSyncService {
     /// per-subject budget would be refreshed by simply naming another
     /// subject. Only NEW positions are charged — a refresh of a row we
     /// already hold writes one column and creates nothing.
-    fn pin_budget_spent(&self, peer: NodeId, now_ms: u64) -> bool {
-        let mut states = self.peers.lock();
-        let state = states.entry(peer).or_default();
-        if now_ms.saturating_sub(state.pin_window_start_ms) >= SERVE_WINDOW_MS {
-            state.pin_window_start_ms = now_ms;
-            state.pins_in_window = 0;
-        }
-        state.pins_in_window >= NEW_PINS_PER_PEER_PER_WINDOW
-    }
-
-    /// Charge one NEW pin row to this peer's window.
-    ///
-    /// Called only on `PinOutcome::Pinned`. Checking the budget before
-    /// the write and charging after it means a refresh is never
-    /// charged, which matters: an honest peer pushes `1 + RELAY_HEADS`
-    /// (17) heads every `HEAD_PUSH_INTERVAL` (30s) — 34 per window —
-    /// almost all of them refreshes of positions we already hold. A
-    /// budget that counted those would throttle honest traffic while
-    /// doing nothing about the flood, which is new rows.
-    fn charge_pin(&self, peer: NodeId) {
-        let mut states = self.peers.lock();
-        let state = states.entry(peer).or_default();
-        state.pins_in_window = state.pins_in_window.saturating_add(1);
-    }
-
-    /// New pin rows this peer has been allowed in the current window.
-    #[cfg(test)]
-    pub(crate) fn pins_in_window_for_test(&self, peer: NodeId) -> u32 {
-        self.peers.lock().get(&peer).map_or(0, |s| s.pins_in_window)
-    }
-
     fn may_serve(&self, peer: NodeId, now_ms: u64) -> bool {
         let mut states = self.peers.lock();
         let state = states.entry(peer).or_default();

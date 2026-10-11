@@ -419,60 +419,71 @@ impl Store {
         to_seq: u64,
     ) -> Result<(Vec<AuditEntryWire>, bool), StoreError> {
         let cap = MAX_INGEST_ROWS_PER_PULL;
-        let rows = self.with_conn(|c| {
+        self.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT seq, at_ms, action, subject, detail, actor, prev_hash, entry_hash
                    FROM audit_log
                   WHERE node_id = ?1 AND seq >= ?2 AND seq <= ?3
                   ORDER BY seq ASC LIMIT ?4",
             )?;
-            let out = stmt
-                .query_map(
-                    params![
-                        node.as_bytes(),
-                        i64c(from_seq),
-                        i64c(to_seq),
-                        i64c(cap as u64 + 1)
-                    ],
-                    |r| {
-                        let prev: Vec<u8> = r.get(6)?;
-                        let hash: Vec<u8> = r.get(7)?;
-                        Ok(AuditEntryWire {
-                            seq: u64::try_from(r.get::<_, i64>(0)?).unwrap_or(0),
-                            at_ms: u64::try_from(r.get::<_, i64>(1)?).unwrap_or(0),
-                            action: r.get(2)?,
-                            subject: r.get(3)?,
-                            detail: r.get(4)?,
-                            actor: r.get(5)?,
-                            prev_hash: <[u8; 32]>::try_from(prev.as_slice()).unwrap_or([0u8; 32]),
-                            entry_hash: <[u8; 32]>::try_from(hash.as_slice()).unwrap_or([0u8; 32]),
-                        })
-                    },
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(out)
-        })?;
-        let over_rows = rows.len() > cap;
-        let mut budget = MAX_SERVE_BYTES;
-        let mut out = Vec::new();
-        let mut over_bytes = false;
-        for row in rows.into_iter().take(cap) {
-            // Cheap upper bound on the encoded row: the variable parts
-            // plus fixed framing. Exactness does not matter — this is
-            // a bound, not an accounting.
-            let cost = row.action.len()
-                + row.subject.as_ref().map_or(0, String::len)
-                + row.detail.as_ref().map_or(0, String::len)
-                + row.actor.len()
-                + 160;
-            if !out.is_empty() && cost > budget {
-                over_bytes = true;
-                break;
+            let out = stmt.query_map(
+                params![
+                    node.as_bytes(),
+                    i64c(from_seq),
+                    i64c(to_seq),
+                    i64c(cap as u64 + 1)
+                ],
+                |r| {
+                    let prev: Vec<u8> = r.get(6)?;
+                    let hash: Vec<u8> = r.get(7)?;
+                    Ok(AuditEntryWire {
+                        seq: u64::try_from(r.get::<_, i64>(0)?).unwrap_or(0),
+                        at_ms: u64::try_from(r.get::<_, i64>(1)?).unwrap_or(0),
+                        action: r.get(2)?,
+                        subject: r.get(3)?,
+                        detail: r.get(4)?,
+                        actor: r.get(5)?,
+                        prev_hash: <[u8; 32]>::try_from(prev.as_slice()).unwrap_or([0u8; 32]),
+                        entry_hash: <[u8; 32]>::try_from(hash.as_slice()).unwrap_or([0u8; 32]),
+                    })
+                },
+            )?;
+            // Apply BOTH budgets inside the cursor loop, so a wide
+            // span stops reading instead of being read whole and then
+            // trimmed (round 8 MAJOR-5).
+            //
+            // This used to `collect()` up to `cap + 1` rows and only
+            // then subtract the byte budget, so serving 7 rows out of
+            // a 20 MB span read and allocated all 20 MB — under the
+            // single process-wide connection mutex, at 20 requests per
+            // peer per minute. The row cap bounded the COUNT and
+            // nothing bounded the bytes read.
+            let mut budget = MAX_SERVE_BYTES;
+            let mut kept: Vec<AuditEntryWire> = Vec::new();
+            let mut truncated = false;
+            for row in out {
+                let row = row?;
+                if kept.len() >= cap {
+                    truncated = true;
+                    break;
+                }
+                // Cheap upper bound on the encoded row: the variable
+                // parts plus fixed framing. Exactness does not matter
+                // — this is a bound, not an accounting.
+                let cost = row.action.len()
+                    + row.subject.as_ref().map_or(0, String::len)
+                    + row.detail.as_ref().map_or(0, String::len)
+                    + row.actor.len()
+                    + 160;
+                if !kept.is_empty() && cost > budget {
+                    truncated = true;
+                    break;
+                }
+                budget = budget.saturating_sub(cost);
+                kept.push(row);
             }
-            budget = budget.saturating_sub(cost);
-            out.push(row);
-        }
-        Ok((out, over_rows || over_bytes))
+            Ok((kept, truncated))
+        })
     }
 }
 

@@ -1210,7 +1210,7 @@ async fn spawn_checkpoint_sweeper(
                 audit_sink.flush_suppressed();
                 crate::executor::prune_audit_log(&store, node);
                 // 5.13c-1: bound the pin table. Evidence-bearing pins
-                // (contradicted / unverifiable) are exempt.
+                // (anything but `unchecked`) are exempt.
                 crate::executor::thin_peer_head_pins(&store);
             }
             _ = shutdown.changed() => return,

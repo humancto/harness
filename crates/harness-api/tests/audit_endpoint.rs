@@ -642,4 +642,24 @@ async fn audit_verify_resumes_partial_runs_and_refuses_empty_ones() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // And it says WHICH 404 it is: an operator who named a seq needs
+    // to know that pin is missing, not that the node has none
+    // (round 8 MINOR-15).
+    assert_eq!(
+        body_json(resp).await["error"],
+        serde_json::json!("no_such_pin")
+    );
+
+    let unknown = harness_core::NodeId::from_bytes([42u8; 16]);
+    let resp = post(
+        &app,
+        Some(&token),
+        &format!("/api/v1/audit/verify/{unknown}"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        body_json(resp).await["error"],
+        serde_json::json!("no_pin_for_node")
+    );
 }

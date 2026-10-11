@@ -982,17 +982,12 @@ fn m18_a_subject_cannot_own_the_verify_target_through_a_tie_break() {
         );
     }
 
-    // The relay path must not be capturable either — this PR cites it
-    // as the precedent for the verify ordering, and the same envelope
-    // would make every honest peer relay the garbage head forever.
-    let (relayed, _seen) = store
-        .newest_pin_as_head(c.node_id())
-        .expect("relay")
-        .expect("some head");
-    assert_eq!(
-        relayed.seq, 9,
-        "the relayed head must be the honest one too"
-    );
+    // Relay is NOT asserted here. With a single relay slot the two
+    // capture directions are mutually exclusive — `seq DESC` hands it
+    // to an inflated self-claim, `seq ASC` to a captor's genuine low
+    // head — so no single-slot rule satisfies both, which is why the
+    // bounded relay SET is ROADMAP 5.13c-1b. `m25` asserts what the
+    // one slot does guarantee today.
 
     // SECOND shape, which the per-envelope dedupe does NOT catch: two
     // SEPARATE envelopes inside one millisecond. They tie on
@@ -1267,20 +1262,18 @@ fn m23_the_envelope_production_sends_is_still_verifiable_by_a_5_13c_1_node() {
 }
 
 #[test]
-fn m24_one_envelope_cannot_sweep_away_a_nodes_corroborated_pins() {
-    // Round 7 BLOCKER-1, the sharpest form found: MAX_HEADS_PER_ENVELOPE
-    // (64) is exactly PIN_KEEP_RECENT (64), so ONE 64-head envelope
-    // used to fill a node's entire recent-pin window, and the next
-    // hourly sweep then deleted its honest CORROBORATED pins — leaving
-    // only the MIN(rowid) row per node. The verdicts were
-    // unrecoverable: `audit_run_corroborates` reads the pin, so
-    // deleting the pin destroys the corroboration, and only the
-    // subject can mint a replacement. It also defeated both of
-    // Decision 25's mitigations, since `?seq=` cannot name a deleted
-    // row.
+fn m24_a_head_flood_cannot_sweep_away_a_nodes_corroborated_pins() {
+    // Round 7 BLOCKER-1, the half that belongs to THIS item.
+    // `MAX_HEADS_PER_ENVELOPE` (64) is exactly `PIN_KEEP_RECENT` (64),
+    // so one 64-head envelope fills a node's whole recent-pin window —
+    // and the sweep used to then delete its honest CORROBORATED pins,
+    // keeping only `MIN(rowid)` per node. Unrecoverably:
+    // `audit_run_corroborates` reads the pin, so losing the row loses
+    // the verdict, and only the subject can mint a replacement.
     //
-    // Two things close it and this test covers both: evidence is no
-    // longer evictable, and a peer has a per-window new-pin budget.
+    // `corroborated` is the status THIS item introduces, so protecting
+    // it from the sweep is this item's job. Bounding the flood itself
+    // is ROADMAP 5.13c-1b.
     let (store, me, trust, b, c, _tmp) = trio();
     let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me, trust);
 
@@ -1296,13 +1289,13 @@ fn m24_one_envelope_cannot_sweep_away_a_nodes_corroborated_pins() {
         h
     };
 
-    // An honest pin for C, corroborated — the evidence under attack.
     svc.ingest(c.node_id(), &envelope(&c, vec![sign_c(100, 0x64)]), 1_000);
     store
         .set_pin_status(c.node_id(), 100, PinStatus::Corroborated)
         .expect("corroborate");
 
-    // B floods genuine, validly signed positions of C in ONE envelope.
+    // B floods genuine, validly signed positions of C — a full
+    // envelope, which is all it used to take.
     let flood: Vec<harness_core::AuditHead> = (1..=64u64)
         .map(|i| sign_c(1_000_000 + i, u8::try_from(i).unwrap_or(0)))
         .collect();
@@ -1315,15 +1308,6 @@ fn m24_one_envelope_cannot_sweep_away_a_nodes_corroborated_pins() {
     env.sign(&b).expect("sign");
     svc.ingest(b.node_id(), &env, 2_000);
 
-    // The budget bounds what one envelope can insert.
-    let inserted = svc.pins_in_window_for_test(b.node_id());
-    assert!(
-        inserted <= crate::audit_sync::NEW_PINS_PER_PEER_PER_WINDOW,
-        "one envelope inserted {inserted} rows, budget is {}",
-        crate::audit_sync::NEW_PINS_PER_PEER_PER_WINDOW
-    );
-
-    // And the ordinary sweep leaves the corroborated evidence alone.
     store
         .thin_peer_head_pins(crate::executor::PIN_KEEP_RECENT, 3_600_000)
         .expect("thin");
@@ -1335,21 +1319,28 @@ fn m24_one_envelope_cannot_sweep_away_a_nodes_corroborated_pins() {
         .collect();
     assert!(
         survivors.contains(&(100, PinStatus::Corroborated)),
-        "the corroborated pin must survive the sweep; have {survivors:?}"
+        "the corroborated pin must survive a full-envelope flood plus the sweep; have {survivors:?}"
     );
 }
 
 #[test]
-fn m25_a_relayer_cannot_own_the_position_the_mesh_learns_for_a_third_party() {
-    // Round 7 BLOCKER-2: relaying ONE pin per peer made that slot a
-    // single prize. B forwards a genuine, validly signed OLD head of
-    // A — nothing forgeable, nothing detectable — and because the
-    // relay selector preferred the LOWER seq on a tie, B owned the
-    // position the rest of the mesh learned for A. `seq ASC` is right
-    // for a verify target (a low position is at least walkable) and
-    // wrong for relay (a low position is just worse for everyone).
+fn m25_the_relay_slot_prefers_the_higher_claim_and_resists_a_replay() {
+    // Round 7 BLOCKER-2 found a trusted peer could own the position
+    // the mesh relays for a third party by forwarding a genuine,
+    // validly signed OLD head — and `seq ASC` actively helped, because
+    // it preferred the lower claim. `seq ASC` is right for a verify
+    // TARGET (a low position is at least walkable) and wrong for
+    // relay (a low position is just worse for everyone).
+    //
+    // Relaying a bounded SET is the real fix and is ROADMAP 5.13c-1b;
+    // the first attempt at it selected the set by `first_seen_ms`,
+    // which the captor also controls, so three unseen old heads took
+    // all three slots and the honest head was EVICTED — worse than
+    // one slot, shipped as its fix. What this item keeps is the
+    // ordering: the higher claim, and `first_seen_ms` so a re-push
+    // cannot re-take the slot.
     let (store, me, trust, b, a, _tmp) = trio();
-    let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me.clone(), trust);
+    let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me, trust);
 
     let sign_a = |seq: u64, hash: u8| {
         let mut h = harness_core::AuditHead {
@@ -1363,31 +1354,45 @@ fn m25_a_relayer_cannot_own_the_position_the_mesh_learns_for_a_third_party() {
         h
     };
 
-    // BOTH directions, because that is what relaying a SET buys. With
-    // a single slot, whichever tie-break you pick loses one of them:
-    // `seq ASC` relays the captor's LOW head, `seq DESC` relays an
-    // INFLATED one, and in each case A's real position does not
-    // travel. A bounded set carries the honest head alongside
-    // whatever the captor adds.
-    let absurd = u64::try_from(i64::MAX).expect("fits");
-    let paired = envelope(
-        &b,
-        vec![sign_a(9_000, 0x90), sign_a(1, 0x01), sign_a(absurd, 0xFF)],
-    );
+    // A's real head and a captor's lower one, same envelope and so the
+    // same instant — the tie must not go to the low position.
+    let paired = envelope(&b, vec![sign_a(9_000, 0x90), sign_a(1, 0x01)]);
     svc.ingest(b.node_id(), &paired, 1_000);
-
     let relayed: Vec<u64> = svc
         .relayable_heads_for_test()
         .into_iter()
         .filter(|h| h.node_id == a.node_id())
         .map(|h| h.seq)
         .collect();
-    assert!(
-        relayed.contains(&9_000),
-        "A's real head must travel onward whatever the captor attached; relaying {relayed:?}"
+    assert_eq!(
+        relayed,
+        vec![9_000],
+        "the relay slot takes the higher claim, not the captor's low one"
     );
-    assert!(
-        relayed.len() <= crate::audit_sync::RELAY_PINS_PER_PEER,
-        "and the set stays bounded; relaying {relayed:?}"
-    );
+    // The documented residual of a SINGLE slot: the higher claim wins,
+    // so a SUBJECT inflating its own position takes the slot from
+    // itself. That is self-harm a recipient already handles (`m10`:
+    // a huge seq does not immunize a node), and it is strictly
+    // preferable to letting a THIRD party make the mesh learn an old
+    // position for an honest node. Both directions need the bounded
+    // set — ROADMAP 5.13c-1b.
+
+    // And re-pushing a head we already hold must not re-take the slot:
+    // `Refreshed` re-stamps `observed_at_ms` (what `main` ordered on)
+    // but never `first_seen_ms`.
+    let replay = envelope(&b, vec![sign_a(1, 0x01)]);
+    for tick in 2..=4u64 {
+        svc.ingest(b.node_id(), &replay, tick * 1_000);
+        let relayed: Vec<u64> = svc
+            .relayable_heads_for_test()
+            .into_iter()
+            .filter(|h| h.node_id == a.node_id())
+            .map(|h| h.seq)
+            .collect();
+        assert_eq!(
+            relayed,
+            vec![9_000],
+            "tick {tick}: a re-pushed old head must not re-take the relay slot"
+        );
+    }
 }
