@@ -421,12 +421,23 @@ reported corroboration while the verifier called the same rows broken.
 Nothing is cached — tampering after a completed walk revokes
 corroboration on the next read.
 
-**Decision 22 — a same-seq disagreement is evidence, not a duplicate.**
+**Decision 22 — a same-seq disagreement is refused, not swallowed.**
 Ingest used `INSERT OR IGNORE`, which silently kept our existing row,
 reported rows it had not written, and threw away the fact that a peer
 offered a *different* entry at a position we already held — which is
-precisely the fork 5.13c-1 exists to detect. It is now an explicit
-refusal, and `committed` counts rows actually written.
+precisely the shape 5.13c-1 detects at the head. It is now an explicit
+`Conflict` refusal, and `committed` counts rows actually written.
+
+Deliberately NOT called evidence in the code: the refusal logs a
+warning and writes **nothing** to `audit_head_conflicts`, and no pin
+becomes `Contradicted`. Entry-level disagreement is strictly stronger
+proof than the head-level fork that *is* recorded, so this is an
+asymmetry worth naming rather than glossing. It stays a refusal for
+one reason: the benign cause — a peer that rebuilt its database and
+restarted at seq 1 — is indistinguishable here from a malicious one,
+and auto-recording a conflict would fire on the honest case. Promoting
+it to recorded evidence needs the operator surface and the repair path
+that 5.13c-3 brings.
 
 ### What 5.13c-2 does NOT give you
 
@@ -448,6 +459,14 @@ refusal, and `committed` counts rows actually written.
 - **`audit_ingest_runs` is not thinned.** One row per
   `(node, target_seq)`; it grows with pin density and the pin sweep
   does not touch it.
+- **Corroboration is not cheap, and Decision 21 makes it uncached.**
+  Re-deriving it walks the run: roughly 107 ms (debug) for a
+  20k-row run, extrapolating to about half a second at the 100k
+  retention bound — all inside the single process-wide connection
+  mutex, on the QUIC receive path. Acceptable today because it runs
+  once per completed run, but 5.13c-3's per-pin UI will multiply it,
+  and a cache there must not become a way for a stale verdict to
+  outlive the rows it was derived from.
 - **Still no reader.** `audit_verify_range`, the run table and the
   corroborated status have no UI. A fork or a failed corroboration
   surfaces as a log line, a database row, and a 202 from the verify
