@@ -329,9 +329,11 @@ Three further gaps, named so they are not mistaken for coverage:
 - **Ingest is unrated.** A trusted peer can insert pin rows faster
   than the hourly sweep reclaims them; thinning bounds the steady
   state but not the interval. This is the only unbounded-work path a
-  trusted peer controls today. It lands in 5.13c-2 beside the
-  entry-serving rate limit, where the request/response primitive it
-  shares lives.
+  trusted peer controls today. It was planned for 5.13c-2 beside the
+  entry-serving rate limit; 5.13c-2 shipped the serving limit and NOT
+  this one, because two attempts at it there produced a blocker each
+  (one of them suppressing fork detection). It is ROADMAP **5.13c-1b**
+  — see Decision 27 for the evidence.
 - **A detected fork has no reader.** `head_conflicts`,
   `peer_head_pins` and `set_pin_status` have no non-test callers: a
   fork surfaces as one `tracing::error!` and a database row. The
@@ -389,8 +391,12 @@ ordering controls.**
 `tier != Guest`.** Reading rows holds the single process-wide
 connection mutex and a `RangeReq` is replayable, so an unlimited
 server lets a trusted peer stall dispatch by asking repeatedly; the
-limit is 20 batches per peer per minute, and it also closes the
-"ingest is unrated" gap 5.13c-1 recorded. The tier gate says
+limit is 20 batches per peer per minute. It does NOT close the "ingest
+is unrated" gap 5.13c-1 recorded, though an earlier version of this
+decision claimed it did: `may_serve` gates `serve_range` on
+`harness.audit.entries`, while that gap is pin-row insertion by
+`ingest` on `harness.audit` — a different channel and a different path,
+which is why closing it needed a separate budget (Decision 27). The tier gate says
 `!= Guest` rather than `== Trusted` because nothing in this build
 constructs `TrustTier::Trusted` outside tests and pairing's QUIC leg is
 stubbed — gating on Trusted would ship the entire pull path inert.
@@ -560,7 +566,7 @@ claiming a *lower*, therefore reachable, position. Not `rowid`: inside
 one envelope `rowid` is the sender's `Vec` order, so `rowid DESC` just
 hands the slot to whichever head the sender listed last. The relay selector shares the
 `first_seen_ms` half and deliberately differs on the tie — see Decision
-27. `p09` pins both.
+27. `p09` pins the verify selector; `m25` the relay one.
 
 **And it is still not enough.** The first version of this paragraph
 said the residual was a *subject* pushing a fresh *inflated* head
@@ -597,15 +603,17 @@ them equal and called them "agreed by construction"; they agreed only
 for rows written after that commit, and the migration case is the one
 that matters.
 
-The surviving range, stated rather than implied: the ingest ceiling is
-`MAX_SERVE_BYTES`, so any legacy row a peer can actually SERVE can also
-be ingested. A row larger than that could never cross the wire in the
-first place — `audit_entries_for_range` admits the first row
-unconditionally, so a single row above the channel frame cap cannot be
-served at all, which is a pre-existing limit of the serve path rather
-than of this cap. An earlier 64 KiB ceiling left rows between 64 KiB
-and ~1 MiB fatally stranded while the text claimed honest history
-"still replicates" (round 7 MAJOR-4).
+The ceiling is the CHANNEL FRAME cap, and getting there took two
+wrong answers. 64 KiB stranded legacy rows from 64 KiB to ~1 MiB.
+`MAX_SERVE_BYTES` (768 KiB) read as airtight — "a row larger than that
+cannot cross the wire anyway" — but the `harness.audit.entries` frame
+cap is 1 MiB, and `audit_entries_for_range` admits its first row
+unconditionally, so a 900 KiB `subject` was served, fitted the frame,
+arrived, and was refused `SubjectTooLarge` — fatally, stranding the
+chain past it. The same failure mode, moved up a band, under text
+asserting it was closed (round 9 finding 4). At the frame cap no band
+is left: a row that cannot be framed cannot arrive, and anything that
+arrives is accepted. `m26` pins the two constants together.
 
 **Decision 27 — the pin flood-control layer is NOT in this item, and
 here is the evidence for why it needs its own.** Rounds 7 and 8 found

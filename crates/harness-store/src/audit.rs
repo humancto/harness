@@ -52,17 +52,27 @@ pub const MAX_AUDIT_SUBJECT_BYTES: usize = MAX_AUDIT_DETAIL_BYTES;
 /// paths now agree by construction". They agree only for rows appended
 /// after that commit; the migration case is the one that matters.
 ///
-/// The ceiling is the SERVE budget, not an arbitrary multiple of the
-/// local cap. A 64 KiB ceiling (round 6's choice) still left legacy
-/// rows between 64 KiB and ~1 MiB fatally stranded while the ADR
-/// claimed honest history "still replicates" (round 7 MAJOR-4). Tying
-/// it to `MAX_SERVE_BYTES` makes the rule "anything a peer can serve,
-/// we can ingest": a row larger than that cannot cross the wire
-/// anyway, since `audit_entries_for_range` admits the first row
-/// unconditionally and a single row over the channel frame cap can
-/// never be served — a pre-existing limit of the serve path, not of
-/// this cap.
-pub const MAX_INGESTED_SUBJECT_BYTES: usize = crate::audit_ingest::MAX_SERVE_BYTES;
+/// The ceiling is the CHANNEL FRAME cap, which is the only value that
+/// makes the rule "anything that can cross the wire, we can ingest"
+/// actually true.
+///
+/// Two earlier choices both left a band stranded, and the second
+/// claimed it had not. 64 KiB (round 6) stranded legacy rows from
+/// 64 KiB to ~1 MiB. `MAX_SERVE_BYTES` (768 KiB, round 8) looked
+/// airtight — "a row larger than that cannot cross the wire anyway" —
+/// but the `harness.audit.entries` frame cap is 1 MiB, not 768 KiB,
+/// and `audit_entries_for_range` admits its first row
+/// unconditionally. So a legacy row with a 900 KiB `subject` IS
+/// served, DOES fit the frame, arrives — and was then refused
+/// `SubjectTooLarge`, which `validate_batch` makes fatal, stranding
+/// the whole chain past it (round 9 finding 4).
+///
+/// At the frame cap there is no band left: a row that cannot be
+/// framed cannot arrive, and anything that arrives is accepted.
+/// `m26` in `harness-daemon` pins this against
+/// `channels::frame_cap(AUDIT_ENTRIES)`, since this crate cannot
+/// depend on `harness-mesh` to read it directly.
+pub const MAX_INGESTED_SUBJECT_BYTES: usize = 1024 * 1024;
 
 /// 5.13b (ADR-0041 follow-up): how long an identical repeat of a
 /// FLOODABLE action is rate-limited per actor.

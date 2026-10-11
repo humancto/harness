@@ -463,6 +463,16 @@ impl Store {
             let mut truncated = false;
             for row in out {
                 let row = row?;
+                // Backstop only: at the current constants the byte
+                // budget always fires first, because the minimum
+                // per-row cost is the 160 bytes of fixed framing and
+                // `160 * MAX_INGEST_ROWS_PER_PULL` (800_000) already
+                // exceeds `MAX_SERVE_BYTES` (786_432). A 5001-row span
+                // serves ~4144 rows, never 5000. Kept because
+                // `MAX_INGEST_ROWS_PER_PULL` is the stated row cap and
+                // a future budget change could make it bind; stated as
+                // unreachable so it is not read as a live guard (round
+                // 9 finding 3).
                 if kept.len() >= cap {
                     truncated = true;
                     break;
@@ -1004,6 +1014,110 @@ mod tests {
         assert!(dst
             .audit_run_corroborates(node(1), last.seq)
             .expect("check"));
+    }
+
+    #[test]
+    fn i09b_a_wide_span_stops_at_the_byte_budget() {
+        // Round 9 finding 3: the streaming byte budget — the headline
+        // change of the scope-cut commit — had no test at all. All
+        // three of its guards survived the whole workspace suite.
+        //
+        // The budget is what actually bounds a served batch: the row
+        // cap is unreachable at the current constants (see the comment
+        // on it), so `truncated` is purely byte-driven. Serving must
+        // stop inside the budget rather than reading the whole span
+        // and trimming afterwards, which is what it used to do.
+        let src = Store::open_memory().expect("store");
+        let sink = crate::audit::StoreAuditSink::new(src.clone(), node(1));
+        // Fat rows, so the budget is reached in a few hundred rows
+        // instead of thousands: a 4 KiB subject is the most a local
+        // append can carry.
+        let fat = "s".repeat(crate::audit::MAX_AUDIT_SUBJECT_BYTES);
+        for _ in 0..400 {
+            sink.record(
+                AuditRecord::new(AuditAction::TaskDispatched, AuditActor::System)
+                    .with_subject(fat.clone()),
+            );
+        }
+
+        let (rows, truncated) = src.audit_entries_for_range(node(1), 1, 400).expect("serve");
+        assert!(truncated, "a span past the budget reports truncation");
+        assert!(
+            rows.len() < 400,
+            "and stops short of the span; served {}",
+            rows.len()
+        );
+        // The served batch is within budget, allowing the one row that
+        // is admitted unconditionally to overshoot.
+        let total: usize = rows
+            .iter()
+            .map(|r| {
+                r.action.len()
+                    + r.subject.as_ref().map_or(0, String::len)
+                    + r.detail.as_ref().map_or(0, String::len)
+                    + r.actor.len()
+                    + 160
+            })
+            .sum();
+        let one_row = crate::audit::MAX_AUDIT_SUBJECT_BYTES + 200;
+        assert!(
+            total <= MAX_SERVE_BYTES + one_row,
+            "served {total} bytes against a budget of {MAX_SERVE_BYTES}"
+        );
+        // A span that fits is NOT reported truncated.
+        let (short, short_trunc) = src.audit_entries_for_range(node(1), 1, 10).expect("serve");
+        assert_eq!(short.len(), 10);
+        assert!(!short_trunc, "a span inside the budget is not truncated");
+    }
+
+    #[test]
+    fn i09c_a_row_bigger_than_the_whole_budget_is_still_served() {
+        // Round 9 finding 3: the `!kept.is_empty()` first-row admit
+        // survived deletion, and no LOCAL fixture can reach it — a
+        // locally appended row maxes out around 8 KiB (4 KiB subject +
+        // 4 KiB detail) against a 768 KiB budget. It is reachable only
+        // through an INGESTED row, which may carry up to the channel
+        // frame cap.
+        //
+        // Without the admit, such a row can never be served: it costs
+        // more than the whole budget, so it is skipped on every
+        // request, forever, and the chain past it is unreachable.
+        let src = Store::open_memory().expect("store");
+        let sink = crate::audit::StoreAuditSink::new(src.clone(), node(1));
+        sink.record(AuditRecord::new(
+            AuditAction::TaskDispatched,
+            AuditActor::System,
+        ));
+        let (mut entries, _) = src.audit_entries_for_range(node(1), 1, 1).expect("serve");
+        // A subject larger than the entire serve budget, but inside
+        // the ingest ceiling — exactly the legacy row Decision 26 is
+        // about.
+        entries[0].subject = Some("x".repeat(MAX_SERVE_BYTES + 1));
+        let action = crate::audit::action_from_str(&entries[0].action).expect("action");
+        entries[0].entry_hash = harness_core::audit_entry_hash(
+            node(1),
+            entries[0].seq,
+            entries[0].at_ms,
+            action,
+            entries[0].subject.as_deref(),
+            entries[0].detail.as_deref(),
+            &entries[0].actor,
+            &entries[0].prev_hash,
+        )
+        .expect("hash");
+
+        let dst = Store::open_memory().expect("dst");
+        dst.audit_ingest_range(node(9), node(1), 1, &entries, now())
+            .expect("ingest")
+            .expect("a row under the frame cap must be accepted");
+
+        let (rows, _) = dst.audit_entries_for_range(node(1), 1, 1).expect("serve");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a row costing more than the whole budget is still served alone, \
+             or the chain past it is unreachable forever"
+        );
     }
 
     #[test]

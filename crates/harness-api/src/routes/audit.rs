@@ -243,16 +243,6 @@ fn parse_node(raw: &str) -> Result<harness_core::NodeId, ()> {
     Ok(harness_core::NodeId::from_bytes(bytes))
 }
 
-/// `POST /api/v1/audit/verify/:node` — ask the mesh to walk a peer's
-/// entries so its newest pin can be corroborated (5.13c-2).
-///
-/// Returns 202: the pull crosses the network and settles
-/// asynchronously, so this reports that a walk was STARTED and the
-/// caller re-reads the pin's status. Claiming a verdict here would be
-/// the same overstatement the History banner refuses.
-// Axum requires a handler future; nothing here awaits, because the
-// pull itself is fire-and-forget into the mesh.
-#[allow(clippy::unused_async)]
 /// Optional explicit target for the verify endpoint.
 ///
 /// Selecting ONE pin to verify is inherently gameable: the subject
@@ -290,6 +280,16 @@ fn select_verify_target(
     }
 }
 
+/// `POST /api/v1/audit/verify/:node` — ask the mesh to walk a peer's
+/// entries so its newest pin can be corroborated (5.13c-2).
+///
+/// Returns 202: the pull crosses the network and settles
+/// asynchronously, so this reports that a walk was STARTED and the
+/// caller re-reads the pin's status. Claiming a verdict here would be
+/// the same overstatement the History banner refuses.
+// Axum requires a handler future; nothing here awaits, because the
+// pull itself is fire-and-forget into the mesh.
+#[allow(clippy::unused_async)]
 pub async fn verify_node_handler(
     State(state): State<ApiState>,
     headers: HeaderMap,

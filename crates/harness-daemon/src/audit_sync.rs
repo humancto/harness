@@ -685,13 +685,15 @@ impl AuditSyncService {
         let _ = net.send_to(peer, OutboundMsg::AuditEntries(env));
     }
 
-    /// May this peer cause one more NEW pin row?
+    /// May this peer be served one more entry BATCH in this window?
     ///
-    /// Counted per reporting peer, not per subject: the attack is a
-    /// relayer offering many genuine positions of a third party, so a
-    /// per-subject budget would be refreshed by simply naming another
-    /// subject. Only NEW positions are charged — a refresh of a row we
-    /// already hold writes one column and creates nothing.
+    /// Decision 18's limiter, and only that: it gates `serve_range` on
+    /// `harness.audit.entries`. It does NOT rate-limit head ingest on
+    /// `harness.audit` — a different channel and a different path,
+    /// which is why closing that gap needs its own budget (ROADMAP
+    /// 5.13c-1b). The revert of a first attempt at that budget left
+    /// its doc comment stranded here, describing behaviour this
+    /// function never had (round 9 finding 5).
     fn may_serve(&self, peer: NodeId, now_ms: u64) -> bool {
         let mut states = self.peers.lock();
         let state = states.entry(peer).or_default();

@@ -1396,3 +1396,24 @@ fn m25_the_relay_slot_prefers_the_higher_claim_and_resists_a_replay() {
         );
     }
 }
+
+#[test]
+fn m26_the_ingest_subject_ceiling_matches_the_channel_frame_cap() {
+    // Round 9 finding 4. Two earlier ceilings each left a band of
+    // legacy rows that could be SERVED and framed but not ingested —
+    // and ingest refusal is fatal, stranding the whole chain past the
+    // offending row. The second of them (768 KiB) asserted in the ADR
+    // that no such band existed, while the frame cap was 1 MiB.
+    //
+    // `harness-store` cannot depend on `harness-mesh`, so the two
+    // constants are declared apart and pinned together here. If the
+    // frame cap moves, this fails rather than silently reopening the
+    // band.
+    assert_eq!(
+        harness_store::MAX_INGESTED_SUBJECT_BYTES,
+        harness_mesh::transport::channels::frame_cap(
+            harness_mesh::transport::channels::AUDIT_ENTRIES
+        ),
+        "a row that can be framed must be ingestable, or refusing it strands the chain"
+    );
+}
