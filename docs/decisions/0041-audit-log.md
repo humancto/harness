@@ -562,16 +562,69 @@ hands the slot to whichever head the sender listed last. Both the
 verify selector and the relay selector use this, because the relay slot
 is the same prize. `p09` pins both.
 
-**And it is still not enough, which is the honest part.** A subject can
-mint a fresh signed position whenever it likes, and any "newest" rule
-selects it; a subject determined to keep its honest head out of this one
-slot can push a new inflated head every tick. That is inherent to
-picking one target from candidates the subject generates. Two things
-answer it instead of pretending the ordering does: `POST
-/api/v1/audit/verify/:node?seq=N` lets an operator name the position —
-removing the adversary from the choice exactly when a node looks
-suspicious — and 5.13c-3a's eager sweep walks several unchecked pins per
-tick rather than one.
+**And it is still not enough.** The first version of this paragraph
+said the residual was a *subject* pushing a fresh *inflated* head
+*every tick*. Round 7 measured the actual attack and it was the
+opposite on all three counts: **any trusted peer** (not just the
+subject), **one envelope** (no repetition), carrying a **lower**
+genuine position — the direction this decision had just finished
+calling safe. Worse, with the `status` clause gone, resolving the
+captured pin did not advance the slot either, so the capture was
+permanent under all three verdicts.
+
+What closed it was not a cleverer ordering. The relay path stopped
+relaying one pin per peer (Decision 27) and the selection stopped being
+the only thing standing between a subject and its own audit: `POST
+/api/v1/audit/verify/:node?seq=N` lets an operator name the position,
+and 5.13c-3a's eager sweep walks several unchecked pins per tick. What
+remains is narrow and worth stating exactly: a peer can still make the
+DEFAULT target a position of its choosing for a window, and a pin whose
+walk fails stays `unchecked` and keeps that default. Naming the pin
+bypasses it; nothing silently reports success.
+
+**Decision 27 — relay a bounded SET of pins per peer, not one.**
+Relaying exactly one pin per peer made that slot a single prize: any
+trusted peer could forward a genuine, validly signed OLD head of a
+third party — nothing forgeable, nothing detectable — and own the
+position the rest of the mesh learned for it. Whichever tie-break the
+single slot used lost one direction: `seq ASC` relayed the captor's low
+head, `seq DESC` would relay an inflated one, and in both cases the
+subject's real position did not travel. `seq ASC` is right for a verify
+TARGET, where a low position is at least walkable, and wrong for relay,
+where a low position is simply worse for everyone. `RELAY_PINS_PER_PEER`
+is 3, inside the existing `RELAY_HEADS` budget, so the honest position
+travels alongside anything a captor attaches. This is affordable
+precisely because Decision 25 now stores every distinct head.
+
+**Decision 28 — head ingest is rate-limited, and evidence is never
+swept.** ADR-0041's 5.13c-1 residual list promised the first half for
+this item — *"Ingest is unrated… It lands in 5.13c-2 beside the
+entry-serving rate limit"* — and it had not been delivered. Round 7
+found the omission had become sharper, not milder: `MAX_HEADS_PER_ENVELOPE`
+(64) is exactly `PIN_KEEP_RECENT` (64), so ONE 64-head envelope filled
+a node's entire recent-pin window, and the next hourly sweep then
+deleted its honest **corroborated** pins, keeping only the `MIN(rowid)`
+row per node. The verdicts were unrecoverable, because
+`audit_run_corroborates` reads the pin: deleting the row destroys the
+corroboration, and only the subject can mint a replacement. It also
+defeated both of Decision 25's mitigations at once, since `?seq=`
+cannot name a row that has been deleted. And storing every distinct
+head — the right fix for the regression above — had made it 64x
+cheaper, raising a relayer's reach from one pin row per subject per
+envelope to 64.
+
+Two changes, because one does not suffice. `NEW_PINS_PER_PEER_PER_WINDOW`
+(24) bounds new positions per reporting peer per window: counted per
+peer rather than per subject, since naming another subject would
+otherwise refresh the budget, and charged only on an outcome that
+actually WROTE a row — a refresh writes one column, and an honest peer
+pushes 17 heads every 30s that are almost all refreshes, so charging
+those would throttle honest traffic while doing nothing about the
+flood. Separately, `PinStatus::evictable` now admits only `Unchecked`:
+every other status is a result we spent a walk to establish. The cost
+is that corroborated pins accumulate; that is bounded in practice
+because a corroborated pin requires entries the subject actually
+served, and a cap on them belongs with 5.13c-3's hygiene pass.
 
 **Decision 26 — the local and ingest `subject` caps differ, on
 purpose.** `subject` had no cap at all before 5.13c-2, so rows far above
@@ -586,6 +639,16 @@ up to `MAX_INGESTED_SUBJECT_BYTES` (64 KiB). An intermediate commit set
 them equal and called them "agreed by construction"; they agreed only
 for rows written after that commit, and the migration case is the one
 that matters.
+
+The surviving range, stated rather than implied: the ingest ceiling is
+`MAX_SERVE_BYTES`, so any legacy row a peer can actually SERVE can also
+be ingested. A row larger than that could never cross the wire in the
+first place — `audit_entries_for_range` admits the first row
+unconditionally, so a single row above the channel frame cap cannot be
+served at all, which is a pre-existing limit of the serve path rather
+than of this cap. An earlier 64 KiB ceiling left rows between 64 KiB
+and ~1 MiB fatally stranded while the text claimed honest history
+"still replicates" (round 7 MAJOR-4).
 
 ### What 5.13c-2 does NOT give you
 

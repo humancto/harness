@@ -273,18 +273,17 @@ pub struct VerifyQuery {
 /// falling back to the default would tell the operator their request
 /// was honoured when it was not.
 fn select_verify_target(
+    pins: &[harness_store::PeerHeadPin],
     store: &harness_store::Store,
     node: harness_core::NodeId,
     want: Option<u64>,
 ) -> Result<Option<harness_store::PeerHeadPin>, ()> {
     match want {
-        Some(seq) => match store.peer_head_pins(node) {
-            Ok(pins) => Ok(pins.into_iter().find(|p| p.seq == seq)),
-            Err(err) => {
-                tracing::error!(target: "harness.api.audit", ?err, "peer_head_pins");
-                Err(())
-            }
-        },
+        // Served from the slice the caller already loaded. This used
+        // to re-scan the whole pin table, so one request cost two full
+        // scans and two allocations, each taking the process-wide
+        // store mutex (round 7 MINOR-11).
+        Some(seq) => Ok(pins.iter().find(|p| p.seq == seq).cloned()),
         None => store.newest_pin_by_observation(node).map_err(|err| {
             tracing::error!(target: "harness.api.audit", ?err, "newest_pin_by_observation");
         }),
@@ -340,20 +339,6 @@ pub async fn verify_node_handler(
     // can be audited (diff review round 4 BLOCKER-2). The relay path
     // has ordered this way since 5.13c-1's re-review; this is the same
     // rule applied to the one operator-facing trigger.
-    let Ok(selected) = select_verify_target(store, node, query.seq) else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "pins_failed" })),
-        )
-            .into_response();
-    };
-    let Some(target) = selected else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "no_pin_for_node" })),
-        )
-            .into_response();
-    };
     let pins = match store.peer_head_pins(node) {
         Ok(p) => p,
         Err(err) => {
@@ -364,6 +349,28 @@ pub async fn verify_node_handler(
             )
                 .into_response();
         }
+    };
+    let Ok(selected) = select_verify_target(&pins, store, node, query.seq) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "pins_failed" })),
+        )
+            .into_response();
+    };
+    let Some(target) = selected else {
+        // Distinguish the two 404s: an operator who named a seq needs
+        // to know THAT pin is missing, not that the node has none
+        // (round 7 MINOR-12).
+        let error = if query.seq.is_some() {
+            "no_such_pin"
+        } else {
+            "no_pin_for_node"
+        };
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": error })),
+        )
+            .into_response();
     };
     // Walk from just past the PREVIOUS pin we hold, so the run is
     // anchored on evidence we took earlier rather than on the subject's
@@ -405,21 +412,13 @@ pub async fn verify_node_handler(
             from_seq
         }
     };
-    // A range we cannot ask for is not a started walk. Saying
-    // `202 started: true` here is the overstatement this endpoint's
-    // 202 exists to avoid.
-    if from_seq > target.seq {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "nothing_to_walk",
-                "node": node.to_string(),
-                "target_seq": target.seq,
-                "from_seq": from_seq,
-            })),
-        )
-            .into_response();
-    }
+    // No `from_seq > target.seq` guard here, deliberately: it would
+    // be dead code (round 7 MINOR-5). `audit_peer_heads` has
+    // `CHECK (seq > 0)` so `target.seq >= 1`, the previous-pin term is
+    // strictly below the target, and the resume term is clamped the
+    // same way — so `from_seq <= target.seq` always holds. An earlier
+    // version of this handler returned 409 here and no test could
+    // reach it.
     let started = puller.request_range(node, node, from_seq, target.seq);
     (
         StatusCode::ACCEPTED,

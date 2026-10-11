@@ -50,11 +50,19 @@ pub const MAX_AUDIT_SUBJECT_BYTES: usize = MAX_AUDIT_DETAIL_BYTES;
 ///
 /// Round 5 set the ingest cap to the local one and called it "the two
 /// paths now agree by construction". They agree only for rows appended
-/// after that commit; the migration case is the one that matters. So
-/// ingest keeps the 64 KiB ceiling: still a bound (the 1 MiB frame
-/// would otherwise admit ~16x this), but loose enough that honest
-/// history written by an older build still replicates.
-pub const MAX_INGESTED_SUBJECT_BYTES: usize = 64 * 1024;
+/// after that commit; the migration case is the one that matters.
+///
+/// The ceiling is the SERVE budget, not an arbitrary multiple of the
+/// local cap. A 64 KiB ceiling (round 6's choice) still left legacy
+/// rows between 64 KiB and ~1 MiB fatally stranded while the ADR
+/// claimed honest history "still replicates" (round 7 MAJOR-4). Tying
+/// it to `MAX_SERVE_BYTES` makes the rule "anything a peer can serve,
+/// we can ingest": a row larger than that cannot cross the wire
+/// anyway, since `audit_entries_for_range` admits the first row
+/// unconditionally and a single row over the channel frame cap can
+/// never be served — a pre-existing limit of the serve path, not of
+/// this cap.
+pub const MAX_INGESTED_SUBJECT_BYTES: usize = crate::audit_ingest::MAX_SERVE_BYTES;
 
 /// 5.13b (ADR-0041 follow-up): how long an identical repeat of a
 /// FLOODABLE action is rate-limited per actor.
