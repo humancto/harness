@@ -134,8 +134,6 @@ async fn m03_a_rewritten_chain_is_caught_as_a_fork() {
         source: a.node_id(),
         assembled_at: 10_000_000,
         heads: vec![forged],
-        range_req: None,
-        range_resp: None,
         sig: Signature::from_bytes([0u8; 64]),
     };
     env.sign(a.identity.as_ref()).expect("sign envelope");
@@ -202,8 +200,6 @@ async fn m04_a_head_from_an_unknown_node_is_dropped() {
         source: a.node_id(),
         assembled_at: 1_000,
         heads: vec![head],
-        range_req: None,
-        range_resp: None,
         sig: Signature::from_bytes([0u8; 64]),
     };
     env.sign(a.identity.as_ref()).expect("sign");
@@ -240,8 +236,6 @@ async fn m05_a_forged_signature_is_rejected_even_from_a_trusted_relay() {
         source: a.node_id(),
         assembled_at: 1_000,
         heads: vec![head],
-        range_req: None,
-        range_resp: None,
         sig: Signature::from_bytes([0u8; 64]),
     };
     env.sign(a.identity.as_ref()).expect("sign");
@@ -389,8 +383,6 @@ fn envelope(
         source: from.node_id(),
         assembled_at: 1_000,
         heads,
-        range_req: None,
-        range_resp: None,
         sig: Signature::from_bytes([0u8; 64]),
     };
     env.sign(from).expect("sign envelope");
@@ -667,10 +659,9 @@ async fn m13_an_unmatched_response_is_dropped() {
         .store
         .audit_entries_for_range(a.node_id(), 1, 5)
         .expect("serve");
-    let mut env = harness_core::AuditSyncEnvelope {
+    let mut env = harness_core::AuditEntriesEnvelope {
         source: a.node_id(),
         assembled_at: now_ms(),
-        heads: Vec::new(),
         range_req: None,
         range_resp: Some(harness_core::AuditRangeResp {
             req_id: [0xAB; 16],
@@ -687,7 +678,7 @@ async fn m13_an_unmatched_response_is_dropped() {
         b.identity.clone(),
         b.trust.clone(),
     );
-    svc.ingest(a.node_id(), &env, now_ms());
+    svc.ingest_entries(a.node_id(), &env, now_ms());
 
     let (rows, _) = b
         .store
@@ -759,10 +750,9 @@ fn m14_a_response_must_start_where_we_asked() {
 
     // We asked for 1..=10; the answer contains only entry 10.
     let req_id = svc.track_inflight_for_test(c.node_id(), c.node_id(), 1, head.seq, now_ms());
-    let mut env = harness_core::AuditSyncEnvelope {
+    let mut env = harness_core::AuditEntriesEnvelope {
         source: c.node_id(),
         assembled_at: now_ms(),
-        heads: Vec::new(),
         range_req: None,
         range_resp: Some(harness_core::AuditRangeResp {
             req_id,
@@ -773,7 +763,7 @@ fn m14_a_response_must_start_where_we_asked() {
         sig: Signature::from_bytes([0u8; 64]),
     };
     env.sign(&c).expect("sign");
-    svc.ingest(c.node_id(), &env, now_ms());
+    svc.ingest_entries(c.node_id(), &env, now_ms());
 
     assert!(
         !store
@@ -802,11 +792,19 @@ async fn m15_the_follow_up_walk_is_bounded() {
     wait_for_mesh(&a, &b).await;
     let svc = b.audit_sync.clone();
 
+    // The SUBJECT is a third node neither peer holds rows for, so `a`
+    // can never answer and the in-flight slot cannot be retired
+    // underneath the assertions below. Asking about `a` itself would
+    // leave a window in which a reply removes the slot and the count
+    // flakes (round 4 MINOR-8); nothing about the round bound needs a
+    // subject the peer can serve.
+    let absent_subject = harness_core::NodeId::from_bytes([0x5A; 16]);
+
     // At the budget the request really goes out and takes a slot.
     assert!(
         svc.request_range_round_for_test(
             a.node_id(),
-            a.node_id(),
+            absent_subject,
             1,
             100,
             crate::audit_sync::MAX_FOLLOWUP_ROUNDS,
@@ -821,7 +819,7 @@ async fn m15_the_follow_up_walk_is_bounded() {
     assert!(
         !svc.request_range_round_for_test(
             a.node_id(),
-            a.node_id(),
+            absent_subject,
             1,
             100,
             crate::audit_sync::MAX_FOLLOWUP_ROUNDS + 1,
@@ -833,5 +831,106 @@ async fn m15_the_follow_up_walk_is_bounded() {
         svc.inflight_len_for_test(),
         at_budget,
         "and takes no additional slot"
+    );
+}
+
+/// A request-bearing entries envelope from `from`, signed by it.
+fn range_req_envelope(
+    from: &harness_core::Identity,
+    subject: harness_core::NodeId,
+    req_id: [u8; 16],
+) -> harness_core::AuditEntriesEnvelope {
+    let mut env = harness_core::AuditEntriesEnvelope {
+        source: from.node_id(),
+        assembled_at: 1_000,
+        range_req: Some(harness_core::AuditRangeReq {
+            req_id,
+            node_id: subject,
+            from_seq: 1,
+            to_seq: 5,
+        }),
+        range_resp: None,
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    env.sign(from).expect("sign envelope");
+    env
+}
+
+#[test]
+fn m16_serving_is_rate_limited_per_peer_and_the_window_resets() {
+    // ADR Decision 18's rate limit. Round 4 of the review deleted the
+    // `may_serve` call and the ENTIRE harness-daemon suite stayed
+    // green: the limit was a security property asserted in the ADR
+    // with no test at all.
+    //
+    // The observable is the budget counter, not a sent frame. Both
+    // guards return before `serve_range` looks up the net, so a test
+    // watching the wire cannot distinguish "refused" from "allowed but
+    // no connection" — the same insensitivity that let the follow-up
+    // bound ship untested (BLOCKER-1).
+    let (store, me, trust, b, _c, _tmp) = trio();
+    let svc = crate::audit_sync::AuditSyncService::new(store, me, trust);
+    let now = 10_000;
+
+    for i in 0..crate::audit_sync::SERVE_BATCHES_PER_MINUTE {
+        let env = range_req_envelope(&b, b.node_id(), [u8::try_from(i % 256).unwrap_or(0); 16]);
+        svc.ingest_entries(b.node_id(), &env, now);
+    }
+    assert_eq!(
+        svc.served_in_window_for_test(b.node_id()),
+        crate::audit_sync::SERVE_BATCHES_PER_MINUTE,
+        "the whole per-minute allowance is usable"
+    );
+
+    // One past the allowance is refused, and refusal does not grow the
+    // counter — so a flooder cannot push the window forward either.
+    let env = range_req_envelope(&b, b.node_id(), [0xFE; 16]);
+    svc.ingest_entries(b.node_id(), &env, now);
+    assert_eq!(
+        svc.served_in_window_for_test(b.node_id()),
+        crate::audit_sync::SERVE_BATCHES_PER_MINUTE,
+        "the request past the allowance is refused"
+    );
+
+    // A fresh window on OUR clock lets the peer through again: this is
+    // a rate limit, not a permanent ban.
+    let env = range_req_envelope(&b, b.node_id(), [0xFF; 16]);
+    svc.ingest_entries(b.node_id(), &env, now + crate::audit_sync::SERVE_WINDOW_MS);
+    assert_eq!(
+        svc.served_in_window_for_test(b.node_id()),
+        1,
+        "the window resets and the counter restarts"
+    );
+}
+
+#[test]
+fn m17_a_guest_peer_is_not_served_and_does_not_spend_the_budget() {
+    // ADR Decision 18's tier gate, which also survived deletion with
+    // all 126 daemon tests green (round 4 MAJOR-3).
+    //
+    // The gate is deliberately checked BEFORE the budget, so a refused
+    // Guest cannot burn the allowance of a peer we would have served.
+    // Asserting the counter is still 0 tests the ORDER as well as the
+    // gate — a gate moved after the budget would leave it at 1.
+    let (store, me, trust, b, _c, _tmp) = trio();
+    trust
+        .add(harness_mesh::trust::Peer {
+            node_id: b.node_id(),
+            pubkey: *b.public_key(),
+            hostname: "guest-node".into(),
+            tier: harness_mesh::trust::TrustTier::Guest,
+            added_at: 0,
+            added_via: harness_mesh::trust::AddedVia::Static,
+        })
+        .expect("re-add as guest");
+    let svc = crate::audit_sync::AuditSyncService::new(store, me, trust);
+
+    let env = range_req_envelope(&b, b.node_id(), [0x11; 16]);
+    svc.ingest_entries(b.node_id(), &env, 10_000);
+
+    assert_eq!(
+        svc.served_in_window_for_test(b.node_id()),
+        0,
+        "a Guest is refused before the budget is consulted"
     );
 }

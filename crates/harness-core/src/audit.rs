@@ -313,17 +313,55 @@ pub struct AuditSyncEnvelope {
     /// The sender's own head, plus any third-party heads it is
     /// relaying. Bounded by the sender; the receiver bounds it again.
     pub heads: Vec<AuditHead>,
-    /// 5.13c-2: a request for entries. `#[serde(default)]` so a
-    /// 5.13c-1 node's envelope still decodes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub range_req: Option<AuditRangeReq>,
-    /// 5.13c-2: the answer to someone's request.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub range_resp: Option<AuditRangeResp>,
     pub sig: Signature,
 }
 
 impl Signable for AuditSyncEnvelope {
+    fn sig_field_mut(&mut self) -> &mut Signature {
+        &mut self.sig
+    }
+    fn sig_field(&self) -> &Signature {
+        &self.sig
+    }
+}
+
+/// Signed envelope carrying entry pulls over `harness.audit.entries`
+/// (5.13c-2, ADR-0041 Decision 24).
+///
+/// A SEPARATE type on a SEPARATE channel, not two more fields on
+/// [`AuditSyncEnvelope`], and the reason is the one Decision 10 gives
+/// for keeping heads off the heartbeat. [`Signable::canonical_bytes`]
+/// re-encodes the DECODED struct, so a peer that does not know a field
+/// drops it, re-encodes without it, and signature verification fails.
+/// Adding these two fields to the head envelope therefore made every
+/// envelope carrying one unverifiable at a 5.13c-1 node — which
+/// resets the stream it arrived on, taking that connection's head
+/// pushes down with it. Pin density is the security parameter of this
+/// design, so that is a wire BREAK dressed as an addition.
+///
+/// A new channel has no such failure mode: an old node returns `None`
+/// from `channels::known`, resets the one unknown stream, and the
+/// connection — and its head pushes — survive. This is the
+/// `TASK_LEASE` precedent, and the same reasoning that put heads on
+/// their own channel in 5.13c-1.
+///
+/// Signed at assembly and checked against the CONNECTION peer. Unlike
+/// a head, neither side of this exchange is relayable: a request is
+/// answered only by the node holding the rows, and a response is
+/// accepted only from the peer we asked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditEntriesEnvelope {
+    pub source: NodeId,
+    /// Unix milliseconds when this envelope was assembled.
+    pub assembled_at: u64,
+    /// A request for entries.
+    pub range_req: Option<AuditRangeReq>,
+    /// The answer to someone's request.
+    pub range_resp: Option<AuditRangeResp>,
+    pub sig: Signature,
+}
+
+impl Signable for AuditEntriesEnvelope {
     fn sig_field_mut(&mut self) -> &mut Signature {
         &mut self.sig
     }

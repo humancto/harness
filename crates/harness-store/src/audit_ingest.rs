@@ -74,6 +74,8 @@ pub enum IngestRefusal {
     Conflict { seq: u64 },
     /// `detail` exceeds what a locally appended row may carry.
     DetailTooLarge { seq: u64 },
+    /// `subject` exceeds what a locally appended row may carry.
+    SubjectTooLarge { seq: u64 },
     /// Rows past the pin this run is walking toward.
     PastTarget { seq: u64 },
 }
@@ -465,14 +467,25 @@ fn validate_batch(
         if e.at_ms > now_ms.saturating_add(MAX_INGEST_SKEW_MS) {
             return Err(IngestRefusal::Skew { seq: e.seq });
         }
-        // Locally appended rows are capped; ingest checked nothing, so
-        // a peer could plant ~1 MiB per row and it would render into
-        // the History feed (diff review MAJOR-6).
+        // Locally appended rows have a `detail` cap; ingest checked
+        // nothing, so a peer could plant ~1 MiB per row and it would
+        // render into the History feed (diff review MAJOR-6).
         if e.detail
             .as_ref()
             .is_some_and(|d| d.len() > crate::audit::MAX_AUDIT_DETAIL_BYTES)
         {
             return Err(IngestRefusal::DetailTooLarge { seq: e.seq });
+        }
+        // `subject` has no cap on the local path at all — it is
+        // bounded only by the frame that produced it — so the cap here
+        // is the local bound, not the much tighter `detail` one
+        // (round 4 MINOR-5). Ingested rows are never pruned, so an
+        // uncapped field on this path is permanent.
+        if e.subject
+            .as_ref()
+            .is_some_and(|sub| sub.len() > crate::audit::MAX_AUDIT_SUBJECT_BYTES)
+        {
+            return Err(IngestRefusal::SubjectTooLarge { seq: e.seq });
         }
         if e.seq > target_seq {
             return Err(IngestRefusal::PastTarget { seq: e.seq });
@@ -1434,6 +1447,39 @@ mod tests {
                 .expect("ingest")
                 .expect_err("refuse"),
             IngestRefusal::DetailTooLarge { seq: 2 }
+        );
+    }
+
+    #[test]
+    fn i25_an_oversized_subject_is_refused() {
+        // `subject` has no cap on the LOCAL append path, so the ingest
+        // cap is the local bound (the frame that produced it), not the
+        // much tighter `detail` one. Without any cap the ingest path
+        // admitted ~16x what an honest local append can hold, into
+        // rows that are never pruned (round 4 MINOR-5).
+        let (_src, mut entries) = chain_of(2);
+        entries[1].subject = Some("s".repeat(crate::audit::MAX_AUDIT_SUBJECT_BYTES + 1));
+        // Re-hash over the oversized subject, so the row is internally
+        // VALID and the size cap is the only possible refusal — the
+        // same reason i20 re-hashes.
+        let action = crate::audit::action_from_str(&entries[1].action).expect("action");
+        entries[1].entry_hash = harness_core::audit_entry_hash(
+            node(1),
+            entries[1].seq,
+            entries[1].at_ms,
+            action,
+            entries[1].subject.as_deref(),
+            entries[1].detail.as_deref(),
+            &entries[1].actor,
+            &entries[1].prev_hash,
+        )
+        .expect("hash");
+        let dst = Store::open_memory().expect("dst");
+        assert_eq!(
+            dst.audit_ingest_range(node(9), node(1), 2, &entries, now())
+                .expect("ingest")
+                .expect_err("refuse"),
+            IngestRefusal::SubjectTooLarge { seq: 2 }
         );
     }
 

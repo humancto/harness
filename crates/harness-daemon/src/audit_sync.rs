@@ -13,7 +13,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
-use harness_core::{AuditHead, AuditSyncEnvelope, Identity, NodeId, PublicKey, Signable};
+use harness_core::{
+    AuditEntriesEnvelope, AuditHead, AuditSyncEnvelope, Identity, NodeId, PublicKey, Signable,
+};
 use harness_mesh::trust::TrustStore;
 use harness_store::{PinOutcome, Store};
 use parking_lot::Mutex as ParkingMutex;
@@ -57,8 +59,8 @@ const REQUEST_TIMEOUT_MS: u64 = 30_000;
 /// rows under the single process-wide connection mutex, and a
 /// `RangeReq` is replayable, so the only thing between a trusted peer
 /// and unbounded read work is this.
-const SERVE_BATCHES_PER_MINUTE: u32 = 20;
-const SERVE_WINDOW_MS: u64 = 60_000;
+pub(crate) const SERVE_BATCHES_PER_MINUTE: u32 = 20;
+pub(crate) const SERVE_WINDOW_MS: u64 = 60_000;
 
 /// Follow-up rounds allowed per walk. `MAX_INGEST_ROWS_PER_PULL`
 /// (5000) rows per round covers any realistic chain well inside this.
@@ -148,18 +150,17 @@ impl AuditSyncService {
     /// Returns the outcomes, for tests and logging. Called from the
     /// `harness.audit` recv arm, which has already checked the
     /// envelope signature against the connection peer.
+    ///
+    /// Heads only. Entry pulls arrive on `harness.audit.entries` and
+    /// land in [`Self::ingest_entries`] — see
+    /// [`harness_core::AuditEntriesEnvelope`] for why they are not two
+    /// more fields here.
     pub(crate) fn ingest(
         &self,
         from: NodeId,
         env: &AuditSyncEnvelope,
         now_ms: u64,
     ) -> Vec<(NodeId, PinOutcome)> {
-        if let Some(req) = &env.range_req {
-            self.serve_range(from, req, now_ms);
-        }
-        if let Some(resp) = &env.range_resp {
-            self.consume_range(from, resp, now_ms);
-        }
         let mut out = Vec::new();
         let keys = self.pubkey_map();
         for head in env.heads.iter().take(harness_core::MAX_HEADS_PER_ENVELOPE) {
@@ -244,6 +245,19 @@ impl AuditSyncService {
             }
         }
         out
+    }
+
+    /// Handle an entry-pull envelope from `harness.audit.entries`.
+    ///
+    /// The recv arm has already verified the envelope signature
+    /// against the connection peer and cross-checked `source`.
+    pub(crate) fn ingest_entries(&self, from: NodeId, env: &AuditEntriesEnvelope, now_ms: u64) {
+        if let Some(req) = &env.range_req {
+            self.serve_range(from, req, now_ms);
+        }
+        if let Some(resp) = &env.range_resp {
+            self.consume_range(from, resp, now_ms);
+        }
     }
 
     /// Our own signed head plus the newest third-party heads we hold.
@@ -356,8 +370,6 @@ impl AuditSyncService {
             source: self.local_id,
             assembled_at: now_ms,
             heads,
-            range_req: None,
-            range_resp: None,
             sig: harness_core::Signature::from_bytes([0u8; 64]),
         };
         if let Err(e) = env.sign(&self.identity) {
@@ -448,10 +460,9 @@ impl AuditSyncService {
             );
         }
         let to_seq = target_seq;
-        let mut env = AuditSyncEnvelope {
+        let mut env = AuditEntriesEnvelope {
             source: self.local_id,
             assembled_at: now_ms,
-            heads: Vec::new(),
             range_req: Some(harness_core::AuditRangeReq {
                 req_id,
                 node_id: subject,
@@ -465,7 +476,7 @@ impl AuditSyncService {
             self.inflight.lock().remove(&req_id);
             return false;
         }
-        if net.send_to(peer, OutboundMsg::AuditHeads(env)).is_err() {
+        if net.send_to(peer, OutboundMsg::AuditEntries(env)).is_err() {
             self.inflight.lock().remove(&req_id);
             return false;
         }
@@ -524,10 +535,9 @@ impl AuditSyncService {
         if entries.is_empty() {
             return;
         }
-        let mut env = AuditSyncEnvelope {
+        let mut env = AuditEntriesEnvelope {
             source: self.local_id,
             assembled_at: now_ms,
-            heads: Vec::new(),
             range_req: None,
             range_resp: Some(harness_core::AuditRangeResp {
                 req_id: req.req_id,
@@ -540,7 +550,7 @@ impl AuditSyncService {
         if env.sign(&self.identity).is_err() {
             return;
         }
-        let _ = net.send_to(peer, OutboundMsg::AuditHeads(env));
+        let _ = net.send_to(peer, OutboundMsg::AuditEntries(env));
     }
 
     fn may_serve(&self, peer: NodeId, now_ms: u64) -> bool {
@@ -555,6 +565,22 @@ impl AuditSyncService {
         }
         state.served_in_window += 1;
         true
+    }
+
+    /// How many batches this peer has been ALLOWED to be served in
+    /// the current window.
+    ///
+    /// The observable for `m16`/`m17`. Both the tier gate and the
+    /// budget return before `serve_range` looks up the net, so a test
+    /// that watched for a sent frame could not tell a refusal from a
+    /// peer with no connection — which is exactly how the round-bound
+    /// test managed to pass with its guard deleted (BLOCKER-1).
+    #[cfg(test)]
+    pub(crate) fn served_in_window_for_test(&self, peer: NodeId) -> u32 {
+        self.peers
+            .lock()
+            .get(&peer)
+            .map_or(0, |s| s.served_in_window)
     }
 
     /// Consume a batch of entries answering one of our requests.
@@ -653,7 +679,6 @@ impl AuditSyncService {
                 "audit range refused"
             ),
         }
-        let _ = flight.from_seq;
         Some(outcome)
     }
 

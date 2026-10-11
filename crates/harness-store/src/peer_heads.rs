@@ -378,6 +378,62 @@ impl Store {
         })
     }
 
+    /// The pin to verify next for one node: the one we observed most
+    /// recently, by OUR clock.
+    ///
+    /// Never `MAX(seq)`. `seq` is signed by the subject and
+    /// [`PinOutcome::RejectedSeq`] only refuses values above
+    /// `i64::MAX`, so a head signed at exactly `i64::MAX` is pinned
+    /// and would be the highest-seq pin for that node forever —
+    /// permanently aiming the verify endpoint at a position the honest
+    /// chain will never reach, so `reached_pin` never fires and no
+    /// honest pin for that node is ever corroborated. One validly
+    /// signed garbage head would let a subject decide whether it can
+    /// be audited at all. `newest_pin_as_head` already orders this way
+    /// for the relay path; this is the same rule for the verify path
+    /// (diff review round 4 BLOCKER-2).
+    ///
+    /// A bogus pin can still absorb ONE verify attempt while it is the
+    /// newest thing we saw. What it cannot do is hold that slot after
+    /// the subject's next honest head arrives.
+    pub fn newest_pin_by_observation(
+        &self,
+        node: NodeId,
+    ) -> Result<Option<PeerHeadPin>, StoreError> {
+        self.with_conn(|c| {
+            let row: Option<(i64, Vec<u8>, i64, i64, i64, String)> = c
+                .query_row(
+                    "SELECT seq, entry_hash, at_ms, first_seen_ms, observed_at_ms, status
+                       FROM audit_peer_heads
+                      WHERE node_id = ?1
+                      ORDER BY observed_at_ms DESC, seq DESC LIMIT 1",
+                    params![node.as_bytes()],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            Ok(row.map(
+                |(seq, hash, at_ms, first_seen, observed, status)| PeerHeadPin {
+                    node_id: node,
+                    seq: u64::try_from(seq).unwrap_or(0),
+                    entry_hash: to_hash(&hash),
+                    at_ms: u64::try_from(at_ms).unwrap_or(0),
+                    first_seen_ms: u64::try_from(first_seen).unwrap_or(0),
+                    observed_at_ms: u64::try_from(observed).unwrap_or(0),
+                    status: PinStatus::from_str(&status).unwrap_or(PinStatus::Unchecked),
+                },
+            ))
+        })
+    }
+
     /// The newest pin we hold for a node, rebuilt as a signed
     /// [`AuditHead`] so it can be RELAYED.
     ///

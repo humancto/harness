@@ -174,8 +174,12 @@ choose. ADR-0006's promise is retired, not deferred again.
   is the expected reaction to a flood. That flush runs in `shutdown()`
   itself, NOT on the housekeeping task's shutdown arm: `shutdown()`
   aborts every spawned task synchronously before its first await, so
-  such an arm is racy on a multi-thread runtime and unreachable on the
-  current-thread one the daemon uses. An exit that does not run `shutdown()`
+  such an arm never runs. (An earlier version of this sentence said the
+  daemon uses a current-thread runtime; it does not — `run_daemon`
+  builds `new_multi_thread`, and only `run_async_cli` is
+  current-thread. Round 4 of the 5.13c-2 review caught the error. The
+  conclusion is unchanged: the arm is unreachable because the abort
+  precedes the await, on either flavour.) An exit that does not run `shutdown()`
   still loses the open window's count — SIGKILL and power loss, but
   also **SIGTERM**, which is the normal production stop
   (`systemctl stop`, `docker stop`): `run_until_signal` awaits
@@ -393,6 +397,21 @@ stubbed — gating on Trusted would ship the entire pull path inert.
 **`peers.toml` membership is the trust boundary in this build**, and
 that is a statement about what exists, not an aspiration.
 
+Be precise about what the tier gate reaches, though, because the
+sentence above overstates it: `TrustStore::tier` returns
+`TrustTier::Default` for an *unknown* node, and nothing in this build
+constructs `Guest` either. So the gate fires only for a peer an
+operator hand-marked `tier = "guest"` in `peers.toml`. The admission
+that actually keeps strangers out is at the transport —
+`incoming.accept(|pk| trust.lookup_by_pubkey(pk).is_some())` in
+`lifecycle.rs` — and the rate limit is what bounds an admitted peer.
+The tier gate is an operator's explicit downgrade switch, not the
+thing standing between the mesh and an unknown caller. Round 4 of the
+review found both of these guards surviving their mutation test — the
+whole `harness-daemon` suite stayed green with either one deleted — so
+they now have tests of their own. A security property asserted here
+with no test is how the first three rounds of this PR went wrong.
+
 **Decision 19 — a served batch is bounded by bytes as well as rows.**
 `detail` is capped at 4 KiB per row, so a 5000-row cap alone permits a
 20 MB frame. The budget is 768 KiB against a 1 MiB channel cap;
@@ -465,6 +484,53 @@ non-reentrant and calling the setter from there would deadlock). Until
 behaviour so the exemption cannot quietly widen. `unverifiable`, by
 contrast, is **not** terminal (`i23`): it records an absence of
 evidence, and evidence arriving later should be allowed to settle it.
+
+**Decision 24 — entry pulls get their own channel, because putting
+them on the head envelope was the exact break Decision 10 forbids.**
+The first implementation added `range_req`/`range_resp` as two
+`Option` fields on `AuditSyncEnvelope`, with
+`#[serde(default, skip_serializing_if = "Option::is_none")]` and a
+comment claiming that made it compatible. The `default` covers only
+the old→new direction. The direction that matters is new→old, and
+Decision 10 spells out the mechanism three screens up:
+`Signable::canonical_bytes` re-encodes the DECODED struct, so a
+receiver that does not know a field drops it, re-encodes without it,
+and signature verification fails.
+
+Measured, not reasoned about — round 4 of the review built a probe
+declaring the 5.13c-1 struct shape and verifying real envelopes
+against it:
+
+```
+push envelope      -> old node verify: Ok(())
+range_req envelope -> old node DECODED, verify: Err(BadSignature)
+```
+
+`skip_serializing_if` saves a plain head push, so the defect hides
+until the first pull. Then: the old node's `channel_recv_loop` takes
+the error branch and **tears down its `harness.audit` stream**, our
+next head push to it fails, `note_send_failed` drives the backoff, and
+head pushes to that peer stop. Pin density is the security parameter
+of this whole design, so a change that silently reduces it on contact
+with an older peer is a wire BREAK dressed as an addition — Decision
+10's words, applied to the layer below where it was written. There is
+no protocol-version negotiation anywhere in this build, so nothing
+would have prevented it.
+
+`range_req`/`range_resp` therefore live on `harness.audit.entries` in
+their own signed `AuditEntriesEnvelope`, and `AuditSyncEnvelope` is
+byte-identical to its 5.13c-1 shape again (`harness.audit` keeps the
+64 KiB default frame too; the 1 MiB cap moved to the new channel with
+the batches that needed it). An old node returns `None` from
+`channels::known`, resets the one unknown stream, and both the
+connection and its head pushes survive. That is the `TASK_LEASE`
+precedent, and it is the same reasoning that kept heads off the
+heartbeat in 5.13c-1 — the lesson simply had to be learned twice, one
+layer down.
+
+A consequence worth stating: this is now the shape any future field
+on either envelope must take. A new field on a signed wire type is
+never additive across versions in this codebase; a new channel is.
 
 ### What 5.13c-2 does NOT give you
 

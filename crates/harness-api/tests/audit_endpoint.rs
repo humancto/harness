@@ -365,3 +365,96 @@ async fn audit_verify_endpoint_is_routed_and_walks_from_the_previous_pin() {
         &[(peer, 6, 9)]
     );
 }
+
+/// 5.13c-2, round 4 BLOCKER-2: the verify target is the pin WE saw
+/// most recently, never the highest `seq`.
+///
+/// `seq` is signed by the subject and `PinOutcome::RejectedSeq` only
+/// refuses values above `i64::MAX`, so a head signed at exactly
+/// `i64::MAX` is pinned and stays the highest-seq pin for that node
+/// forever. Selecting on `MAX(seq)` therefore let one validly signed
+/// garbage head aim every verify attempt past the honest chain:
+/// `reached_pin` never fires, `settle_pin_from_run` is never called,
+/// and no pin for that node can ever be corroborated — the subject
+/// deciding whether it is auditable at all. This endpoint is the only
+/// non-test trigger for a pull, so that was the whole feature.
+///
+/// ADR-0041 Decision 14 fixed the identical bug on the relay path in
+/// 5.13c-1; this is the governing rule of the subsystem — no ordering
+/// decision may key on a field the subject of that ordering controls.
+#[tokio::test]
+async fn audit_verify_target_ignores_an_absurd_subject_chosen_seq() {
+    let store = Store::open_memory().expect("store");
+    let puller = Arc::new(StubPuller::default());
+    let identity = Arc::new(Identity::generate());
+    let admin = AdminFile::from_password("hunter2").expect("hash");
+    let state = ApiStateBuilder::new(identity, "test")
+        .with_auth(Arc::new(AuthProvider::new(Some(admin))))
+        .with_store(store.clone())
+        .with_audit_puller(puller.clone())
+        .build();
+    let app = router(state);
+    let login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"password":"hunter2"}"#))
+                .expect("req"),
+        )
+        .await
+        .expect("login");
+    let token = body_json(login).await["token"]
+        .as_str()
+        .expect("token")
+        .to_string();
+
+    let peer = harness_core::NodeId::from_bytes([7u8; 16]);
+    // The garbage head is pinned FIRST, so it is both the highest seq
+    // and the oldest observation. Only an `observed_at_ms` ordering
+    // can tell the two apart.
+    let absurd = u64::try_from(i64::MAX).expect("i64::MAX fits u64");
+    for (seq, hash, observed) in [
+        (absurd, 0xCCu8, 1_000u64),
+        (5, 0xAA, 5_000),
+        (9, 0xBB, 9_000),
+    ] {
+        store
+            .pin_peer_head(
+                &harness_core::AuditHead {
+                    node_id: peer,
+                    seq,
+                    entry_hash: [hash; 32],
+                    at_ms: seq,
+                    sig: harness_core::Signature::from_bytes([1u8; 64]),
+                },
+                peer,
+                observed,
+            )
+            .expect("pin");
+    }
+    // It really is stored and really is the highest seq, so this test
+    // is not passing because the pin was rejected on the way in.
+    let pins = store.peer_head_pins(peer).expect("pins");
+    assert_eq!(
+        pins.last().expect("pin").seq,
+        absurd,
+        "the absurd head is pinned and is MAX(seq) — the defect's premise"
+    );
+
+    let resp = post(&app, Some(&token), &format!("/api/v1/audit/verify/{peer}")).await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["target_seq"],
+        serde_json::json!(9),
+        "the newest pin by OUR clock, not the subject's biggest number"
+    );
+    assert_eq!(body["from_seq"], serde_json::json!(6));
+    assert_eq!(
+        puller.calls.lock().expect("lock").as_slice(),
+        &[(peer, 6, 9)]
+    );
+}

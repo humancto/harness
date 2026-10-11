@@ -26,6 +26,19 @@ use crate::open::Store;
 /// are hashes and identifiers, never payloads.
 pub const MAX_AUDIT_DETAIL_BYTES: usize = 4096;
 
+/// Ceiling on an INGESTED row's `subject` (5.13c-2, diff review round
+/// 4 MINOR-5).
+///
+/// Unlike `detail` there is no cap on the local append path: a local
+/// `subject` is bounded only by the 64 KiB exec frame that produced
+/// it. The ingest path inherits the 1 MiB `harness.audit.entries`
+/// frame instead, so without this a peer could plant ~16x more
+/// subject bytes per row than any honest local append can hold — and
+/// ingested rows are never pruned, because `prune_audit_log` runs
+/// only for the local node. Set to the local bound rather than to
+/// `MAX_AUDIT_DETAIL_BYTES`: a tighter cap would refuse honest rows.
+pub const MAX_AUDIT_SUBJECT_BYTES: usize = 64 * 1024;
+
 /// 5.13b (ADR-0041 follow-up): how long an identical repeat of a
 /// FLOODABLE action is rate-limited per actor.
 ///
@@ -325,19 +338,6 @@ impl Store {
                         == Some(want_hex.as_str())
             })
         }))
-    }
-
-    /// Public wrapper: the stored hash at one position, for callers
-    /// outside this crate (the API's verify endpoint).
-    ///
-    /// # Errors
-    /// Underlying sqlite errors.
-    pub fn audit_entry_hash_at_pub(
-        &self,
-        node_id: NodeId,
-        seq: u64,
-    ) -> Result<Option<[u8; 32]>, StoreError> {
-        self.audit_entry_hash_at(node_id, seq)
     }
 
     /// Rows for one node from `from_seq`, ascending, bounded.

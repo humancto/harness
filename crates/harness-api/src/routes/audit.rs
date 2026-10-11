@@ -292,6 +292,33 @@ pub async fn verify_node_handler(
             .into_response();
     }
 
+    // The pin we observed most recently, by OUR clock — never
+    // `MAX(seq)`. `seq` is signed by the subject, so selecting on it
+    // let one head signed at `i64::MAX` own this endpoint's target
+    // forever: every attempt would aim past the honest chain,
+    // `reached_pin` would never fire, and no pin for that node could
+    // ever be corroborated. The subject would be choosing whether it
+    // can be audited (diff review round 4 BLOCKER-2). The relay path
+    // has ordered this way since 5.13c-1's re-review; this is the same
+    // rule applied to the one operator-facing trigger.
+    let target = match store.newest_pin_by_observation(node) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "no_pin_for_node" })),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            tracing::error!(target: "harness.api.audit", ?err, "newest_pin_by_observation");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "pins_failed" })),
+            )
+                .into_response();
+        }
+    };
     let pins = match store.peer_head_pins(node) {
         Ok(p) => p,
         Err(err) => {
@@ -303,14 +330,6 @@ pub async fn verify_node_handler(
                 .into_response();
         }
     };
-    let Some(target) = pins.last() else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "no_pin_for_node" })),
-        )
-            .into_response();
-    };
-
     // Walk from just past the PREVIOUS pin we hold, so the run is
     // anchored on evidence we took earlier rather than on the subject's
     // own say-so (diff review MAJOR-8).
