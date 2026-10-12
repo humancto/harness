@@ -1675,6 +1675,16 @@ thread_local! {
     /// asserting a limiter's counter instead of its line.
     static AUDIT_DROPPED_REPORTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static AUDIT_SUPPRESSING_SEEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Which emitted line carried `suppressing` — its 1-based ordinal
+    /// among the ERROR lines of the counted block.
+    ///
+    /// The count alone pins cardinality, not position, and the
+    /// difference is a real behaviour: `last_in_window: *count == 1`
+    /// announces on the FIRST line of the window, still exactly once,
+    /// so it passed a count-only assertion while telling an operator
+    /// the budget was spent with seven lines still to come — and
+    /// saying nothing on the line that actually spends it.
+    static AUDIT_SUPPRESSING_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Pulls `dropped_before` / `suppressing` out of an event's fields.
@@ -1690,6 +1700,9 @@ impl tracing::field::Visit for FieldGrab {
     fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
         if field.name() == "suppressing" && value {
             AUDIT_SUPPRESSING_SEEN.with(|c| c.set(c.get() + 1));
+            // `on_event` counts the line before visiting its fields,
+            // so this already includes the line being visited.
+            AUDIT_SUPPRESSING_AT.with(|c| c.set(AUDIT_ERRORS_SEEN.with(std::cell::Cell::get)));
         }
     }
 
@@ -1751,14 +1764,17 @@ fn count_audit_errors(f: impl FnOnce()) -> usize {
 /// every line conveys nothing — an operator still cannot tell the
 /// budget-spending line from the ones before it. That inverse
 /// mutation survived the whole suite when this returned a bool.
-fn observe_suppression(f: impl FnOnce()) -> (u64, usize) {
+fn observe_suppression(f: impl FnOnce()) -> (u64, usize, usize) {
     install_audit_counter();
     AUDIT_DROPPED_REPORTED.with(|c| c.set(0));
     AUDIT_SUPPRESSING_SEEN.with(|c| c.set(0));
+    AUDIT_SUPPRESSING_AT.with(|c| c.set(0));
+    AUDIT_ERRORS_SEEN.with(|c| c.set(0));
     f();
     (
         AUDIT_DROPPED_REPORTED.with(std::cell::Cell::get),
         AUDIT_SUPPRESSING_SEEN.with(std::cell::Cell::get),
+        AUDIT_SUPPRESSING_AT.with(std::cell::Cell::get),
     )
 }
 
@@ -1994,15 +2010,22 @@ fn m29c_a_suppressed_fork_line_is_counted_and_reported_not_silent() {
     // false, both left all 143 tests green — the same mistake as
     // asserting a limiter's counter instead of its line. So observe
     // what the EMITTED lines actually said.
-    let (_, suppressing) = observe_suppression(|| {
+    let (_, suppressing, announced_on) = observe_suppression(|| {
         for i in 0..14u8 {
             svc.ingest(b.node_id(), &envelope(&b, vec![sign_c(7, 0x40 + i)]), 1_000);
         }
     });
     assert_eq!(
         suppressing, 1,
-        "EXACTLY the line that spends the budget announces suppression — \
-         a flag that is always set says nothing an operator can use"
+        "exactly ONE line per window announces suppression — a flag \
+         that is always set says nothing an operator can use"
+    );
+    assert_eq!(
+        announced_on,
+        crate::audit_sync::FORK_LOGS_PER_WINDOW as usize,
+        "and it is the line that SPENDS the budget, not merely some \
+         line: announcing on the first one is still exactly once, but \
+         claims the budget is gone with seven lines still to come"
     );
     assert_eq!(
         svc.fork_logs_dropped_for_test(b.node_id()),
@@ -2012,7 +2035,7 @@ fn m29c_a_suppressed_fork_line_is_counted_and_reported_not_silent() {
 
     // The next window's first line CARRIES the count, and that is
     // what clears it — not the roll.
-    let (reported, _) = observe_suppression(|| {
+    let (reported, _, _) = observe_suppression(|| {
         svc.ingest(
             b.node_id(),
             &envelope(&b, vec![sign_c(7, 0xFE)]),
