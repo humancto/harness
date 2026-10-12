@@ -977,7 +977,23 @@ unstorable head discarded the whole envelope's writes.
   overflow arriving today is misbehaviour, at a rate the sender picks,
   on a channel with no message rate limit. A per-envelope `WARN` there
   would have been a log-flood vector handed to the sender. 1b-ii
-  promotes it to `warn` under the per-peer log window.
+  promotes it to `warn` under the per-peer log window. The const
+  assert is per-binary, though, and this crate's cap deliberately
+  leaves headroom for `RELAY_HEADS` to grow without a lockstep change:
+  so in a MIXED-VERSION mesh an upgraded sender whose
+  `1 + RELAY_HEADS` exceeds an older node's cap has the excess
+  truncated silently at `debug`, which is the one honest case the
+  original `warn` was justified by. Promoting it belongs with the log
+  window rather than before it.
+- The `debug_assert_eq!` on the `zip` pairing in `ingest` is a
+  placeholder, not a guard: it is compiled out in release and checks
+  only lengths, not order, so a skipped outcome plus a filler would
+  pass it while mis-attributing every later fork. The real coverage is
+  `p10` and `m28`, which index outcomes positionally. 1b-ii adds the
+  `continue` this protects against and should either promote it to a
+  plain `assert_eq!` (the invariant is internal, so a panic is not an
+  attacker-reachable DoS) or have `pin_peer_heads` return
+  `(head, outcome)` pairs so the pairing cannot drift at all.
 - Earlier drafts of this amendment stated the residual row growth as
   `allowance x sweep interval`. That was wrong on its own terms: each
   admitted position also carried up to 8 conflict rows and an overflow

@@ -298,7 +298,7 @@ impl Store {
     ///   Every head in one envelope is pinned at the same receiver-side
     ///   instant, so without a tie-breaker the "newest N" count sees
     ///   zero newer rows for ALL of them and exempts every one — a
-    ///   peer sending 64 signed heads per envelope would defeat the
+    ///   peer sending a full envelope of signed heads would defeat the
     ///   bound outright.
     ///
     /// The OLDEST pin per node is always kept — it anchors the
@@ -1048,8 +1048,8 @@ mod tests {
         // Codex P1 on #66: every head in one envelope is pinned at the
         // same receiver-side `now_ms`. Without a tie-breaker the
         // "newest N" correlated count sees zero newer rows for all of
-        // them, exempts every one, and a peer sending 64 signed heads
-        // per envelope defeats the bound outright.
+        // them, exempts every one, and a peer sending a full envelope
+        // of signed heads defeats the bound outright.
         let s = Store::open_memory().expect("store");
         for seq in 1..=40u64 {
             s.pin_peer_head(
