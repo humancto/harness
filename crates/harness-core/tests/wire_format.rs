@@ -524,3 +524,169 @@ fn replica_sync_envelope_wire_format_is_stable() {
     // CHANGING THIS SNAPSHOT IS A WIRE-FORMAT BREAK.
     insta::assert_snapshot!("replica_sync_envelope_wire_v0", hex::encode(&buf));
 }
+
+// -----------------------------------------------------------------------------
+// 5.13c audit envelopes — frozen because round 5 found nothing enforcing
+// ADR-0041 Decision 24.
+//
+// Round 3 of #67 shipped two new fields on the SIGNED `AuditSyncEnvelope`.
+// `Signable::canonical_bytes` re-encodes the DECODED struct, so a node that
+// does not know a field re-encodes without it and signature verification
+// fails — a wire BREAK dressed as an addition, and the exact thing Decision
+// 10 forbids. `ReplicaSyncEnvelope`, the structurally identical gossip
+// envelope, was already pinned here; the audit ones were not, so the only
+// thing enforcing Decision 24 was reviewer vigilance — which is what failed.
+//
+// `audit_sync_envelope_wire_v0` is specifically the shape a 5.13c-1 node can
+// verify. If a future change needs a field on either envelope, the answer is
+// a NEW CHANNEL, not a re-snapshot.
+// -----------------------------------------------------------------------------
+
+fn fixture_audit_head(signer: &Identity, seq: u64) -> harness_core::AuditHead {
+    let mut head = harness_core::AuditHead {
+        node_id: signer.node_id(),
+        seq,
+        entry_hash: [0x5Au8; 32],
+        at_ms: 1_700_000_000_000,
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    head.sign(signer).expect("sign head");
+    head
+}
+
+#[test]
+fn audit_head_wire_format_is_stable() {
+    let signer = fixture_identity();
+    let head = fixture_audit_head(&signer, 42);
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&head, &mut buf).expect("serialize");
+
+    // CHANGING THIS SNAPSHOT IS A WIRE-FORMAT BREAK.
+    insta::assert_snapshot!("audit_head_wire_v0", hex::encode(&buf));
+}
+
+#[test]
+fn audit_sync_envelope_wire_format_is_stable() {
+    let source = fixture_identity();
+    let mut env = harness_core::AuditSyncEnvelope {
+        source: source.node_id(),
+        assembled_at: 1_700_000_000_000,
+        heads: vec![
+            fixture_audit_head(&source, 42),
+            fixture_audit_head(&source, 7),
+        ],
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    env.sign(&source).expect("sign envelope");
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&env, &mut buf).expect("serialize");
+
+    // CHANGING THIS SNAPSHOT IS A WIRE-FORMAT BREAK — and for this type
+    // specifically it also breaks 5.13c-1 head pushes.
+    insta::assert_snapshot!("audit_sync_envelope_wire_v0", hex::encode(&buf));
+}
+
+#[test]
+fn audit_entries_envelope_wire_format_is_stable() {
+    let source = fixture_identity();
+    let mut env = harness_core::AuditEntriesEnvelope {
+        source: source.node_id(),
+        assembled_at: 1_700_000_000_000,
+        range_req: Some(harness_core::AuditRangeReq {
+            req_id: [0x11u8; 16],
+            node_id: source.node_id(),
+            from_seq: 101,
+            to_seq: 200,
+        }),
+        range_resp: None,
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    env.sign(&source).expect("sign envelope");
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&env, &mut buf).expect("serialize");
+
+    // CHANGING THIS SNAPSHOT IS A WIRE-FORMAT BREAK.
+    insta::assert_snapshot!("audit_entries_envelope_wire_v0", hex::encode(&buf));
+}
+
+// -----------------------------------------------------------------------------
+// The REAL Decision 24 guard: cross-version verification.
+//
+// The snapshots above catch shape drift — a renamed field, a reordered one, a
+// changed type. They do NOT catch an `Option` field with
+// `skip_serializing_if = "Option::is_none"`, which encodes to identical bytes
+// while `None`.
+//
+// This test is a SECOND tripwire, not the primary one. Round 5 claimed it
+// caught what the snapshot missed; round 6 disproved that — both are
+// hand-written fixtures, so they co-vary. A field added to the struct and
+// populated in `push_round`, with the fixtures left at the default the
+// compiler nudges you to write, passes BOTH. The guard that actually reads
+// the wire is `m23` in `harness-daemon`, which decodes the envelope
+// `assemble_push_envelope` produces. This one stays because it is cheap and
+// catches the case where someone updates the fixtures too.
+//
+// If either fails, the answer is a NEW CHANNEL (ADR-0041 Decision 24), not a
+// new frozen shape.
+// -----------------------------------------------------------------------------
+
+/// The 5.13c-1 wire shape, frozen. Do not add fields.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenAuditSyncEnvelopeV1 {
+    source: NodeId,
+    assembled_at: u64,
+    heads: Vec<harness_core::AuditHead>,
+    sig: Signature,
+}
+
+impl Signable for FrozenAuditSyncEnvelopeV1 {
+    fn sig_field_mut(&mut self) -> &mut Signature {
+        &mut self.sig
+    }
+    fn sig_field(&self) -> &Signature {
+        &self.sig
+    }
+}
+
+#[test]
+fn a_5_13c_1_node_can_still_verify_our_head_pushes() {
+    let source = fixture_identity();
+    // Built the way the head-push path builds it: heads populated, because
+    // an empty envelope would pass even against a broken type.
+    let mut live = harness_core::AuditSyncEnvelope {
+        source: source.node_id(),
+        assembled_at: 1_700_000_000_000,
+        heads: vec![
+            fixture_audit_head(&source, 42),
+            fixture_audit_head(&source, 7),
+        ],
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    live.sign(&source).expect("sign envelope");
+
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&live, &mut buf).expect("serialize");
+    let old: FrozenAuditSyncEnvelopeV1 =
+        ciborium::de::from_reader(buf.as_slice()).expect("an old node decodes our envelope");
+
+    old.verify_signature(source.public_key())
+        .expect("a 5.13c-1 node must still verify a head push from current code");
+
+    // And the reverse: an envelope an OLD node signs must verify here, or
+    // we would stop accepting head pushes from peers that have not updated.
+    let mut from_old = FrozenAuditSyncEnvelopeV1 {
+        source: source.node_id(),
+        assembled_at: 1_700_000_000_000,
+        heads: vec![fixture_audit_head(&source, 42)],
+        sig: Signature::from_bytes([0u8; 64]),
+    };
+    from_old.sign(&source).expect("sign");
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&from_old, &mut buf).expect("serialize");
+    let live_decoded: harness_core::AuditSyncEnvelope =
+        ciborium::de::from_reader(buf.as_slice()).expect("we decode an old node's envelope");
+    live_decoded
+        .verify_signature(source.public_key())
+        .expect("current code must still verify a 5.13c-1 head push");
+}

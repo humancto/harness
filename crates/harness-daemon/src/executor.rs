@@ -530,8 +530,8 @@ pub(crate) fn prune_audit_log(store: &Store, node: NodeId) {
 pub(crate) const PIN_KEEP_RECENT: usize = 64;
 pub(crate) const PIN_LADDER_MS: u64 = 6 * 60 * 60 * 1000;
 
-/// Thin the peer-head pin table. Status-aware: `contradicted` and
-/// `unverifiable` pins are never evicted, because they ARE the
+/// Thin the peer-head pin table. Status-aware: only `unchecked` pins
+/// are ever evicted — every other status is a result, and they ARE the
 /// evidence.
 pub(crate) fn thin_peer_head_pins(store: &Store) {
     match store.thin_peer_head_pins(PIN_KEEP_RECENT, PIN_LADDER_MS) {

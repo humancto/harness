@@ -123,7 +123,7 @@ mod tests {
     #[test]
     fn open_memory_runs_migrations() {
         let s = Store::open_memory().expect("open");
-        assert_eq!(s.schema_version().unwrap(), "10");
+        assert_eq!(s.schema_version().unwrap(), "11");
     }
 
     #[test]
@@ -132,13 +132,13 @@ mod tests {
         let path = dir.path().join("harness.db");
         let cfg = StoreConfig::at(&path);
         let s = Store::open(&cfg).expect("open");
-        assert_eq!(s.schema_version().unwrap(), "10");
+        assert_eq!(s.schema_version().unwrap(), "11");
         assert!(path.exists());
 
         // Re-open is a no-op for migrations.
         drop(s);
         let s2 = Store::open(&cfg).expect("re-open");
-        assert_eq!(s2.schema_version().unwrap(), "10");
+        assert_eq!(s2.schema_version().unwrap(), "11");
     }
 
     #[test]
@@ -147,6 +147,6 @@ mod tests {
         let count: i64 = s
             .with_conn(|c| Ok(c.query_row("SELECT count(*) FROM _migrations", [], |r| r.get(0))?))
             .expect("count");
-        assert_eq!(count, 10);
+        assert_eq!(count, 11);
     }
 }

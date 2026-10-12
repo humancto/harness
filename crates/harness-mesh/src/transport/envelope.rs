@@ -94,6 +94,19 @@ pub mod channels {
     /// permanently. A new channel has no such failure mode.
     pub const AUDIT: &str = "harness.audit";
 
+    /// Entry pulls behind a pinned head (5.13c-2, ADR-0041 Decision
+    /// 24): `AuditEntriesEnvelope` carrying a `RangeReq` or a batch of
+    /// entries. A SEPARATE channel from [`AUDIT`] rather than two more
+    /// fields on the head envelope, for the reason stated there:
+    /// `Signable::canonical_bytes` re-encodes the DECODED struct, so
+    /// an added field makes a 5.13c-1 node re-encode without it and
+    /// fail verification — which resets the stream it arrived on and
+    /// takes that connection's HEAD pushes down with it. On its own
+    /// channel an old node returns `None` from [`known`], resets only
+    /// this stream, and head pushes keep working: the `TASK_LEASE`
+    /// precedent again.
+    pub const AUDIT_ENTRIES: &str = "harness.audit.entries";
+
     /// Map a wire-sourced name onto its static constant. `None` for
     /// anything we don't recognize — the stream gets reset.
     #[must_use]
@@ -108,6 +121,7 @@ pub mod channels {
             TASK_LEASE => Some(TASK_LEASE),
             GOSSIP_STATE => Some(GOSSIP_STATE),
             AUDIT => Some(AUDIT),
+            AUDIT_ENTRIES => Some(AUDIT_ENTRIES),
             _ => None,
         }
     }
@@ -127,7 +141,13 @@ pub mod channels {
     #[must_use]
     pub fn frame_cap(channel: &'static str) -> usize {
         match channel {
-            TASK_ASSIGN => 1024 * 1024,
+            // 5.13c-2's entry batches share assign's 1 MiB: the store
+            // bounds a served batch to MAX_SERVE_BYTES (768 KiB), so
+            // this leaves headroom for CBOR framing without inviting
+            // an oversized frame. [`AUDIT`] itself keeps the 64 KiB
+            // default it had in 5.13c-1 — a head is ~130 bytes and
+            // MAX_HEADS_PER_ENVELOPE bounds a batch well under that.
+            TASK_ASSIGN | AUDIT_ENTRIES => 1024 * 1024,
             TASK_RESULT => 8 * 1024 * 1024,
             ANNOUNCE | GOSSIP_STATE => 256 * 1024,
             TASK_PARTIAL => 64 * 1024,

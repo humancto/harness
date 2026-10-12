@@ -149,6 +149,11 @@ pub(crate) enum OutboundMsg {
     /// head just means the pin is taken on a later tick, and pins are
     /// idempotent.
     AuditHeads(harness_core::AuditSyncEnvelope),
+    /// Entry pull request or batch (5.13c-2) on its own channel.
+    /// Fire-and-forget like the heads: a lost request times out of the
+    /// in-flight table after `REQUEST_TIMEOUT_MS` and is simply asked
+    /// again later.
+    AuditEntries(harness_core::AuditEntriesEnvelope),
 }
 
 impl OutboundMsg {
@@ -163,6 +168,7 @@ impl OutboundMsg {
             OutboundMsg::Partial(_) => channels::TASK_PARTIAL,
             OutboundMsg::LeaseExtend(_) => channels::TASK_LEASE,
             OutboundMsg::AuditHeads(_) => channels::AUDIT,
+            OutboundMsg::AuditEntries(_) => channels::AUDIT_ENTRIES,
         }
     }
 }
@@ -542,6 +548,7 @@ impl PeerNet {
             // Signed at assembly like Gossip: the envelope is not
             // Sequenced, because pins are idempotent.
             OutboundMsg::AuditHeads(a) => ch.send(a).await,
+            OutboundMsg::AuditEntries(a) => ch.send(a).await,
             OutboundMsg::Partial(p) => {
                 let mut p = p.clone();
                 p.seq = ch.next_seq();
@@ -786,6 +793,42 @@ impl PeerNet {
                                     "audit envelope arrived before the sync service was attached"
                                 );
                                 self.handlers.on_audit_heads(peer_id, env);
+                            }
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                n if n == channels::AUDIT_ENTRIES => {
+                    match ch.recv::<harness_core::AuditEntriesEnvelope>().await {
+                        // `recv` verified the envelope signature
+                        // against the connection peer's pubkey. The
+                        // `source` cross-check is the same one the
+                        // head channel does: neither half of an entry
+                        // exchange is relayable, so a mismatch is a
+                        // replay of someone else's traffic.
+                        Ok(env) => {
+                            // The `source` cross-check lives in
+                            // `ingest_entries`, where a unit test can
+                            // reach it — a copy here survived deletion
+                            // with the whole daemon suite green
+                            // (round 5 MAJOR-3).
+                            if let Some(svc) = self.audit_sync() {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                                    .unwrap_or(0);
+                                svc.ingest_entries(peer_id, &env, now);
+                            } else {
+                                // Unreachable in the daemon, same as
+                                // the head arm: `attach_audit_sync`
+                                // runs in `build()` before the accept
+                                // loop is spawned.
+                                tracing::warn!(
+                                    target: "harness.audit.sync",
+                                    peer = %peer_id,
+                                    "audit entries arrived before the sync service was attached"
+                                );
                             }
                             Ok(())
                         }

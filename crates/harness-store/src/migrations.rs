@@ -55,6 +55,11 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "audit_peer_heads",
         include_str!("../migrations/V0010__audit_peer_heads.sql"),
     ),
+    (
+        11,
+        "audit_entry_ingest",
+        include_str!("../migrations/V0011__audit_entry_ingest.sql"),
+    ),
 ];
 
 pub(crate) fn run(conn: &Connection) -> Result<(), StoreError> {

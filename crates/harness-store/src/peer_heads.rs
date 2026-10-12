@@ -53,13 +53,32 @@ impl PinStatus {
         }
     }
 
-    /// Thinning may only ever evict these. A `Contradicted` or
-    /// `Unverifiable` pin is the record of something worth keeping,
-    /// and an age sweep that dropped it would be a second route to the
+    /// Thinning may only ever evict `Unchecked`. Every other status is
+    /// a RESULT — something we spent a chain walk to establish — and an
+    /// age sweep that dropped it would be a second route to the
     /// deletion this table exists to prevent.
+    ///
+    /// `Corroborated` used to be evictable, which round 7 showed was
+    /// exploitable: `MAX_HEADS_PER_ENVELOPE` is 64 and
+    /// `PIN_KEEP_RECENT` is also 64, so ONE 64-head envelope fills a
+    /// node's entire recent-pin window, and the next hourly sweep then
+    /// deleted its honest corroborated pins — keeping only the
+    /// `MIN(rowid)` row per node. The verdicts were unrecoverable:
+    /// `audit_run_corroborates` reads the pin, so deleting the pin
+    /// destroys the corroboration, and only the subject can mint a
+    /// replacement. It also defeated both of Decision 25's
+    /// mitigations at once, since `?seq=` cannot name a row that has
+    /// been deleted.
+    ///
+    /// Cost of keeping them: corroborated pins now accumulate. That is
+    /// bounded in practice because a corroborated pin requires a
+    /// successful walk over entries the subject actually served — it
+    /// is expensive for an attacker to create and cheap for an honest
+    /// peer — but a cap on corroborated pins belongs in 5.13c-3's
+    /// hygiene pass alongside `audit_ingest_runs` thinning.
     #[cfg_attr(not(test), allow(dead_code))] // pinned against the SQL by p06b
     fn evictable(self) -> bool {
-        matches!(self, PinStatus::Unchecked | PinStatus::Corroborated)
+        matches!(self, PinStatus::Unchecked)
     }
 }
 
@@ -319,10 +338,12 @@ impl Store {
     /// thins the rest to one per `ladder_ms` bucket. Two rules make
     /// this safe:
     ///
-    /// - Only `Unchecked`/`Corroborated` pins are ever evicted. A
-    ///   `Contradicted` pin is the evidence; an age sweep that dropped
-    ///   it would reintroduce, by the back door, the deletion the
-    ///   append-only design exists to prevent.
+    /// - Only `Unchecked` pins are ever evicted. Every other status
+    ///   is a RESULT — something a chain walk established — and an
+    ///   age sweep that dropped one would reintroduce, by the back
+    ///   door, the deletion the append-only design exists to prevent.
+    ///   `Corroborated` was evictable until round 8 of #67 showed a
+    ///   head flood plus the ordinary sweep deleting it.
     /// - Thinning keys on `first_seen_ms`, never on `seq`. A node that
     ///   floods 100k entries would otherwise push every honest
     ///   historical pin into the thinned tail.
@@ -346,18 +367,36 @@ impl Store {
             let tx = c.unchecked_transaction()?;
             let removed = tx.execute(
                 "DELETE FROM audit_peer_heads
-                  WHERE status IN ('unchecked','corroborated')
+                  WHERE status = 'unchecked'
                     AND rowid NOT IN (
                         -- newest N EVICTABLE pins per node. Filtered on
                         -- status so a burst of manufactured forks
                         -- cannot consume the recent window and
                         -- accelerate eviction of honest pins (diff
                         -- review, thinning wrinkle).
+                        --
+                        -- `b.status` is the load-bearing half: it
+                        -- counts how many newer pins sit ABOVE this
+                        -- one. Count non-evictable rows there and,
+                        -- once a node has `keep_recent` permanent
+                        -- pins — which `corroborated` now is — every
+                        -- `unchecked` pin scores outside the window
+                        -- and becomes evictable at once. `p06e` pins
+                        -- it (round 8 M7, which survived with the
+                        -- whole suite green).
+                        --
+                        -- `a.status` is a redundant narrowing, kept
+                        -- for symmetry and cheapness: the outer DELETE
+                        -- already touches only `unchecked`, so adding
+                        -- permanent rowids to this exemption list
+                        -- cannot change any outcome. It has no test
+                        -- because widening it is a genuine no-op, not
+                        -- because nobody looked (round 8 M6).
                         SELECT rowid FROM audit_peer_heads a
-                         WHERE a.status IN ('unchecked','corroborated')
+                         WHERE a.status = 'unchecked'
                            AND (SELECT COUNT(*) FROM audit_peer_heads b
                                  WHERE b.node_id = a.node_id
-                                   AND b.status IN ('unchecked','corroborated')
+                                   AND b.status = 'unchecked'
                                    AND (b.first_seen_ms > a.first_seen_ms
                                         OR (b.first_seen_ms = a.first_seen_ms
                                             AND b.rowid > a.rowid))) < ?1
@@ -378,6 +417,105 @@ impl Store {
         })
     }
 
+    /// The pin to verify next for one node: the one we observed most
+    /// recently, by OUR clock.
+    ///
+    /// Never `MAX(seq)`. `seq` is signed by the subject and
+    /// [`PinOutcome::RejectedSeq`] only refuses values above
+    /// `i64::MAX`, so a head signed at exactly `i64::MAX` is pinned
+    /// and would be the highest-seq pin for that node forever —
+    /// permanently aiming the verify endpoint at a position the honest
+    /// chain will never reach, so `reached_pin` never fires and no
+    /// honest pin for that node is ever corroborated. One validly
+    /// signed garbage head would let a subject decide whether it can
+    /// be audited at all. `newest_pin_as_head` already orders this way
+    /// for the relay path; this is the same rule for the verify path
+    /// (diff review round 4 BLOCKER-2).
+    ///
+    /// Order on `first_seen_ms DESC, seq ASC` — when we FIRST saw
+    /// that position, then the lower claim.
+    ///
+    /// Three attempts at this got it wrong, each time by keying on
+    /// something the subject controls:
+    ///
+    /// - Round 4: `MAX(seq)`. A head signed at `i64::MAX` owned the
+    ///   slot forever.
+    /// - Round 5: `observed_at_ms DESC, seq DESC`. Every head in one
+    ///   envelope is pinned with the same `now_ms`, so the subject
+    ///   manufactured a tie and `seq DESC` resolved it in its favour.
+    /// - Round 5 again, `seq ASC` plus an unchecked-first clause. The
+    ///   envelope is deliberately NOT replay-protected, so the subject
+    ///   re-pushes a genuine OLD head and `Refreshed` re-stamps
+    ///   `observed_at_ms` on that row: our clock stamps it, but the
+    ///   subject chooses WHAT gets stamped. And `Contradicted` is also
+    ///   `<> 'unchecked'`, so a subject that self-forked its own
+    ///   newest position handed the slot back to an older, lower pin —
+    ///   the clause was a regression, so it is gone.
+    ///
+    /// `first_seen_ms` is stamped once on INSERT and never touched by
+    /// the `Refreshed` branch, so a replayed old head keeps its
+    /// original value and cannot re-win.
+    ///
+    /// The tie breaks on `seq ASC`, not `rowid`. `rowid` looks like
+    /// our own value, but within ONE envelope it is the sender's `Vec`
+    /// order — so `rowid DESC` just hands the slot to whichever head
+    /// the sender listed last, which `p09` demonstrates. `seq` is the
+    /// subject's field either way, but ASC is the direction that
+    /// cannot be inflated: to win a tie you must claim a LOWER,
+    /// therefore reachable, position.
+    ///
+    /// # What this still does NOT give you
+    ///
+    /// A subject can mint a fresh signed position whenever it likes,
+    /// and any "newest" rule selects it. So a subject determined to
+    /// keep its honest head out of this one slot can do so by pushing
+    /// a new inflated head every tick. That is not a tie-break bug —
+    /// it is inherent to choosing ONE target from candidates the
+    /// subject generates, and no ordering fixes it.
+    ///
+    /// Two things address it instead: an operator can name the target
+    /// explicitly (`?seq=` on the verify endpoint), and 5.13c-3a's
+    /// eager sweep walks several unchecked pins per tick rather than
+    /// one. This function is the default for the manual path, not a
+    /// defence.
+    pub fn newest_pin_by_observation(
+        &self,
+        node: NodeId,
+    ) -> Result<Option<PeerHeadPin>, StoreError> {
+        self.with_conn(|c| {
+            let row: Option<(i64, Vec<u8>, i64, i64, i64, String)> = c
+                .query_row(
+                    "SELECT seq, entry_hash, at_ms, first_seen_ms, observed_at_ms, status
+                       FROM audit_peer_heads
+                      WHERE node_id = ?1
+                      ORDER BY first_seen_ms DESC, seq ASC LIMIT 1",
+                    params![node.as_bytes()],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            Ok(row.map(
+                |(seq, hash, at_ms, first_seen, observed, status)| PeerHeadPin {
+                    node_id: node,
+                    seq: u64::try_from(seq).unwrap_or(0),
+                    entry_hash: to_hash(&hash),
+                    at_ms: u64::try_from(at_ms).unwrap_or(0),
+                    first_seen_ms: u64::try_from(first_seen).unwrap_or(0),
+                    observed_at_ms: u64::try_from(observed).unwrap_or(0),
+                    status: PinStatus::from_str(&status).unwrap_or(PinStatus::Unchecked),
+                },
+            ))
+        })
+    }
+
     /// The newest pin we hold for a node, rebuilt as a signed
     /// [`AuditHead`] so it can be RELAYED.
     ///
@@ -385,6 +523,32 @@ impl Store {
     /// carries its own signature, so node C can learn A's head from B
     /// and still verify it against A's key. We are not re-signing
     /// anything — the stored signature is A's, returned verbatim.
+    ///
+    /// Ordered `first_seen_ms DESC, seq DESC`, which is NOT quite the
+    /// verify selector's rule and the difference is deliberate.
+    ///
+    /// `first_seen_ms` for the same reason: it is written once on
+    /// INSERT and never touched by the `Refreshed` branch, so a peer
+    /// re-pushing a head we already hold cannot re-take the slot.
+    /// `main` ordered on `observed_at_ms`, which that branch DOES
+    /// re-stamp, so this is the one improvement kept from the
+    /// relay-selection work.
+    ///
+    /// But `seq DESC`, not the verify path's `seq ASC`: for a verify
+    /// TARGET a lower claim is at least walkable, so preferring it is
+    /// safe. For RELAY a lower position is simply worse for everyone —
+    /// round 7 measured a trusted peer forwarding a genuine OLD head
+    /// of a third party and owning the position the mesh learned for
+    /// it, which `seq ASC` actively helped.
+    ///
+    /// This is still ONE slot, and one slot is still capturable by a
+    /// peer that introduces a previously-unseen position. Relaying a
+    /// bounded SET is the fix, and it is ROADMAP 5.13c-1b rather than
+    /// this item: the first attempt at it selected the set by
+    /// `first_seen_ms` too, so three unseen old heads took all three
+    /// slots and the honest head was evicted — a worse outcome than
+    /// one slot, shipped as a fix for it. `m25` pins this ordering;
+    /// `p09` covers the verify selector.
     pub fn newest_pin_as_head(&self, node: NodeId) -> Result<Option<(AuditHead, u64)>, StoreError> {
         self.with_conn(|c| {
             let row: Option<PinRow> = c
@@ -399,7 +563,7 @@ impl Store {
                     "SELECT seq, entry_hash, at_ms, sig, observed_at_ms
                        FROM audit_peer_heads
                       WHERE node_id = ?1
-                      ORDER BY observed_at_ms DESC, seq DESC LIMIT 1",
+                      ORDER BY first_seen_ms DESC, seq DESC LIMIT 1",
                     params![node.as_bytes()],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )
@@ -425,6 +589,82 @@ impl Store {
 
     /// Mark a pin's status (5.13c-2 drives this from entry pulls).
     pub fn set_pin_status(
+        &self,
+        node: NodeId,
+        seq: u64,
+        status: PinStatus,
+    ) -> Result<bool, StoreError> {
+        let seq = i64::try_from(seq).unwrap_or(i64::MAX);
+        self.with_conn(|c| {
+            // A CONTRADICTED pin never moves back (diff review
+            // BLOCKER on #67). Two validly-signed heads at one
+            // position is the strongest evidence this feature
+            // produces, and an unconditional UPDATE let a later walk
+            // of whichever side we happen to hold repaint it green.
+            //
+            // Not merely a display bug: thinning evicts `unchecked`
+            // pins, so a repainted pin becomes sweepable — Decision
+            // 12's rule ("a contradicted pin is the evidence")
+            // defeated through the back door. (`settle_pin_from_run`
+            // can still move a pin `Corroborated -> Unchecked` and so
+            // make an evidence-bearing row evictable again; that is
+            // reachable only by local tampering, never by the subject,
+            // and is recorded in the ADR's limits.)
+            //
+            // `Unverifiable` is deliberately NOT sticky (diff review
+            // MAJOR-5): ingest validates rows against the SUBJECT's
+            // hashes and cares only that they are not our own chain,
+            // so a third node that retained a range the owner pruned
+            // can serve it and legitimately corroborate. That is what
+            // relay is for. Only `contradicted` is terminal.
+            let n = c.execute(
+                "UPDATE audit_peer_heads SET status = ?3
+                  WHERE node_id = ?1 AND seq = ?2
+                    AND status <> 'contradicted'",
+                params![node.as_bytes(), seq, status.as_str()],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    /// The stored status of one pin, if we hold it.
+    ///
+    /// # Errors
+    /// Underlying sqlite errors.
+    pub fn pin_status(&self, node: NodeId, seq: u64) -> Result<Option<PinStatus>, StoreError> {
+        let seq = i64::try_from(seq).unwrap_or(i64::MAX);
+        self.with_conn(|c| {
+            let raw: Option<String> = c
+                .query_row(
+                    "SELECT status FROM audit_peer_heads WHERE node_id = ?1 AND seq = ?2",
+                    params![node.as_bytes(), seq],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(raw.map(|s| PinStatus::from_str(&s).unwrap_or(PinStatus::Unchecked)))
+        })
+    }
+
+    /// Force a pin's status, including out of `contradicted`.
+    ///
+    /// The ONLY intended caller is 5.13c-3's operator
+    /// acknowledgement — the one act that may legitimately retire a
+    /// fork verdict, and which records itself in the local chain so
+    /// the retirement is itself evidence.
+    ///
+    /// Fork detection does NOT use this and cannot (diff review
+    /// MAJOR-3): its `status = 'contradicted'` UPDATE runs inside
+    /// `pin_peer_head`'s own `with_conn` closure, and `with_conn`
+    /// takes the single process-wide mutex non-reentrantly, so
+    /// calling this from there would deadlock. An earlier version of
+    /// this doc named it as a caller, which was wrong.
+    ///
+    /// Ordinary settle paths use [`Self::set_pin_status`], which
+    /// refuses to leave `contradicted`.
+    ///
+    /// # Errors
+    /// Underlying sqlite errors.
+    pub fn force_pin_status(
         &self,
         node: NodeId,
         seq: u64,
@@ -752,5 +992,178 @@ mod tests {
         // oldest, with heavy overlap between those sets.
         assert!(after.len() <= 7, "kept {} pins", after.len());
         assert_eq!(after[0].seq, 1, "the oldest pin still anchors");
+    }
+    #[test]
+    fn p09_the_verify_target_does_not_break_a_tie_on_an_inflated_seq() {
+        // Round 6 MINOR-9 / BLOCKER-1, re-tested in round 7. Every
+        // head in one envelope is
+        // pinned at the same instant, so the tie-break decides, and
+        // `seq` is the SUBJECT's field — a `seq` tie-break let a
+        // subject choose both its own verify target and the head every
+        // honest peer relays for it. Both selectors key on our own
+        // insert order instead.
+        let s = Store::open_memory().expect("store");
+        let absurd = u64::try_from(i64::MAX).expect("fits");
+        // Honest first, inflated second, SAME instant — so insert
+        // order favours the attacker and only the key can save us.
+        s.pin_peer_head(&head(1, 9, 0x09, 9), node(2), 1_000)
+            .expect("pin honest");
+        s.pin_peer_head(&head(1, absurd, 0xFF, absurd), node(2), 1_000)
+            .expect("pin absurd");
+
+        // Both stored: the fix is in the ordering, never in discarding
+        // evidence.
+        let seqs: Vec<u64> = s
+            .peer_head_pins(node(1))
+            .expect("pins")
+            .into_iter()
+            .map(|p| p.seq)
+            .collect();
+        assert_eq!(seqs.len(), 2, "both positions are stored, have {seqs:?}");
+
+        // Verify target: newest position we FIRST saw, tie on the
+        // LOWER seq — never `MAX(seq)`.
+        let target = s
+            .newest_pin_by_observation(node(1))
+            .expect("target")
+            .expect("some pin");
+        assert_ne!(
+            target.seq, absurd,
+            "an inflated claim must not win the verify slot"
+        );
+
+        // The RELAY selector deliberately differs on the tie (`seq
+        // DESC`, see its doc comment), so it is not asserted here: for
+        // relay a lower position is simply worse, and with one slot
+        // the two capture directions are mutually exclusive. What both
+        // selectors DO share is `first_seen_ms`, so a re-push cannot
+        // re-take either slot.
+        s.pin_peer_head(&head(1, 9, 0x09, 9), node(2), 5_000)
+            .expect("re-push");
+        assert_ne!(
+            s.newest_pin_by_observation(node(1))
+                .expect("target")
+                .expect("some pin")
+                .seq,
+            absurd,
+            "a re-push must not move the verify target either"
+        );
+    }
+    #[test]
+    fn p06d_a_corroborated_pin_survives_being_pushed_out_of_the_recent_window() {
+        // Round 7 BLOCKER-1. `Corroborated` used to be evictable, so a
+        // flood that pushed an honest corroborated pin out of
+        // `PIN_KEEP_RECENT` made the hourly sweep delete it — and the
+        // verdict was unrecoverable, because `audit_run_corroborates`
+        // reads the pin, so losing the row loses the corroboration and
+        // only the subject can mint a replacement.
+        //
+        // p06b only checks that `evictable()` AGREES with the SQL, so
+        // flipping both together passes it. This asserts the policy.
+        let s = Store::open_memory().expect("store");
+        // An UNCHECKED pin first, so it takes the `MIN(rowid)`
+        // always-kept slot. Otherwise the corroborated pin would
+        // survive for being the oldest row rather than for its status,
+        // and the test would pass against the defect.
+        s.pin_peer_head(&head(1, 1, 0x01, 1), node(2), 1_000)
+            .expect("pin");
+        s.pin_peer_head(&head(1, 2, 0x02, 2), node(2), 1_001)
+            .expect("pin");
+        s.set_pin_status(node(1), 2, PinStatus::Corroborated)
+            .expect("corroborate");
+        // Newer pins, all in ONE age bucket (coarse ladder) so the
+        // bucket rule has something to thin, and enough of them that
+        // the corroborated pin at seq 2 is well outside keep_recent.
+        for i in 3..=40u64 {
+            s.pin_peer_head(
+                &head(1, i, u8::try_from(i).unwrap_or(0), i),
+                node(2),
+                1_000 + i,
+            )
+            .expect("pin");
+        }
+
+        s.thin_peer_head_pins(2, 1_000_000).expect("thin");
+
+        let survivors: Vec<(u64, PinStatus)> = s
+            .peer_head_pins(node(1))
+            .expect("pins")
+            .into_iter()
+            .map(|p| (p.seq, p.status))
+            .collect();
+        assert!(
+            survivors.contains(&(2, PinStatus::Corroborated)),
+            "a corroborated pin is EVIDENCE and must outlive the sweep; have {survivors:?}"
+        );
+        assert!(
+            survivors.len() < 40,
+            "and the sweep still thinned the unchecked ones; have {} rows",
+            survivors.len()
+        );
+    }
+    #[test]
+    fn p06e_permanent_pins_do_not_consume_the_recent_window() {
+        // Round 8 M6/M7: both `status` filters in the keep-recent
+        // subquery could be widened back to
+        // `IN ('unchecked','corroborated')` with the ENTIRE workspace
+        // suite green. They are not equivalent and the `b` one is the
+        // dangerous half: it counts the pins sitting ABOVE a candidate,
+        // so counting permanent rows there means that once a node has
+        // `keep_recent` corroborated pins — which never expire now —
+        // every `unchecked` pin scores outside the window and becomes
+        // evictable in one sweep.
+        let s = Store::open_memory().expect("store");
+        let keep = 4usize;
+
+        // UNCHECKED pins first (oldest), then `keep` corroborated ones
+        // that are NEWER. Order matters: the `b` subquery counts rows
+        // ABOVE a candidate, so the permanent rows have to sit above
+        // the candidate to discriminate at all. An earlier version of
+        // this test put them below and passed against both mutants.
+        for i in 1..=keep as u64 {
+            s.pin_peer_head(
+                &head(1, i, u8::try_from(i).unwrap_or(0), i),
+                node(2),
+                1_000 + i,
+            )
+            .expect("pin");
+        }
+        for i in (keep as u64 + 1)..=(keep as u64 * 2) {
+            s.pin_peer_head(
+                &head(1, i, u8::try_from(i).unwrap_or(0), i),
+                node(2),
+                2_000 + i,
+            )
+            .expect("pin");
+            s.set_pin_status(node(1), i, PinStatus::Corroborated)
+                .expect("corroborate");
+        }
+
+        s.thin_peer_head_pins(keep, 1_000_000).expect("thin");
+
+        let survivors: Vec<u64> = s
+            .peer_head_pins(node(1))
+            .expect("pins")
+            .into_iter()
+            .map(|p| p.seq)
+            .collect();
+
+        // Every unchecked pin has fewer than `keep` UNCHECKED rows
+        // above it, so all of them are inside the window and must
+        // live. Count the permanent rows there and they are all pushed
+        // out at once.
+        for i in 1..=keep as u64 {
+            assert!(
+                survivors.contains(&i),
+                "unchecked pin {i} is inside keep_recent and must survive; have {survivors:?}"
+            );
+        }
+        // And the permanent ones survive regardless of the window.
+        for i in (keep as u64 + 1)..=(keep as u64 * 2) {
+            assert!(
+                survivors.contains(&i),
+                "corroborated pin {i} must survive; have {survivors:?}"
+            );
+        }
     }
 }

@@ -129,7 +129,9 @@ pub async fn list_handler(
 
     let next_cursor = rows.last().map(|r| {
         serde_json::json!({
-            "before_ms": r.at_ms,
+            // The cursor must key on the same value the feed is
+            // ORDERED by, or paging skips or repeats ingested rows.
+            "before_ms": r.feed_ms,
             "before_node": r.node_id.to_string(),
             "before_seq": r.seq,
         })
@@ -239,4 +241,194 @@ fn parse_node(raw: &str) -> Result<harness_core::NodeId, ()> {
         bytes[i] = u8::from_str_radix(hex, 16).map_err(|_| ())?;
     }
     Ok(harness_core::NodeId::from_bytes(bytes))
+}
+
+/// Optional explicit target for the verify endpoint.
+///
+/// Selecting ONE pin to verify is inherently gameable: the subject
+/// mints the candidates, so it can always push a fresh inflated head
+/// and take whatever "newest" slot the default rule picks (round 6
+/// BLOCKER-1). Letting the operator name the position removes the
+/// adversary from the choice for the manual path, which is the path a
+/// human uses precisely when a node looks suspicious.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct VerifyQuery {
+    /// Pin to walk toward. Defaults to `newest_pin_by_observation`.
+    pub seq: Option<u64>,
+}
+
+/// The pin a verify request should walk toward.
+///
+/// `want` names one explicitly; it must EXIST, because silently
+/// falling back to the default would tell the operator their request
+/// was honoured when it was not.
+fn select_verify_target(
+    pins: &[harness_store::PeerHeadPin],
+    store: &harness_store::Store,
+    node: harness_core::NodeId,
+    want: Option<u64>,
+) -> Result<Option<harness_store::PeerHeadPin>, ()> {
+    match want {
+        // Served from the slice the caller already loaded. This used
+        // to re-scan the whole pin table, so one request cost two full
+        // scans and two allocations, each taking the process-wide
+        // store mutex (round 7 MINOR-11).
+        Some(seq) => Ok(pins.iter().find(|p| p.seq == seq).cloned()),
+        None => store.newest_pin_by_observation(node).map_err(|err| {
+            tracing::error!(target: "harness.api.audit", ?err, "newest_pin_by_observation");
+        }),
+    }
+}
+
+/// `POST /api/v1/audit/verify/:node` — ask the mesh to walk a peer's
+/// entries so its newest pin can be corroborated (5.13c-2).
+///
+/// Returns 202: the pull crosses the network and settles
+/// asynchronously, so this reports that a walk was STARTED and the
+/// caller re-reads the pin's status. Claiming a verdict here would be
+/// the same overstatement the History banner refuses.
+// Axum requires a handler future; nothing here awaits, because the
+// pull itself is fire-and-forget into the mesh.
+#[allow(clippy::unused_async)]
+pub async fn verify_node_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    axum::extract::Path(node): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<VerifyQuery>,
+) -> axum::response::Response {
+    if !is_authenticated(&state.auth, &headers) {
+        return unauthorized();
+    }
+    let Ok(node) = parse_node(&node) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "bad_node" })),
+        )
+            .into_response();
+    };
+    let Some(store) = state.store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "store_not_configured" })),
+        )
+            .into_response();
+    };
+    let Some(puller) = state.audit_puller.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "mesh_not_configured" })),
+        )
+            .into_response();
+    };
+    if node == state.local_node_id {
+        // Our own chain is verified locally; asking a peer to vouch
+        // for it would be asking the subject to corroborate itself.
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "own_chain" })),
+        )
+            .into_response();
+    }
+
+    // The pin we observed most recently, by OUR clock — never
+    // `MAX(seq)`. `seq` is signed by the subject, so selecting on it
+    // let one head signed at `i64::MAX` own this endpoint's target
+    // forever: every attempt would aim past the honest chain,
+    // `reached_pin` would never fire, and no pin for that node could
+    // ever be corroborated. The subject would be choosing whether it
+    // can be audited (diff review round 4 BLOCKER-2). The relay path
+    // has ordered this way since 5.13c-1's re-review; this is the same
+    // rule applied to the one operator-facing trigger.
+    let pins = match store.peer_head_pins(node) {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::error!(target: "harness.api.audit", ?err, "peer_head_pins");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "pins_failed" })),
+            )
+                .into_response();
+        }
+    };
+    let Ok(selected) = select_verify_target(&pins, store, node, query.seq) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "pins_failed" })),
+        )
+            .into_response();
+    };
+    let Some(target) = selected else {
+        // Distinguish the two 404s: an operator who named a seq needs
+        // to know THAT pin is missing, not that the node has none
+        // (round 7 MINOR-12).
+        let error = if query.seq.is_some() {
+            "no_such_pin"
+        } else {
+            "no_pin_for_node"
+        };
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": error })),
+        )
+            .into_response();
+    };
+    // Walk from just past the PREVIOUS pin we hold, so the run is
+    // anchored on evidence we took earlier rather than on the subject's
+    // own say-so (diff review MAJOR-8).
+    //
+    // The first version asked for `[target.seq, target.seq]` whenever
+    // we already held that row — a one-row "walk" that re-read
+    // something we had and proved nothing.
+    let from_seq = pins
+        .iter()
+        .filter(|p| p.seq < target.seq)
+        .map(|p| p.seq)
+        .max()
+        .map_or(1, |prev| prev.saturating_add(1));
+    // Resume a walk already under way (round 5 MINOR-9). A multi-batch
+    // walk whose request timed out leaves a run committed to
+    // `through_seq`, and `check_run_anchor` requires a continuing batch
+    // to start at `through_seq + 1` — so asking from the previous pin
+    // again was refused `NotContiguous` on every retry while this
+    // endpoint still answered 202, leaving that pin permanently
+    // unwalkable and the operator told it had started.
+    let from_seq = match store.audit_run_progress(node, target.seq) {
+        // Resume a PARTIAL walk. Clamped strictly below the target
+        // (round 6 MAJOR-5): a COMPLETE run has `through == target`,
+        // and resuming from `target + 1` asked for an empty range —
+        // `serve_range` returns early on an empty batch, so no reply
+        // ever came, the in-flight slot timed out, and the endpoint
+        // still answered `202 started: true`. Re-verifying any
+        // corroborated pin was a permanent silent no-op, which also
+        // meant `i02d`'s "tampering after a walk revokes
+        // corroboration" could never fire in production, because
+        // nothing could re-walk.
+        Ok(Some(through)) if through < target.seq => from_seq.max(through.saturating_add(1)),
+        // Complete, past the target, or no run at all: re-walk from
+        // the previous pin rather than asking for nothing.
+        Ok(_) => from_seq,
+        Err(err) => {
+            tracing::error!(target: "harness.api.audit", ?err, "audit_run_progress");
+            from_seq
+        }
+    };
+    // No `from_seq > target.seq` guard here, deliberately: it would
+    // be dead code (round 7 MINOR-5). `audit_peer_heads` has
+    // `CHECK (seq > 0)` so `target.seq >= 1`, the previous-pin term is
+    // strictly below the target, and the resume term is clamped the
+    // same way — so `from_seq <= target.seq` always holds. An earlier
+    // version of this handler returned 409 here and no test could
+    // reach it.
+    let started = puller.request_range(node, node, from_seq, target.seq);
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "started": started,
+            "node": node.to_string(),
+            "target_seq": target.seq,
+            "from_seq": from_seq,
+            "status": target.status.as_str(),
+        })),
+    )
+        .into_response()
 }

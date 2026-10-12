@@ -1390,6 +1390,7 @@ dependencies = [
  "parking_lot",
  "predicates",
  "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

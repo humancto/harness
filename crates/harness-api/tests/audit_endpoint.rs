@@ -1,5 +1,10 @@
 //! 5.13a: `GET /api/v1/audit` — the History feed over the hash chain.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+// The resume test walks all three run states plus the explicit target
+// in one sequence deliberately: the states are a progression (no run ->
+// partial -> complete) built by real ingest calls, and splitting them
+// would mean rebuilding that progression three times.
+#![allow(clippy::too_many_lines)]
 
 use std::sync::Arc;
 
@@ -8,6 +13,7 @@ use axum::{
     http::{header, Request, StatusCode},
 };
 use harness_api::{router, ApiStateBuilder, AuthProvider};
+use harness_core::AuditSink;
 use harness_core::{AuditAction, AuditActor, AuditRecord, Identity};
 use harness_mesh::AdminFile;
 use harness_store::Store;
@@ -208,4 +214,452 @@ async fn cancel_and_resume_are_recorded() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].subject.as_deref(), Some(task_id.as_str()));
     assert_eq!(rows[0].actor, "local_admin", "an operator, not a peer");
+}
+
+/// A stub puller, so the verify endpoint can be driven without a mesh.
+#[derive(Debug, Default)]
+struct StubPuller {
+    calls: std::sync::Mutex<Vec<(harness_core::NodeId, u64, u64)>>,
+}
+
+impl harness_api::AuditPuller for StubPuller {
+    fn request_range(
+        &self,
+        _peer: harness_core::NodeId,
+        subject: harness_core::NodeId,
+        from_seq: u64,
+        target_seq: u64,
+    ) -> bool {
+        self.calls
+            .lock()
+            .expect("lock")
+            .push((subject, from_seq, target_seq));
+        true
+    }
+}
+
+async fn post(app: &axum::Router, token: Option<&str>, uri: &str) -> axum::http::Response<Body> {
+    let mut req = Request::builder().method("POST").uri(uri);
+    if let Some(t) = token {
+        req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
+    }
+    app.clone()
+        .oneshot(req.body(Body::empty()).expect("req"))
+        .await
+        .expect("resp")
+}
+
+/// 5.13c-2: `POST /api/v1/audit/verify/:node`.
+///
+/// This test exists because the route was NOT registered on the first
+/// push: the edit landed in a file with no route table, the handler
+/// was `pub` so nothing warned, the build passed, and the endpoint
+/// 404'd while the docs claimed it shipped. A route with no test is a
+/// route that can silently disappear.
+#[tokio::test]
+async fn audit_verify_endpoint_is_routed_and_walks_from_the_previous_pin() {
+    let (app, store, token, _first_local) = app_store_token().await;
+    let peer = harness_core::NodeId::from_bytes([9u8; 16]);
+
+    // Unauthenticated is refused before anything else.
+    assert_eq!(
+        post(&app, None, &format!("/api/v1/audit/verify/{peer}"))
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Wrong method on a real path is 405, not 404 — proof the path
+    // itself is registered.
+    assert_eq!(
+        get(&app, Some(&token), &format!("/api/v1/audit/verify/{peer}"))
+            .await
+            .status(),
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+
+    // No puller wired: service unavailable, not 404.
+    assert_eq!(
+        post(&app, Some(&token), &format!("/api/v1/audit/verify/{peer}"))
+            .await
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    // Rebuild with a puller.
+    let puller = Arc::new(StubPuller::default());
+    let identity = Arc::new(Identity::generate());
+    let local = identity.node_id();
+    let admin = AdminFile::from_password("hunter2").expect("hash");
+    let state = ApiStateBuilder::new(identity, "test")
+        .with_auth(Arc::new(AuthProvider::new(Some(admin))))
+        .with_store(store.clone())
+        .with_audit_puller(puller.clone())
+        .build();
+    let app2 = router(state);
+    let login = app2
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"password":"hunter2"}"#))
+                .expect("req"),
+        )
+        .await
+        .expect("login");
+    let token2 = body_json(login).await["token"]
+        .as_str()
+        .expect("token")
+        .to_string();
+
+    // No pin for that node yet.
+    assert_eq!(
+        post(
+            &app2,
+            Some(&token2),
+            &format!("/api/v1/audit/verify/{peer}")
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // Our own chain is never verified by asking someone else.
+    assert_eq!(
+        post(
+            &app2,
+            Some(&token2),
+            &format!("/api/v1/audit/verify/{local}")
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    // Pins at 5 and 9: the walk starts just past the PREVIOUS pin, not
+    // at the target and not always at 1.
+    for (seq, hash) in [(5u64, 0xAAu8), (9, 0xBB)] {
+        store
+            .pin_peer_head(
+                &harness_core::AuditHead {
+                    node_id: peer,
+                    seq,
+                    entry_hash: [hash; 32],
+                    at_ms: seq,
+                    sig: harness_core::Signature::from_bytes([1u8; 64]),
+                },
+                peer,
+                seq * 1_000,
+            )
+            .expect("pin");
+    }
+    let resp = post(
+        &app2,
+        Some(&token2),
+        &format!("/api/v1/audit/verify/{peer}"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = body_json(resp).await;
+    assert_eq!(body["target_seq"], serde_json::json!(9));
+    assert_eq!(body["from_seq"], serde_json::json!(6));
+    assert_eq!(body["started"], serde_json::json!(true));
+    assert_eq!(
+        puller.calls.lock().expect("lock").as_slice(),
+        &[(peer, 6, 9)]
+    );
+}
+
+/// 5.13c-2, round 4 BLOCKER-2: the verify target is the pin WE saw
+/// most recently, never the highest `seq`.
+///
+/// `seq` is signed by the subject and `PinOutcome::RejectedSeq` only
+/// refuses values above `i64::MAX`, so a head signed at exactly
+/// `i64::MAX` is pinned and stays the highest-seq pin for that node
+/// forever. Selecting on `MAX(seq)` therefore let one validly signed
+/// garbage head aim every verify attempt past the honest chain:
+/// `reached_pin` never fires, `settle_pin_from_run` is never called,
+/// and no pin for that node can ever be corroborated — the subject
+/// deciding whether it is auditable at all. This endpoint is the only
+/// non-test trigger for a pull, so that was the whole feature.
+///
+/// ADR-0041 Decision 14 fixed the identical bug on the relay path in
+/// 5.13c-1; this is the governing rule of the subsystem — no ordering
+/// decision may key on a field the subject of that ordering controls.
+#[tokio::test]
+async fn audit_verify_target_ignores_an_absurd_subject_chosen_seq() {
+    let store = Store::open_memory().expect("store");
+    let puller = Arc::new(StubPuller::default());
+    let identity = Arc::new(Identity::generate());
+    let admin = AdminFile::from_password("hunter2").expect("hash");
+    let state = ApiStateBuilder::new(identity, "test")
+        .with_auth(Arc::new(AuthProvider::new(Some(admin))))
+        .with_store(store.clone())
+        .with_audit_puller(puller.clone())
+        .build();
+    let app = router(state);
+    let login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"password":"hunter2"}"#))
+                .expect("req"),
+        )
+        .await
+        .expect("login");
+    let token = body_json(login).await["token"]
+        .as_str()
+        .expect("token")
+        .to_string();
+
+    let peer = harness_core::NodeId::from_bytes([7u8; 16]);
+    // The garbage head is pinned FIRST, so it is both the highest seq
+    // and the oldest observation. Only an `observed_at_ms` ordering
+    // can tell the two apart.
+    let absurd = u64::try_from(i64::MAX).expect("i64::MAX fits u64");
+    for (seq, hash, observed) in [
+        (absurd, 0xCCu8, 1_000u64),
+        (5, 0xAA, 5_000),
+        (9, 0xBB, 9_000),
+    ] {
+        store
+            .pin_peer_head(
+                &harness_core::AuditHead {
+                    node_id: peer,
+                    seq,
+                    entry_hash: [hash; 32],
+                    at_ms: seq,
+                    sig: harness_core::Signature::from_bytes([1u8; 64]),
+                },
+                peer,
+                observed,
+            )
+            .expect("pin");
+    }
+    // It really is stored and really is the highest seq, so this test
+    // is not passing because the pin was rejected on the way in.
+    let pins = store.peer_head_pins(peer).expect("pins");
+    assert_eq!(
+        pins.last().expect("pin").seq,
+        absurd,
+        "the absurd head is pinned and is MAX(seq) — the defect's premise"
+    );
+
+    let resp = post(&app, Some(&token), &format!("/api/v1/audit/verify/{peer}")).await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["target_seq"],
+        serde_json::json!(9),
+        "the newest pin by OUR clock, not the subject's biggest number"
+    );
+    assert_eq!(body["from_seq"], serde_json::json!(6));
+    assert_eq!(
+        puller.calls.lock().expect("lock").as_slice(),
+        &[(peer, 6, 9)]
+    );
+}
+
+/// 5.13c-2, round 6 MAJOR-5: the resume path across all three run
+/// states, plus the explicit `?seq=` target.
+///
+/// `audit_run_progress` had no test anywhere — deleting the whole
+/// resume block left every harness-api test green — and the logic was
+/// wrong for the COMMON case: a run that COMPLETED has
+/// `through == target`, so resuming from `target + 1` asked for an
+/// empty range. `serve_range` returns early on an empty batch, so no
+/// reply ever came, the in-flight slot timed out, and the endpoint
+/// still answered `202 started: true`. Re-verifying any corroborated
+/// pin was a permanent silent no-op — which also meant `i02d`'s
+/// "tampering after a walk revokes corroboration" could never fire in
+/// production, because nothing could re-walk.
+#[tokio::test]
+async fn audit_verify_resumes_partial_runs_and_refuses_empty_ones() {
+    let store = Store::open_memory().expect("store");
+    let puller = Arc::new(StubPuller::default());
+    let identity = Arc::new(Identity::generate());
+    let admin = AdminFile::from_password("hunter2").expect("hash");
+    let state = ApiStateBuilder::new(identity, "test")
+        .with_auth(Arc::new(AuthProvider::new(Some(admin))))
+        .with_store(store.clone())
+        .with_audit_puller(puller.clone())
+        .build();
+    let app = router(state);
+    let login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"password":"hunter2"}"#))
+                .expect("req"),
+        )
+        .await
+        .expect("login");
+    let token = body_json(login).await["token"]
+        .as_str()
+        .expect("token")
+        .to_string();
+
+    let peer = harness_core::NodeId::from_bytes([3u8; 16]);
+    for (seq, hash, observed) in [(5u64, 0xAAu8, 5_000u64), (20, 0xBB, 9_000)] {
+        store
+            .pin_peer_head(
+                &harness_core::AuditHead {
+                    node_id: peer,
+                    seq,
+                    entry_hash: [hash; 32],
+                    at_ms: seq,
+                    sig: harness_core::Signature::from_bytes([1u8; 64]),
+                },
+                peer,
+                observed,
+            )
+            .expect("pin");
+    }
+
+    // 1. No run yet: walk from just past the previous pin.
+    let resp = post(&app, Some(&token), &format!("/api/v1/audit/verify/{peer}")).await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = body_json(resp).await;
+    assert_eq!(body["target_seq"], serde_json::json!(20));
+    assert_eq!(
+        body["from_seq"],
+        serde_json::json!(6),
+        "no run -> previous pin + 1"
+    );
+
+    // 2. A PARTIAL run: resume from where it got to, not from the pin.
+    //    (Driven through the real ingest path so the run row is real.)
+    let src = Store::open_memory().expect("src");
+    let sink = harness_store::audit::StoreAuditSink::new(src.clone(), peer);
+    for i in 0..20 {
+        sink.record(
+            harness_core::AuditRecord::new(
+                harness_core::AuditAction::TaskDispatched,
+                harness_core::AuditActor::System,
+            )
+            .with_subject(format!("t-{i}")),
+        );
+    }
+    let (entries, _) = src.audit_entries_for_range(peer, 1, 20).expect("serve");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(0))
+        .unwrap_or(0);
+    // Re-pin to the real hashes so the walk is coherent.
+    for e in [&entries[4], &entries[19]] {
+        store
+            .pin_peer_head(
+                &harness_core::AuditHead {
+                    node_id: peer,
+                    seq: e.seq,
+                    entry_hash: e.entry_hash,
+                    at_ms: e.at_ms,
+                    sig: harness_core::Signature::from_bytes([1u8; 64]),
+                },
+                peer,
+                now,
+            )
+            .expect("repin");
+    }
+    store
+        .audit_ingest_range(
+            harness_core::NodeId::from_bytes([9u8; 16]),
+            peer,
+            20,
+            &entries[..10],
+            now,
+        )
+        .expect("ingest")
+        .expect("accepted");
+    let progress = store.audit_run_progress(peer, 20).expect("progress");
+    assert_eq!(progress, Some(10), "a partial run committed through 10");
+
+    let resp = post(&app, Some(&token), &format!("/api/v1/audit/verify/{peer}")).await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["from_seq"],
+        serde_json::json!(11),
+        "partial run -> resume at through + 1"
+    );
+
+    // 3. A COMPLETE run: must NOT ask for an empty range and must not
+    //    claim it started one.
+    store
+        .audit_ingest_range(
+            harness_core::NodeId::from_bytes([9u8; 16]),
+            peer,
+            20,
+            &entries[10..],
+            now,
+        )
+        .expect("ingest")
+        .expect("accepted");
+    assert_eq!(
+        store.audit_run_progress(peer, 20).expect("progress"),
+        Some(20)
+    );
+
+    let resp = post(&app, Some(&token), &format!("/api/v1/audit/verify/{peer}")).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "a complete run re-walks from the previous pin rather than asking for nothing"
+    );
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["from_seq"],
+        serde_json::json!(6),
+        "re-verification stays possible"
+    );
+
+    // 4. The explicit operator target, which is the escape hatch for a
+    //    subject that games the default selection.
+    let resp = post(
+        &app,
+        Some(&token),
+        &format!("/api/v1/audit/verify/{peer}?seq=5"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert_eq!(body_json(resp).await["target_seq"], serde_json::json!(5));
+
+    // A named pin that does not exist is a 404, never a silent
+    // fallback to the default — that would report success for a
+    // request we did not honour.
+    let resp = post(
+        &app,
+        Some(&token),
+        &format!("/api/v1/audit/verify/{peer}?seq=999"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // And it says WHICH 404 it is: an operator who named a seq needs
+    // to know that pin is missing, not that the node has none
+    // (round 8 MINOR-15).
+    assert_eq!(
+        body_json(resp).await["error"],
+        serde_json::json!("no_such_pin")
+    );
+
+    let unknown = harness_core::NodeId::from_bytes([42u8; 16]);
+    let resp = post(
+        &app,
+        Some(&token),
+        &format!("/api/v1/audit/verify/{unknown}"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        body_json(resp).await["error"],
+        serde_json::json!("no_pin_for_node")
+    );
 }

@@ -730,8 +730,7 @@ impl DaemonOrchestrator {
         audit_sync.attach_net(&peer_net);
         peer_net.attach_audit_sync(&audit_sync);
 
-        let api_state =
-            harness_api::ApiStateBuilder::new(identity.clone(), config.mesh_name.clone())
+        let api_state = harness_api::ApiStateBuilder::new(identity.clone(), config.mesh_name.clone())
                 .with_node_name(config.node_name.clone())
                 .with_peers(heartbeat.peers())
                 .with_capabilities(cap_ids)
@@ -741,6 +740,9 @@ impl DaemonOrchestrator {
                 .with_secrets(secrets.clone())
                 .with_partials(partial_buffers)
                 .with_pause(pause.clone())
+                // 5.13c-2: without this the verify endpoint answers
+                // `mesh_not_configured` forever.
+                .with_audit_puller(audit_sync.clone())
                 .build();
         let api_handle = harness_api::serve(config.api_bind, api_state.clone())
             .await
@@ -795,6 +797,13 @@ impl DaemonOrchestrator {
     #[cfg(test)]
     pub(crate) fn partial_buffers(&self) -> Arc<harness_api::PartialBuffers> {
         self.api_state.partials.clone()
+    }
+
+    /// Audit-sync handle for test assertions — m12 drives a real pull
+    /// through the daemon's own service, not a fresh one.
+    #[cfg(test)]
+    pub(crate) fn audit_sync(&self) -> Arc<crate::audit_sync::AuditSyncService> {
+        self.audit_sync.clone()
     }
 
     /// Audit sink handle for test assertions.
@@ -1201,7 +1210,7 @@ async fn spawn_checkpoint_sweeper(
                 audit_sink.flush_suppressed();
                 crate::executor::prune_audit_log(&store, node);
                 // 5.13c-1: bound the pin table. Evidence-bearing pins
-                // (contradicted / unverifiable) are exempt.
+                // (anything but `unchecked`) are exempt.
                 crate::executor::thin_peer_head_pins(&store);
             }
             _ = shutdown.changed() => return,

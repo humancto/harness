@@ -26,6 +26,54 @@ use crate::open::Store;
 /// are hashes and identifiers, never payloads.
 pub const MAX_AUDIT_DETAIL_BYTES: usize = 4096;
 
+/// What a NEWLY APPENDED row's `subject` is truncated to.
+///
+/// `subject` had no cap at all before 5.13c-2: `shell.rs` passes
+/// `input.cmd` straight to `with_subject`, `cmd` is length-checked
+/// nowhere, and a `Task` arrives over a 1 MiB `TASK_ASSIGN` frame or
+/// over HTTP under axum's 2 MB default. Capping it going forward is
+/// right — a command line needing more than this is not something the
+/// History feed should render.
+pub const MAX_AUDIT_SUBJECT_BYTES: usize = MAX_AUDIT_DETAIL_BYTES;
+
+/// What an INGESTED row's `subject` may carry — deliberately LOOSER
+/// than [`MAX_AUDIT_SUBJECT_BYTES`] (round 6 MAJOR-4).
+///
+/// The two caps differ, and the asymmetry is the point. Rows with a
+/// subject far above the local cap ALREADY EXIST on any node that ran
+/// a long command under a build before 5.13c-2, because there was no
+/// local cap then. `subject` is inside `entry_hash`, so such a row can
+/// never be truncated into acceptability — and by this module's own
+/// ingest rules the refusal is fatal, not cosmetic: `validate_batch`
+/// stops at the first offending row and no follow-up is issued, so one
+/// legacy row makes the whole chain past it permanently unverifiable.
+///
+/// Round 5 set the ingest cap to the local one and called it "the two
+/// paths now agree by construction". They agree only for rows appended
+/// after that commit; the migration case is the one that matters.
+///
+/// The ceiling is the CHANNEL FRAME cap, which is the only value that
+/// makes the rule "anything that can cross the wire, we can ingest"
+/// actually true.
+///
+/// Two earlier choices both left a band stranded, and the second
+/// claimed it had not. 64 KiB (round 6) stranded legacy rows from
+/// 64 KiB to ~1 MiB. `MAX_SERVE_BYTES` (768 KiB, round 8) looked
+/// airtight — "a row larger than that cannot cross the wire anyway" —
+/// but the `harness.audit.entries` frame cap is 1 MiB, not 768 KiB,
+/// and `audit_entries_for_range` admits its first row
+/// unconditionally. So a legacy row with a 900 KiB `subject` IS
+/// served, DOES fit the frame, arrives — and was then refused
+/// `SubjectTooLarge`, which `validate_batch` makes fatal, stranding
+/// the whole chain past it (round 9 finding 4).
+///
+/// At the frame cap there is no band left: a row that cannot be
+/// framed cannot arrive, and anything that arrives is accepted.
+/// `m26` in `harness-daemon` pins this against
+/// `channels::frame_cap(AUDIT_ENTRIES)`, since this crate cannot
+/// depend on `harness-mesh` to read it directly.
+pub const MAX_INGESTED_SUBJECT_BYTES: usize = 1024 * 1024;
+
 /// 5.13b (ADR-0041 follow-up): how long an identical repeat of a
 /// FLOODABLE action is rate-limited per actor.
 ///
@@ -94,6 +142,14 @@ pub struct AuditRow {
     pub actor: String,
     pub prev_hash: [u8; 32],
     pub entry_hash: [u8; 32],
+    /// The timestamp the merged feed ORDERS by: our receive time for
+    /// an ingested peer row, the row's own `at_ms` for a local one
+    /// (5.13c-2, Codex P2 on #67).
+    ///
+    /// A peer's `at_ms` is inside its own hash preimage and therefore
+    /// chosen by that peer, so ordering the feed on it lets an
+    /// ingested row pick its own position in every node's History.
+    pub feed_ms: u64,
 }
 
 /// Keyset cursor for [`Store::audit_recent`] — the full ordering key,
@@ -126,7 +182,17 @@ fn row_to_audit(r: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRow> {
     let node_raw: Vec<u8> = r.get(0)?;
     let prev: Vec<u8> = r.get(7)?;
     let entry: Vec<u8> = r.get(8)?;
+    let at_ms = u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0);
+    // Queries that do not select the effective column fall back to
+    // `at_ms`, which is correct for local rows.
+    let feed_ms = r
+        .get::<_, Option<i64>>(9)
+        .ok()
+        .flatten()
+        .and_then(|v| u64::try_from(v).ok())
+        .unwrap_or(at_ms);
     Ok(AuditRow {
+        feed_ms,
         node_id: NodeId::from_bytes(<[u8; 16]>::try_from(node_raw.as_slice()).unwrap_or([0u8; 16])),
         seq: u64::try_from(r.get::<_, i64>(1)?).unwrap_or(0),
         at_ms: u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
@@ -137,6 +203,29 @@ fn row_to_audit(r: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRow> {
         prev_hash: to_hash(&prev),
         entry_hash: to_hash(&entry),
     })
+}
+
+/// Clamp a `subject` to [`MAX_AUDIT_SUBJECT_BYTES`] on a char
+/// boundary.
+///
+/// Truncating mid-codepoint would panic on slicing, and a subject
+/// arrives from a peer-supplied command line, so the boundary walk is
+/// not optional.
+fn truncate_subject(raw: &str) -> String {
+    if raw.len() <= MAX_AUDIT_SUBJECT_BYTES {
+        return raw.to_owned();
+    }
+    let mut end = MAX_AUDIT_SUBJECT_BYTES;
+    while end > 0 && !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    tracing::warn!(
+        target: "harness.store.audit",
+        bytes = raw.len(),
+        kept = end,
+        "audit subject over cap; truncated"
+    );
+    raw[..end].to_owned()
 }
 
 impl Store {
@@ -169,7 +258,7 @@ impl Store {
             }
         });
         let action = record.action;
-        let subject = record.subject.clone();
+        let subject = record.subject.as_deref().map(truncate_subject);
         self.with_conn(move |c| {
             let tx = c.unchecked_transaction()?;
             let head: Option<(i64, Vec<u8>)> = tx
@@ -309,6 +398,69 @@ impl Store {
         }))
     }
 
+    /// Rows for one node from `from_seq`, ascending, bounded.
+    pub(crate) fn audit_rows_from(
+        &self,
+        node_id: NodeId,
+        from_seq: u64,
+        max_rows: usize,
+    ) -> Result<Vec<AuditRow>, StoreError> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT node_id, seq, at_ms, action, subject, detail, actor,
+                        prev_hash, entry_hash
+                   FROM audit_log
+                  WHERE node_id = ?1 AND seq >= ?2
+               ORDER BY seq ASC
+                  LIMIT ?3",
+            )?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        node_id.as_bytes(),
+                        i64::try_from(from_seq).unwrap_or(i64::MAX),
+                        i64::try_from(max_rows).unwrap_or(i64::MAX),
+                    ],
+                    row_to_audit,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// One stored row's `prev_hash`.
+    pub(crate) fn entry_prev_hash_at(
+        &self,
+        node_id: NodeId,
+        seq: u64,
+    ) -> Result<Option<[u8; 32]>, StoreError> {
+        self.with_conn(|c| {
+            let raw: Option<Vec<u8>> = c
+                .query_row(
+                    "SELECT prev_hash FROM audit_log WHERE node_id = ?1 AND seq = ?2",
+                    params![node_id.as_bytes(), i64::try_from(seq).unwrap_or(i64::MAX)],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(raw.map(|b| to_hash(&b)))
+        })
+    }
+
+    /// Walk rows from `from_seq` WITHOUT re-checking the anchor — the
+    /// caller has established one (5.13c-2 anchors on a pin).
+    pub(crate) fn audit_verify_from_anchor(
+        &self,
+        node_id: NodeId,
+        from_seq: u64,
+        max_rows: usize,
+    ) -> Result<ChainStatus, StoreError> {
+        let rows = self.audit_rows_from(node_id, from_seq, max_rows)?;
+        if rows.is_empty() {
+            return Ok(ChainStatus::Empty);
+        }
+        Ok(verify_rows(node_id, &rows))
+    }
+
     /// The signed head of this node's chain — what a peer pins so a
     /// later rewrite is detectable (5.13c gossips it).
     ///
@@ -401,7 +553,7 @@ impl Store {
         })
     }
 
-    fn audit_entry_hash_at(
+    pub(crate) fn audit_entry_hash_at(
         &self,
         node_id: NodeId,
         seq: u64,
@@ -445,17 +597,21 @@ impl Store {
         };
         self.with_conn(|c| {
             let mut stmt = c.prepare(
+                // Ordered and paged on the EFFECTIVE timestamp — our
+                // receive time for ingested rows — so a peer cannot
+                // choose where its entries land in our History
+                // (Codex P2 on #67). The V0011 index covers this.
                 "SELECT node_id, seq, at_ms, action, subject, detail, actor,
-                        prev_hash, entry_hash
+                        prev_hash, entry_hash, COALESCE(received_at_ms, at_ms) AS feed_ms
                    FROM audit_log
                   WHERE (?1 IS NULL
-                         OR at_ms < ?1
-                         OR (at_ms = ?1
+                         OR COALESCE(received_at_ms, at_ms) < ?1
+                         OR (COALESCE(received_at_ms, at_ms) = ?1
                              AND (node_id < ?2
                                   OR (node_id = ?2 AND seq < ?3))))
                     AND (?4 IS NULL OR action = ?4)
                     AND (?5 IS NULL OR node_id = ?5)
-               ORDER BY at_ms DESC, node_id DESC, seq DESC
+               ORDER BY feed_ms DESC, node_id DESC, seq DESC
                   LIMIT ?6",
             )?;
             let rows = stmt
@@ -477,7 +633,7 @@ impl Store {
 }
 
 /// Walk an ascending run of one node's entries.
-fn verify_rows(node_id: NodeId, rows: &[AuditRow]) -> ChainStatus {
+pub(crate) fn verify_rows(node_id: NodeId, rows: &[AuditRow]) -> ChainStatus {
     let Some(first) = rows.first() else {
         return ChainStatus::Empty;
     };
@@ -524,7 +680,7 @@ fn verify_rows(node_id: NodeId, rows: &[AuditRow]) -> ChainStatus {
 /// and reproduce its hash — so rewriting a `task.dispatched` row's
 /// action to anything unrecognized would display the forged action
 /// while the chain reported "verified".
-fn action_from_str(s: &str) -> Option<AuditAction> {
+pub(crate) fn action_from_str(s: &str) -> Option<AuditAction> {
     Some(match s {
         "task.dispatched" => AuditAction::TaskDispatched,
         "task.cancelled" => AuditAction::TaskCancelled,
@@ -1541,5 +1697,55 @@ mod tests {
                 through_seq: BURST_ALLOWANCE + 1
             }
         );
+    }
+    #[test]
+    fn a10b_an_oversized_subject_is_truncated_on_a_char_boundary() {
+        // Round 5 MAJOR-4: `subject` was capped on INGEST but not
+        // locally, so an honest local row above the ingest cap was
+        // refused when a peer tried to replicate it — and the refusal
+        // stops the walk, because validate_batch returns on the first
+        // offending row and no follow-up is issued. The two paths now
+        // share one constant.
+        let store = Store::open_memory().expect("store");
+        let sink = StoreAuditSink::new(store.clone(), NodeId::from_bytes([1u8; 16]));
+        // The fixture has to STRADDLE the cap, or the boundary walk is
+        // never exercised (round 6 MINOR-8): an earlier version used a
+        // 2-byte char against a 4096-byte cap, where 4096 is always a
+        // boundary and a naive slice would not have panicked — so the
+        // test passed with the walk replaced by a bare slice.
+        // `MAX_AUDIT_SUBJECT_BYTES % 3 == 1`, so a 3-byte char lands
+        // mid-codepoint.
+        assert_eq!(
+            MAX_AUDIT_SUBJECT_BYTES % 3,
+            1,
+            "fixture assumes the cap is not a multiple of 3"
+        );
+        let subject = "\u{20ac}".repeat(MAX_AUDIT_SUBJECT_BYTES);
+        sink.record(
+            AuditRecord::new(AuditAction::TaskDispatched, AuditActor::System).with_subject(subject),
+        );
+        let rows = store.audit_recent(None, None, None, 10).expect("recent");
+        let stored = rows[0].subject.as_deref().expect("subject");
+        assert!(
+            stored.len() <= MAX_AUDIT_SUBJECT_BYTES,
+            "stored {} bytes, cap {MAX_AUDIT_SUBJECT_BYTES}",
+            stored.len()
+        );
+        assert!(!stored.is_empty(), "truncated, not dropped");
+        // The real property: what we kept is still valid UTF-8 ending
+        // on a boundary, and is the largest such prefix.
+        assert_eq!(
+            stored.len() % 3,
+            0,
+            "truncated on a char boundary, kept {} bytes",
+            stored.len()
+        );
+        assert!(
+            stored.len() > MAX_AUDIT_SUBJECT_BYTES - 3,
+            "and kept the largest prefix that fits"
+        );
+        // And what we store is exactly what ingest will accept, which
+        // is the property the two paths have to share.
+        assert!(stored.len() <= crate::audit::MAX_AUDIT_SUBJECT_BYTES);
     }
 }
