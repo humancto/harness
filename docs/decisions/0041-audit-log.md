@@ -765,3 +765,108 @@ What this item keeps, because they are its own:
   corroborated status have no UI. A fork or a failed corroboration
   surfaces as a log line, a database row, and a 202 from the verify
   endpoint. 5.13c-3 owns the operator surface.
+
+## Amendment — 5.13c-1b-i: the ingest allowance Decision 27 promised
+
+Decision 27 moved this work out of 5.13c-2 and promised 1b would
+record its resolution. Two sub-problems land here; the relay set and
+the conversion cap are 5.13c-1b-ii.
+
+**Decision 28 — the allowance is an integer, spent in OUR order, over
+the whole envelope.** Three shapes were tried and the first two both
+handed the decision to the adversary:
+
+| attempt | shape | how it failed |
+|---|---|---|
+| 1 | checked per head in `ingest`, before `pin_peer_head`, with a `continue` | a spent allowance dropped every head from that peer, `Fork` included, so a node could hide a rewrite of its own chain behind junk heads |
+| 2 | checked per head INSIDE `pin_peer_head` | `ingest` iterates the SENDER's `Vec` order, so this is an attacker-ordered allowance: junk listed first, the genuine head refused in every window, in every peer, forever |
+| 3 | one batched `pin_peer_heads`, allowance by value, spend order ours | — |
+
+Attempt 2 is the instructive one. It fixes attempt 1 exactly and
+reintroduces the class by a new route, and the harm is larger: the
+subject gets to collapse its own pin density, which this module calls
+the security parameter of the whole design. `p10` is that probe — junk
+listed before the honest head — and it fails against sender ordering.
+
+The spend order is the highest NEW position for each distinct subject
+first, then the remainder by descending seq, with the input index
+breaking ties only after both. A subject cannot crowd out its own
+honest head; a relayer cannot crowd out a third party's.
+
+An **integer** rather than a callback or trait handle, because a
+budget handle invoked from inside `pin_peer_head`'s `with_conn`
+closure that touched the store would deadlock the daemon *silently* —
+one process-wide non-reentrant `parking_lot::Mutex`, and Decision 23
+already records that hazard for `force_pin_status`. The batched form
+also replaces 64 lock acquisitions and 64 write transactions per
+envelope with one of each.
+
+Classification is never refused: `Fork`, `Refreshed` and
+`RejectedSeq` always proceed. `StalePinned` IS charged and refusable,
+and that needs stating because it shares the insert arm with `Pinned`
+— Decision 13's BLOCKER-1 was unconditional, permanent non-insertion
+driven by a seq comparison, which a per-window allowance ordered by us
+is not. `PinOutcome::BudgetRefused` makes a refusal visible, and
+`ingest`'s match has no `_` arm so the variant is a compile error at
+every site.
+
+**The number is derived, not picked.**
+
+```
+HONEST_PINS_PER_WINDOW = (1 + RELAY_HEADS) × (WINDOW / PUSH_INTERVAL)
+                       = 17 × 2 = 34
+```
+
+A relayed head carries that subject's *newest* pin, so on a mesh that
+is appending audit entries every subject's head advances between
+ticks: relayed heads are NEW positions, not refreshes. An earlier
+attempt assumed "almost all refreshes", picked 24 against this floor
+of 34, and claimed in its own doc comment that it never tripped. The
+window is FIXED rather than sliding, which doubles the worst honest
+burst, so the allowance is `2 × 34 + 4 = 72`. It errs high: a refusal
+is a permanent loss of pin density, while excess allowance costs only
+rows the hourly sweep already bounds. Three `const assert!`s pin the
+relationship, because a *number* is the artifact most likely to drift
+— round 6 recorded one moving 64 → 1024 with every test green.
+
+**This bounds ROW GROWTH, not work.** The ed25519 verify happens in
+`ingest` before the pin call, for every head, so no allowance placed
+there can bound crypto. Row growth is precisely the recorded gap. The
+two work levers that are in scope are taken: the batched single
+transaction above, and `MAX_HEADS_PER_ENVELOPE` dropped 64 → 24, since
+an honest sender emits 17 and the remaining 47 were pure attacker
+headroom in a receive-side `take()` that no signature covers.
+
+**Decision 29 — conflict rows are REFUSED beyond a per-position cap,
+never deleted.** `audit_head_conflicts`' UNIQUE key includes
+`other_hash`, which the subject mints freely, so one envelope could
+write a row per head — each an ed25519 verify plus a write — with no
+message rate limit on the channel. Beyond
+`MAX_CONFLICTS_PER_POSITION` the branch is counted in
+`audit_conflict_overflow` (V0012) and the row refused.
+
+Refused, not deleted, because deleting a conflict row would be
+Decision 12 by the back door: the kept rows carry both signatures in
+full and are the proof. The count is readable so an operator is told
+more branches exist rather than shown a silently partial picture, and
+the outcome still returns a stable `conflict_id` — 5.13c-3's
+acknowledgement binds by it, and suppression must never renumber.
+
+The per-head `AUDIT CHAIN FORK` ERROR line is bounded the same way,
+per peer per window, on 5.13b's `shell.denied` precedent: capping the
+rows leaves the log line as the floodable surface, so capping one
+without the other trades a row flood for a log flood.
+
+### What 5.13c-1b-i does NOT give you
+
+- **The relay slot is still one capturable position**, in both
+  directions. 5.13c-1b-ii.
+- **`contradicted` pins still accumulate.** 5.13c-2 made everything
+  but `unchecked` non-evictable, which was right for evidence and
+  opens an accumulation path at `allowance × sweep interval`.
+  5.13c-1b-ii caps the conversion rather than deleting rows.
+- **No message rate limit on `harness.audit`.** Charging cannot
+  substitute, because the cost is upstream of the charge.
+- **An over-allowance peer loses positions permanently.** A refused
+  position is not retried; the subject's next push may re-offer it,
+  but nothing guarantees that. This is why the allowance errs high.
