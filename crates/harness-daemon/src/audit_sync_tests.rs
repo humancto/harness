@@ -1264,16 +1264,24 @@ fn m23_the_envelope_production_sends_is_still_verifiable_by_a_5_13c_1_node() {
 #[test]
 fn m24_a_head_flood_cannot_sweep_away_a_nodes_corroborated_pins() {
     // Round 7 BLOCKER-1, the half that belongs to THIS item.
-    // `MAX_HEADS_PER_ENVELOPE` (64) is exactly `PIN_KEEP_RECENT` (64),
-    // so one 64-head envelope fills a node's whole recent-pin window —
-    // and the sweep used to then delete its honest CORROBORATED pins,
-    // keeping only `MIN(rowid)` per node. Unrecoverably:
-    // `audit_run_corroborates` reads the pin, so losing the row loses
-    // the verdict, and only the subject can mint a replacement.
+    // `MAX_HEADS_PER_ENVELOPE` used to be 64, exactly
+    // `PIN_KEEP_RECENT`, so ONE envelope filled a node's whole
+    // recent-pin window — and the sweep used to then delete its honest
+    // CORROBORATED pins, keeping only `MIN(rowid)` per node.
+    // Unrecoverably: `audit_run_corroborates` reads the pin, so losing
+    // the row loses the verdict, and only the subject can mint a
+    // replacement.
+    //
+    // 5.13c-1b-i narrowed the cap to 24, so one envelope no longer
+    // reaches 64 pins. That is a real improvement and exactly why this
+    // test must not quietly become weaker than its name: it keeps the
+    // ORIGINAL pressure by sending as many full envelopes as it takes
+    // to overfill `PIN_KEEP_RECENT`, so the sweep is still asked the
+    // question the round-7 defect got wrong.
     //
     // `corroborated` is the status THIS item introduces, so protecting
     // it from the sweep is this item's job. Bounding the flood itself
-    // is ROADMAP 5.13c-1b.
+    // is ROADMAP 5.13c-1b-ii.
     let (store, me, trust, b, c, _tmp) = trio();
     let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me, trust);
 
@@ -1289,24 +1297,52 @@ fn m24_a_head_flood_cannot_sweep_away_a_nodes_corroborated_pins() {
         h
     };
 
+    // An OLDER unchecked pin first, and it is load-bearing. The sweep
+    // exempts `MIN(rowid)` per node and `MIN(rowid)` per time bucket,
+    // and BOTH exemptions are status-blind. Ingesting the corroborated
+    // pin first made it rowid 1 for this node, so it was protected
+    // twice over by rules that never look at `status` — deleting the
+    // sweep's `status = 'unchecked'` filter outright, which is the
+    // round-7 defect in full, left this test passing. Seeding seq 50
+    // ahead of it takes both exemptions, so seq 100 survives only
+    // because it is corroborated, which is the property named above.
+    svc.ingest(c.node_id(), &envelope(&c, vec![sign_c(50, 0x32)]), 500);
     svc.ingest(c.node_id(), &envelope(&c, vec![sign_c(100, 0x64)]), 1_000);
     store
         .set_pin_status(c.node_id(), 100, PinStatus::Corroborated)
         .expect("corroborate");
 
-    // B floods genuine, validly signed positions of C — a full
-    // envelope, which is all it used to take.
-    let flood: Vec<harness_core::AuditHead> = (1..=64u64)
-        .map(|i| sign_c(1_000_000 + i, u8::try_from(i).unwrap_or(0)))
-        .collect();
-    let mut env = harness_core::AuditSyncEnvelope {
-        source: b.node_id(),
-        assembled_at: 2_000,
-        heads: flood,
-        sig: Signature::from_bytes([0u8; 64]),
-    };
-    env.sign(&b).expect("sign");
-    svc.ingest(b.node_id(), &env, 2_000);
+    // B floods genuine, validly signed positions of C, in as many
+    // full envelopes as it takes to overfill the recent window.
+    let cap = harness_core::MAX_HEADS_PER_ENVELOPE;
+    let needed = crate::executor::PIN_KEEP_RECENT + cap;
+    let mut sent = 0usize;
+    let mut tick = 2_000u64;
+    while sent < needed {
+        let flood: Vec<harness_core::AuditHead> = (0..cap)
+            .map(|j| {
+                let i = u64::try_from(sent + j).unwrap_or(0);
+                sign_c(
+                    1_000_000 + i + 1,
+                    u8::try_from((sent + j) % 251).unwrap_or(0),
+                )
+            })
+            .collect();
+        let mut env = harness_core::AuditSyncEnvelope {
+            source: b.node_id(),
+            assembled_at: tick,
+            heads: flood,
+            sig: Signature::from_bytes([0u8; 64]),
+        };
+        env.sign(&b).expect("sign");
+        svc.ingest(b.node_id(), &env, tick);
+        sent += cap;
+        tick += 1_000;
+    }
+    assert!(
+        store.peer_head_pins(c.node_id()).expect("pins").len() > crate::executor::PIN_KEEP_RECENT,
+        "the flood must actually overfill the recent window, or the sweep is never asked"
+    );
 
     store
         .thin_peer_head_pins(crate::executor::PIN_KEEP_RECENT, 3_600_000)
@@ -1415,5 +1451,112 @@ fn m26_the_ingest_subject_ceiling_matches_the_channel_frame_cap() {
             harness_mesh::transport::channels::AUDIT_ENTRIES
         ),
         "a row that can be framed must be ingestable, or refusing it strands the chain"
+    );
+}
+
+#[test]
+fn m27_an_oversized_envelope_is_truncated_and_the_cap_covers_an_honest_sender() {
+    // `MAX_HEADS_PER_ENVELOPE` is the ONLY bound on per-envelope
+    // crypto: `ingest` verifies each head before anything downstream
+    // can refuse it, so a sender that ignores the cap must be cut off
+    // by the receiver's own `take()` and not by trusting the count.
+    //
+    // The cap must also be wide enough for an HONEST envelope
+    // (`1 + RELAY_HEADS`), or the same `take()` discards the tail of a
+    // legitimate relay set. A const assert in `audit_sync` pins that
+    // direction; this pins the truncation itself.
+    let (store, me, trust, b, c, _tmp) = trio();
+    let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me, trust);
+    let cap = harness_core::MAX_HEADS_PER_ENVELOPE;
+    assert!(
+        cap > 16,
+        "the cap must fit an honest sender's own head plus its relay set"
+    );
+
+    let over: Vec<harness_core::AuditHead> = (1..=u64::try_from(cap + 8).unwrap_or(0))
+        .map(|i| {
+            let mut h = harness_core::AuditHead {
+                node_id: c.node_id(),
+                seq: i,
+                entry_hash: [u8::try_from(i % 251).unwrap_or(0); 32],
+                at_ms: i,
+                sig: Signature::from_bytes([0u8; 64]),
+            };
+            h.sign(&c).expect("sign");
+            h
+        })
+        .collect();
+    let outcomes = svc.ingest(b.node_id(), &envelope(&b, over), 2_000);
+    assert_eq!(
+        outcomes.len(),
+        cap,
+        "exactly the cap is classified; the tail is ignored, not trusted"
+    );
+    assert_eq!(
+        store.peer_head_pins(c.node_id()).expect("pins").len(),
+        cap,
+        "and nothing past the cap reached the store"
+    );
+}
+
+#[test]
+fn m28_a_same_envelope_fork_at_an_unheld_position_is_caught_at_ingest() {
+    // `p10`/`p11` prove the STORE classifies a same-envelope fork at a
+    // position we have never pinned. Nothing proved the second branch
+    // still reaches the store: the only thing that gets two branches
+    // at one position past `ingest` is the dedupe key being
+    // `(node_id, seq, entry_hash)` rather than `(node_id, seq)`, and
+    // narrowing that key left the whole workspace green. `m03` covers
+    // only a CROSS-envelope fork at an already-held position.
+    //
+    // That is a live trap rather than a hypothetical: ADR-0041
+    // Decision 28 tells 5.13c-1b-ii to dedupe candidates by
+    // `(node_id, seq)` before applying the allowance. Done at the
+    // wrong layer, that silently destroys the evidence — one ordinary
+    // pin, no conflict row, no log line, and a subject double-signs
+    // with impunity. This test is what makes that regression loud.
+    let (store, me, trust, b, c, _tmp) = trio();
+    let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me, trust);
+
+    let sign_c = |seq: u64, hash: u8| {
+        let mut h = harness_core::AuditHead {
+            node_id: c.node_id(),
+            seq,
+            entry_hash: [hash; 32],
+            at_ms: seq,
+            sig: Signature::from_bytes([0u8; 64]),
+        };
+        h.sign(&c).expect("sign");
+        h
+    };
+
+    // B relays two differently-signed branches of C at one position we
+    // do not hold, in ONE envelope.
+    let env = envelope(&b, vec![sign_c(7, 0xAA), sign_c(7, 0xBB)]);
+    let outcomes = svc.ingest(b.node_id(), &env, 2_000);
+
+    assert_eq!(
+        outcomes.len(),
+        2,
+        "both branches must be classified, not collapsed, got {outcomes:?}"
+    );
+    assert!(
+        matches!(outcomes[0].1, harness_store::PinOutcome::Pinned),
+        "the first branch pins, got {:?}",
+        outcomes[0].1
+    );
+    assert!(
+        matches!(outcomes[1].1, harness_store::PinOutcome::Fork { .. }),
+        "and the second is a FORK, got {:?}",
+        outcomes[1].1
+    );
+    let conflicts = store.head_conflicts(10).expect("conflicts");
+    assert_eq!(conflicts.len(), 1, "with a conflict row holding both sides");
+    assert_eq!(conflicts[0].held_hash, [0xAA; 32]);
+    assert_eq!(conflicts[0].other_hash, [0xBB; 32]);
+    assert_eq!(
+        conflicts[0].reported_by,
+        b.node_id(),
+        "provenance is the relayer, not the accused"
     );
 }

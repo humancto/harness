@@ -59,11 +59,14 @@ impl PinStatus {
     /// deletion this table exists to prevent.
     ///
     /// `Corroborated` used to be evictable, which round 7 showed was
-    /// exploitable: `MAX_HEADS_PER_ENVELOPE` is 64 and
-    /// `PIN_KEEP_RECENT` is also 64, so ONE 64-head envelope fills a
-    /// node's entire recent-pin window, and the next hourly sweep then
-    /// deleted its honest corroborated pins — keeping only the
-    /// `MIN(rowid)` row per node. The verdicts were unrecoverable:
+    /// exploitable: `MAX_HEADS_PER_ENVELOPE` was then 64, exactly
+    /// `PIN_KEEP_RECENT`, so ONE envelope filled a node's entire
+    /// recent-pin window, and the next hourly sweep then deleted its
+    /// honest corroborated pins — keeping only the `MIN(rowid)` row
+    /// per node. (5.13c-1b-i narrowed the cap to 24, so one envelope
+    /// no longer reaches 64 pins. That raises the cost of the flood;
+    /// it does not restore the verdicts, which is why the status
+    /// filter and not the cap is what makes this safe.) The verdicts were unrecoverable:
     /// `audit_run_corroborates` reads the pin, so deleting the pin
     /// destroys the corroboration, and only the subject can mint a
     /// replacement. It also defeated both of Decision 25's
@@ -123,7 +126,8 @@ pub enum PinOutcome {
     /// from not STORING it. Storing costs one row and buys a position
     /// a later contradiction can fork against.
     StalePinned,
-    /// `seq` exceeds what the store can represent (`i64::MAX`).
+    /// `seq` is outside what the store can represent: 0, which
+    /// `CHECK (seq > 0)` refuses, or above `i64::MAX`.
     ///
     /// Rejected rather than clamped (diff review MAJOR-3): clamping
     /// maps every oversized seq onto one row, so two distinct signed
@@ -143,9 +147,9 @@ fn to_sig(raw: &[u8]) -> Signature {
 }
 
 impl Store {
-    /// Record a peer's signed head.
+    /// Record a batch of signed heads in ONE transaction.
     ///
-    /// The caller MUST have verified `head`'s signature against
+    /// The caller MUST have verified every `head`'s signature against
     /// `head.node_id`'s own public key — not the relaying peer's.
     /// `reported_by` is provenance for a fork record, never blame.
     ///
@@ -153,115 +157,58 @@ impl Store {
     /// obvious "one row per node, higher seq wins" design deletes the
     /// pin the corroboration check needs, so a node that truncates and
     /// regrows past the pin reads as ordinary growth.
+    ///
+    /// One lock acquisition and one transaction for the whole
+    /// envelope, where the per-head path cost up to
+    /// `MAX_HEADS_PER_ENVELOPE` of each.
+    ///
+    /// No per-peer allowance is applied here, and that is deliberate
+    /// rather than pending: two spend orders were implemented and
+    /// withdrawn because each one let the sender pick who got refused.
+    /// ADR-0041 Decision 28 records both and why an allowance without
+    /// a sender-independent order is worse than none. 5.13c-1b-ii
+    /// carries the round-robin order that replaces them.
+    ///
+    /// Outcomes are returned per input head, in input order.
+    ///
+    /// # Errors
+    /// Underlying sqlite errors.
+    pub fn pin_peer_heads(
+        &self,
+        heads: &[AuditHead],
+        reported_by: NodeId,
+        now_ms: u64,
+    ) -> Result<Vec<PinOutcome>, StoreError> {
+        self.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            let mut out = Vec::with_capacity(heads.len());
+            for head in heads {
+                // An earlier head in this same batch may have
+                // inserted the position this one names, in which case
+                // the re-read inside `pin_one` sees it and classifies
+                // this one as the same-envelope fork it is.
+                out.push(pin_one(&tx, head, reported_by, now_ms)?);
+            }
+            tx.commit()?;
+            Ok(out)
+        })
+    }
+
+    /// Record one signed head. [`Self::pin_peer_heads`] with a
+    /// single-element slice, kept because most callers and tests have
+    /// exactly one head in hand.
+    ///
+    /// # Errors
+    /// Underlying sqlite errors.
     pub fn pin_peer_head(
         &self,
         head: &AuditHead,
         reported_by: NodeId,
         now_ms: u64,
     ) -> Result<PinOutcome, StoreError> {
-        // Never clamp a value a signature covers.
-        let Ok(seq) = i64::try_from(head.seq) else {
-            return Ok(PinOutcome::RejectedSeq);
-        };
         self.with_conn(|c| {
             let tx = c.unchecked_transaction()?;
-            let existing: Option<(Vec<u8>, i64, Vec<u8>)> = tx
-                .query_row(
-                    "SELECT entry_hash, at_ms, sig FROM audit_peer_heads
-                      WHERE node_id = ?1 AND seq = ?2",
-                    params![head.node_id.as_bytes(), seq],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .optional()?;
-
-            let outcome = match existing {
-                Some((held_hash, held_at, held_sig)) if to_hash(&held_hash) == head.entry_hash => {
-                    tx.execute(
-                        "UPDATE audit_peer_heads SET observed_at_ms = ?3
-                          WHERE node_id = ?1 AND seq = ?2",
-                        params![head.node_id.as_bytes(), seq, i64_ms(now_ms)],
-                    )?;
-                    let _ = (held_at, held_sig);
-                    PinOutcome::Refreshed
-                }
-                Some((held_hash, held_at, held_sig)) => {
-                    // The PK collision IS the fork detector. Keying the
-                    // table on the hash too would store both as
-                    // ordinary pins and detect nothing.
-                    tx.execute(
-                        "INSERT OR IGNORE INTO audit_head_conflicts(
-                             node_id, seq, held_hash, held_at_ms, held_sig,
-                             other_hash, other_at_ms, other_sig,
-                             reported_by, detected_at_ms)
-                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-                        params![
-                            head.node_id.as_bytes(),
-                            seq,
-                            held_hash,
-                            held_at,
-                            held_sig,
-                            head.entry_hash.as_slice(),
-                            i64_ms(head.at_ms),
-                            head.sig.to_bytes().as_slice(),
-                            reported_by.as_bytes(),
-                            i64_ms(now_ms),
-                        ],
-                    )?;
-                    let conflict_id: i64 = tx.query_row(
-                        "SELECT id FROM audit_head_conflicts
-                          WHERE node_id = ?1 AND seq = ?2
-                            AND held_hash = ?3 AND other_hash = ?4",
-                        params![
-                            head.node_id.as_bytes(),
-                            seq,
-                            held_hash,
-                            head.entry_hash.as_slice()
-                        ],
-                        |r| r.get(0),
-                    )?;
-                    // The held pin is now contradicted, and a
-                    // contradicted pin is never evicted by thinning.
-                    tx.execute(
-                        "UPDATE audit_peer_heads SET status = 'contradicted'
-                          WHERE node_id = ?1 AND seq = ?2",
-                        params![head.node_id.as_bytes(), seq],
-                    )?;
-                    PinOutcome::Fork { conflict_id }
-                }
-                None => {
-                    let highest: Option<i64> = tx
-                        .query_row(
-                            "SELECT MAX(seq) FROM audit_peer_heads WHERE node_id = ?1",
-                            params![head.node_id.as_bytes()],
-                            |r| r.get(0),
-                        )
-                        .optional()?
-                        .flatten();
-                    // ALWAYS insert. Whether this position is below the
-                    // newest we hold changes only the CLASSIFICATION
-                    // (it is not a regression claim), never whether we
-                    // keep the pin — see `PinOutcome::StalePinned`.
-                    tx.execute(
-                        "INSERT INTO audit_peer_heads(
-                             node_id, seq, entry_hash, at_ms, sig,
-                             first_seen_ms, observed_at_ms, status)
-                         VALUES (?1,?2,?3,?4,?5,?6,?6,'unchecked')",
-                        params![
-                            head.node_id.as_bytes(),
-                            seq,
-                            head.entry_hash.as_slice(),
-                            i64_ms(head.at_ms),
-                            head.sig.to_bytes().as_slice(),
-                            i64_ms(now_ms),
-                        ],
-                    )?;
-                    if highest.is_some_and(|h| seq < h) {
-                        PinOutcome::StalePinned
-                    } else {
-                        PinOutcome::Pinned
-                    }
-                }
-            };
+            let outcome = pin_one(&tx, head, reported_by, now_ms)?;
             tx.commit()?;
             Ok(outcome)
         })
@@ -351,7 +298,7 @@ impl Store {
     ///   Every head in one envelope is pinned at the same receiver-side
     ///   instant, so without a tie-breaker the "newest N" count sees
     ///   zero newer rows for ALL of them and exempts every one — a
-    ///   peer sending 64 signed heads per envelope would defeat the
+    ///   peer sending a full envelope of signed heads would defeat the
     ///   bound outright.
     ///
     /// The OLDEST pin per node is always kept — it anchors the
@@ -694,6 +641,140 @@ pub struct HeadConflict {
     pub detected_at_ms: u64,
 }
 
+/// One head, inside a transaction the caller owns.
+///
+/// Takes `&Transaction` rather than `&Store` so a whole envelope can
+/// run in one `with_conn`. It must never reach back into
+/// `Store::with_conn`: that holds a single process-wide, NON-reentrant
+/// `parking_lot::Mutex`, which blocks forever rather than panicking.
+/// ADR-0041 Decision 23 records the same hazard for
+/// `force_pin_status`.
+fn pin_one(
+    tx: &rusqlite::Transaction<'_>,
+    head: &AuditHead,
+    reported_by: NodeId,
+    now_ms: u64,
+) -> Result<PinOutcome, StoreError> {
+    // Never clamp a value a signature covers.
+    let Ok(seq) = i64::try_from(head.seq) else {
+        return Ok(PinOutcome::RejectedSeq);
+    };
+    // `audit_peer_heads` and `audit_head_conflicts` have both carried
+    // CHECK (seq > 0) since V0010, and a whole envelope now shares ONE
+    // transaction. Letting seq 0 reach the INSERT raises a constraint
+    // violation, which abandons that transaction and rolls back every
+    // honest head beside it — so a single self-signed seq-0 head,
+    // which any paired peer can mint for its own node_id, voids the
+    // entire envelope including heads for subjects it is the only path
+    // to. On the per-head path that cost one head; batched it costs
+    // all MAX_HEADS_PER_ENVELOPE of them, in every window, forever.
+    //
+    // Rejected at both ends of the range for the same reason the upper
+    // end is: the store cannot hold it, and clamping would forge a seq
+    // its signer never signed.
+    if seq == 0 {
+        return Ok(PinOutcome::RejectedSeq);
+    }
+    let existing: Option<(Vec<u8>, i64, Vec<u8>)> = tx
+        .query_row(
+            "SELECT entry_hash, at_ms, sig FROM audit_peer_heads
+              WHERE node_id = ?1 AND seq = ?2",
+            params![head.node_id.as_bytes(), seq],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+
+    let outcome = match existing {
+        Some((held_hash, held_at, held_sig)) if to_hash(&held_hash) == head.entry_hash => {
+            tx.execute(
+                "UPDATE audit_peer_heads SET observed_at_ms = ?3
+                  WHERE node_id = ?1 AND seq = ?2",
+                params![head.node_id.as_bytes(), seq, i64_ms(now_ms)],
+            )?;
+            let _ = (held_at, held_sig);
+            PinOutcome::Refreshed
+        }
+        Some((held_hash, held_at, held_sig)) => {
+            // The PK collision IS the fork detector. Keying the
+            // table on the hash too would store both as
+            // ordinary pins and detect nothing.
+            tx.execute(
+                "INSERT OR IGNORE INTO audit_head_conflicts(
+                     node_id, seq, held_hash, held_at_ms, held_sig,
+                     other_hash, other_at_ms, other_sig,
+                     reported_by, detected_at_ms)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![
+                    head.node_id.as_bytes(),
+                    seq,
+                    held_hash,
+                    held_at,
+                    held_sig,
+                    head.entry_hash.as_slice(),
+                    i64_ms(head.at_ms),
+                    head.sig.to_bytes().as_slice(),
+                    reported_by.as_bytes(),
+                    i64_ms(now_ms),
+                ],
+            )?;
+            let conflict_id: i64 = tx.query_row(
+                "SELECT id FROM audit_head_conflicts
+                  WHERE node_id = ?1 AND seq = ?2
+                    AND held_hash = ?3 AND other_hash = ?4",
+                params![
+                    head.node_id.as_bytes(),
+                    seq,
+                    held_hash,
+                    head.entry_hash.as_slice()
+                ],
+                |r| r.get(0),
+            )?;
+            // The held pin is now contradicted, and a
+            // contradicted pin is never evicted by thinning.
+            tx.execute(
+                "UPDATE audit_peer_heads SET status = 'contradicted'
+                  WHERE node_id = ?1 AND seq = ?2",
+                params![head.node_id.as_bytes(), seq],
+            )?;
+            PinOutcome::Fork { conflict_id }
+        }
+        None => {
+            let highest: Option<i64> = tx
+                .query_row(
+                    "SELECT MAX(seq) FROM audit_peer_heads WHERE node_id = ?1",
+                    params![head.node_id.as_bytes()],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            // ALWAYS insert. Whether this position is below the
+            // newest we hold changes only the CLASSIFICATION
+            // (it is not a regression claim), never whether we
+            // keep the pin — see `PinOutcome::StalePinned`.
+            tx.execute(
+                "INSERT INTO audit_peer_heads(
+                     node_id, seq, entry_hash, at_ms, sig,
+                     first_seen_ms, observed_at_ms, status)
+                 VALUES (?1,?2,?3,?4,?5,?6,?6,'unchecked')",
+                params![
+                    head.node_id.as_bytes(),
+                    seq,
+                    head.entry_hash.as_slice(),
+                    i64_ms(head.at_ms),
+                    head.sig.to_bytes().as_slice(),
+                    i64_ms(now_ms),
+                ],
+            )?;
+            if highest.is_some_and(|h| seq < h) {
+                PinOutcome::StalePinned
+            } else {
+                PinOutcome::Pinned
+            }
+        }
+    };
+    Ok(outcome)
+}
+
 fn i64_ms(ms: u64) -> i64 {
     i64::try_from(ms).unwrap_or(i64::MAX)
 }
@@ -967,8 +1048,8 @@ mod tests {
         // Codex P1 on #66: every head in one envelope is pinned at the
         // same receiver-side `now_ms`. Without a tie-breaker the
         // "newest N" correlated count sees zero newer rows for all of
-        // them, exempts every one, and a peer sending 64 signed heads
-        // per envelope defeats the bound outright.
+        // them, exempts every one, and a peer sending a full envelope
+        // of signed heads defeats the bound outright.
         let s = Store::open_memory().expect("store");
         for seq in 1..=40u64 {
             s.pin_peer_head(
@@ -1165,5 +1246,79 @@ mod tests {
                 "corroborated pin {i} must survive; have {survivors:?}"
             );
         }
+    }
+
+    #[test]
+    fn p10_one_unstorable_seq_does_not_void_the_rest_of_the_envelope() {
+        // `audit_peer_heads` has carried CHECK (seq > 0) since V0010,
+        // so a head at seq 0 cannot be stored. Batching the envelope
+        // into ONE transaction turned that from a per-head loss into a
+        // whole-envelope loss: the INSERT raised a constraint
+        // violation, the transaction was abandoned, and every honest
+        // head beside it was rolled back. Any paired peer can mint a
+        // self-signed seq-0 head for its own node_id, so this was one
+        // head per envelope away from denying pin density outright.
+        let s = Store::open_memory().expect("store");
+        let heads = vec![
+            head(1, 5, 0xAA, 5),
+            head(1, 0, 0xBB, 1),
+            head(1, 6, 0xCC, 6),
+        ];
+        let outcomes = s
+            .pin_peer_heads(&heads, node(2), 1_000)
+            .expect("the batch must COMMIT, not fail the envelope");
+        assert!(
+            matches!(outcomes[1], PinOutcome::RejectedSeq),
+            "seq 0 is not storable, got {:?}",
+            outcomes[1]
+        );
+        assert!(
+            matches!(outcomes[0], PinOutcome::Pinned) && matches!(outcomes[2], PinOutcome::Pinned),
+            "the honest heads beside it must survive, got {outcomes:?}"
+        );
+        let kept: Vec<u64> = s
+            .peer_head_pins(node(1))
+            .expect("pins")
+            .into_iter()
+            .map(|p| p.seq)
+            .collect();
+        assert_eq!(kept, vec![5, 6], "and must be durably pinned");
+    }
+
+    #[test]
+    fn p11_a_fork_between_two_new_branches_in_one_envelope_is_recorded() {
+        // p03 covers a fork against a position we ALREADY hold. This
+        // is the other half: both branches arrive in one envelope at a
+        // position we have never pinned. The first insert makes the
+        // position exist, so `pin_one`'s re-read inside the shared
+        // transaction sees it and classifies the second as the fork it
+        // is — rather than storing two unrelated pins and detecting
+        // nothing.
+        let s = Store::open_memory().expect("store");
+        let heads = vec![head(1, 7, 0xAA, 7), head(1, 7, 0xBB, 7)];
+        let outcomes = s.pin_peer_heads(&heads, node(2), 1_000).expect("pin batch");
+        assert!(
+            matches!(outcomes[0], PinOutcome::Pinned),
+            "the first branch pins, got {:?}",
+            outcomes[0]
+        );
+        assert!(
+            matches!(outcomes[1], PinOutcome::Fork { .. }),
+            "and the second is a fork, got {:?}",
+            outcomes[1]
+        );
+        let conflicts = s.head_conflicts(10).expect("conflicts");
+        assert_eq!(conflicts.len(), 1, "one conflict row for the pair");
+        // Both signatures are kept: that is what shows a third party
+        // the node signed two histories at one position.
+        assert_eq!(conflicts[0].held_hash, [0xAA; 32]);
+        assert_eq!(conflicts[0].other_hash, [0xBB; 32]);
+        let pins = s.peer_head_pins(node(1)).expect("pins");
+        assert_eq!(pins.len(), 1, "the fork adds evidence, not a second pin");
+        assert_eq!(
+            pins[0].status,
+            PinStatus::Contradicted,
+            "and the held pin is marked contradicted"
+        );
     }
 }

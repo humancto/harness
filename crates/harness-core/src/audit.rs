@@ -372,7 +372,24 @@ impl Signable for AuditEntriesEnvelope {
 
 /// Most heads one envelope may carry. A sender that exceeds this is
 /// misbehaving; the receiver truncates rather than trusting the count.
-pub const MAX_HEADS_PER_ENVELOPE: usize = 64;
+///
+/// Lowered from 64 to 24 in 5.13c-1b-i. An honest sender emits
+/// `1 + RELAY_HEADS` = 17 heads, so 64 left 47 heads of pure attacker
+/// headroom in a receive-side `take()` that no signature covers, and
+/// each of those heads costs the receiver an ed25519 verify. The cap
+/// is the ONLY bound on that work: the verify happens in `ingest`
+/// before anything downstream can refuse the head, so no per-peer
+/// budget can bound it — which is why this number is the one that
+/// matters and why it is not waiting on 5.13c-1b-ii.
+///
+/// It is also no longer equal to `PIN_KEEP_RECENT` (64), so a single
+/// envelope can no longer fill a node's whole recent-pin window.
+///
+/// 24 leaves headroom above 17 for a mesh that grows `RELAY_HEADS`
+/// without a lockstep change here; `harness-daemon` const-asserts the
+/// relationship, which this crate cannot do because `RELAY_HEADS`
+/// lives there.
+pub const MAX_HEADS_PER_ENVELOPE: usize = 24;
 
 /// Recording side of the audit log, implemented by `harness-store`.
 ///

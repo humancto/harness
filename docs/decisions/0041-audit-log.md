@@ -765,3 +765,240 @@ What this item keeps, because they are its own:
   corroborated status have no UI. A fork or a failed corroboration
   surfaces as a log line, a database row, and a 202 from the verify
   endpoint. 5.13c-3 owns the operator surface.
+
+## Amendment — 5.13c-1b-i: what the ingest allowance cost to attempt
+
+Decision 27 moved the pin flood-control layer out of 5.13c-2 and
+promised 1b would record its resolution. This amendment records
+something less convenient: the allowance was implemented twice, failed
+adversarial review both times for the same reason, and has been taken
+back out. What 1b-i ships is the substrate plus two bugs the attempt
+uncovered. The allowance itself is 5.13c-1b-ii.
+
+Writing this down rather than quietly re-cutting the scope is the
+point: four earlier rounds in this subsystem each "fixed" an ordering
+defect with a new ordering defect, and the only thing that broke the
+cycle was naming the rule being broken.
+
+**Decision 28 — an allowance whose spend order the SENDER can steer is
+worse than no allowance, so no allowance ships until the order is
+sender-independent.**
+
+The rule this subsystem keeps breaking: *no ordering decision may key
+on a field the subject of that ordering controls.* Two attempts:
+
+- **Attempt 1 — per head, in the order received.** `ingest` iterates
+  the sender's `Vec`, so the budget was spent in the sender's order: a
+  subject lists junk positions first and its genuine head last, and
+  the honest position is refused in every window, in every peer,
+  forever. Rejected in review.
+- **Attempt 2 — two tiers, `(best_per_subject != seq, Reverse(seq),
+  index)`.** Intended to give each subject its newest position first.
+  `best_per_subject` was built ONLY from the sender's envelope and
+  never consulted `audit_peer_heads`, so tier-0 membership and the
+  intra-tier order both keyed on `seq` — a field the subject mints.
+  Two probes disproved the two properties this ADR had claimed:
+  - "A subject cannot crowd out its own honest head": with
+    `[(N1, seq 9_000, honest), (N1, seq 9_000_000, bogus)]` and one
+    unit of allowance, the bogus head takes tier 0 and the honest one
+    is refused.
+  - "A relayer cannot crowd out a third party's": with
+    `[(N1, seq 5, third party), (N9, seq 1_000_000, relayer's own)]`,
+    the relayer's own head wins.
+
+  Attempt 2 is strictly worse than attempt 1, which is why it is worth
+  recording. Attempt 1 keyed on the sender's `Vec` index, which is
+  rewritten by every relay. `seq` is covered by the subject's
+  signature, so a head stamped `seq = i64::MAX` holds first place in
+  every relayer's envelope at every receiver, permanently.
+
+What 1b-ii must do instead: allocate **round-robin across distinct
+subjects**, subjects ordered by something we own (our own
+`first_seen_ms` for that subject), and let each subject's own slot be
+filled by whichever of its heads it likes — a choice that can only
+affect itself. With `S` distinct subjects and allowance `A` every
+subject gets at least `floor(A / S)`, which is the property this ADR
+claimed and did not have, and it is a property of the allocator rather
+than of a sort key. Two further constraints 1b-ii inherits:
+
+- Candidates must be deduped by `(node_id, seq)` BEFORE the allowance
+  is applied, or a sender fills the selection window with free
+  duplicates of one position: 24 heads at one position spent 1 unit
+  and produced 23 forks. **That dedupe is for SELECTION only, and it
+  must not become the ingest dedupe.** `ingest` keys on
+  `(node_id, seq, entry_hash)`; narrowing it to `(node_id, seq)`
+  destroys the second branch of a same-envelope fork before anything
+  can classify it — one ordinary pin, no conflict row, no log line,
+  and a subject double-signs with impunity. That narrowing left the
+  whole workspace green when this amendment was first written, which
+  is why `m28` now exists at the ingest layer: every head still
+  reaches `pin_one` and is still classified, and only the allowance's
+  own candidate list is collapsed.
+- `Fork`, `Refreshed` and `RejectedSeq` are classifications, not new
+  rows, and must never be refused. An allowance that suppressed
+  `Fork` would let a node hide a rewrite of its own chain behind junk
+  heads. Attempt 1 did exactly that.
+
+A same-envelope fork at a position we do NOT already hold is the sharp
+edge here, and it is why the allowance cannot simply be re-added over
+this item's batching: with the budget spent, neither branch inserts,
+both read back no stored row, and the fork is classified as a refusal
+— no conflict row, no log line. In 1b-i, with no allowance, the first
+branch always inserts and the second is a genuine `Fork` (`p11`).
+1b-ii must keep that true, and the honest way is to write the conflict
+row from the two in-batch branches directly, ordered canonically by
+`entry_hash` so a replay with the branches swapped dedupes on
+`UNIQUE(node_id, seq, held_hash, other_hash)` instead of writing a
+mirrored second row. Force-selecting an insert instead would hand out
+up to 12 free, eviction-immune `contradicted` pins per envelope on a
+channel with no message rate limit.
+
+**Decision 29 — the per-position conflict cap is withdrawn: as built it
+let the accused bury the branch that accuses it.**
+
+1b-i implemented `MAX_CONFLICTS_PER_POSITION = 8` per `(node_id, seq)`,
+refusing further branches rather than deleting any, and counting the
+refusals. Refusing rather than deleting was right. Keying the cap on
+the position alone was not: the subject is the only party who can mint
+validly signed branches at its own position, so it fills all 8 slots
+with self-signed junk and the genuine contradicting head — relayed by
+a different peer — is refused and persisted nowhere. Not in
+`audit_head_conflicts`, because it was refused; not in
+`audit_peer_heads`, because the position is held. The returned
+`conflict_id` then points at a junk pair, so 5.13c-3's acknowledgement
+would bind the wrong evidence.
+
+That is Decision 12 ("a contradicted pin is the evidence") defeated
+through a path an attacker triggers at will, and `main` does not have
+it, so it is a regression and it comes out. The pin is still marked
+`contradicted` and the 8 junk rows still prove the subject
+double-signed, so detection survives — but the specific branch pair,
+and the head of the chain the subject is actually running, do not.
+
+1b-iii may bound the table again, either way:
+
+- partition the cap by provenance, `(node_id, seq, reported_by)`, so
+  heads the subject pushes itself can never occupy the slot a
+  third-party report needs; or
+- keep one global cap but persist the refused branch's `other_hash`
+  and `other_sig` in the overflow row, so no signature is ever
+  discarded.
+
+Whichever lands, the metric must be honest about what it counts. The
+withdrawn version documented `suppressed` as the number of DISTINCT
+refused branches while incrementing it once per occurrence, so a
+replayed branch inflated it without bound. Deduplicating by hash needs
+unbounded per-position hash storage, which is the very thing the cap
+exists to prevent, so the honest resolution is to name it an
+occurrence count.
+
+**Decision 30 — a seq the store cannot hold is rejected, not allowed to
+reach the INSERT.**
+
+`audit_peer_heads` and `audit_head_conflicts` have both carried
+`CHECK (seq > 0)` since V0010, and `ingest` filters heads on dedupe,
+own-chain, keyability and signature — never on `seq`. `pin_one`
+guarded only the upper end of the range (`i64::try_from`). So a head
+at seq 0 reached the INSERT, raised a constraint violation, and
+returned `Err`.
+
+Per head that cost one head. Batching the envelope into ONE
+transaction — which is the main thing 1b-i does — turns it into the
+loss of the whole envelope: the transaction is abandoned and every
+honest head beside it is rolled back, including heads for subjects the
+sender is the only path to. Any paired peer can mint a self-signed
+seq-0 head for its own node_id and repeat it every window.
+
+Rejected at both ends of the range for the same reason: the store
+cannot represent it, and clamping would forge a seq its signer never
+signed (Decision 11's `RejectedSeq`, now covering 0 as well as
+`> i64::MAX`). `p10` pins it, and deleting the guard reproduces
+`CHECK constraint failed: seq > 0` through the whole batch.
+
+**Decision 31 — `MAX_HEADS_PER_ENVELOPE` 64 -> 24, and this one does
+not wait for the allowance.**
+
+An honest sender emits `1 + RELAY_HEADS` = 17 heads, so 64 left 47
+heads of pure attacker headroom in a receive-side `take()` that no
+signature covers. Each of those heads costs the receiver an ed25519
+verify, and `ingest` performs that verify BEFORE anything downstream
+could refuse the head — so the cap is the only bound on per-envelope
+crypto, and no per-peer budget could ever be one. It is also no longer
+equal to `PIN_KEEP_RECENT` (64), so one envelope can no longer fill a
+node's whole recent-pin window; `m24` keeps its original pressure by
+sending as many full envelopes as that now takes.
+
+`m24` needed a second correction beyond the envelope count, and it is
+worth recording because the first version of this paragraph claimed a
+guard the test did not have. The sweep exempts `MIN(rowid)` per node
+AND `MIN(rowid)` per time bucket, and both exemptions are status-blind.
+`m24` ingested its corroborated pin first, making it `rowid` 1, so it
+was protected twice over by rules that never look at `status` —
+deleting the sweep's `status = 'unchecked'` filter outright, which is
+the round-7 defect in full, left `m24` passing. It now seeds an older
+`unchecked` pin ahead of the corroborated one so that both exemptions
+are taken by that row, and the corroborated pin survives only because
+of its status. Verified in both directions.
+
+`harness-daemon` const-asserts `MAX_HEADS_PER_ENVELOPE > RELAY_HEADS`,
+since a cap below what an honest sender emits would make the same
+`take()` silently truncate a legitimate relay set. `harness-core`
+cannot assert it: `RELAY_HEADS` lives in the daemon. `m27` pins the
+truncation, and the truncation is now logged — the one case where the
+narrowing discards something must not look like a quiet peer.
+
+**Decision 32 — the batching's cost is tail latency, not throughput,
+and it is not a free win.**
+
+Worth recording next to "one lock acquisition and one transaction":
+fairness granularity on the process-wide store mutex moves from
+per-head to per-envelope. Measured on a file-backed WAL store with 24
+heads, total work roughly halves — 2.17 ms of short holds becomes
+1.09 ms as one hold — but the worst-case wait for an unrelated store
+caller (task dispatch, leases, result writes) rises from about 0.16 ms
+to about 1.09 ms. It is bounded by the cap, and the cap fell 64 -> 24
+in the same item, so it is better than `main`'s worst case in
+aggregate. Rollback is `DropBehavior::Rollback` on the early `?`, which
+is why closing the seq-0 path (Decision 30) mattered: before it, one
+unstorable head discarded the whole envelope's writes.
+
+### Carried out of 1b-i
+
+- The allowance (Decision 28) and the conflict bound (Decision 29).
+  Until they land, `audit_head_conflicts` and the pin table grow with
+  what peers send, bounded only by the hourly sweep for `unchecked`
+  pins and not at all for `contradicted` ones.
+- A fork logs an `ERROR` per occurrence with no per-peer rate limit.
+  Bounded fork logging was built for 1b-i and withdrawn with the rest
+  of the rate-limiting machinery; it belongs with 1b-ii.
+- The oversized-envelope line logs at `debug` for the same reason. The
+  const assert keeps the cap above what an honest sender emits, so no
+  honest peer can reach that branch without a code change: every
+  overflow arriving today is misbehaviour, at a rate the sender picks,
+  on a channel with no message rate limit. A per-envelope `WARN` there
+  would have been a log-flood vector handed to the sender. 1b-ii
+  promotes it to `warn` under the per-peer log window. The const
+  assert is per-binary, though, and this crate's cap deliberately
+  leaves headroom for `RELAY_HEADS` to grow without a lockstep change:
+  so in a MIXED-VERSION mesh an upgraded sender whose
+  `1 + RELAY_HEADS` exceeds an older node's cap has the excess
+  truncated silently at `debug`, which is the one honest case the
+  original `warn` was justified by. Promoting it belongs with the log
+  window rather than before it.
+- The `debug_assert_eq!` on the `zip` pairing in `ingest` is a
+  placeholder, not a guard: it is compiled out in release and checks
+  only lengths, not order, so a skipped outcome plus a filler would
+  pass it while mis-attributing every later fork. The real coverage is
+  `p10` and `m28`, which index outcomes positionally. 1b-ii adds the
+  `continue` this protects against and should either promote it to a
+  plain `assert_eq!` (the invariant is internal, so a panic is not an
+  attacker-reachable DoS) or have `pin_peer_heads` return
+  `(head, outcome)` pairs so the pairing cannot drift at all.
+- Earlier drafts of this amendment stated the residual row growth as
+  `allowance x sweep interval`. That was wrong on its own terms: each
+  admitted position also carried up to 8 conflict rows and an overflow
+  row, none of which any sweep touches. The corrected figure belongs
+  with whichever item bounds those tables.
+- `harness.audit` still has no message rate limit, so per-message work
+  is bounded only by the envelope cap. Charging cannot substitute,
+  because the cost is upstream of any charge.

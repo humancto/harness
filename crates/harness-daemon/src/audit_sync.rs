@@ -34,6 +34,16 @@ pub(crate) const HEAD_PUSH_INTERVAL: Duration = Duration::from_millis(200);
 /// Third-party heads relayed alongside our own, newest first.
 const RELAY_HEADS: usize = 16;
 
+// An honest envelope carries our own head plus the relay set, so the
+// cap in `harness-core` must leave room for all of them. If it ever
+// does not, `ingest`'s `take()` silently discards the tail of an
+// HONEST sender's envelope — which looks exactly like a quiet peer.
+// `harness-core` cannot assert this itself: `RELAY_HEADS` lives here.
+// Spelled `> RELAY_HEADS` rather than `>= 1 + RELAY_HEADS` only
+// because clippy rejects the latter; it is the same bound, and the
+// `1` is our own head.
+const _: () = assert!(harness_core::MAX_HEADS_PER_ENVELOPE > RELAY_HEADS);
+
 /// Consecutive send failures to one peer before we back off. A
 /// pre-5.13c peer resets the unknown channel every time, so without
 /// this the loop opens and resets a stream against every old node on
@@ -182,9 +192,9 @@ impl AuditSyncService {
     /// accusation is worse than none.
     ///
     /// Built once per envelope, not once per head: `all_peers()`
-    /// clones the whole peer list, and a 64-head envelope arriving at
-    /// the sender's chosen rate would otherwise be 64 full clones
-    /// (diff review MAJOR-5).
+    /// clones the whole peer list, and a full envelope arriving at the
+    /// sender's chosen rate would otherwise be one full clone per head
+    /// — `MAX_HEADS_PER_ENVELOPE` of them (diff review MAJOR-5).
     fn pubkey_map(&self) -> HashMap<NodeId, PublicKey> {
         self.trust
             .all_peers()
@@ -252,6 +262,29 @@ impl AuditSyncService {
         // collapsed; anything else is stored and classified.
         let mut seen: std::collections::HashSet<(NodeId, u64, [u8; 32])> =
             std::collections::HashSet::new();
+        // The cap is the only bound on per-envelope work, so the one
+        // case where narrowing it to MAX_HEADS_PER_ENVELOPE actually
+        // discards something must not be silent.
+        //
+        // DEBUG, not warn, and deliberately: the const assert above
+        // keeps the cap above what an honest sender emits, so no
+        // honest peer can reach this branch without a code change —
+        // every overflow that arrives today is misbehaviour, the
+        // sender chooses how often to send it, and `harness.audit` has
+        // no message rate limit. A per-envelope WARN here would be a
+        // log-flood vector handed to the sender. 5.13c-1b-ii carries
+        // the per-peer log window; this line is promoted to `warn`
+        // under it, alongside `AUDIT CHAIN FORK`.
+        if env.heads.len() > harness_core::MAX_HEADS_PER_ENVELOPE {
+            tracing::debug!(
+                target: "harness.audit.sync",
+                relayer = %from,
+                offered = env.heads.len(),
+                cap = harness_core::MAX_HEADS_PER_ENVELOPE,
+                "audit envelope carried more heads than the cap; the tail was ignored"
+            );
+        }
+        let mut accepted: Vec<harness_core::AuditHead> = Vec::new();
         for head in env.heads.iter().take(harness_core::MAX_HEADS_PER_ENVELOPE) {
             if !seen.insert((head.node_id, head.seq, head.entry_hash)) {
                 continue;
@@ -280,61 +313,42 @@ impl AuditSyncService {
                 );
                 continue;
             }
-            match self.store.pin_peer_head(head, from, now_ms) {
-                Ok(outcome) => {
-                    match outcome {
-                        PinOutcome::Fork { conflict_id } => tracing::error!(
-                            target: "harness.audit.sync",
-                            subject = %head.node_id,
-                            seq = head.seq,
-                            conflict_id,
-                            reported_by = %from,
-                            "AUDIT CHAIN FORK: two signed heads at one position"
-                        ),
-                        // A node offering a position below one we
-                        // already hold is the loudest signal available
-                        // before entries exist — a wiped or restored
-                        // DB looks exactly like this — so it is not
-                        // silent, even though it is not evidence
-                        // (diff review 1(c)/1(d)).
-                        // FIRST-PARTY only: a node offering a
-                        // position below one we hold for it is the
-                        // loudest signal available before entries
-                        // exist (a wiped or restored DB looks exactly
-                        // like this). A RELAYED head lagging ours is
-                        // the normal steady state in any mesh with
-                        // relays, and warning on it would drown the
-                        // signal the warn exists for.
-                        PinOutcome::StalePinned if from == head.node_id => tracing::warn!(
-                            target: "harness.audit.sync",
-                            subject = %head.node_id,
-                            offered_seq = head.seq,
-                            "node advertised a head below one we already hold for it"
-                        ),
-                        PinOutcome::StalePinned => tracing::debug!(
-                            target: "harness.audit.sync",
-                            subject = %head.node_id,
-                            offered_seq = head.seq,
-                            reported_by = %from,
-                            "relayed head lags the pin we hold"
-                        ),
-                        PinOutcome::RejectedSeq => tracing::warn!(
-                            target: "harness.audit.sync",
-                            subject = %head.node_id,
-                            reported_by = %from,
-                            "audit head seq exceeds the representable range; rejected"
-                        ),
-                        PinOutcome::Pinned | PinOutcome::Refreshed => {}
-                    }
-                    out.push((head.node_id, outcome));
-                }
-                Err(e) => tracing::warn!(
+            accepted.push(head.clone());
+        }
+        if accepted.is_empty() {
+            return out;
+        }
+        // ONE lock acquisition and ONE transaction for the whole
+        // envelope, where the per-head path cost up to
+        // MAX_HEADS_PER_ENVELOPE of each. Sharing the transaction is
+        // also what lets `pin_one` see a position an earlier head in
+        // this same envelope inserted, and so classify the second
+        // branch as the fork it is.
+        let outcomes = match self.store.pin_peer_heads(&accepted, from, now_ms) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
                     target: "harness.audit.sync",
                     ?e,
-                    subject = %head.node_id,
-                    "pinning peer head failed"
-                ),
+                    relayer = %from,
+                    "pinning peer heads failed"
+                );
+                return out;
             }
+        };
+        // `zip` would silently truncate on a length mismatch, and the
+        // pairing is what attributes a `Fork` to a subject. 1b-ii adds
+        // a per-peer allowance inside this very loop, where one
+        // `continue` that skips an outcome would shift every later
+        // pair and log a fork against an innocent node.
+        debug_assert_eq!(
+            accepted.len(),
+            outcomes.len(),
+            "pin_peer_heads returns one outcome per input head, in input order"
+        );
+        for (head, outcome) in accepted.iter().zip(outcomes) {
+            log_pin_outcome(from, head, &outcome);
+            out.push((head.node_id, outcome));
         }
         out
     }
@@ -869,6 +883,57 @@ impl AuditSyncService {
                 _ = shutdown.changed() => return,
             }
         }
+    }
+}
+
+/// Log one pin outcome. Split out of `ingest` only to keep it under
+/// clippy's line limit; the arms are the interesting part and belong
+/// read together.
+fn log_pin_outcome(from: NodeId, head: &harness_core::AuditHead, outcome: &PinOutcome) {
+    match outcome {
+        PinOutcome::Fork { conflict_id } => tracing::error!(
+            target: "harness.audit.sync",
+            subject = %head.node_id,
+            seq = head.seq,
+            conflict_id,
+            reported_by = %from,
+            "AUDIT CHAIN FORK: two signed heads at one position"
+        ),
+        // A node offering a position below one we
+        // already hold is the loudest signal available
+        // before entries exist — a wiped or restored
+        // DB looks exactly like this — so it is not
+        // silent, even though it is not evidence
+        // (diff review 1(c)/1(d)).
+        // FIRST-PARTY only: a node offering a
+        // position below one we hold for it is the
+        // loudest signal available before entries
+        // exist (a wiped or restored DB looks exactly
+        // like this). A RELAYED head lagging ours is
+        // the normal steady state in any mesh with
+        // relays, and warning on it would drown the
+        // signal the warn exists for.
+        PinOutcome::StalePinned if from == head.node_id => tracing::warn!(
+            target: "harness.audit.sync",
+            subject = %head.node_id,
+            offered_seq = head.seq,
+            "node advertised a head below one we already hold for it"
+        ),
+        PinOutcome::StalePinned => tracing::debug!(
+            target: "harness.audit.sync",
+            subject = %head.node_id,
+            offered_seq = head.seq,
+            reported_by = %from,
+            "relayed head lags the pin we hold"
+        ),
+        PinOutcome::RejectedSeq => tracing::warn!(
+            target: "harness.audit.sync",
+            subject = %head.node_id,
+            offered_seq = head.seq,
+            reported_by = %from,
+            "audit head seq is not storable; rejected"
+        ),
+        PinOutcome::Pinned | PinOutcome::Refreshed => {}
     }
 }
 
