@@ -179,7 +179,8 @@ choose. ADR-0006's promise is retired, not deferred again.
   builds `new_multi_thread`, and only `run_async_cli` is
   current-thread. Round 4 of the 5.13c-2 review caught the error. The
   conclusion is unchanged: the arm is unreachable because the abort
-  precedes the await, on either flavour.) An exit that does not run `shutdown()`
+  precedes the await, on either flavour.) An exit that does not run
+  `shutdown()`
   still loses the open window's count — SIGKILL and power loss, but
   also **SIGTERM**, which is the normal production stop
   (`systemctl stop`, `docker stop`): `run_until_signal` awaits
@@ -395,8 +396,10 @@ limit is 20 batches per peer per minute. It does NOT close the "ingest
 is unrated" gap 5.13c-1 recorded, though an earlier version of this
 decision claimed it did: `may_serve` gates `serve_range` on
 `harness.audit.entries`, while that gap is pin-row insertion by
-`ingest` on `harness.audit` — a different channel and a different path,
-which is why closing it needed a separate budget (Decision 27). The tier gate says
+`ingest` on `harness.audit` — a different channel and a different
+path, which is why closing it needed a separate budget (Decision 27).
+
+The tier gate says
 `!= Guest` rather than `== Trusted` because nothing in this build
 constructs `TrustTier::Trusted` outside tests and pairing's QUIC leg is
 stubbed — gating on Trusted would ship the entire pull path inert.
@@ -564,9 +567,10 @@ The tie breaks on `seq ASC` — still the subject's field, but in the
 only direction that cannot be inflated, since winning a tie requires
 claiming a *lower*, therefore reachable, position. Not `rowid`: inside
 one envelope `rowid` is the sender's `Vec` order, so `rowid DESC` just
-hands the slot to whichever head the sender listed last. The relay selector shares the
-`first_seen_ms` half and deliberately differs on the tie — see Decision
-27. `p09` pins the verify selector; `m25` the relay one.
+hands the slot to whichever head the sender listed last. The relay
+selector shares the `first_seen_ms` half and deliberately differs on
+the tie — see Decision 27. `p09` pins the verify selector; `m25` the
+relay one.
 
 **And it is still not enough.** The first version of this paragraph
 said the residual was a *subject* pushing a fresh *inflated* head
@@ -598,7 +602,7 @@ cosmetic: `validate_batch` stops at the first offending row and no
 follow-up is issued, so a single legacy row makes the whole chain past
 it permanently unverifiable. So new local appends truncate at
 `MAX_AUDIT_SUBJECT_BYTES` (4 KiB, matching `detail`) while ingest admits
-up to `MAX_INGESTED_SUBJECT_BYTES` (64 KiB). An intermediate commit set
+up to `MAX_INGESTED_SUBJECT_BYTES`, derived below. An intermediate commit set
 them equal and called them "agreed by construction"; they agreed only
 for rows written after that commit, and the migration case is the one
 that matters.
@@ -658,7 +662,10 @@ What this item keeps, because they are its own:
   `main` ordered on) and a re-push must not re-take the slot, and `seq
   DESC` rather than the verify path's `seq ASC` because for relay a
   lower position is simply worse. One slot is still capturable by a
-  peer introducing an unseen position; that is 5.13c-1b.
+  peer introducing an unseen position — and `seq DESC` opens the other
+  direction while closing that one, since it hands the slot to an
+  INFLATED self-claim. Both are 5.13c-1b, which records both;
+  no single-slot rule satisfies them together.
 - The serve path now applies its byte budget INSIDE the cursor loop.
   It used to collect up to `cap + 1` rows and then trim, so serving 7
   rows out of a wide span read and allocated the whole span under the
@@ -717,8 +724,8 @@ What this item keeps, because they are its own:
   `ingest()` returns, turning every assertion about it into a race.
   The coherent fix is to move the whole `harness.audit.entries` recv
   arm off the runtime's workers, which is a change to `peer_net.rs`'s
-  channel loop and is out of this item's scope — ROADMAP **6.0a**. Until then the
-  stall is real and documented rather than hidden.
+  channel loop and is out of this item's scope — ROADMAP **6.0a**.
+  Until then the stall is real and documented rather than hidden.
 
   5.13c-3's per-pin UI will multiply this cost, and a cache there must
   not become a way for a stale verdict to outlive the rows it was
@@ -737,6 +744,23 @@ What this item keeps, because they are its own:
   indistinguishable from a slow walk. A capability signal is the real
   fix and belongs with 5.13c-3's operator surface, which is where the
   distinction becomes visible.
+- **A 1 MiB `subject` ceiling means a feed page can render half a
+  gigabyte.** `audit_recent` materializes up to `MAX_LIMIT` (500) rows
+  across all nodes inside `with_conn`, and the handler clones every
+  `subject` into a DTO and serializes it — so `MAX_LIMIT ×
+  MAX_INGESTED_SUBJECT_BYTES` is ~512 MB of strings per authenticated
+  `GET /api/v1/audit?limit=500`, with the process-wide store mutex held
+  for the read, and ingested rows are never pruned. This is the hazard
+  the ingest `detail` cap exists to prevent, reopened for `subject` at
+  256x the local cap — deliberately, because the alternative strands
+  honest chains (Decision 26), but the cost belongs written down.
+  Reaching it takes a trusted peer writing such rows into its own
+  chain and ~17 operator-triggered verifies, since the 1 MiB frame
+  admits one such row per batch. `verify_page` and the keyset cursor
+  are unaffected: they touch only local rows, which `truncate_subject`
+  clamps at 4 KiB. The remedy is render-side truncation in the DTO —
+  safe, because `entry_hash` is reported separately and the stored row
+  is untouched — and it belongs with 5.13c-3's `audit_forget_peer_range`.
 - **Still no reader.** `audit_verify_range`, the run table and the
   corroborated status have no UI. A fork or a failed corroboration
   surfaces as a log line, a database row, and a 202 from the verify

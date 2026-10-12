@@ -74,7 +74,12 @@ pub enum IngestRefusal {
     Conflict { seq: u64 },
     /// `detail` exceeds what a locally appended row may carry.
     DetailTooLarge { seq: u64 },
-    /// `subject` exceeds what a locally appended row may carry.
+    /// `subject` exceeds the INGEST ceiling
+    /// (`MAX_INGESTED_SUBJECT_BYTES`), which is deliberately looser
+    /// than the local cap — Decision 26. Not "what a locally appended
+    /// row may carry", which is 256x smaller and is what the
+    /// neighbouring `DetailTooLarge` really is bounded by (round 10
+    /// MINOR-5).
     SubjectTooLarge { seq: u64 },
     /// Rows past the pin this run is walking toward.
     PastTarget { seq: u64 },
@@ -425,6 +430,14 @@ impl Store {
                    FROM audit_log
                   WHERE node_id = ?1 AND seq >= ?2 AND seq <= ?3
                   ORDER BY seq ASC LIMIT ?4",
+                // `cap + 1` is dead at the current constants for the
+                // same reason as the `kept.len() >= cap` backstop
+                // below: the loop always breaks on the byte budget by
+                // row ~4916, so this bound can never bind. Widening it
+                // leaves the suite green; NARROWING it fails five
+                // tests, so the clause is live and only its value is
+                // dead. Labelled here so the query is not read as the
+                // thing bounding the walk (round 10 MINOR-4).
             )?;
             let out = stmt.query_map(
                 params![
@@ -467,8 +480,10 @@ impl Store {
                 // budget always fires first, because the minimum
                 // per-row cost is the 160 bytes of fixed framing and
                 // `160 * MAX_INGEST_ROWS_PER_PULL` (800_000) already
-                // exceeds `MAX_SERVE_BYTES` (786_432). A 5001-row span
-                // serves ~4144 rows, never 5000. Kept because
+                // exceeds `MAX_SERVE_BYTES` (786_432) — so at most
+                // 4915 rows are servable for ANY row shape, never
+                // 5000. (The exact count varies with row size: ~4345
+                // for a `task.dispatched`/`system` row.) Kept because
                 // `MAX_INGEST_ROWS_PER_PULL` is the stated row cap and
                 // a future budget change could make it bind; stated as
                 // unreachable so it is not read as a live guard (round
