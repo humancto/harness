@@ -103,6 +103,20 @@ pub struct PeerHeadPin {
 pub enum PinOutcome {
     /// A position we had not pinned.
     Pinned,
+    /// A NEW position refused because the reporting peer had spent its
+    /// allowance for this window (5.13c-1b-i).
+    ///
+    /// Only ever returned for a position we do not already hold.
+    /// `Fork`, `Refreshed` and `RejectedSeq` are classifications, not
+    /// writes of new rows, and are never refused — an allowance that
+    /// suppressed `Fork` would let a node hide a rewrite of its own
+    /// chain behind junk heads, which is how the first attempt at this
+    /// failed.
+    ///
+    /// A refusal is a permanent loss of pin density, which the sync
+    /// module calls the security parameter of the whole design, so the
+    /// allowance errs high.
+    BudgetRefused,
     /// Same position, same hash — the pin was refreshed.
     Refreshed,
     /// Same position, DIFFERENT hash. Two histories, both signed by
@@ -153,115 +167,133 @@ impl Store {
     /// obvious "one row per node, higher seq wins" design deletes the
     /// pin the corroboration check needs, so a node that truncates and
     /// regrows past the pin reads as ordinary growth.
+    /// Pin a whole envelope's heads under one allowance, in ONE
+    /// transaction.
+    ///
+    /// # Why batched, and why the allowance is an integer
+    ///
+    /// Two earlier attempts at this allowance failed, both by letting
+    /// something the adversary controls decide the outcome:
+    ///
+    /// 1. Checked per head in `ingest` BEFORE `pin_peer_head`, with a
+    ///    `continue` past it. A spent allowance then dropped every
+    ///    head from that peer — `Fork` included — so a node could hide
+    ///    a rewrite of its own chain behind junk heads: no conflict
+    ///    row, no log line.
+    /// 2. Moved inside `pin_peer_head`, per head. `ingest` iterates
+    ///    the SENDER's `Vec` order, so that is an attacker-ordered
+    ///    allowance: a subject lists 64 junk positions first and its
+    ///    genuine head last, and the honest position is refused in
+    ///    every window, in every peer, forever. The subject gets to
+    ///    collapse its own pin density.
+    ///
+    /// So the allowance arrives as a plain `u32` and the spend order
+    /// is OURS: the highest NEW position for each distinct subject
+    /// first, then the remainder. A subject cannot crowd out its own
+    /// honest head and a relayer cannot crowd out a third party's.
+    ///
+    /// An integer rather than a callback or trait handle, because a
+    /// budget handle invoked from inside this `with_conn` closure that
+    /// touched the store would deadlock the daemon silently —
+    /// `with_conn` holds one process-wide non-reentrant
+    /// `parking_lot::Mutex`, and Decision 23 already records that
+    /// hazard for `force_pin_status`. One lock acquisition and one
+    /// transaction for the whole envelope also replaces the 64 of each
+    /// that the per-head path cost.
+    ///
+    /// Returns an outcome per input head, in input order, plus how
+    /// much of the allowance was spent.
+    ///
+    /// # Errors
+    /// Underlying sqlite errors.
+    pub fn pin_peer_heads(
+        &self,
+        heads: &[AuditHead],
+        reported_by: NodeId,
+        allowance: u32,
+        now_ms: u64,
+    ) -> Result<(Vec<PinOutcome>, u32), StoreError> {
+        self.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+
+            // Pass 1, read-only: which heads are NEW positions?
+            // `RejectedSeq` is decided here too, since it needs no
+            // read and must never consume allowance.
+            let mut is_new = vec![false; heads.len()];
+            for (i, head) in heads.iter().enumerate() {
+                let Ok(seq) = i64::try_from(head.seq) else {
+                    continue;
+                };
+                let held: Option<i64> = tx
+                    .query_row(
+                        "SELECT 1 FROM audit_peer_heads WHERE node_id = ?1 AND seq = ?2",
+                        params![head.node_id.as_bytes(), seq],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                is_new[i] = held.is_none();
+            }
+
+            // Spend the allowance in OUR order: highest new seq per
+            // distinct subject first, then everything else by
+            // descending seq. Ties break on input index only after
+            // both keys, so the sender's ordering is the last word and
+            // never the first.
+            let mut candidates: Vec<(usize, NodeId, u64)> = heads
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| is_new[*i])
+                .map(|(i, h)| (i, h.node_id, h.seq))
+                .collect();
+            let mut best_per_subject: std::collections::HashMap<NodeId, u64> =
+                std::collections::HashMap::new();
+            for (_, node, seq) in &candidates {
+                let e = best_per_subject.entry(*node).or_insert(*seq);
+                if *seq > *e {
+                    *e = *seq;
+                }
+            }
+            candidates.sort_by_key(|(i, node, seq)| {
+                let first_tier = u8::from(best_per_subject.get(node) != Some(seq));
+                (first_tier, std::cmp::Reverse(*seq), *i)
+            });
+            let selected: std::collections::HashSet<usize> = candidates
+                .into_iter()
+                .take(allowance as usize)
+                .map(|(i, _, _)| i)
+                .collect();
+
+            // Pass 2, in INPUT order, applying writes. The existing
+            // row is re-read because an earlier head in this same
+            // batch may have inserted the position — in which case
+            // this one is a genuine same-envelope fork and must be
+            // recorded, not refused.
+            let mut out = Vec::with_capacity(heads.len());
+            let mut spent = 0u32;
+            for (i, head) in heads.iter().enumerate() {
+                let outcome = pin_one(&tx, head, reported_by, now_ms, selected.contains(&i))?;
+                if matches!(outcome, PinOutcome::Pinned | PinOutcome::StalePinned) {
+                    spent = spent.saturating_add(1);
+                }
+                out.push(outcome);
+            }
+            tx.commit()?;
+            Ok((out, spent))
+        })
+    }
+
+    /// Pin one head. Equivalent to [`Self::pin_peer_heads`] with an
+    /// allowance of 1 and a single-element slice, kept because most
+    /// callers and tests have exactly one head in hand.
     pub fn pin_peer_head(
         &self,
         head: &AuditHead,
         reported_by: NodeId,
         now_ms: u64,
     ) -> Result<PinOutcome, StoreError> {
-        // Never clamp a value a signature covers.
-        let Ok(seq) = i64::try_from(head.seq) else {
-            return Ok(PinOutcome::RejectedSeq);
-        };
         self.with_conn(|c| {
             let tx = c.unchecked_transaction()?;
-            let existing: Option<(Vec<u8>, i64, Vec<u8>)> = tx
-                .query_row(
-                    "SELECT entry_hash, at_ms, sig FROM audit_peer_heads
-                      WHERE node_id = ?1 AND seq = ?2",
-                    params![head.node_id.as_bytes(), seq],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .optional()?;
-
-            let outcome = match existing {
-                Some((held_hash, held_at, held_sig)) if to_hash(&held_hash) == head.entry_hash => {
-                    tx.execute(
-                        "UPDATE audit_peer_heads SET observed_at_ms = ?3
-                          WHERE node_id = ?1 AND seq = ?2",
-                        params![head.node_id.as_bytes(), seq, i64_ms(now_ms)],
-                    )?;
-                    let _ = (held_at, held_sig);
-                    PinOutcome::Refreshed
-                }
-                Some((held_hash, held_at, held_sig)) => {
-                    // The PK collision IS the fork detector. Keying the
-                    // table on the hash too would store both as
-                    // ordinary pins and detect nothing.
-                    tx.execute(
-                        "INSERT OR IGNORE INTO audit_head_conflicts(
-                             node_id, seq, held_hash, held_at_ms, held_sig,
-                             other_hash, other_at_ms, other_sig,
-                             reported_by, detected_at_ms)
-                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-                        params![
-                            head.node_id.as_bytes(),
-                            seq,
-                            held_hash,
-                            held_at,
-                            held_sig,
-                            head.entry_hash.as_slice(),
-                            i64_ms(head.at_ms),
-                            head.sig.to_bytes().as_slice(),
-                            reported_by.as_bytes(),
-                            i64_ms(now_ms),
-                        ],
-                    )?;
-                    let conflict_id: i64 = tx.query_row(
-                        "SELECT id FROM audit_head_conflicts
-                          WHERE node_id = ?1 AND seq = ?2
-                            AND held_hash = ?3 AND other_hash = ?4",
-                        params![
-                            head.node_id.as_bytes(),
-                            seq,
-                            held_hash,
-                            head.entry_hash.as_slice()
-                        ],
-                        |r| r.get(0),
-                    )?;
-                    // The held pin is now contradicted, and a
-                    // contradicted pin is never evicted by thinning.
-                    tx.execute(
-                        "UPDATE audit_peer_heads SET status = 'contradicted'
-                          WHERE node_id = ?1 AND seq = ?2",
-                        params![head.node_id.as_bytes(), seq],
-                    )?;
-                    PinOutcome::Fork { conflict_id }
-                }
-                None => {
-                    let highest: Option<i64> = tx
-                        .query_row(
-                            "SELECT MAX(seq) FROM audit_peer_heads WHERE node_id = ?1",
-                            params![head.node_id.as_bytes()],
-                            |r| r.get(0),
-                        )
-                        .optional()?
-                        .flatten();
-                    // ALWAYS insert. Whether this position is below the
-                    // newest we hold changes only the CLASSIFICATION
-                    // (it is not a regression claim), never whether we
-                    // keep the pin — see `PinOutcome::StalePinned`.
-                    tx.execute(
-                        "INSERT INTO audit_peer_heads(
-                             node_id, seq, entry_hash, at_ms, sig,
-                             first_seen_ms, observed_at_ms, status)
-                         VALUES (?1,?2,?3,?4,?5,?6,?6,'unchecked')",
-                        params![
-                            head.node_id.as_bytes(),
-                            seq,
-                            head.entry_hash.as_slice(),
-                            i64_ms(head.at_ms),
-                            head.sig.to_bytes().as_slice(),
-                            i64_ms(now_ms),
-                        ],
-                    )?;
-                    if highest.is_some_and(|h| seq < h) {
-                        PinOutcome::StalePinned
-                    } else {
-                        PinOutcome::Pinned
-                    }
-                }
-            };
+            let outcome = pin_one(&tx, head, reported_by, now_ms, true)?;
             tx.commit()?;
             Ok(outcome)
         })
@@ -297,6 +329,30 @@ impl Store {
     }
 
     /// Recorded forks, newest first.
+    /// How many conflict branches at this position were REFUSED by
+    /// the per-position cap.
+    ///
+    /// Surfaced so an operator is told more branches exist rather
+    /// than shown a silently partial picture — and so 5.13c-3's
+    /// acknowledgement can state that an ack binds the kept pair and
+    /// cannot clear an un-enumerable remainder.
+    ///
+    /// # Errors
+    /// Underlying sqlite errors.
+    pub fn conflict_overflow(&self, node: NodeId, seq: u64) -> Result<usize, StoreError> {
+        self.with_conn(|c| {
+            let n: Option<i64> = c
+                .query_row(
+                    "SELECT suppressed FROM audit_conflict_overflow
+                      WHERE node_id = ?1 AND seq = ?2",
+                    params![node.as_bytes(), i64_ms(seq)],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(usize::try_from(n.unwrap_or(0)).unwrap_or(0))
+        })
+    }
+
     pub fn head_conflicts(&self, limit: usize) -> Result<Vec<HeadConflict>, StoreError> {
         self.with_conn(|c| {
             let mut stmt = c.prepare(
@@ -692,6 +748,203 @@ pub struct HeadConflict {
     pub other_sig: Signature,
     pub reported_by: NodeId,
     pub detected_at_ms: u64,
+}
+
+/// Conflict rows kept per `(node_id, seq)` before refusals start.
+///
+/// `audit_head_conflicts` is keyed on `other_hash`, which the SUBJECT
+/// mints freely, so without this one envelope writes a row per head.
+/// Beyond this the refusals are COUNTED, never deleted: the kept rows
+/// hold both signatures in full and are the proof, and deleting a
+/// conflict row would be Decision 12 by the back door.
+pub const MAX_CONFLICTS_PER_POSITION: i64 = 8;
+
+/// Pin one head inside an existing transaction.
+///
+/// `allow_new` is the allowance decision, already made by the caller
+/// in an order the sender does not control. It gates ONLY the insert
+/// of a position we do not hold. `Fork`, `Refreshed` and
+/// `RejectedSeq` are classifications and always proceed — an
+/// allowance that suppressed `Fork` is how the first attempt at this
+/// let a node hide a rewrite of its own chain.
+fn pin_one(
+    tx: &rusqlite::Transaction<'_>,
+    head: &AuditHead,
+    reported_by: NodeId,
+    now_ms: u64,
+    allow_new: bool,
+) -> Result<PinOutcome, StoreError> {
+    // Never clamp a value a signature covers.
+    let Ok(seq) = i64::try_from(head.seq) else {
+        return Ok(PinOutcome::RejectedSeq);
+    };
+    let existing: Option<(Vec<u8>, i64, Vec<u8>)> = tx
+        .query_row(
+            "SELECT entry_hash, at_ms, sig FROM audit_peer_heads
+              WHERE node_id = ?1 AND seq = ?2",
+            params![head.node_id.as_bytes(), seq],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+
+    match existing {
+        Some((held_hash, _held_at, _held_sig)) if to_hash(&held_hash) == head.entry_hash => {
+            tx.execute(
+                "UPDATE audit_peer_heads SET observed_at_ms = ?3
+                  WHERE node_id = ?1 AND seq = ?2",
+                params![head.node_id.as_bytes(), seq, i64_ms(now_ms)],
+            )?;
+            Ok(PinOutcome::Refreshed)
+        }
+        Some((held_hash, held_at, held_sig)) => record_fork(
+            tx,
+            head,
+            seq,
+            &held_hash,
+            held_at,
+            &held_sig,
+            reported_by,
+            now_ms,
+        ),
+        None => {
+            if !allow_new {
+                return Ok(PinOutcome::BudgetRefused);
+            }
+            let highest: Option<i64> = tx
+                .query_row(
+                    "SELECT MAX(seq) FROM audit_peer_heads WHERE node_id = ?1",
+                    params![head.node_id.as_bytes()],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            // ALWAYS insert when allowed. Whether this position is
+            // below the newest we hold changes only the
+            // CLASSIFICATION (it is not a regression claim), never
+            // whether we keep the pin — see `PinOutcome::StalePinned`.
+            tx.execute(
+                "INSERT INTO audit_peer_heads(
+                     node_id, seq, entry_hash, at_ms, sig,
+                     first_seen_ms, observed_at_ms, status)
+                 VALUES (?1,?2,?3,?4,?5,?6,?6,'unchecked')",
+                params![
+                    head.node_id.as_bytes(),
+                    seq,
+                    head.entry_hash.as_slice(),
+                    i64_ms(head.at_ms),
+                    head.sig.to_bytes().as_slice(),
+                    i64_ms(now_ms),
+                ],
+            )?;
+            if highest.is_some_and(|h| seq < h) {
+                Ok(PinOutcome::StalePinned)
+            } else {
+                Ok(PinOutcome::Pinned)
+            }
+        }
+    }
+}
+
+/// Record a same-seq fork, bounded per position.
+///
+/// Beyond [`MAX_CONFLICTS_PER_POSITION`] the branch is COUNTED rather
+/// than stored — never deleted, which would be Decision 12 by the
+/// back door — and the outcome still carries a stable `conflict_id`
+/// so 5.13c-3's acknowledgement has something to bind.
+#[allow(clippy::too_many_arguments)] // all of it is one row's worth of columns
+fn record_fork(
+    tx: &rusqlite::Transaction<'_>,
+    head: &AuditHead,
+    seq: i64,
+    held_hash: &[u8],
+    held_at: i64,
+    held_sig: &[u8],
+    reported_by: NodeId,
+    now_ms: u64,
+) -> Result<PinOutcome, StoreError> {
+    {
+        // The PK collision IS the fork detector. Keying the table
+        // on the hash too would store both as ordinary pins and
+        // detect nothing.
+        //
+        // Bounded per position: beyond MAX_CONFLICTS_PER_POSITION
+        // the branch is counted rather than stored, and the
+        // outcome still reports the FIRST conflict's id so the
+        // caller has a stable handle (5.13c-3's acknowledgement
+        // binds by it).
+        let held_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM audit_head_conflicts WHERE node_id = ?1 AND seq = ?2",
+            params![head.node_id.as_bytes(), seq],
+            |r| r.get(0),
+        )?;
+        let already: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM audit_head_conflicts
+                      WHERE node_id = ?1 AND seq = ?2
+                        AND held_hash = ?3 AND other_hash = ?4",
+                params![
+                    head.node_id.as_bytes(),
+                    seq,
+                    held_hash,
+                    head.entry_hash.as_slice()
+                ],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if already.is_none() && held_count >= MAX_CONFLICTS_PER_POSITION {
+            tx.execute(
+                "INSERT INTO audit_conflict_overflow(node_id, seq, suppressed, first_ms, last_ms)
+                     VALUES (?1,?2,1,?3,?3)
+                     ON CONFLICT(node_id, seq) DO UPDATE
+                       SET suppressed = suppressed + 1, last_ms = ?3",
+                params![head.node_id.as_bytes(), seq, i64_ms(now_ms)],
+            )?;
+        } else if already.is_none() {
+            tx.execute(
+                "INSERT INTO audit_head_conflicts(
+                         node_id, seq, held_hash, held_at_ms, held_sig,
+                         other_hash, other_at_ms, other_sig,
+                         reported_by, detected_at_ms)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![
+                    head.node_id.as_bytes(),
+                    seq,
+                    held_hash,
+                    held_at,
+                    held_sig,
+                    head.entry_hash.as_slice(),
+                    i64_ms(head.at_ms),
+                    head.sig.to_bytes().as_slice(),
+                    reported_by.as_bytes(),
+                    i64_ms(now_ms),
+                ],
+            )?;
+        }
+        // Whichever branch ran, the caller needs a stable id: the
+        // row for THIS pair if we kept it, else the oldest at this
+        // position.
+        let conflict_id: i64 = tx.query_row(
+            "SELECT id FROM audit_head_conflicts
+                  WHERE node_id = ?1 AND seq = ?2
+                  ORDER BY (held_hash = ?3 AND other_hash = ?4) DESC, id ASC
+                  LIMIT 1",
+            params![
+                head.node_id.as_bytes(),
+                seq,
+                held_hash,
+                head.entry_hash.as_slice()
+            ],
+            |r| r.get(0),
+        )?;
+        // The held pin is now contradicted, and a contradicted pin
+        // is never evicted by thinning.
+        tx.execute(
+            "UPDATE audit_peer_heads SET status = 'contradicted'
+                  WHERE node_id = ?1 AND seq = ?2",
+            params![head.node_id.as_bytes(), seq],
+        )?;
+        Ok(PinOutcome::Fork { conflict_id })
+    }
 }
 
 fn i64_ms(ms: u64) -> i64 {
@@ -1165,5 +1418,135 @@ mod tests {
                 "corroborated pin {i} must survive; have {survivors:?}"
             );
         }
+    }
+    #[test]
+    fn p10_junk_listed_first_cannot_crowd_out_the_honest_head() {
+        // 5.13c-1b-i, and the probe that kills the shape the first
+        // draft of this item proposed. `ingest` iterates the SENDER's
+        // `Vec` order, so a per-head allowance is an attacker-ordered
+        // allowance: a subject lists its junk positions FIRST and its
+        // genuine head last, and the honest position is refused in
+        // every window, in every peer, forever. The subject would get
+        // to collapse its own pin density, which the sync module calls
+        // the security parameter of the whole design.
+        //
+        // The allowance is spent in OUR order instead: highest new
+        // position per subject first.
+        let s = Store::open_memory().expect("store");
+        let allowance = 4u32;
+        let mut heads: Vec<AuditHead> = (1..=20u64)
+            .map(|i| head(1, i, u8::try_from(i).unwrap_or(0), i))
+            .collect();
+        // The honest head is the highest, listed LAST.
+        heads.push(head(1, 9_000, 0x90, 9_000));
+
+        let (outcomes, spent) = s
+            .pin_peer_heads(&heads, node(2), allowance, 1_000)
+            .expect("pin batch");
+        assert_eq!(spent, allowance, "the whole allowance is spent");
+        assert_eq!(
+            outcomes.last(),
+            Some(&PinOutcome::Pinned),
+            "the honest head is pinned despite being listed last, got {:?}",
+            outcomes.last()
+        );
+        let seqs: Vec<u64> = s
+            .peer_head_pins(node(1))
+            .expect("pins")
+            .into_iter()
+            .map(|p| p.seq)
+            .collect();
+        assert!(seqs.contains(&9_000), "have {seqs:?}");
+        assert_eq!(
+            seqs.len(),
+            allowance as usize,
+            "and the allowance bounded the rest; have {seqs:?}"
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| **o == PinOutcome::BudgetRefused)
+                .count(),
+            heads.len() - allowance as usize,
+            "the rest are refused, visibly"
+        );
+    }
+
+    #[test]
+    fn p11_a_fork_is_recorded_even_when_the_allowance_is_spent() {
+        // The first attempt at this allowance checked it per head
+        // BEFORE `pin_peer_head` and `continue`d past it, so a spent
+        // allowance dropped `Fork` outcomes too — a node could hide a
+        // rewrite of its own chain behind junk heads: no conflict row,
+        // no log line. Classification is never refused.
+        let s = Store::open_memory().expect("store");
+        s.pin_peer_head(&head(1, 10, 0xAA, 10), node(2), 1_000)
+            .expect("pin");
+
+        // One envelope: junk first to exhaust the allowance, then the
+        // conflicting head at the position we already hold.
+        let mut heads: Vec<AuditHead> = (100..=120u64)
+            .map(|i| head(1, i, u8::try_from(i % 251).unwrap_or(0), i))
+            .collect();
+        heads.push(head(1, 10, 0xBB, 10));
+
+        let (outcomes, _) = s
+            .pin_peer_heads(&heads, node(2), 2, 2_000)
+            .expect("pin batch");
+        assert!(
+            matches!(outcomes.last(), Some(PinOutcome::Fork { .. })),
+            "the fork must be recorded with the allowance spent, got {:?}",
+            outcomes.last()
+        );
+        assert_eq!(
+            s.head_conflicts(10).expect("conflicts").len(),
+            1,
+            "and a conflict row written"
+        );
+        assert_eq!(status_of_pin(&s, 10), PinStatus::Contradicted);
+    }
+
+    #[test]
+    fn p12_conflicts_are_bounded_per_position_and_counted_not_deleted() {
+        // `audit_head_conflicts` is keyed on `other_hash`, which the
+        // subject mints freely, so one envelope could write a row per
+        // head. Beyond the cap they are REFUSED and counted — never
+        // deleted, which would be Decision 12 by the back door.
+        let s = Store::open_memory().expect("store");
+        s.pin_peer_head(&head(1, 7, 0x01, 7), node(2), 1_000)
+            .expect("pin");
+        let branches = usize::try_from(MAX_CONFLICTS_PER_POSITION).expect("fits") * 3;
+        for i in 0..branches {
+            let hash = u8::try_from(100 + i).unwrap_or(0);
+            s.pin_peer_head(&head(1, 7, hash, 7), node(2), 2_000 + i as u64)
+                .expect("pin");
+        }
+
+        let kept = s.head_conflicts(100).expect("conflicts");
+        assert_eq!(
+            i64::try_from(kept.len()).expect("fits"),
+            MAX_CONFLICTS_PER_POSITION,
+            "bounded at the cap; kept {}",
+            kept.len()
+        );
+        // The first row still carries both signatures in full — that
+        // is the proof the cap must not cost.
+        assert!(kept.iter().all(|c| c.seq == 7));
+        let suppressed = s.conflict_overflow(node(1), 7).expect("overflow");
+        assert_eq!(
+            suppressed,
+            branches - usize::try_from(MAX_CONFLICTS_PER_POSITION).expect("fits"),
+            "and the refusals are counted"
+        );
+        assert_eq!(status_of_pin(&s, 7), PinStatus::Contradicted);
+    }
+
+    fn status_of_pin(s: &Store, seq: u64) -> PinStatus {
+        s.peer_head_pins(node(1))
+            .expect("pins")
+            .into_iter()
+            .find(|p| p.seq == seq)
+            .expect("pin")
+            .status
     }
 }
