@@ -824,7 +824,16 @@ than of a sort key. Two further constraints 1b-ii inherits:
 - Candidates must be deduped by `(node_id, seq)` BEFORE the allowance
   is applied, or a sender fills the selection window with free
   duplicates of one position: 24 heads at one position spent 1 unit
-  and produced 23 forks.
+  and produced 23 forks. **That dedupe is for SELECTION only, and it
+  must not become the ingest dedupe.** `ingest` keys on
+  `(node_id, seq, entry_hash)`; narrowing it to `(node_id, seq)`
+  destroys the second branch of a same-envelope fork before anything
+  can classify it — one ordinary pin, no conflict row, no log line,
+  and a subject double-signs with impunity. That narrowing left the
+  whole workspace green when this amendment was first written, which
+  is why `m28` now exists at the ingest layer: every head still
+  reaches `pin_one` and is still classified, and only the allowance's
+  own candidate list is collapsed.
 - `Fork`, `Refreshed` and `RejectedSeq` are classifications, not new
   rows, and must never be refused. An allowance that suppressed
   `Fork` would let a node hide a rewrite of its own chain behind junk
@@ -919,12 +928,39 @@ equal to `PIN_KEEP_RECENT` (64), so one envelope can no longer fill a
 node's whole recent-pin window; `m24` keeps its original pressure by
 sending as many full envelopes as that now takes.
 
+`m24` needed a second correction beyond the envelope count, and it is
+worth recording because the first version of this paragraph claimed a
+guard the test did not have. The sweep exempts `MIN(rowid)` per node
+AND `MIN(rowid)` per time bucket, and both exemptions are status-blind.
+`m24` ingested its corroborated pin first, making it `rowid` 1, so it
+was protected twice over by rules that never look at `status` —
+deleting the sweep's `status = 'unchecked'` filter outright, which is
+the round-7 defect in full, left `m24` passing. It now seeds an older
+`unchecked` pin ahead of the corroborated one so that both exemptions
+are taken by that row, and the corroborated pin survives only because
+of its status. Verified in both directions.
+
 `harness-daemon` const-asserts `MAX_HEADS_PER_ENVELOPE > RELAY_HEADS`,
 since a cap below what an honest sender emits would make the same
 `take()` silently truncate a legitimate relay set. `harness-core`
 cannot assert it: `RELAY_HEADS` lives in the daemon. `m27` pins the
 truncation, and the truncation is now logged — the one case where the
 narrowing discards something must not look like a quiet peer.
+
+**Decision 32 — the batching's cost is tail latency, not throughput,
+and it is not a free win.**
+
+Worth recording next to "one lock acquisition and one transaction":
+fairness granularity on the process-wide store mutex moves from
+per-head to per-envelope. Measured on a file-backed WAL store with 24
+heads, total work roughly halves — 2.17 ms of short holds becomes
+1.09 ms as one hold — but the worst-case wait for an unrelated store
+caller (task dispatch, leases, result writes) rises from about 0.16 ms
+to about 1.09 ms. It is bounded by the cap, and the cap fell 64 -> 24
+in the same item, so it is better than `main`'s worst case in
+aggregate. Rollback is `DropBehavior::Rollback` on the early `?`, which
+is why closing the seq-0 path (Decision 30) mattered: before it, one
+unstorable head discarded the whole envelope's writes.
 
 ### Carried out of 1b-i
 
@@ -935,6 +971,13 @@ narrowing discards something must not look like a quiet peer.
 - A fork logs an `ERROR` per occurrence with no per-peer rate limit.
   Bounded fork logging was built for 1b-i and withdrawn with the rest
   of the rate-limiting machinery; it belongs with 1b-ii.
+- The oversized-envelope line logs at `debug` for the same reason. The
+  const assert keeps the cap above what an honest sender emits, so no
+  honest peer can reach that branch without a code change: every
+  overflow arriving today is misbehaviour, at a rate the sender picks,
+  on a channel with no message rate limit. A per-envelope `WARN` there
+  would have been a log-flood vector handed to the sender. 1b-ii
+  promotes it to `warn` under the per-peer log window.
 - Earlier drafts of this amendment stated the residual row growth as
   `allowance x sweep interval`. That was wrong on its own terms: each
   admitted position also carried up to 8 conflict rows and an overflow

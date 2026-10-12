@@ -59,11 +59,14 @@ impl PinStatus {
     /// deletion this table exists to prevent.
     ///
     /// `Corroborated` used to be evictable, which round 7 showed was
-    /// exploitable: `MAX_HEADS_PER_ENVELOPE` is 64 and
-    /// `PIN_KEEP_RECENT` is also 64, so ONE 64-head envelope fills a
-    /// node's entire recent-pin window, and the next hourly sweep then
-    /// deleted its honest corroborated pins — keeping only the
-    /// `MIN(rowid)` row per node. The verdicts were unrecoverable:
+    /// exploitable: `MAX_HEADS_PER_ENVELOPE` was then 64, exactly
+    /// `PIN_KEEP_RECENT`, so ONE envelope filled a node's entire
+    /// recent-pin window, and the next hourly sweep then deleted its
+    /// honest corroborated pins — keeping only the `MIN(rowid)` row
+    /// per node. (5.13c-1b-i narrowed the cap to 24, so one envelope
+    /// no longer reaches 64 pins. That raises the cost of the flood;
+    /// it does not restore the verdicts, which is why the status
+    /// filter and not the cap is what makes this safe.) The verdicts were unrecoverable:
     /// `audit_run_corroborates` reads the pin, so deleting the pin
     /// destroys the corroboration, and only the subject can mint a
     /// replacement. It also defeated both of Decision 25's

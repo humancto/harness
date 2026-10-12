@@ -1297,6 +1297,16 @@ fn m24_a_head_flood_cannot_sweep_away_a_nodes_corroborated_pins() {
         h
     };
 
+    // An OLDER unchecked pin first, and it is load-bearing. The sweep
+    // exempts `MIN(rowid)` per node and `MIN(rowid)` per time bucket,
+    // and BOTH exemptions are status-blind. Ingesting the corroborated
+    // pin first made it rowid 1 for this node, so it was protected
+    // twice over by rules that never look at `status` — deleting the
+    // sweep's `status = 'unchecked'` filter outright, which is the
+    // round-7 defect in full, left this test passing. Seeding seq 50
+    // ahead of it takes both exemptions, so seq 100 survives only
+    // because it is corroborated, which is the property named above.
+    svc.ingest(c.node_id(), &envelope(&c, vec![sign_c(50, 0x32)]), 500);
     svc.ingest(c.node_id(), &envelope(&c, vec![sign_c(100, 0x64)]), 1_000);
     store
         .set_pin_status(c.node_id(), 100, PinStatus::Corroborated)
@@ -1486,5 +1496,67 @@ fn m27_an_oversized_envelope_is_truncated_and_the_cap_covers_an_honest_sender() 
         store.peer_head_pins(c.node_id()).expect("pins").len(),
         cap,
         "and nothing past the cap reached the store"
+    );
+}
+
+#[test]
+fn m28_a_same_envelope_fork_at_an_unheld_position_is_caught_at_ingest() {
+    // `p10`/`p11` prove the STORE classifies a same-envelope fork at a
+    // position we have never pinned. Nothing proved the second branch
+    // still reaches the store: the only thing that gets two branches
+    // at one position past `ingest` is the dedupe key being
+    // `(node_id, seq, entry_hash)` rather than `(node_id, seq)`, and
+    // narrowing that key left the whole workspace green. `m03` covers
+    // only a CROSS-envelope fork at an already-held position.
+    //
+    // That is a live trap rather than a hypothetical: ADR-0041
+    // Decision 28 tells 5.13c-1b-ii to dedupe candidates by
+    // `(node_id, seq)` before applying the allowance. Done at the
+    // wrong layer, that silently destroys the evidence — one ordinary
+    // pin, no conflict row, no log line, and a subject double-signs
+    // with impunity. This test is what makes that regression loud.
+    let (store, me, trust, b, c, _tmp) = trio();
+    let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me, trust);
+
+    let sign_c = |seq: u64, hash: u8| {
+        let mut h = harness_core::AuditHead {
+            node_id: c.node_id(),
+            seq,
+            entry_hash: [hash; 32],
+            at_ms: seq,
+            sig: Signature::from_bytes([0u8; 64]),
+        };
+        h.sign(&c).expect("sign");
+        h
+    };
+
+    // B relays two differently-signed branches of C at one position we
+    // do not hold, in ONE envelope.
+    let env = envelope(&b, vec![sign_c(7, 0xAA), sign_c(7, 0xBB)]);
+    let outcomes = svc.ingest(b.node_id(), &env, 2_000);
+
+    assert_eq!(
+        outcomes.len(),
+        2,
+        "both branches must be classified, not collapsed, got {outcomes:?}"
+    );
+    assert!(
+        matches!(outcomes[0].1, harness_store::PinOutcome::Pinned),
+        "the first branch pins, got {:?}",
+        outcomes[0].1
+    );
+    assert!(
+        matches!(outcomes[1].1, harness_store::PinOutcome::Fork { .. }),
+        "and the second is a FORK, got {:?}",
+        outcomes[1].1
+    );
+    let conflicts = store.head_conflicts(10).expect("conflicts");
+    assert_eq!(conflicts.len(), 1, "with a conflict row holding both sides");
+    assert_eq!(conflicts[0].held_hash, [0xAA; 32]);
+    assert_eq!(conflicts[0].other_hash, [0xBB; 32]);
+    assert_eq!(
+        conflicts[0].reported_by,
+        b.node_id(),
+        "provenance is the relayer, not the accused"
     );
 }

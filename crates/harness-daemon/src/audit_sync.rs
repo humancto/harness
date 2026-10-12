@@ -192,9 +192,9 @@ impl AuditSyncService {
     /// accusation is worse than none.
     ///
     /// Built once per envelope, not once per head: `all_peers()`
-    /// clones the whole peer list, and a 64-head envelope arriving at
-    /// the sender's chosen rate would otherwise be 64 full clones
-    /// (diff review MAJOR-5).
+    /// clones the whole peer list, and a full envelope arriving at the
+    /// sender's chosen rate would otherwise be one full clone per head
+    /// — `MAX_HEADS_PER_ENVELOPE` of them (diff review MAJOR-5).
     fn pubkey_map(&self) -> HashMap<NodeId, PublicKey> {
         self.trust
             .all_peers()
@@ -264,11 +264,19 @@ impl AuditSyncService {
             std::collections::HashSet::new();
         // The cap is the only bound on per-envelope work, so the one
         // case where narrowing it to MAX_HEADS_PER_ENVELOPE actually
-        // discards something must not be silent — otherwise a sender
-        // whose relay set outgrew the cap looks identical to one that
-        // is simply quiet.
+        // discards something must not be silent.
+        //
+        // DEBUG, not warn, and deliberately: the const assert above
+        // keeps the cap above what an honest sender emits, so no
+        // honest peer can reach this branch without a code change —
+        // every overflow that arrives today is misbehaviour, the
+        // sender chooses how often to send it, and `harness.audit` has
+        // no message rate limit. A per-envelope WARN here would be a
+        // log-flood vector handed to the sender. 5.13c-1b-ii carries
+        // the per-peer log window; this line is promoted to `warn`
+        // under it, alongside `AUDIT CHAIN FORK`.
         if env.heads.len() > harness_core::MAX_HEADS_PER_ENVELOPE {
-            tracing::warn!(
+            tracing::debug!(
                 target: "harness.audit.sync",
                 relayer = %from,
                 offered = env.heads.len(),
@@ -328,52 +336,18 @@ impl AuditSyncService {
                 return out;
             }
         };
+        // `zip` would silently truncate on a length mismatch, and the
+        // pairing is what attributes a `Fork` to a subject. 1b-ii adds
+        // a per-peer allowance inside this very loop, where one
+        // `continue` that skips an outcome would shift every later
+        // pair and log a fork against an innocent node.
+        debug_assert_eq!(
+            accepted.len(),
+            outcomes.len(),
+            "pin_peer_heads returns one outcome per input head, in input order"
+        );
         for (head, outcome) in accepted.iter().zip(outcomes) {
-            match outcome {
-                PinOutcome::Fork { conflict_id } => tracing::error!(
-                    target: "harness.audit.sync",
-                    subject = %head.node_id,
-                    seq = head.seq,
-                    conflict_id,
-                    reported_by = %from,
-                    "AUDIT CHAIN FORK: two signed heads at one position"
-                ),
-                // A node offering a position below one we
-                // already hold is the loudest signal available
-                // before entries exist — a wiped or restored
-                // DB looks exactly like this — so it is not
-                // silent, even though it is not evidence
-                // (diff review 1(c)/1(d)).
-                // FIRST-PARTY only: a node offering a
-                // position below one we hold for it is the
-                // loudest signal available before entries
-                // exist (a wiped or restored DB looks exactly
-                // like this). A RELAYED head lagging ours is
-                // the normal steady state in any mesh with
-                // relays, and warning on it would drown the
-                // signal the warn exists for.
-                PinOutcome::StalePinned if from == head.node_id => tracing::warn!(
-                    target: "harness.audit.sync",
-                    subject = %head.node_id,
-                    offered_seq = head.seq,
-                    "node advertised a head below one we already hold for it"
-                ),
-                PinOutcome::StalePinned => tracing::debug!(
-                    target: "harness.audit.sync",
-                    subject = %head.node_id,
-                    offered_seq = head.seq,
-                    reported_by = %from,
-                    "relayed head lags the pin we hold"
-                ),
-                PinOutcome::RejectedSeq => tracing::warn!(
-                    target: "harness.audit.sync",
-                    subject = %head.node_id,
-                    offered_seq = head.seq,
-                    reported_by = %from,
-                    "audit head seq is not storable; rejected"
-                ),
-                PinOutcome::Pinned | PinOutcome::Refreshed => {}
-            }
+            log_pin_outcome(from, head, &outcome);
             out.push((head.node_id, outcome));
         }
         out
@@ -909,6 +883,57 @@ impl AuditSyncService {
                 _ = shutdown.changed() => return,
             }
         }
+    }
+}
+
+/// Log one pin outcome. Split out of `ingest` only to keep it under
+/// clippy's line limit; the arms are the interesting part and belong
+/// read together.
+fn log_pin_outcome(from: NodeId, head: &harness_core::AuditHead, outcome: &PinOutcome) {
+    match outcome {
+        PinOutcome::Fork { conflict_id } => tracing::error!(
+            target: "harness.audit.sync",
+            subject = %head.node_id,
+            seq = head.seq,
+            conflict_id,
+            reported_by = %from,
+            "AUDIT CHAIN FORK: two signed heads at one position"
+        ),
+        // A node offering a position below one we
+        // already hold is the loudest signal available
+        // before entries exist — a wiped or restored
+        // DB looks exactly like this — so it is not
+        // silent, even though it is not evidence
+        // (diff review 1(c)/1(d)).
+        // FIRST-PARTY only: a node offering a
+        // position below one we hold for it is the
+        // loudest signal available before entries
+        // exist (a wiped or restored DB looks exactly
+        // like this). A RELAYED head lagging ours is
+        // the normal steady state in any mesh with
+        // relays, and warning on it would drown the
+        // signal the warn exists for.
+        PinOutcome::StalePinned if from == head.node_id => tracing::warn!(
+            target: "harness.audit.sync",
+            subject = %head.node_id,
+            offered_seq = head.seq,
+            "node advertised a head below one we already hold for it"
+        ),
+        PinOutcome::StalePinned => tracing::debug!(
+            target: "harness.audit.sync",
+            subject = %head.node_id,
+            offered_seq = head.seq,
+            reported_by = %from,
+            "relayed head lags the pin we hold"
+        ),
+        PinOutcome::RejectedSeq => tracing::warn!(
+            target: "harness.audit.sync",
+            subject = %head.node_id,
+            offered_seq = head.seq,
+            reported_by = %from,
+            "audit head seq is not storable; rejected"
+        ),
+        PinOutcome::Pinned | PinOutcome::Refreshed => {}
     }
 }
 
