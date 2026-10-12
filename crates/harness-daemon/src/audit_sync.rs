@@ -26,13 +26,64 @@ use crate::peer_net::{OutboundMsg, PeerNet};
 /// How often we push our head. Production 30s: a pin every half minute
 /// bounds how much history a node could rewrite unobserved, without
 /// making the channel chatty.
+///
+/// Any per-window budget derived from an interval MUST use
+/// [`HEAD_PUSH_INTERVAL_PROD`] and never this constant: under
+/// `cfg(test)` this is 200ms, so `WINDOW / INTERVAL` becomes 300 and
+/// the derived budget is one no test can ever reach — the suite then
+/// passes vacuously, which is the failure mode ADR-0041 keeps
+/// recording. Only the timer in `run()` takes the `cfg`-gated value.
 #[cfg(not(test))]
-pub(crate) const HEAD_PUSH_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const HEAD_PUSH_INTERVAL: Duration = HEAD_PUSH_INTERVAL_PROD;
 #[cfg(test)]
 pub(crate) const HEAD_PUSH_INTERVAL: Duration = Duration::from_millis(200);
 
+/// The production push interval, whatever the build profile.
+pub(crate) const HEAD_PUSH_INTERVAL_PROD: Duration = Duration::from_secs(30);
+
 /// Third-party heads relayed alongside our own, newest first.
 const RELAY_HEADS: usize = 16;
+
+/// Per-peer window for the log lines a PEER can provoke.
+pub(crate) const LOG_WINDOW_MS: u64 = 60_000;
+/// `AUDIT CHAIN FORK` lines allowed per peer per window. A fork is the
+/// loudest event this subsystem has, so the limit is generous; it
+/// exists only because the sender picks the rate.
+pub(crate) const FORK_LOGS_PER_WINDOW: u32 = 8;
+/// Oversized-envelope lines per peer per window. One is enough: the
+/// condition is static for a given sender, so repeats carry nothing.
+pub(crate) const OVERSIZE_LOGS_PER_WINDOW: u32 = 1;
+
+/// Which peer-provoked log line is being rated.
+#[derive(Clone, Copy)]
+enum PeerLog {
+    Fork,
+    OversizedEnvelope,
+}
+
+/// What [`AuditSyncService::may_log`] decided about one line.
+///
+/// Not a `bool`, because `if may_log { log }` drops the overflow
+/// SILENTLY and an operator then cannot tell 8 forks from 8000.
+/// ADR-0041's `shell.denied` limiter settled this for the same
+/// problem: the counts are written first and can never be crowded
+/// out, because "a completed flood shows its first ten rows and no
+/// trace of the rest" is not a record.
+#[must_use]
+enum LogDecision {
+    /// Emit the line. `dropped_before` is how many were suppressed
+    /// since the last emitted one — it rides the next line that gets
+    /// through, so it survives any number of window rolls and cannot
+    /// be crowded out. `last_in_window` marks the line that spends
+    /// the budget, so the suppression is announced rather than
+    /// inferred from silence.
+    Emit {
+        dropped_before: u32,
+        last_in_window: bool,
+    },
+    /// Budget spent. Counted, reported on the next emitted line.
+    Drop,
+}
 
 // An honest envelope carries our own head plus the relay set, so the
 // cap in `harness-core` must leave room for all of them. If it ever
@@ -131,6 +182,21 @@ struct PeerSyncState {
     /// Serve-side rate limiting: window start and batches served in it.
     serve_window_start_ms: u64,
     served_in_window: u32,
+    /// Log rate limiting, with its OWN window start — never the serve
+    /// or pin window's. 1b-i's withdrawn version rolled the pin
+    /// window's start from the fork limiter while leaving its
+    /// counters, which was unreachable only because of call order; if
+    /// that order had ever changed the allowance would have frozen at
+    /// whatever the counter held and never recovered. Exactly one
+    /// place rolls this window, and it resets every counter under it.
+    log_window_start_ms: u64,
+    fork_logs_in_window: u32,
+    oversize_logs_in_window: u32,
+    /// Lines suppressed since the last one that got through. Survives
+    /// window rolls deliberately: the count is only cleared by being
+    /// REPORTED, never by time passing.
+    fork_logs_dropped: u32,
+    oversize_logs_dropped: u32,
 }
 
 /// A request we sent and are still waiting on.
@@ -266,23 +332,36 @@ impl AuditSyncService {
         // case where narrowing it to MAX_HEADS_PER_ENVELOPE actually
         // discards something must not be silent.
         //
-        // DEBUG, not warn, and deliberately: the const assert above
-        // keeps the cap above what an honest sender emits, so no
-        // honest peer can reach this branch without a code change —
-        // every overflow that arrives today is misbehaviour, the
-        // sender chooses how often to send it, and `harness.audit` has
-        // no message rate limit. A per-envelope WARN here would be a
-        // log-flood vector handed to the sender. 5.13c-1b-ii carries
-        // the per-peer log window; this line is promoted to `warn`
-        // under it, alongside `AUDIT CHAIN FORK`.
+        // WARN, now that the per-peer log window exists to bound it.
+        // It was `debug` only because the sender picks the rate and
+        // `harness.audit` has no message rate limit, so an unrated
+        // per-envelope WARN was a log-flood lever handed to the
+        // sender. Rated at one line per peer per window it is safe to
+        // be loud, and being loud matters for the one HONEST case:
+        // the const assert is per-binary, and `harness-core`
+        // deliberately leaves the cap headroom for `RELAY_HEADS` to
+        // grow, so in a mixed-version mesh an upgraded sender whose
+        // `1 + RELAY_HEADS` exceeds our cap is truncated here. That
+        // must not look like a quiet peer (Decision 31).
         if env.heads.len() > harness_core::MAX_HEADS_PER_ENVELOPE {
-            tracing::debug!(
-                target: "harness.audit.sync",
-                relayer = %from,
-                offered = env.heads.len(),
-                cap = harness_core::MAX_HEADS_PER_ENVELOPE,
-                "audit envelope carried more heads than the cap; the tail was ignored"
-            );
+            // `..` discards `last_in_window`, which is a constant
+            // `true` while OVERSIZE_LOGS_PER_WINDOW is 1. If that
+            // const is ever raised, bind it and emit it: otherwise
+            // this line silently stops announcing suppression, with
+            // no compile error to catch it.
+            if let LogDecision::Emit { dropped_before, .. } =
+                self.may_log(from, PeerLog::OversizedEnvelope, now_ms)
+            {
+                tracing::warn!(
+                    target: "harness.audit.sync",
+                    relayer = %from,
+                    offered = env.heads.len(),
+                    cap = harness_core::MAX_HEADS_PER_ENVELOPE,
+                    dropped_heads = env.heads.len() - harness_core::MAX_HEADS_PER_ENVELOPE,
+                    dropped_before,
+                    "audit envelope carried more heads than the cap; the tail was ignored"
+                );
+            }
         }
         let mut accepted: Vec<harness_core::AuditHead> = Vec::new();
         for head in env.heads.iter().take(harness_core::MAX_HEADS_PER_ENVELOPE) {
@@ -336,18 +415,8 @@ impl AuditSyncService {
                 return out;
             }
         };
-        // `zip` would silently truncate on a length mismatch, and the
-        // pairing is what attributes a `Fork` to a subject. 1b-ii adds
-        // a per-peer allowance inside this very loop, where one
-        // `continue` that skips an outcome would shift every later
-        // pair and log a fork against an innocent node.
-        debug_assert_eq!(
-            accepted.len(),
-            outcomes.len(),
-            "pin_peer_heads returns one outcome per input head, in input order"
-        );
-        for (head, outcome) in accepted.iter().zip(outcomes) {
-            log_pin_outcome(from, head, &outcome);
+        for (head, outcome) in outcomes {
+            self.log_pin_outcome(from, head, &outcome, now_ms);
             out.push((head.node_id, outcome));
         }
         out
@@ -699,19 +768,124 @@ impl AuditSyncService {
         let _ = net.send_to(peer, OutboundMsg::AuditEntries(env));
     }
 
+    /// Whether this peer may provoke one more log line of `kind`.
+    ///
+    /// Takes the `peers` lock and nothing else, and the lock-order
+    /// rule this file depends on is that the `peers` mutex is NEVER
+    /// held ACROSS a `Store::with_conn` call — `with_conn` holds a
+    /// non-reentrant `parking_lot::Mutex<Connection>`, one per
+    /// `Store` and so effectively one in the daemon. Callers sit on
+    /// both sides of the store work (the oversized-envelope check
+    /// runs before `pin_peer_heads`, the fork line after it); what
+    /// matters is that none of them spans it.
+    ///
+    /// Returns [`LogDecision::Drop`] once the window's budget for
+    /// `kind` is spent.
+    /// The CALLER decides what to do about that, which is the part
+    /// worth being careful with: a bare `if may_log { log }` drops
+    /// lines silently, and ADR-0041's `shell.denied` limiter is
+    /// explicit that a flood must leave a record of its own size.
+    fn may_log(&self, peer: NodeId, kind: PeerLog, now_ms: u64) -> LogDecision {
+        let mut states = self.peers.lock();
+        let state = states.entry(peer).or_default();
+        // A clock that moved BACKWARDS must roll the window, not
+        // freeze it. `saturating_sub` alone prevents the underflow and
+        // not the freeze: if the first envelopes land while the RTC
+        // reads ahead (a batteryless clock before NTP settles, which
+        // is exactly when the mesh first connects), the start is
+        // stamped in the future, every later subtraction saturates to
+        // 0, and the counters never reset. This limiter would then
+        // silence `AUDIT CHAIN FORK` for that peer for the life of the
+        // process. `may_serve` has the same shape and the same fix; an
+        // earlier version of this comment claimed it "fails OPEN
+        // (serves more)" and used that to justify fixing only this
+        // one, which was backwards — a frozen window's counter only
+        // grows, so both fail CLOSED.
+        if now_ms < state.log_window_start_ms || now_ms - state.log_window_start_ms >= LOG_WINDOW_MS
+        {
+            state.log_window_start_ms = now_ms;
+            state.fork_logs_in_window = 0;
+            state.oversize_logs_in_window = 0;
+        }
+        let (count, dropped, limit) = match kind {
+            PeerLog::Fork => (
+                &mut state.fork_logs_in_window,
+                &mut state.fork_logs_dropped,
+                FORK_LOGS_PER_WINDOW,
+            ),
+            PeerLog::OversizedEnvelope => (
+                &mut state.oversize_logs_in_window,
+                &mut state.oversize_logs_dropped,
+                OVERSIZE_LOGS_PER_WINDOW,
+            ),
+        };
+        if *count >= limit {
+            *dropped = dropped.saturating_add(1);
+            return LogDecision::Drop;
+        }
+        *count += 1;
+        LogDecision::Emit {
+            dropped_before: std::mem::take(dropped),
+            last_in_window: *count == limit,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fork_logs_in_window_for_test(&self, peer: NodeId) -> u32 {
+        self.peers
+            .lock()
+            .entry(peer)
+            .or_default()
+            .fork_logs_in_window
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fork_logs_dropped_for_test(&self, peer: NodeId) -> u32 {
+        self.peers.lock().entry(peer).or_default().fork_logs_dropped
+    }
+
+    #[cfg(test)]
+    pub(crate) fn oversize_logs_dropped_for_test(&self, peer: NodeId) -> u32 {
+        self.peers
+            .lock()
+            .entry(peer)
+            .or_default()
+            .oversize_logs_dropped
+    }
+
+    #[cfg(test)]
+    pub(crate) fn oversize_logs_in_window_for_test(&self, peer: NodeId) -> u32 {
+        self.peers
+            .lock()
+            .entry(peer)
+            .or_default()
+            .oversize_logs_in_window
+    }
+
     /// May this peer be served one more entry BATCH in this window?
     ///
     /// Decision 18's limiter, and only that: it gates `serve_range` on
     /// `harness.audit.entries`. It does NOT rate-limit head ingest on
     /// `harness.audit` — a different channel and a different path,
     /// which is why closing that gap needs its own budget (ROADMAP
-    /// 5.13c-1b). The revert of a first attempt at that budget left
-    /// its doc comment stranded here, describing behaviour this
-    /// function never had (round 9 finding 5).
+    /// 5.13c-1b-ii). The revert of a first attempt at that budget left
+    /// this block stranded above a different function once already
+    /// (round 9 finding 5), and inserting `may_log` above it stranded
+    /// it a second time — hence this note.
     fn may_serve(&self, peer: NodeId, now_ms: u64) -> bool {
         let mut states = self.peers.lock();
         let state = states.entry(peer).or_default();
-        if now_ms.saturating_sub(state.serve_window_start_ms) >= SERVE_WINDOW_MS {
+        // Same backwards-clock hazard as `may_log`, and it fails
+        // CLOSED here too: with the start stamped in the future the
+        // subtraction is always 0, the window never rolls,
+        // `served_in_window` saturates, and this returns false until
+        // the wall clock passes the stamp — ending every peer's walk.
+        // An earlier note claimed this one "fails open (serves more)";
+        // there is no clock direction in which a frozen window serves
+        // more, because the counter only grows.
+        if now_ms < state.serve_window_start_ms
+            || now_ms - state.serve_window_start_ms >= SERVE_WINDOW_MS
+        {
             state.serve_window_start_ms = now_ms;
             state.served_in_window = 0;
         }
@@ -886,54 +1060,77 @@ impl AuditSyncService {
     }
 }
 
-/// Log one pin outcome. Split out of `ingest` only to keep it under
-/// clippy's line limit; the arms are the interesting part and belong
-/// read together.
-fn log_pin_outcome(from: NodeId, head: &harness_core::AuditHead, outcome: &PinOutcome) {
-    match outcome {
-        PinOutcome::Fork { conflict_id } => tracing::error!(
-            target: "harness.audit.sync",
-            subject = %head.node_id,
-            seq = head.seq,
-            conflict_id,
-            reported_by = %from,
-            "AUDIT CHAIN FORK: two signed heads at one position"
-        ),
-        // A node offering a position below one we
-        // already hold is the loudest signal available
-        // before entries exist — a wiped or restored
-        // DB looks exactly like this — so it is not
-        // silent, even though it is not evidence
-        // (diff review 1(c)/1(d)).
-        // FIRST-PARTY only: a node offering a
-        // position below one we hold for it is the
-        // loudest signal available before entries
-        // exist (a wiped or restored DB looks exactly
-        // like this). A RELAYED head lagging ours is
-        // the normal steady state in any mesh with
-        // relays, and warning on it would drown the
-        // signal the warn exists for.
-        PinOutcome::StalePinned if from == head.node_id => tracing::warn!(
-            target: "harness.audit.sync",
-            subject = %head.node_id,
-            offered_seq = head.seq,
-            "node advertised a head below one we already hold for it"
-        ),
-        PinOutcome::StalePinned => tracing::debug!(
-            target: "harness.audit.sync",
-            subject = %head.node_id,
-            offered_seq = head.seq,
-            reported_by = %from,
-            "relayed head lags the pin we hold"
-        ),
-        PinOutcome::RejectedSeq => tracing::warn!(
-            target: "harness.audit.sync",
-            subject = %head.node_id,
-            offered_seq = head.seq,
-            reported_by = %from,
-            "audit head seq is not storable; rejected"
-        ),
-        PinOutcome::Pinned | PinOutcome::Refreshed => {}
+impl AuditSyncService {
+    /// Log one pin outcome. Split out of `ingest` only to keep it
+    /// under clippy's line limit; the arms are the interesting part
+    /// and belong read together.
+    fn log_pin_outcome(
+        &self,
+        from: NodeId,
+        head: &harness_core::AuditHead,
+        outcome: &PinOutcome,
+        now_ms: u64,
+    ) {
+        match outcome {
+            // Rated per peer per window. A fork is the loudest event
+            // this subsystem has and the row is written either way, so
+            // the limit only bounds the LINES — otherwise a sender
+            // that mints conflicts at its own position turns our own
+            // alarm into its flood (24 per envelope, unrated channel).
+            PinOutcome::Fork { conflict_id } => {
+                if let LogDecision::Emit {
+                    dropped_before,
+                    last_in_window,
+                } = self.may_log(from, PeerLog::Fork, now_ms)
+                {
+                    tracing::error!(
+                        target: "harness.audit.sync",
+                        subject = %head.node_id,
+                        seq = head.seq,
+                        conflict_id,
+                        reported_by = %from,
+                        dropped_before,
+                        suppressing = last_in_window,
+                        "AUDIT CHAIN FORK: two signed heads at one position"
+                    );
+                }
+            }
+            // A node offering a position below one we
+            // already hold is the loudest signal available
+            // before entries exist — a wiped or restored
+            // DB looks exactly like this — so it is not
+            // silent, even though it is not evidence
+            // (diff review 1(c)/1(d)).
+            // FIRST-PARTY only: a node offering a
+            // position below one we hold for it is the
+            // loudest signal available before entries
+            // exist (a wiped or restored DB looks exactly
+            // like this). A RELAYED head lagging ours is
+            // the normal steady state in any mesh with
+            // relays, and warning on it would drown the
+            // signal the warn exists for.
+            PinOutcome::StalePinned if from == head.node_id => tracing::warn!(
+                target: "harness.audit.sync",
+                subject = %head.node_id,
+                offered_seq = head.seq,
+                "node advertised a head below one we already hold for it"
+            ),
+            PinOutcome::StalePinned => tracing::debug!(
+                target: "harness.audit.sync",
+                subject = %head.node_id,
+                offered_seq = head.seq,
+                reported_by = %from,
+                "relayed head lags the pin we hold"
+            ),
+            PinOutcome::RejectedSeq => tracing::warn!(
+                target: "harness.audit.sync",
+                subject = %head.node_id,
+                offered_seq = head.seq,
+                reported_by = %from,
+                "audit head seq is not storable; rejected"
+            ),
+            PinOutcome::Pinned | PinOutcome::Refreshed => {}
+        }
     }
 }
 

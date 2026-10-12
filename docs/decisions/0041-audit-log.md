@@ -1002,3 +1002,98 @@ unstorable head discarded the whole envelope's writes.
 - `harness.audit` still has no message rate limit, so per-message work
   is bounded only by the envelope cap. Charging cannot substitute,
   because the cost is upstream of any charge.
+
+## Amendment — 5.13c-1b-ii PR A: rating a peer-provoked log line
+
+PR A carries the mechanical half of 1b-ii: paired `(head, outcome)`
+returns, a per-peer window on the log lines a PEER can provoke, the
+oversized-envelope line promoted back to `warn` under that window, and
+`HEAD_PUSH_INTERVAL_PROD` split out so no budget is ever derived from
+the `cfg(test)` 200ms interval. No allowance, no ordering decision.
+
+**Decision 33 — a rated line must leave a record of its own size, and
+a bad clock must ROLL the window rather than freeze it.**
+
+Three things went wrong in the first cut of this, all found by review
+and all now mutation-covered:
+
+1. **The guard had no test, only a counter.** `m29` asserted
+   `fork_logs_in_window`, not the lines. A refactor that keeps the
+   charge and emits unconditionally therefore restored the whole flood
+   lever with all 141 daemon tests green — the repo's own named
+   failure mode ("a guard with no test is a guard that disappears"),
+   reproduced in the file that quotes it. The tests now count real
+   `tracing` events, with the count in a THREAD-LOCAL so parallel
+   tests emitting the same line cannot inflate it.
+
+   The subscriber is installed as the GLOBAL default, once, with one
+   `rebuild_interest_cache`. A review round argued this was
+   unnecessary — that a plain `with_default` passes alone, in
+   parallel, and under `--test-threads=1`. All three are true and the
+   conclusion is still wrong: with `with_default` and no rebuild,
+   `m29` counts 0 and fails under a FILTERED subset, which is the most
+   common developer invocation, while the full suite passes. Stated as
+   measured rather than as first written: `cargo test -p harness-daemon m2`
+   failed 11 of 15 runs, and the narrower `m29` filter failed on this
+   author's runs but passed 18 of 18 on a reviewer's. So it is
+   intermittent, not reproducible, and which filter trips it is not
+   stable — which is the argument, not a weaker version of it: a
+   guard's test must not depend on thread scheduling. Callsite
+   interest is cached process-wide, so whether the layer ever sees the
+   event depends on which tests ran first and on which thread. The
+   global default plus the rebuild is deterministic across every
+   filter, which is the property a guard's test needs.
+   One consequence to keep in mind: any OTHER test installing a global
+   subscriber makes these three tests fail loudly (verified), rather
+   than degrade to silently counting 0 — which is the right failure
+   mode, but it does mean this file owns the process's subscriber.
+2. **Dropping a line silently is not rating it.** `if may_log { log }`
+   leaves an operator unable to tell 8 forks from 8000, and the
+   residual attack is concrete: a peer burns the budget on self-forks
+   at its own position, and the one fork it later relays about a third
+   party is dropped with nothing recording that it was. Decision 18's
+   `shell.denied` limiter had already settled this — the counts are
+   written first and can never be crowded out. So `may_log` returns a
+   `LogDecision`, not a `bool`: the line that spends the budget is
+   marked `suppressing`, and the drop count rides the next line that
+   gets through. It is cleared by being REPORTED, never by time
+   passing, so it survives any number of window rolls.
+3. **`saturating_sub` prevents the underflow, not the freeze.** If a
+   peer's first envelopes arrive while the clock reads ahead — a
+   batteryless RTC before NTP settles, which is exactly when the mesh
+   first connects — the window start is stamped in the future, every
+   later subtraction saturates to 0, and the counters never reset.
+   That silences `AUDIT CHAIN FORK` for that peer for the life of the
+   process. An explicit `now_ms < start` check rolls the window
+   instead.
+
+   A first version of this note claimed `may_serve` shares the shape
+   but "fails OPEN (serves more)", and used that as the reason to fix
+   one limiter and not the other. **That was backwards.** With
+   `serve_window_start_ms` stamped in the future the subtraction is
+   always 0, the window never rolls, `served_in_window` saturates at
+   `SERVE_BATCHES_PER_MINUTE`, and `may_serve` then returns false
+   until the wall clock passes the stamp — refusing to serve ranges
+   and ending every peer's walk. There is no clock direction in which
+   a frozen window serves MORE: the counter only grows. Both limiters
+   fail closed, so both get the same check; the harms differ (lost
+   corroboration against a lost fork alarm) but that was never the
+   argument being made.
+
+The oversize line's own rating needed both halves covered separately:
+deleting the gate AND deleting the counter's reset left the whole
+workspace green, and the reset is the sharper half — without it the
+`warn` fires once per peer per PROCESS, so an upgraded sender whose
+`1 + RELAY_HEADS` exceeds an older node's cap (Decision 31's one
+honest case) looks exactly like the quiet peer that case exists to
+distinguish. A counter-only assertion cannot see it, because a stuck
+counter and a correctly rolled one read the same; `m27` counts the
+line across the roll.
+
+Carried to PR B: key the fork budget on `(reported_by, subject)`
+rather than `reported_by` alone. That removes the cross-subject
+residual in (2) entirely, and it is NOT the subject-keying mistake
+Decision 18 records for `shell.denied` — there the subject was an
+attacker-minted command string with a fresh key per attempt, whereas
+here it is a `NodeId` that must already be in the trust store, so the
+key space is bounded by trusted peers and cannot be minted.
