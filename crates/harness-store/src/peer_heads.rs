@@ -169,16 +169,26 @@ impl Store {
     /// a sender-independent order is worse than none. 5.13c-1b-ii
     /// carries the round-robin order that replaces them.
     ///
-    /// Outcomes are returned per input head, in input order.
+    /// Each outcome is returned PAIRED with the head it belongs to.
+    ///
+    /// Returning a bare `Vec<PinOutcome>` for the caller to `zip` was
+    /// the earlier shape, and the pairing is what attributes a `Fork`
+    /// to a subject: one skipped outcome shifts every later pair and
+    /// logs a fork against an innocent node. `zip` truncates silently
+    /// on a length mismatch, and a `debug_assert` on the lengths is
+    /// compiled out in release and cannot see a reordering at all.
+    /// Pairing here makes the misalignment unrepresentable instead.
+    /// 5.13c-1b-ii adds a per-subject cap inside this loop, which is
+    /// exactly the `continue` that would have caused it.
     ///
     /// # Errors
     /// Underlying sqlite errors.
-    pub fn pin_peer_heads(
+    pub fn pin_peer_heads<'h>(
         &self,
-        heads: &[AuditHead],
+        heads: &'h [AuditHead],
         reported_by: NodeId,
         now_ms: u64,
-    ) -> Result<Vec<PinOutcome>, StoreError> {
+    ) -> Result<Vec<(&'h AuditHead, PinOutcome)>, StoreError> {
         self.with_conn(|c| {
             let tx = c.unchecked_transaction()?;
             let mut out = Vec::with_capacity(heads.len());
@@ -187,7 +197,7 @@ impl Store {
                 // inserted the position this one names, in which case
                 // the re-read inside `pin_one` sees it and classifies
                 // this one as the same-envelope fork it is.
-                out.push(pin_one(&tx, head, reported_by, now_ms)?);
+                out.push((head, pin_one(&tx, head, reported_by, now_ms)?));
             }
             tx.commit()?;
             Ok(out)
@@ -1268,14 +1278,22 @@ mod tests {
             .pin_peer_heads(&heads, node(2), 1_000)
             .expect("the batch must COMMIT, not fail the envelope");
         assert!(
-            matches!(outcomes[1], PinOutcome::RejectedSeq),
+            matches!(outcomes[1].1, PinOutcome::RejectedSeq),
             "seq 0 is not storable, got {:?}",
-            outcomes[1]
+            outcomes[1].1
         );
         assert!(
-            matches!(outcomes[0], PinOutcome::Pinned) && matches!(outcomes[2], PinOutcome::Pinned),
+            matches!(outcomes[0].1, PinOutcome::Pinned)
+                && matches!(outcomes[2].1, PinOutcome::Pinned),
             "the honest heads beside it must survive, got {outcomes:?}"
         );
+        // The pairing is the point: each outcome names its own head.
+        assert_eq!(
+            outcomes[1].0.seq, 0,
+            "the refusal belongs to the seq-0 head"
+        );
+        assert_eq!(outcomes[0].0.seq, 5);
+        assert_eq!(outcomes[2].0.seq, 6);
         let kept: Vec<u64> = s
             .peer_head_pins(node(1))
             .expect("pins")
@@ -1298,14 +1316,14 @@ mod tests {
         let heads = vec![head(1, 7, 0xAA, 7), head(1, 7, 0xBB, 7)];
         let outcomes = s.pin_peer_heads(&heads, node(2), 1_000).expect("pin batch");
         assert!(
-            matches!(outcomes[0], PinOutcome::Pinned),
+            matches!(outcomes[0].1, PinOutcome::Pinned),
             "the first branch pins, got {:?}",
-            outcomes[0]
+            outcomes[0].1
         );
         assert!(
-            matches!(outcomes[1], PinOutcome::Fork { .. }),
+            matches!(outcomes[1].1, PinOutcome::Fork { .. }),
             "and the second is a fork, got {:?}",
-            outcomes[1]
+            outcomes[1].1
         );
         let conflicts = s.head_conflicts(10).expect("conflicts");
         assert_eq!(conflicts.len(), 1, "one conflict row for the pair");
@@ -1319,6 +1337,39 @@ mod tests {
             pins[0].status,
             PinStatus::Contradicted,
             "and the held pin is marked contradicted"
+        );
+    }
+
+    #[test]
+    fn p12_held_hash_means_the_pin_we_hold_not_the_lower_hash() {
+        // The convention, pinned so 5.13c-1b-ii cannot drift from it.
+        //
+        // A diff review asked for this pair to be canonicalized by
+        // `entry_hash`. It must NOT be. The pin row is append-only and
+        // the fork path never replaces it, so `held_hash` is always
+        // the FIRST hash we pinned — determined by our own store, not
+        // by the sender — and that is exactly the provenance the
+        // column name claims. Canonicalizing would trade a true
+        // statement for a sortable one.
+        //
+        // p11 and m28 both happen to list 0xAA before 0xBB, so they
+        // would still pass if the order became hash-based. This one
+        // pins the HIGH hash first, so it fails if it ever does.
+        let s = Store::open_memory().expect("store");
+        let heads = vec![head(1, 7, 0xBB, 7), head(1, 7, 0xAA, 7)];
+        let outcomes = s.pin_peer_heads(&heads, node(2), 1_000).expect("pin batch");
+        assert!(matches!(outcomes[0].1, PinOutcome::Pinned));
+        assert!(matches!(outcomes[1].1, PinOutcome::Fork { .. }));
+
+        let conflicts = s.head_conflicts(10).expect("conflicts");
+        assert_eq!(conflicts.len(), 1, "one row, not a mirrored pair");
+        assert_eq!(
+            conflicts[0].held_hash, [0xBB; 32],
+            "held is what we HOLD, even though it sorts higher"
+        );
+        assert_eq!(
+            conflicts[0].other_hash, [0xAA; 32],
+            "and other is the branch that contradicted it"
         );
     }
 }

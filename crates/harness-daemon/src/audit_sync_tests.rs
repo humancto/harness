@@ -1560,3 +1560,114 @@ fn m28_a_same_envelope_fork_at_an_unheld_position_is_caught_at_ingest() {
         "provenance is the relayer, not the accused"
     );
 }
+
+#[test]
+fn m29_fork_log_lines_are_bounded_per_peer_and_the_window_rolls() {
+    // The conflict ROW is written for every fork regardless — the
+    // evidence is never rated. What is rated is the ERROR line, which
+    // a sender can otherwise mint at will: it signs branches at its
+    // own position, and `harness.audit` has no message rate limit, so
+    // our own loudest alarm becomes its log flood.
+    //
+    // The limiter's window is its OWN. 1b-i's withdrawn version rolled
+    // the PIN window's start from the fork limiter while leaving that
+    // window's counters, which was unreachable only because of call
+    // order; this keeps one window with one roll point.
+    let (store, me, trust, b, c, _tmp) = trio();
+    let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me, trust);
+
+    let sign_c = |seq: u64, hash: u8| {
+        let mut h = harness_core::AuditHead {
+            node_id: c.node_id(),
+            seq,
+            entry_hash: [hash; 32],
+            at_ms: seq,
+            sig: Signature::from_bytes([0u8; 64]),
+        };
+        h.sign(&c).expect("sign");
+        h
+    };
+
+    // One pin, then a run of distinct branches at that same position:
+    // every one after the first is a fork.
+    for i in 0..14u8 {
+        svc.ingest(b.node_id(), &envelope(&b, vec![sign_c(7, 0x40 + i)]), 1_000);
+    }
+    let capped = svc.fork_logs_in_window_for_test(b.node_id());
+    assert_eq!(
+        capped,
+        crate::audit_sync::FORK_LOGS_PER_WINDOW,
+        "fork log lines must saturate at the per-window limit"
+    );
+    // The rows are NOT rated: 14 branches at one position, first
+    // pinned, 13 forks, all recorded.
+    assert_eq!(
+        store.head_conflicts(100).expect("conflicts").len(),
+        13,
+        "every fork is still RECORDED; only the log line is rated"
+    );
+
+    // A later window starts fresh.
+    svc.ingest(
+        b.node_id(),
+        &envelope(&b, vec![sign_c(7, 0xFE)]),
+        1_000 + crate::audit_sync::LOG_WINDOW_MS,
+    );
+    assert_eq!(
+        svc.fork_logs_in_window_for_test(b.node_id()),
+        1,
+        "the window must roll, not stay saturated forever"
+    );
+}
+
+#[test]
+fn m30_the_fork_log_budget_is_per_peer_not_global() {
+    // A noisy peer must not silence the alarm for an honest one.
+    let (store, me, trust, b, c, _tmp) = trio();
+    let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me, trust);
+
+    let sign_c = |seq: u64, hash: u8| {
+        let mut h = harness_core::AuditHead {
+            node_id: c.node_id(),
+            seq,
+            entry_hash: [hash; 32],
+            at_ms: seq,
+            sig: Signature::from_bytes([0u8; 64]),
+        };
+        h.sign(&c).expect("sign");
+        h
+    };
+
+    for i in 0..14u8 {
+        svc.ingest(b.node_id(), &envelope(&b, vec![sign_c(7, 0x40 + i)]), 1_000);
+    }
+    assert_eq!(
+        svc.fork_logs_in_window_for_test(b.node_id()),
+        crate::audit_sync::FORK_LOGS_PER_WINDOW,
+        "b has spent its budget"
+    );
+    assert_eq!(
+        svc.fork_logs_in_window_for_test(c.node_id()),
+        0,
+        "and c's is untouched"
+    );
+}
+
+#[test]
+fn m31_a_per_window_budget_must_derive_from_the_prod_push_interval() {
+    // `HEAD_PUSH_INTERVAL` is 200ms under `cfg(test)`, so a budget
+    // derived from it would be ~150x too large and no test could ever
+    // reach it — the suite would pass vacuously, which is the failure
+    // mode ADR-0041 keeps recording. 5.13c-1b-ii derives its cap from
+    // the prod constant; this pins that the two genuinely differ in a
+    // test build, so the distinction cannot quietly collapse.
+    assert_eq!(
+        crate::audit_sync::HEAD_PUSH_INTERVAL_PROD,
+        std::time::Duration::from_secs(30)
+    );
+    assert_ne!(
+        crate::audit_sync::HEAD_PUSH_INTERVAL,
+        crate::audit_sync::HEAD_PUSH_INTERVAL_PROD,
+        "in a test build these must differ, or this guard proves nothing"
+    );
+}
