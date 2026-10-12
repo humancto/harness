@@ -1528,19 +1528,50 @@ fn m27_an_oversized_envelope_is_truncated_and_the_cap_covers_an_honest_sender() 
         crate::audit_sync::OVERSIZE_LOGS_PER_WINDOW,
         "a second oversized envelope in the same window adds no line"
     );
-    // Count the LINE across the roll. A counter-only assertion cannot
-    // discriminate: with the reset deleted the counter sits at its
-    // limit forever, which reads the same as a correctly rolled one.
-    let warns = count_audit_warns(|| {
+    // Two separate line counts, because the two halves of the rating
+    // fail independently and the counter assertions above cannot see
+    // the first one at all.
+    //
+    // (1) The GATE. With OVERSIZE_LOGS_PER_WINDOW == 1 the charge
+    // saturates whether or not its result gates the line, so the
+    // counter reads 1 either way — deleting the gate but keeping the
+    // charge left all 143 tests green. Repeated IN-WINDOW envelopes
+    // are what discriminate: rated, three of them give one line.
+    let warns_in_window = count_audit_warns(|| {
+        for t in 0..3u64 {
+            let tick = 2_000 + crate::audit_sync::LOG_WINDOW_MS + t * 100;
+            svc.ingest(b.node_id(), &envelope(&b, over2.clone()), tick);
+        }
+    });
+    assert_eq!(
+        warns_in_window, 1,
+        "three oversized envelopes in one window must yield ONE line; \
+         without the gate each logs and no counter can tell"
+    );
+    assert_eq!(
+        svc.oversize_logs_dropped_for_test(b.node_id()),
+        2,
+        "and the two it suppressed are counted, so the next line can report them"
+    );
+
+    // (2) The window's RESET. A stuck counter and a correctly rolled
+    // one both read 1, so this half has to count the line as well.
+    let warns_after_roll = count_audit_warns(|| {
         svc.ingest(
             b.node_id(),
             &envelope(&b, over2),
-            2_500 + crate::audit_sync::LOG_WINDOW_MS,
+            2_000 + 2 * crate::audit_sync::LOG_WINDOW_MS,
         );
     });
     assert_eq!(
-        warns, 1,
-        "the window must ROLL, or the warn fires once per peer per process          and an upgraded sender truncated on every push looks quiet"
+        warns_after_roll, 1,
+        "the window must ROLL, or the warn fires once per peer per \
+         process and an upgraded sender truncated on every push looks quiet"
+    );
+    assert_eq!(
+        svc.oversize_logs_dropped_for_test(b.node_id()),
+        0,
+        "and that line reported the backlog, which is what clears it"
     );
 }
 
@@ -1616,12 +1647,14 @@ fn m28_a_same_envelope_fork_at_an_unheld_position_is_caught_at_ingest() {
 /// counting events at that level counts fork lines.
 ///
 /// Installed as the GLOBAL default, not via `with_default`, and this
-/// is the load-bearing part. Callsite interest is cached process-wide
-/// and `rebuild_interest_cache` re-registers against the GLOBAL
-/// dispatcher: with only a thread-local subscriber the callsite caches
-/// as disabled and the layer sees nothing. That failed as `m29`
-/// counting 0 in parallel while passing alone and under
-/// `--test-threads=1`.
+/// is the load-bearing part. Callsite interest is cached
+/// process-wide, so whether this layer ever sees the event depends on
+/// which tests ran first and on which thread. Measured, with
+/// `with_default` and no rebuild: the full suite passes, alone passes,
+/// `--test-threads=1` passes — and `cargo test -p harness-daemon m29`
+/// FAILS, reproducibly, counting 0. A guard's test cannot be
+/// filter-dependent, so the global default plus one
+/// `rebuild_interest_cache` is what makes it deterministic.
 ///
 /// The count is a THREAD-LOCAL, so parallel tests that emit the same
 /// line on their own threads cannot inflate it.
@@ -1630,6 +1663,34 @@ struct AuditErrorCounter;
 thread_local! {
     static AUDIT_ERRORS_SEEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static AUDIT_WARNS_SEEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// `dropped_before` and `suppressing` as actually EMITTED.
+    ///
+    /// Asserting the private `fork_logs_dropped` counter is not
+    /// asserting that the number ever reaches a log line: zeroing the
+    /// field without reporting it, or hard-coding `suppressing` to
+    /// false, both left all 143 tests green — the same mistake as
+    /// asserting a limiter's counter instead of its line.
+    static AUDIT_DROPPED_REPORTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static AUDIT_SUPPRESSING_SEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Pulls `dropped_before` / `suppressing` out of an event's fields.
+struct FieldGrab;
+
+impl tracing::field::Visit for FieldGrab {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name() == "dropped_before" {
+            AUDIT_DROPPED_REPORTED.with(|c| c.set(c.get() + value));
+        }
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        if field.name() == "suppressing" && value {
+            AUDIT_SUPPRESSING_SEEN.with(|c| c.set(true));
+        }
+    }
+
+    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
 }
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AuditErrorCounter {
@@ -1645,8 +1706,9 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AuditErrorCounter 
         match *m.level() {
             tracing::Level::ERROR => AUDIT_ERRORS_SEEN.with(|c| c.set(c.get() + 1)),
             tracing::Level::WARN => AUDIT_WARNS_SEEN.with(|c| c.set(c.get() + 1)),
-            _ => {}
+            _ => return,
         }
+        event.record(&mut FieldGrab);
     }
 }
 
@@ -1657,8 +1719,11 @@ fn install_audit_counter() {
     static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     INIT.get_or_init(|| {
         let subscriber = tracing_subscriber::registry().with(AuditErrorCounter);
-        // Another test installing one first is not a failure here, it
-        // just means these helpers cannot count.
+        // If another test has already installed a global subscriber
+        // this returns Err and the counting tests then FAIL loudly
+        // (verified) rather than quietly counting 0 — which is the
+        // right failure mode, but it does mean this module owns the
+        // test process's subscriber. Do not add another.
         if tracing::subscriber::set_global_default(subscriber).is_ok() {
             // Any callsite that already fired is cached against the
             // previous (absent) subscriber; re-register against ours.
@@ -1674,7 +1739,27 @@ fn count_audit_errors(f: impl FnOnce()) -> usize {
     AUDIT_ERRORS_SEEN.with(std::cell::Cell::get)
 }
 
+/// Run `f` and report what the EMITTED lines said about suppression:
+/// the summed `dropped_before`, and whether any line carried
+/// `suppressing = true`.
+fn observe_suppression(f: impl FnOnce()) -> (u64, bool) {
+    install_audit_counter();
+    AUDIT_DROPPED_REPORTED.with(|c| c.set(0));
+    AUDIT_SUPPRESSING_SEEN.with(|c| c.set(false));
+    f();
+    (
+        AUDIT_DROPPED_REPORTED.with(std::cell::Cell::get),
+        AUDIT_SUPPRESSING_SEEN.with(std::cell::Cell::get),
+    )
+}
+
 /// As [`count_audit_errors`], for WARN — the truncation line's level.
+///
+/// Counts EVERY warn on this target, and several others are reachable
+/// from `ingest` (a first-party stale head, an unstorable seq, a
+/// source mismatch, a failed pin). Callers must therefore keep the
+/// counted block to traffic that provokes only the line under test;
+/// `m27`'s counted envelopes are all `Refreshed`, so they do not.
 ///
 /// Counting the LINE and not the counter is load-bearing here: with
 /// the window's reset deleted the counter sits at its limit forever,
@@ -1894,20 +1979,78 @@ fn m29c_a_suppressed_fork_line_is_counted_and_reported_not_silent() {
 
     // 14 branches: 1 pin + 13 forks, of which 8 are emitted and 5 are
     // dropped and counted.
-    for i in 0..14u8 {
-        svc.ingest(b.node_id(), &envelope(&b, vec![sign_c(7, 0x40 + i)]), 1_000);
-    }
-    assert_eq!(svc.fork_logs_dropped_for_test(b.node_id()), 5);
+    // The counter alone is not the property. Zeroing the field
+    // without putting it on a line, or hard-coding `suppressing`
+    // false, both left all 143 tests green — the same mistake as
+    // asserting a limiter's counter instead of its line. So observe
+    // what the EMITTED lines actually said.
+    let (_, suppressing) = observe_suppression(|| {
+        for i in 0..14u8 {
+            svc.ingest(b.node_id(), &envelope(&b, vec![sign_c(7, 0x40 + i)]), 1_000);
+        }
+    });
+    assert!(
+        suppressing,
+        "the line that spends the budget must announce the suppression"
+    );
+    assert_eq!(
+        svc.fork_logs_dropped_for_test(b.node_id()),
+        5,
+        "and the five dropped lines are counted"
+    );
 
-    // The next window's first line carries the count and clears it.
-    svc.ingest(
-        b.node_id(),
-        &envelope(&b, vec![sign_c(7, 0xFE)]),
-        1_000 + crate::audit_sync::LOG_WINDOW_MS,
+    // The next window's first line CARRIES the count, and that is
+    // what clears it — not the roll.
+    let (reported, _) = observe_suppression(|| {
+        svc.ingest(
+            b.node_id(),
+            &envelope(&b, vec![sign_c(7, 0xFE)]),
+            1_000 + crate::audit_sync::LOG_WINDOW_MS,
+        );
+    });
+    assert_eq!(
+        reported, 5,
+        "the drop count must reach a log line, or the flood leaves no record of its size"
     );
     assert_eq!(
         svc.fork_logs_dropped_for_test(b.node_id()),
         0,
-        "the count is cleared by being reported, not by the roll"
+        "and reporting it is what clears it, not time passing"
+    );
+}
+
+#[test]
+fn m32_a_backwards_clock_rolls_the_serve_window_too() {
+    // `may_serve` carries the same frozen-window hazard as `may_log`,
+    // and the fix for `may_log` originally justified skipping this one
+    // with the claim that serving "fails OPEN (serves more)". That was
+    // backwards: a frozen window's counter only grows, so once the
+    // allowance is spent `may_serve` refuses every range request until
+    // the wall clock passes a start stamped in the future — ending
+    // every peer's corroboration walk, which is the one thing
+    // 5.13c-2 exists to make possible.
+    let (store, me, trust, b, _c, _tmp) = trio();
+    let svc = crate::audit_sync::AuditSyncService::new(store, me, trust);
+
+    // Spend the allowance while the clock reads far ahead.
+    let future = 2_000_000_000_000u64;
+    for i in 0..crate::audit_sync::SERVE_BATCHES_PER_MINUTE {
+        let env = range_req_envelope(&b, b.node_id(), [u8::try_from(i % 256).unwrap_or(0); 16]);
+        svc.ingest_entries(b.node_id(), &env, future);
+    }
+    assert_eq!(
+        svc.served_in_window_for_test(b.node_id()),
+        crate::audit_sync::SERVE_BATCHES_PER_MINUTE,
+        "precondition: the allowance is spent"
+    );
+
+    // NTP corrects the clock down. The window must roll, or this peer
+    // is refused service for the life of the process.
+    let env = range_req_envelope(&b, b.node_id(), [0xFE; 16]);
+    svc.ingest_entries(b.node_id(), &env, 10_000);
+    assert_eq!(
+        svc.served_in_window_for_test(b.node_id()),
+        1,
+        "a corrected clock must not leave the peer permanently refused"
     );
 }

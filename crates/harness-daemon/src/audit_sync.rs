@@ -69,6 +69,7 @@ enum PeerLog {
 /// problem: the counts are written first and can never be crowded
 /// out, because "a completed flood shows its first ten rows and no
 /// trace of the rest" is not a record.
+#[must_use]
 enum LogDecision {
     /// Emit the line. `dropped_before` is how many were suppressed
     /// since the last emitted one — it rides the next line that gets
@@ -343,6 +344,11 @@ impl AuditSyncService {
         // `1 + RELAY_HEADS` exceeds our cap is truncated here. That
         // must not look like a quiet peer (Decision 31).
         if env.heads.len() > harness_core::MAX_HEADS_PER_ENVELOPE {
+            // `..` discards `last_in_window`, which is a constant
+            // `true` while OVERSIZE_LOGS_PER_WINDOW is 1. If that
+            // const is ever raised, bind it and emit it: otherwise
+            // this line silently stops announcing suppression, with
+            // no compile error to catch it.
             if let LogDecision::Emit { dropped_before, .. } =
                 self.may_log(from, PeerLog::OversizedEnvelope, now_ms)
             {
@@ -773,7 +779,8 @@ impl AuditSyncService {
     /// runs before `pin_peer_heads`, the fork line after it); what
     /// matters is that none of them spans it.
     ///
-    /// Returns false once the window's budget for `kind` is spent.
+    /// Returns [`LogDecision::Drop`] once the window's budget for
+    /// `kind` is spent.
     /// The CALLER decides what to do about that, which is the part
     /// worth being careful with: a bare `if may_log { log }` drops
     /// lines silently, and ADR-0041's `shell.denied` limiter is
@@ -789,9 +796,11 @@ impl AuditSyncService {
         // stamped in the future, every later subtraction saturates to
         // 0, and the counters never reset. This limiter would then
         // silence `AUDIT CHAIN FORK` for that peer for the life of the
-        // process. `may_serve` shares the pattern but fails OPEN
-        // (serves more); this one fails CLOSED, on the loudest alarm
-        // the subsystem has, so it gets the explicit check.
+        // process. `may_serve` has the same shape and the same fix; an
+        // earlier version of this comment claimed it "fails OPEN
+        // (serves more)" and used that to justify fixing only this
+        // one, which was backwards — a frozen window's counter only
+        // grows, so both fail CLOSED.
         if now_ms < state.log_window_start_ms || now_ms - state.log_window_start_ms >= LOG_WINDOW_MS
         {
             state.log_window_start_ms = now_ms;
@@ -836,6 +845,15 @@ impl AuditSyncService {
     }
 
     #[cfg(test)]
+    pub(crate) fn oversize_logs_dropped_for_test(&self, peer: NodeId) -> u32 {
+        self.peers
+            .lock()
+            .entry(peer)
+            .or_default()
+            .oversize_logs_dropped
+    }
+
+    #[cfg(test)]
     pub(crate) fn oversize_logs_in_window_for_test(&self, peer: NodeId) -> u32 {
         self.peers
             .lock()
@@ -857,7 +875,17 @@ impl AuditSyncService {
     fn may_serve(&self, peer: NodeId, now_ms: u64) -> bool {
         let mut states = self.peers.lock();
         let state = states.entry(peer).or_default();
-        if now_ms.saturating_sub(state.serve_window_start_ms) >= SERVE_WINDOW_MS {
+        // Same backwards-clock hazard as `may_log`, and it fails
+        // CLOSED here too: with the start stamped in the future the
+        // subtraction is always 0, the window never rolls,
+        // `served_in_window` saturates, and this returns false until
+        // the wall clock passes the stamp — ending every peer's walk.
+        // An earlier note claimed this one "fails open (serves more)";
+        // there is no clock direction in which a frozen window serves
+        // more, because the counter only grows.
+        if now_ms < state.serve_window_start_ms
+            || now_ms - state.serve_window_start_ms >= SERVE_WINDOW_MS
+        {
             state.serve_window_start_ms = now_ms;
             state.served_in_window = 0;
         }

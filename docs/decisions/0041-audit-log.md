@@ -1023,12 +1023,25 @@ and all now mutation-covered:
    lever with all 141 daemon tests green — the repo's own named
    failure mode ("a guard with no test is a guard that disappears"),
    reproduced in the file that quotes it. The tests now count real
-   `tracing` events. Two mechanics matter: the subscriber must be the
-   GLOBAL default, because `rebuild_interest_cache` re-registers
-   against the global dispatcher and a thread-local one leaves the
-   callsite cached as disabled (this presented as `m29` counting 0 in
-   parallel while passing alone); and the count is a thread-local, so
-   parallel tests emitting the same line cannot inflate it.
+   `tracing` events, with the count in a THREAD-LOCAL so parallel
+   tests emitting the same line cannot inflate it.
+
+   The subscriber is installed as the GLOBAL default, once, with one
+   `rebuild_interest_cache`. A review round argued this was
+   unnecessary — that a plain `with_default` passes alone, in
+   parallel, and under `--test-threads=1`. All three are true and the
+   conclusion is still wrong: with `with_default` and no rebuild,
+   `m29` FAILS reproducibly whenever a FILTERED subset runs
+   (`cargo test -p harness-daemon m29`, or `m2`), which is the most
+   common developer invocation, while the full suite passes. Callsite
+   interest is cached process-wide, so whether the layer ever sees the
+   event depends on which tests ran first and on which thread. The
+   global default plus the rebuild is deterministic across every
+   filter, which is the property a guard's test needs.
+   One consequence to keep in mind: any OTHER test installing a global
+   subscriber makes these three tests fail loudly (verified), rather
+   than degrade to silently counting 0 — which is the right failure
+   mode, but it does mean this file owns the process's subscriber.
 2. **Dropping a line silently is not rating it.** `if may_log { log }`
    leaves an operator unable to tell 8 forks from 8000, and the
    residual attack is concrete: a peer burns the budget on self-forks
@@ -1046,10 +1059,21 @@ and all now mutation-covered:
    first connects — the window start is stamped in the future, every
    later subtraction saturates to 0, and the counters never reset.
    That silences `AUDIT CHAIN FORK` for that peer for the life of the
-   process. The asymmetry the shared pattern hides is the point:
-   `may_serve` has the same shape and fails OPEN (serves more), while
-   this one fails CLOSED, on the loudest alarm the subsystem has. An
-   explicit `now_ms < start` check rolls the window instead.
+   process. An explicit `now_ms < start` check rolls the window
+   instead.
+
+   A first version of this note claimed `may_serve` shares the shape
+   but "fails OPEN (serves more)", and used that as the reason to fix
+   one limiter and not the other. **That was backwards.** With
+   `serve_window_start_ms` stamped in the future the subtraction is
+   always 0, the window never rolls, `served_in_window` saturates at
+   `SERVE_BATCHES_PER_MINUTE`, and `may_serve` then returns false
+   until the wall clock passes the stamp — refusing to serve ranges
+   and ending every peer's walk. There is no clock direction in which
+   a frozen window serves MORE: the counter only grows. Both limiters
+   fail closed, so both get the same check; the harms differ (lost
+   corroboration against a lost fork alarm) but that was never the
+   argument being made.
 
 The oversize line's own rating needed both halves covered separately:
 deleting the gate AND deleting the counter's reset left the whole
