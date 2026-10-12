@@ -1651,9 +1651,12 @@ fn m28_a_same_envelope_fork_at_an_unheld_position_is_caught_at_ingest() {
 /// process-wide, so whether this layer ever sees the event depends on
 /// which tests ran first and on which thread. Measured, with
 /// `with_default` and no rebuild: the full suite passes, alone passes,
-/// `--test-threads=1` passes — and `cargo test -p harness-daemon m29`
-/// FAILS, reproducibly, counting 0. A guard's test cannot be
-/// filter-dependent, so the global default plus one
+/// `--test-threads=1` passes — and a FILTERED run counts 0 and fails.
+/// Intermittently, and not always on the same filter:
+/// `-p harness-daemon m2` failed 11 of 15 runs, while the narrower
+/// `m29` filter failed here but passed 18 of 18 elsewhere. That
+/// instability IS the argument — a guard's test must not depend on
+/// thread scheduling — so the global default plus one
 /// `rebuild_interest_cache` is what makes it deterministic.
 ///
 /// The count is a THREAD-LOCAL, so parallel tests that emit the same
@@ -1671,7 +1674,7 @@ thread_local! {
     /// false, both left all 143 tests green — the same mistake as
     /// asserting a limiter's counter instead of its line.
     static AUDIT_DROPPED_REPORTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static AUDIT_SUPPRESSING_SEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static AUDIT_SUPPRESSING_SEEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Pulls `dropped_before` / `suppressing` out of an event's fields.
@@ -1686,7 +1689,7 @@ impl tracing::field::Visit for FieldGrab {
 
     fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
         if field.name() == "suppressing" && value {
-            AUDIT_SUPPRESSING_SEEN.with(|c| c.set(true));
+            AUDIT_SUPPRESSING_SEEN.with(|c| c.set(c.get() + 1));
         }
     }
 
@@ -1740,12 +1743,18 @@ fn count_audit_errors(f: impl FnOnce()) -> usize {
 }
 
 /// Run `f` and report what the EMITTED lines said about suppression:
-/// the summed `dropped_before`, and whether any line carried
+/// the summed `dropped_before`, and HOW MANY lines carried
 /// `suppressing = true`.
-fn observe_suppression(f: impl FnOnce()) -> (u64, bool) {
+///
+/// A count, not a bool. "Did any line announce it" is satisfied by a
+/// constant `true` as happily as by the real thing, and announcing on
+/// every line conveys nothing — an operator still cannot tell the
+/// budget-spending line from the ones before it. That inverse
+/// mutation survived the whole suite when this returned a bool.
+fn observe_suppression(f: impl FnOnce()) -> (u64, usize) {
     install_audit_counter();
     AUDIT_DROPPED_REPORTED.with(|c| c.set(0));
-    AUDIT_SUPPRESSING_SEEN.with(|c| c.set(false));
+    AUDIT_SUPPRESSING_SEEN.with(|c| c.set(0));
     f();
     (
         AUDIT_DROPPED_REPORTED.with(std::cell::Cell::get),
@@ -1901,9 +1910,10 @@ fn m29b_a_backwards_clock_rolls_the_window_instead_of_freezing_it() {
     // connects — the window start is stamped in the future, every
     // later subtraction saturates to 0, and the counters never reset.
     // `AUDIT CHAIN FORK` would then be silenced for that peer for the
-    // life of the process. `may_serve` shares the pattern but fails
-    // OPEN (serves more); this one fails CLOSED, on the loudest alarm
-    // the subsystem has.
+    // life of the process. `may_serve` has the same shape and the same
+    // fix — see `m32`. An earlier version of this comment claimed it
+    // "fails OPEN (serves more)", which was backwards: a frozen
+    // window's counter only grows, so both fail closed.
     let (store, me, trust, b, c, _tmp) = trio();
     let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me, trust);
 
@@ -1989,9 +1999,10 @@ fn m29c_a_suppressed_fork_line_is_counted_and_reported_not_silent() {
             svc.ingest(b.node_id(), &envelope(&b, vec![sign_c(7, 0x40 + i)]), 1_000);
         }
     });
-    assert!(
-        suppressing,
-        "the line that spends the budget must announce the suppression"
+    assert_eq!(
+        suppressing, 1,
+        "EXACTLY the line that spends the budget announces suppression — \
+         a flag that is always set says nothing an operator can use"
     );
     assert_eq!(
         svc.fork_logs_dropped_for_test(b.node_id()),

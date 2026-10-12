@@ -1012,7 +1012,7 @@ oversized-envelope line promoted back to `warn` under that window, and
 the `cfg(test)` 200ms interval. No allowance, no ordering decision.
 
 **Decision 33 — a rated line must leave a record of its own size, and
-the limiter must fail OPEN on a bad clock.**
+a bad clock must ROLL the window rather than freeze it.**
 
 Three things went wrong in the first cut of this, all found by review
 and all now mutation-covered:
@@ -1031,9 +1031,14 @@ and all now mutation-covered:
    unnecessary — that a plain `with_default` passes alone, in
    parallel, and under `--test-threads=1`. All three are true and the
    conclusion is still wrong: with `with_default` and no rebuild,
-   `m29` FAILS reproducibly whenever a FILTERED subset runs
-   (`cargo test -p harness-daemon m29`, or `m2`), which is the most
-   common developer invocation, while the full suite passes. Callsite
+   `m29` counts 0 and fails under a FILTERED subset, which is the most
+   common developer invocation, while the full suite passes. Stated as
+   measured rather than as first written: `cargo test -p harness-daemon m2`
+   failed 11 of 15 runs, and the narrower `m29` filter failed on this
+   author's runs but passed 18 of 18 on a reviewer's. So it is
+   intermittent, not reproducible, and which filter trips it is not
+   stable — which is the argument, not a weaker version of it: a
+   guard's test must not depend on thread scheduling. Callsite
    interest is cached process-wide, so whether the layer ever sees the
    event depends on which tests ran first and on which thread. The
    global default plus the rebuild is deterministic across every
