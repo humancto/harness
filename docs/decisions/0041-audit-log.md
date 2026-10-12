@@ -1002,3 +1002,69 @@ unstorable head discarded the whole envelope's writes.
 - `harness.audit` still has no message rate limit, so per-message work
   is bounded only by the envelope cap. Charging cannot substitute,
   because the cost is upstream of any charge.
+
+## Amendment — 5.13c-1b-ii PR A: rating a peer-provoked log line
+
+PR A carries the mechanical half of 1b-ii: paired `(head, outcome)`
+returns, a per-peer window on the log lines a PEER can provoke, the
+oversized-envelope line promoted back to `warn` under that window, and
+`HEAD_PUSH_INTERVAL_PROD` split out so no budget is ever derived from
+the `cfg(test)` 200ms interval. No allowance, no ordering decision.
+
+**Decision 33 — a rated line must leave a record of its own size, and
+the limiter must fail OPEN on a bad clock.**
+
+Three things went wrong in the first cut of this, all found by review
+and all now mutation-covered:
+
+1. **The guard had no test, only a counter.** `m29` asserted
+   `fork_logs_in_window`, not the lines. A refactor that keeps the
+   charge and emits unconditionally therefore restored the whole flood
+   lever with all 141 daemon tests green — the repo's own named
+   failure mode ("a guard with no test is a guard that disappears"),
+   reproduced in the file that quotes it. The tests now count real
+   `tracing` events. Two mechanics matter: the subscriber must be the
+   GLOBAL default, because `rebuild_interest_cache` re-registers
+   against the global dispatcher and a thread-local one leaves the
+   callsite cached as disabled (this presented as `m29` counting 0 in
+   parallel while passing alone); and the count is a thread-local, so
+   parallel tests emitting the same line cannot inflate it.
+2. **Dropping a line silently is not rating it.** `if may_log { log }`
+   leaves an operator unable to tell 8 forks from 8000, and the
+   residual attack is concrete: a peer burns the budget on self-forks
+   at its own position, and the one fork it later relays about a third
+   party is dropped with nothing recording that it was. Decision 18's
+   `shell.denied` limiter had already settled this — the counts are
+   written first and can never be crowded out. So `may_log` returns a
+   `LogDecision`, not a `bool`: the line that spends the budget is
+   marked `suppressing`, and the drop count rides the next line that
+   gets through. It is cleared by being REPORTED, never by time
+   passing, so it survives any number of window rolls.
+3. **`saturating_sub` prevents the underflow, not the freeze.** If a
+   peer's first envelopes arrive while the clock reads ahead — a
+   batteryless RTC before NTP settles, which is exactly when the mesh
+   first connects — the window start is stamped in the future, every
+   later subtraction saturates to 0, and the counters never reset.
+   That silences `AUDIT CHAIN FORK` for that peer for the life of the
+   process. The asymmetry the shared pattern hides is the point:
+   `may_serve` has the same shape and fails OPEN (serves more), while
+   this one fails CLOSED, on the loudest alarm the subsystem has. An
+   explicit `now_ms < start` check rolls the window instead.
+
+The oversize line's own rating needed both halves covered separately:
+deleting the gate AND deleting the counter's reset left the whole
+workspace green, and the reset is the sharper half — without it the
+`warn` fires once per peer per PROCESS, so an upgraded sender whose
+`1 + RELAY_HEADS` exceeds an older node's cap (Decision 31's one
+honest case) looks exactly like the quiet peer that case exists to
+distinguish. A counter-only assertion cannot see it, because a stuck
+counter and a correctly rolled one read the same; `m27` counts the
+line across the roll.
+
+Carried to PR B: key the fork budget on `(reported_by, subject)`
+rather than `reported_by` alone. That removes the cross-subject
+residual in (2) entirely, and it is NOT the subject-keying mistake
+Decision 18 records for `shell.denied` — there the subject was an
+attacker-minted command string with a fresh key per attempt, whereas
+here it is a `NodeId` that must already be in the trust store, so the
+key space is bounded by trusted peers and cannot be minted.

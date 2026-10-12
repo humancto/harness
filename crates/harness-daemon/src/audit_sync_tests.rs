@@ -1497,6 +1497,51 @@ fn m27_an_oversized_envelope_is_truncated_and_the_cap_covers_an_honest_sender() 
         cap,
         "and nothing past the cap reached the store"
     );
+
+    // The truncation WARN is rated, and both halves of that rating
+    // need covering: deleting the gate AND the counter's reset left
+    // the entire workspace green. The reset is the sharper half — with
+    // it gone the warn fires once per peer per PROCESS, so an upgraded
+    // sender truncated on every push looks exactly like the quiet peer
+    // Decision 31 says must not happen.
+    assert_eq!(
+        svc.oversize_logs_in_window_for_test(b.node_id()),
+        crate::audit_sync::OVERSIZE_LOGS_PER_WINDOW,
+        "the first oversized envelope spends the window's budget"
+    );
+    let over2: Vec<harness_core::AuditHead> = (1..=u64::try_from(cap + 8).unwrap_or(0))
+        .map(|i| {
+            let mut h = harness_core::AuditHead {
+                node_id: c.node_id(),
+                seq: 10_000 + i,
+                entry_hash: [u8::try_from(i % 251).unwrap_or(0); 32],
+                at_ms: i,
+                sig: Signature::from_bytes([0u8; 64]),
+            };
+            h.sign(&c).expect("sign");
+            h
+        })
+        .collect();
+    svc.ingest(b.node_id(), &envelope(&b, over2.clone()), 2_500);
+    assert_eq!(
+        svc.oversize_logs_in_window_for_test(b.node_id()),
+        crate::audit_sync::OVERSIZE_LOGS_PER_WINDOW,
+        "a second oversized envelope in the same window adds no line"
+    );
+    // Count the LINE across the roll. A counter-only assertion cannot
+    // discriminate: with the reset deleted the counter sits at its
+    // limit forever, which reads the same as a correctly rolled one.
+    let warns = count_audit_warns(|| {
+        svc.ingest(
+            b.node_id(),
+            &envelope(&b, over2),
+            2_500 + crate::audit_sync::LOG_WINDOW_MS,
+        );
+    });
+    assert_eq!(
+        warns, 1,
+        "the window must ROLL, or the warn fires once per peer per process          and an upgraded sender truncated on every push looks quiet"
+    );
 }
 
 #[test]
@@ -1561,6 +1606,88 @@ fn m28_a_same_envelope_fork_at_an_unheld_position_is_caught_at_ingest() {
     );
 }
 
+/// Counts ERROR events on `harness.audit.sync`, per emitting thread.
+///
+/// Exists because asserting the limiter's COUNTER is not asserting the
+/// LINE: a refactor that keeps the charge and emits unconditionally
+/// restores the whole flood lever with the counter still saturating,
+/// and the review that found it confirmed all 141 daemon tests stayed
+/// green. `AUDIT CHAIN FORK` is the only ERROR this target emits, so
+/// counting events at that level counts fork lines.
+///
+/// Installed as the GLOBAL default, not via `with_default`, and this
+/// is the load-bearing part. Callsite interest is cached process-wide
+/// and `rebuild_interest_cache` re-registers against the GLOBAL
+/// dispatcher: with only a thread-local subscriber the callsite caches
+/// as disabled and the layer sees nothing. That failed as `m29`
+/// counting 0 in parallel while passing alone and under
+/// `--test-threads=1`.
+///
+/// The count is a THREAD-LOCAL, so parallel tests that emit the same
+/// line on their own threads cannot inflate it.
+struct AuditErrorCounter;
+
+thread_local! {
+    static AUDIT_ERRORS_SEEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static AUDIT_WARNS_SEEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AuditErrorCounter {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let m = event.metadata();
+        if m.target() != "harness.audit.sync" {
+            return;
+        }
+        match *m.level() {
+            tracing::Level::ERROR => AUDIT_ERRORS_SEEN.with(|c| c.set(c.get() + 1)),
+            tracing::Level::WARN => AUDIT_WARNS_SEEN.with(|c| c.set(c.get() + 1)),
+            _ => {}
+        }
+    }
+}
+
+/// Run `f` and return how many `harness.audit.sync` ERROR lines it
+/// emitted on this thread.
+fn install_audit_counter() {
+    use tracing_subscriber::layer::SubscriberExt;
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        let subscriber = tracing_subscriber::registry().with(AuditErrorCounter);
+        // Another test installing one first is not a failure here, it
+        // just means these helpers cannot count.
+        if tracing::subscriber::set_global_default(subscriber).is_ok() {
+            // Any callsite that already fired is cached against the
+            // previous (absent) subscriber; re-register against ours.
+            tracing::callsite::rebuild_interest_cache();
+        }
+    });
+}
+
+fn count_audit_errors(f: impl FnOnce()) -> usize {
+    install_audit_counter();
+    AUDIT_ERRORS_SEEN.with(|c| c.set(0));
+    f();
+    AUDIT_ERRORS_SEEN.with(std::cell::Cell::get)
+}
+
+/// As [`count_audit_errors`], for WARN — the truncation line's level.
+///
+/// Counting the LINE and not the counter is load-bearing here: with
+/// the window's reset deleted the counter sits at its limit forever,
+/// which reads identically to a correctly rolled one, so a
+/// counter-only assertion cannot tell a working roll from a warn that
+/// fires once per process.
+fn count_audit_warns(f: impl FnOnce()) -> usize {
+    install_audit_counter();
+    AUDIT_WARNS_SEEN.with(|c| c.set(0));
+    f();
+    AUDIT_WARNS_SEEN.with(std::cell::Cell::get)
+}
+
 #[test]
 fn m29_fork_log_lines_are_bounded_per_peer_and_the_window_rolls() {
     // The conflict ROW is written for every fork regardless — the
@@ -1589,10 +1716,19 @@ fn m29_fork_log_lines_are_bounded_per_peer_and_the_window_rolls() {
     };
 
     // One pin, then a run of distinct branches at that same position:
-    // every one after the first is a fork.
-    for i in 0..14u8 {
-        svc.ingest(b.node_id(), &envelope(&b, vec![sign_c(7, 0x40 + i)]), 1_000);
-    }
+    // every one after the first is a fork. Count the EMITTED LINES —
+    // asserting only the counter let a mutation that keeps the charge
+    // and logs unconditionally pass with the whole suite green.
+    let lines = count_audit_errors(|| {
+        for i in 0..14u8 {
+            svc.ingest(b.node_id(), &envelope(&b, vec![sign_c(7, 0x40 + i)]), 1_000);
+        }
+    });
+    assert_eq!(
+        lines,
+        crate::audit_sync::FORK_LOGS_PER_WINDOW as usize,
+        "exactly the budgeted number of fork LINES may be emitted"
+    );
     let capped = svc.fork_logs_in_window_for_test(b.node_id());
     assert_eq!(
         capped,
@@ -1669,5 +1805,109 @@ fn m31_a_per_window_budget_must_derive_from_the_prod_push_interval() {
         crate::audit_sync::HEAD_PUSH_INTERVAL,
         crate::audit_sync::HEAD_PUSH_INTERVAL_PROD,
         "in a test build these must differ, or this guard proves nothing"
+    );
+}
+
+#[test]
+fn m29b_a_backwards_clock_rolls_the_window_instead_of_freezing_it() {
+    // `saturating_sub` prevents the underflow, not the freeze. If the
+    // first envelopes land while the clock reads AHEAD — a batteryless
+    // RTC before NTP settles, which is exactly when the mesh first
+    // connects — the window start is stamped in the future, every
+    // later subtraction saturates to 0, and the counters never reset.
+    // `AUDIT CHAIN FORK` would then be silenced for that peer for the
+    // life of the process. `may_serve` shares the pattern but fails
+    // OPEN (serves more); this one fails CLOSED, on the loudest alarm
+    // the subsystem has.
+    let (store, me, trust, b, c, _tmp) = trio();
+    let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me, trust);
+
+    let sign_c = |seq: u64, hash: u8| {
+        let mut h = harness_core::AuditHead {
+            node_id: c.node_id(),
+            seq,
+            entry_hash: [hash; 32],
+            at_ms: seq,
+            sig: Signature::from_bytes([0u8; 64]),
+        };
+        h.sign(&c).expect("sign");
+        h
+    };
+
+    // Saturate the budget with the clock far in the future.
+    let future = 2_000_000_000_000u64;
+    for i in 0..14u8 {
+        svc.ingest(
+            b.node_id(),
+            &envelope(&b, vec![sign_c(7, 0x40 + i)]),
+            future,
+        );
+    }
+    assert_eq!(
+        svc.fork_logs_in_window_for_test(b.node_id()),
+        crate::audit_sync::FORK_LOGS_PER_WINDOW,
+        "precondition: the budget is spent"
+    );
+
+    // NTP corrects the clock DOWN. The window must roll, and a
+    // genuine fork must be loud again.
+    let lines = count_audit_errors(|| {
+        svc.ingest(b.node_id(), &envelope(&b, vec![sign_c(7, 0xFE)]), 1_000);
+    });
+    assert_eq!(
+        lines, 1,
+        "a corrected clock must not leave the fork alarm silenced"
+    );
+    assert_eq!(
+        svc.fork_logs_in_window_for_test(b.node_id()),
+        1,
+        "and the window must have rolled to the corrected time"
+    );
+}
+
+#[test]
+fn m29c_a_suppressed_fork_line_is_counted_and_reported_not_silent() {
+    // ADR-0041's `shell.denied` limiter settled this for the same
+    // problem: "a completed flood shows its first ten rows and no
+    // trace of the rest" is not a record. A bare `if may_log { log }`
+    // leaves an operator unable to tell 8 forks from 8000, and the
+    // residual attack is real — a peer burns the budget on self-forks
+    // at its own position, and the one fork it later relays about a
+    // third party is dropped with nothing saying so.
+    //
+    // So the count rides the next line that gets through, and it is
+    // cleared by being REPORTED, never by time passing.
+    let (store, me, trust, b, c, _tmp) = trio();
+    let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me, trust);
+
+    let sign_c = |seq: u64, hash: u8| {
+        let mut h = harness_core::AuditHead {
+            node_id: c.node_id(),
+            seq,
+            entry_hash: [hash; 32],
+            at_ms: seq,
+            sig: Signature::from_bytes([0u8; 64]),
+        };
+        h.sign(&c).expect("sign");
+        h
+    };
+
+    // 14 branches: 1 pin + 13 forks, of which 8 are emitted and 5 are
+    // dropped and counted.
+    for i in 0..14u8 {
+        svc.ingest(b.node_id(), &envelope(&b, vec![sign_c(7, 0x40 + i)]), 1_000);
+    }
+    assert_eq!(svc.fork_logs_dropped_for_test(b.node_id()), 5);
+
+    // The next window's first line carries the count and clears it.
+    svc.ingest(
+        b.node_id(),
+        &envelope(&b, vec![sign_c(7, 0xFE)]),
+        1_000 + crate::audit_sync::LOG_WINDOW_MS,
+    );
+    assert_eq!(
+        svc.fork_logs_dropped_for_test(b.node_id()),
+        0,
+        "the count is cleared by being reported, not by the roll"
     );
 }

@@ -52,13 +52,36 @@ pub(crate) const LOG_WINDOW_MS: u64 = 60_000;
 pub(crate) const FORK_LOGS_PER_WINDOW: u32 = 8;
 /// Oversized-envelope lines per peer per window. One is enough: the
 /// condition is static for a given sender, so repeats carry nothing.
-const OVERSIZE_LOGS_PER_WINDOW: u32 = 1;
+pub(crate) const OVERSIZE_LOGS_PER_WINDOW: u32 = 1;
 
 /// Which peer-provoked log line is being rated.
 #[derive(Clone, Copy)]
 enum PeerLog {
     Fork,
     OversizedEnvelope,
+}
+
+/// What [`AuditSyncService::may_log`] decided about one line.
+///
+/// Not a `bool`, because `if may_log { log }` drops the overflow
+/// SILENTLY and an operator then cannot tell 8 forks from 8000.
+/// ADR-0041's `shell.denied` limiter settled this for the same
+/// problem: the counts are written first and can never be crowded
+/// out, because "a completed flood shows its first ten rows and no
+/// trace of the rest" is not a record.
+enum LogDecision {
+    /// Emit the line. `dropped_before` is how many were suppressed
+    /// since the last emitted one — it rides the next line that gets
+    /// through, so it survives any number of window rolls and cannot
+    /// be crowded out. `last_in_window` marks the line that spends
+    /// the budget, so the suppression is announced rather than
+    /// inferred from silence.
+    Emit {
+        dropped_before: u32,
+        last_in_window: bool,
+    },
+    /// Budget spent. Counted, reported on the next emitted line.
+    Drop,
 }
 
 // An honest envelope carries our own head plus the relay set, so the
@@ -168,6 +191,11 @@ struct PeerSyncState {
     log_window_start_ms: u64,
     fork_logs_in_window: u32,
     oversize_logs_in_window: u32,
+    /// Lines suppressed since the last one that got through. Survives
+    /// window rolls deliberately: the count is only cleared by being
+    /// REPORTED, never by time passing.
+    fork_logs_dropped: u32,
+    oversize_logs_dropped: u32,
 }
 
 /// A request we sent and are still waiting on.
@@ -314,16 +342,20 @@ impl AuditSyncService {
         // grow, so in a mixed-version mesh an upgraded sender whose
         // `1 + RELAY_HEADS` exceeds our cap is truncated here. That
         // must not look like a quiet peer (Decision 31).
-        if env.heads.len() > harness_core::MAX_HEADS_PER_ENVELOPE
-            && self.may_log(from, PeerLog::OversizedEnvelope, now_ms)
-        {
-            tracing::warn!(
-                target: "harness.audit.sync",
-                relayer = %from,
-                offered = env.heads.len(),
-                cap = harness_core::MAX_HEADS_PER_ENVELOPE,
-                "audit envelope carried more heads than the cap; the tail was ignored"
-            );
+        if env.heads.len() > harness_core::MAX_HEADS_PER_ENVELOPE {
+            if let LogDecision::Emit { dropped_before, .. } =
+                self.may_log(from, PeerLog::OversizedEnvelope, now_ms)
+            {
+                tracing::warn!(
+                    target: "harness.audit.sync",
+                    relayer = %from,
+                    offered = env.heads.len(),
+                    cap = harness_core::MAX_HEADS_PER_ENVELOPE,
+                    dropped_heads = env.heads.len() - harness_core::MAX_HEADS_PER_ENVELOPE,
+                    dropped_before,
+                    "audit envelope carried more heads than the cap; the tail was ignored"
+                );
+            }
         }
         let mut accepted: Vec<harness_core::AuditHead> = Vec::new();
         for head in env.heads.iter().take(harness_core::MAX_HEADS_PER_ENVELOPE) {
@@ -730,41 +762,63 @@ impl AuditSyncService {
         let _ = net.send_to(peer, OutboundMsg::AuditEntries(env));
     }
 
-    /// May this peer be served one more entry BATCH in this window?
-    ///
-    /// Decision 18's limiter, and only that: it gates `serve_range` on
-    /// `harness.audit.entries`. It does NOT rate-limit head ingest on
-    /// `harness.audit` — a different channel and a different path,
-    /// which is why closing that gap needs its own budget (ROADMAP
-    /// 5.13c-1b). The revert of a first attempt at that budget left
-    /// its doc comment stranded here, describing behaviour this
-    /// function never had (round 9 finding 5).
     /// Whether this peer may provoke one more log line of `kind`.
     ///
-    /// Takes the `peers` lock and nothing else. The lock-order rule
-    /// this file now depends on: the `peers` mutex is NEVER held
-    /// across a `Store::with_conn` call, which holds the single
-    /// process-wide non-reentrant connection mutex. Every caller here
-    /// runs after the store work, not around it.
-    fn may_log(&self, peer: NodeId, kind: PeerLog, now_ms: u64) -> bool {
+    /// Takes the `peers` lock and nothing else, and the lock-order
+    /// rule this file depends on is that the `peers` mutex is NEVER
+    /// held ACROSS a `Store::with_conn` call — `with_conn` holds a
+    /// non-reentrant `parking_lot::Mutex<Connection>`, one per
+    /// `Store` and so effectively one in the daemon. Callers sit on
+    /// both sides of the store work (the oversized-envelope check
+    /// runs before `pin_peer_heads`, the fork line after it); what
+    /// matters is that none of them spans it.
+    ///
+    /// Returns false once the window's budget for `kind` is spent.
+    /// The CALLER decides what to do about that, which is the part
+    /// worth being careful with: a bare `if may_log { log }` drops
+    /// lines silently, and ADR-0041's `shell.denied` limiter is
+    /// explicit that a flood must leave a record of its own size.
+    fn may_log(&self, peer: NodeId, kind: PeerLog, now_ms: u64) -> LogDecision {
         let mut states = self.peers.lock();
         let state = states.entry(peer).or_default();
-        if now_ms.saturating_sub(state.log_window_start_ms) >= LOG_WINDOW_MS {
+        // A clock that moved BACKWARDS must roll the window, not
+        // freeze it. `saturating_sub` alone prevents the underflow and
+        // not the freeze: if the first envelopes land while the RTC
+        // reads ahead (a batteryless clock before NTP settles, which
+        // is exactly when the mesh first connects), the start is
+        // stamped in the future, every later subtraction saturates to
+        // 0, and the counters never reset. This limiter would then
+        // silence `AUDIT CHAIN FORK` for that peer for the life of the
+        // process. `may_serve` shares the pattern but fails OPEN
+        // (serves more); this one fails CLOSED, on the loudest alarm
+        // the subsystem has, so it gets the explicit check.
+        if now_ms < state.log_window_start_ms || now_ms - state.log_window_start_ms >= LOG_WINDOW_MS
+        {
             state.log_window_start_ms = now_ms;
             state.fork_logs_in_window = 0;
             state.oversize_logs_in_window = 0;
         }
-        let (count, limit) = match kind {
-            PeerLog::Fork => (&mut state.fork_logs_in_window, FORK_LOGS_PER_WINDOW),
-            PeerLog::OversizedEnvelope => {
-                (&mut state.oversize_logs_in_window, OVERSIZE_LOGS_PER_WINDOW)
-            }
+        let (count, dropped, limit) = match kind {
+            PeerLog::Fork => (
+                &mut state.fork_logs_in_window,
+                &mut state.fork_logs_dropped,
+                FORK_LOGS_PER_WINDOW,
+            ),
+            PeerLog::OversizedEnvelope => (
+                &mut state.oversize_logs_in_window,
+                &mut state.oversize_logs_dropped,
+                OVERSIZE_LOGS_PER_WINDOW,
+            ),
         };
         if *count >= limit {
-            return false;
+            *dropped = dropped.saturating_add(1);
+            return LogDecision::Drop;
         }
         *count += 1;
-        true
+        LogDecision::Emit {
+            dropped_before: std::mem::take(dropped),
+            last_in_window: *count == limit,
+        }
     }
 
     #[cfg(test)]
@@ -776,6 +830,30 @@ impl AuditSyncService {
             .fork_logs_in_window
     }
 
+    #[cfg(test)]
+    pub(crate) fn fork_logs_dropped_for_test(&self, peer: NodeId) -> u32 {
+        self.peers.lock().entry(peer).or_default().fork_logs_dropped
+    }
+
+    #[cfg(test)]
+    pub(crate) fn oversize_logs_in_window_for_test(&self, peer: NodeId) -> u32 {
+        self.peers
+            .lock()
+            .entry(peer)
+            .or_default()
+            .oversize_logs_in_window
+    }
+
+    /// May this peer be served one more entry BATCH in this window?
+    ///
+    /// Decision 18's limiter, and only that: it gates `serve_range` on
+    /// `harness.audit.entries`. It does NOT rate-limit head ingest on
+    /// `harness.audit` — a different channel and a different path,
+    /// which is why closing that gap needs its own budget (ROADMAP
+    /// 5.13c-1b-ii). The revert of a first attempt at that budget left
+    /// this block stranded above a different function once already
+    /// (round 9 finding 5), and inserting `may_log` above it stranded
+    /// it a second time — hence this note.
     fn may_serve(&self, peer: NodeId, now_ms: u64) -> bool {
         let mut states = self.peers.lock();
         let state = states.entry(peer).or_default();
@@ -972,13 +1050,19 @@ impl AuditSyncService {
             // that mints conflicts at its own position turns our own
             // alarm into its flood (24 per envelope, unrated channel).
             PinOutcome::Fork { conflict_id } => {
-                if self.may_log(from, PeerLog::Fork, now_ms) {
+                if let LogDecision::Emit {
+                    dropped_before,
+                    last_in_window,
+                } = self.may_log(from, PeerLog::Fork, now_ms)
+                {
                     tracing::error!(
                         target: "harness.audit.sync",
                         subject = %head.node_id,
                         seq = head.seq,
                         conflict_id,
                         reported_by = %from,
+                        dropped_before,
+                        suppressing = last_in_window,
                         "AUDIT CHAIN FORK: two signed heads at one position"
                     );
                 }
