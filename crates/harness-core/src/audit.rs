@@ -375,11 +375,15 @@ impl Signable for AuditEntriesEnvelope {
 ///
 /// Lowered from 64 to 24 in 5.13c-1b-i. An honest sender emits
 /// `1 + RELAY_HEADS` = 17 heads, so 64 left 47 heads of pure attacker
-/// headroom in a receive-side `take()` that no signature covers — and
-/// each extra head costs the receiver an ed25519 verify before any
-/// allowance can refuse it, because the verify happens in `ingest`
-/// ahead of the pin call. Narrowing the cap is cheaper than any
-/// budget, and the budget cannot bound crypto at all.
+/// headroom in a receive-side `take()` that no signature covers, and
+/// each of those heads costs the receiver an ed25519 verify. The cap
+/// is the ONLY bound on that work: the verify happens in `ingest`
+/// before anything downstream can refuse the head, so no per-peer
+/// budget can bound it — which is why this number is the one that
+/// matters and why it is not waiting on 5.13c-1b-ii.
+///
+/// It is also no longer equal to `PIN_KEEP_RECENT` (64), so a single
+/// envelope can no longer fill a node's whole recent-pin window.
 ///
 /// 24 leaves headroom above 17 for a mesh that grows `RELAY_HEADS`
 /// without a lockstep change here; `harness-daemon` const-asserts the

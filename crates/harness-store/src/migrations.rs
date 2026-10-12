@@ -60,11 +60,6 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "audit_entry_ingest",
         include_str!("../migrations/V0011__audit_entry_ingest.sql"),
     ),
-    (
-        12,
-        "audit_conflict_bound",
-        include_str!("../migrations/V0012__audit_conflict_bound.sql"),
-    ),
 ];
 
 pub(crate) fn run(conn: &Connection) -> Result<(), StoreError> {

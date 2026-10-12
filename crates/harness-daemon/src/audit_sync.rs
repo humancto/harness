@@ -32,93 +32,17 @@ pub(crate) const HEAD_PUSH_INTERVAL: Duration = Duration::from_secs(30);
 pub(crate) const HEAD_PUSH_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Third-party heads relayed alongside our own, newest first.
-pub(crate) const RELAY_HEADS: usize = 16;
+const RELAY_HEADS: usize = 16;
 
-/// Window for the per-peer new-pin allowance, and the production push
-/// interval it is derived against.
-///
-/// `HEAD_PUSH_INTERVAL` is 200 ms in test builds, so the formula below
-/// names the production figure explicitly rather than reading it —
-/// otherwise the derived allowance would be two orders of magnitude
-/// larger under `cargo test` and the limit would be untestable. The
-/// const assert at the bottom keeps the two from drifting in the build
-/// that matters.
-pub(crate) const PIN_WINDOW_MS: u64 = 60_000;
-const HEAD_PUSH_INTERVAL_PROD_MS: u64 = 30_000;
-
-/// Honest NEW pin positions one reporting peer causes per window.
-///
-/// Derived, and this derivation is the whole point: a relayed head
-/// carries that subject's **newest** pin, and on a mesh that is
-/// actually appending audit entries every subject's head advances
-/// between ticks. So relayed heads are NEW positions, not refreshes.
-/// An earlier attempt at this allowance assumed the opposite —
-/// "almost all refreshes" — and picked 24 against a floor of 34,
-/// while its own doc comment claimed it never tripped.
-#[allow(clippy::cast_possible_truncation)] // both operands are small consts
-const HONEST_PINS_PER_WINDOW: u32 =
-    (1 + RELAY_HEADS as u32) * (PIN_WINDOW_MS / HEAD_PUSH_INTERVAL_PROD_MS) as u32;
-
-/// NEW pin positions one reporting peer may cause per window.
-///
-/// ADR-0041's 5.13c-1 residual promised this ("ingest is unrated… the
-/// only unbounded-work path a trusted peer controls"); 5.13c-2 tried
-/// twice and produced a blocker each time, so it landed here.
-///
-/// The window is FIXED, not sliding, which doubles the worst honest
-/// burst: a peer's pushes can land either side of a boundary, so the
-/// allowance covers `2 x HONEST_PINS_PER_WINDOW` plus slack. A sliding
-/// window would halve it at the cost of per-peer timestamp state; the
-/// fixed window is the cheaper trade and the burst is stated rather
-/// than discovered.
-///
-/// It errs HIGH on purpose. A refusal is a permanent loss of pin
-/// density — the security parameter of this design — whereas excess
-/// allowance only costs rows the hourly sweep already bounds.
-pub(crate) const NEW_PINS_PER_PEER_PER_WINDOW: u32 = HONEST_PINS_PER_WINDOW * 2 + 4;
-
-// The relationship IS the justification, so it is enforced at compile
-// time: a *number* is the artifact most likely to drift, and round 6
-// recorded one moving 64 -> 1024 with every test green because the
-// only test referencing it did so symbolically.
-const _: () = assert!(
-    NEW_PINS_PER_PEER_PER_WINDOW >= HONEST_PINS_PER_WINDOW * 2,
-    "the allowance must cover an honest peer's fixed-window boundary burst"
-);
-const _: () = assert!(
-    NEW_PINS_PER_PEER_PER_WINDOW <= HONEST_PINS_PER_WINDOW * 4,
-    "and must not become a budget a hostile peer can spend freely"
-);
-#[cfg(not(test))]
-const _: () = assert!(
-    HEAD_PUSH_INTERVAL.as_millis() == HEAD_PUSH_INTERVAL_PROD_MS as u128,
-    "the allowance is derived against the production push interval"
-);
-
-// An honest sender emits `1 + RELAY_HEADS` heads, so the receive-side
-// cap must leave room for that and no more than necessary: every head
-// above it is attacker headroom that costs an ed25519 verify before
-// any allowance can refuse it (5.13c-1b-i). `MAX_HEADS_PER_ENVELOPE`
-// lives in harness-core, which cannot see `RELAY_HEADS`, so the
-// relationship is asserted here.
-const _: () = assert!(
-    harness_core::MAX_HEADS_PER_ENVELOPE > RELAY_HEADS,
-    "the envelope cap must admit an honest sender's own head plus its relay window"
-);
-const _: () = assert!(
-    harness_core::MAX_HEADS_PER_ENVELOPE <= 2 * (1 + RELAY_HEADS),
-    "and must not leave headroom an attacker can spend on verifies"
-);
-
-/// Fork log lines emitted per peer per window before the rest are
-/// counted into a summary.
-///
-/// `MAX_CONFLICTS_PER_POSITION` bounds the ROWS; this bounds the
-/// `AUDIT CHAIN FORK` ERROR lines, which are per head and therefore
-/// floodable by design once the rows are capped. 5.13b's `shell.denied`
-/// limiter is the in-repo precedent: the first few in full, the rest
-/// counted.
-const FORK_LOGS_PER_WINDOW: u32 = 8;
+// An honest envelope carries our own head plus the relay set, so the
+// cap in `harness-core` must leave room for all of them. If it ever
+// does not, `ingest`'s `take()` silently discards the tail of an
+// HONEST sender's envelope — which looks exactly like a quiet peer.
+// `harness-core` cannot assert this itself: `RELAY_HEADS` lives here.
+// Spelled `> RELAY_HEADS` rather than `>= 1 + RELAY_HEADS` only
+// because clippy rejects the latter; it is the same bound, and the
+// `1` is our own head.
+const _: () = assert!(harness_core::MAX_HEADS_PER_ENVELOPE > RELAY_HEADS);
 
 /// Consecutive send failures to one peer before we back off. A
 /// pre-5.13c peer resets the unknown channel every time, so without
@@ -207,12 +131,6 @@ struct PeerSyncState {
     /// Serve-side rate limiting: window start and batches served in it.
     serve_window_start_ms: u64,
     served_in_window: u32,
-    /// Ingest-side allowance: window start, NEW pin positions this
-    /// peer caused in it, refusals, and fork lines emitted.
-    pin_window_start_ms: u64,
-    pins_in_window: u32,
-    refused_in_window: u32,
-    fork_logs_in_window: u32,
 }
 
 /// A request we sent and are still waiting on.
@@ -344,7 +262,21 @@ impl AuditSyncService {
         // collapsed; anything else is stored and classified.
         let mut seen: std::collections::HashSet<(NodeId, u64, [u8; 32])> =
             std::collections::HashSet::new();
-        let mut accepted: Vec<AuditHead> = Vec::new();
+        // The cap is the only bound on per-envelope work, so the one
+        // case where narrowing it to MAX_HEADS_PER_ENVELOPE actually
+        // discards something must not be silent — otherwise a sender
+        // whose relay set outgrew the cap looks identical to one that
+        // is simply quiet.
+        if env.heads.len() > harness_core::MAX_HEADS_PER_ENVELOPE {
+            tracing::warn!(
+                target: "harness.audit.sync",
+                relayer = %from,
+                offered = env.heads.len(),
+                cap = harness_core::MAX_HEADS_PER_ENVELOPE,
+                "audit envelope carried more heads than the cap; the tail was ignored"
+            );
+        }
+        let mut accepted: Vec<harness_core::AuditHead> = Vec::new();
         for head in env.heads.iter().take(harness_core::MAX_HEADS_PER_ENVELOPE) {
             if !seen.insert((head.node_id, head.seq, head.entry_hash)) {
                 continue;
@@ -378,17 +310,13 @@ impl AuditSyncService {
         if accepted.is_empty() {
             return out;
         }
-
-        // ONE batched call under ONE allowance. The allowance is an
-        // integer and the spend order is the store's (highest new
-        // position per subject first), never the sender's `Vec` order
-        // — see `Store::pin_peer_heads` for why both earlier shapes
-        // failed.
-        let allowance = self.pin_allowance(from, now_ms);
-        let (outcomes, spent) = match self
-            .store
-            .pin_peer_heads(&accepted, from, allowance, now_ms)
-        {
+        // ONE lock acquisition and ONE transaction for the whole
+        // envelope, where the per-head path cost up to
+        // MAX_HEADS_PER_ENVELOPE of each. Sharing the transaction is
+        // also what lets `pin_one` see a position an earlier head in
+        // this same envelope inserted, and so classify the second
+        // branch as the fork it is.
+        let outcomes = match self.store.pin_peer_heads(&accepted, from, now_ms) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
@@ -400,34 +328,30 @@ impl AuditSyncService {
                 return out;
             }
         };
-        self.charge_pins(from, spent);
-
         for (head, outcome) in accepted.iter().zip(outcomes) {
             match outcome {
-                PinOutcome::Fork { conflict_id } => {
-                    // Bounded per window: the rows are capped at
-                    // MAX_CONFLICTS_PER_POSITION, which leaves the
-                    // per-head ERROR line as the floodable surface.
-                    if self.may_log_fork(from, now_ms) {
-                        tracing::error!(
-                            target: "harness.audit.sync",
-                            subject = %head.node_id,
-                            seq = head.seq,
-                            conflict_id,
-                            reported_by = %from,
-                            "AUDIT CHAIN FORK: two signed heads at one position"
-                        );
-                    }
-                }
-                // A node offering a position below one we already hold
-                // is the loudest signal available before entries exist
-                // — a wiped or restored DB looks exactly like this —
-                // so it is not silent, even though it is not evidence.
-                //
-                // FIRST-PARTY only: a RELAYED head lagging ours is the
-                // normal steady state in any mesh with relays, and
-                // warning on it would drown the signal the warn exists
-                // for.
+                PinOutcome::Fork { conflict_id } => tracing::error!(
+                    target: "harness.audit.sync",
+                    subject = %head.node_id,
+                    seq = head.seq,
+                    conflict_id,
+                    reported_by = %from,
+                    "AUDIT CHAIN FORK: two signed heads at one position"
+                ),
+                // A node offering a position below one we
+                // already hold is the loudest signal available
+                // before entries exist — a wiped or restored
+                // DB looks exactly like this — so it is not
+                // silent, even though it is not evidence
+                // (diff review 1(c)/1(d)).
+                // FIRST-PARTY only: a node offering a
+                // position below one we hold for it is the
+                // loudest signal available before entries
+                // exist (a wiped or restored DB looks exactly
+                // like this). A RELAYED head lagging ours is
+                // the normal steady state in any mesh with
+                // relays, and warning on it would drown the
+                // signal the warn exists for.
                 PinOutcome::StalePinned if from == head.node_id => tracing::warn!(
                     target: "harness.audit.sync",
                     subject = %head.node_id,
@@ -444,13 +368,10 @@ impl AuditSyncService {
                 PinOutcome::RejectedSeq => tracing::warn!(
                     target: "harness.audit.sync",
                     subject = %head.node_id,
+                    offered_seq = head.seq,
                     reported_by = %from,
-                    "audit head seq exceeds the representable range; rejected"
+                    "audit head seq is not storable; rejected"
                 ),
-                // Counted, not logged per head: a flooder would
-                // otherwise turn its own refusals into a log flood.
-                // Summarised once when the window rolls.
-                PinOutcome::BudgetRefused => self.count_refusal(from),
                 PinOutcome::Pinned | PinOutcome::Refreshed => {}
             }
             out.push((head.node_id, outcome));
@@ -813,77 +734,6 @@ impl AuditSyncService {
     /// 5.13c-1b). The revert of a first attempt at that budget left
     /// its doc comment stranded here, describing behaviour this
     /// function never had (round 9 finding 5).
-    /// How many NEW pin positions this peer may still cause in the
-    /// current window.
-    ///
-    /// Rolls the window and, on the roll, summarises any refusals the
-    /// previous one accumulated — once per window rather than per
-    /// head, so a flooder cannot turn its own refusals into a log
-    /// flood.
-    fn pin_allowance(&self, peer: NodeId, now_ms: u64) -> u32 {
-        let mut states = self.peers.lock();
-        let state = states.entry(peer).or_default();
-        if now_ms.saturating_sub(state.pin_window_start_ms) >= PIN_WINDOW_MS {
-            if state.refused_in_window > 0 {
-                tracing::warn!(
-                    target: "harness.audit.sync",
-                    peer = %peer,
-                    refused = state.refused_in_window,
-                    allowance = NEW_PINS_PER_PEER_PER_WINDOW,
-                    "peer exceeded its new-pin allowance; positions were dropped"
-                );
-            }
-            state.pin_window_start_ms = now_ms;
-            state.pins_in_window = 0;
-            state.refused_in_window = 0;
-            state.fork_logs_in_window = 0;
-        }
-        NEW_PINS_PER_PEER_PER_WINDOW.saturating_sub(state.pins_in_window)
-    }
-
-    /// Charge the positions the store actually inserted.
-    fn charge_pins(&self, peer: NodeId, spent: u32) {
-        let mut states = self.peers.lock();
-        let state = states.entry(peer).or_default();
-        state.pins_in_window = state.pins_in_window.saturating_add(spent);
-    }
-
-    fn count_refusal(&self, peer: NodeId) {
-        let mut states = self.peers.lock();
-        let state = states.entry(peer).or_default();
-        state.refused_in_window = state.refused_in_window.saturating_add(1);
-    }
-
-    /// Whether to emit a fork ERROR line, bounded per peer per window.
-    fn may_log_fork(&self, peer: NodeId, now_ms: u64) -> bool {
-        let mut states = self.peers.lock();
-        let state = states.entry(peer).or_default();
-        if now_ms.saturating_sub(state.pin_window_start_ms) >= PIN_WINDOW_MS {
-            state.pin_window_start_ms = now_ms;
-            state.fork_logs_in_window = 0;
-        }
-        if state.fork_logs_in_window >= FORK_LOGS_PER_WINDOW {
-            return false;
-        }
-        state.fork_logs_in_window += 1;
-        true
-    }
-
-    /// New positions this peer has been charged in the current window.
-    #[cfg(test)]
-    pub(crate) fn pins_in_window_for_test(&self, peer: NodeId) -> u32 {
-        self.peers.lock().get(&peer).map_or(0, |s| s.pins_in_window)
-    }
-
-    /// Refusals counted for this peer in the current window.
-    #[cfg(test)]
-    pub(crate) fn refused_in_window_for_test(&self, peer: NodeId) -> u32 {
-        self.peers
-            .lock()
-            .get(&peer)
-            .map_or(0, |s| s.refused_in_window)
-    }
-
     fn may_serve(&self, peer: NodeId, now_ms: u64) -> bool {
         let mut states = self.peers.lock();
         let state = states.entry(peer).or_default();

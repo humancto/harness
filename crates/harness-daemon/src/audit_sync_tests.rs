@@ -1263,21 +1263,25 @@ fn m23_the_envelope_production_sends_is_still_verifiable_by_a_5_13c_1_node() {
 
 #[test]
 fn m24_a_head_flood_cannot_sweep_away_a_nodes_corroborated_pins() {
-    // Round 7 BLOCKER-1, the half that belonged to 5.13c-2.
+    // Round 7 BLOCKER-1, the half that belongs to THIS item.
+    // `MAX_HEADS_PER_ENVELOPE` used to be 64, exactly
+    // `PIN_KEEP_RECENT`, so ONE envelope filled a node's whole
+    // recent-pin window — and the sweep used to then delete its honest
+    // CORROBORATED pins, keeping only `MIN(rowid)` per node.
+    // Unrecoverably: `audit_run_corroborates` reads the pin, so losing
+    // the row loses the verdict, and only the subject can mint a
+    // replacement.
     //
-    // The premise has since narrowed: `MAX_HEADS_PER_ENVELOPE` was 64,
-    // exactly `PIN_KEEP_RECENT`, so ONE envelope filled a node's whole
-    // recent-pin window. 5.13c-1b-i lowered the cap to 24 and added a
-    // per-peer allowance, so a single envelope no longer can — but the
-    // property under test is unchanged and still load-bearing: the
-    // sweep used to delete honest CORROBORATED pins,
-    // keeping only `MIN(rowid)` per node. Unrecoverably:
-    // `audit_run_corroborates` reads the pin, so losing the row loses
-    // the verdict, and only the subject can mint a replacement.
+    // 5.13c-1b-i narrowed the cap to 24, so one envelope no longer
+    // reaches 64 pins. That is a real improvement and exactly why this
+    // test must not quietly become weaker than its name: it keeps the
+    // ORIGINAL pressure by sending as many full envelopes as it takes
+    // to overfill `PIN_KEEP_RECENT`, so the sweep is still asked the
+    // question the round-7 defect got wrong.
     //
     // `corroborated` is the status THIS item introduces, so protecting
     // it from the sweep is this item's job. Bounding the flood itself
-    // is ROADMAP 5.13c-1b.
+    // is ROADMAP 5.13c-1b-ii.
     let (store, me, trust, b, c, _tmp) = trio();
     let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me, trust);
 
@@ -1298,20 +1302,37 @@ fn m24_a_head_flood_cannot_sweep_away_a_nodes_corroborated_pins() {
         .set_pin_status(c.node_id(), 100, PinStatus::Corroborated)
         .expect("corroborate");
 
-    // B floods genuine, validly signed positions of C. One envelope is
-    // no longer enough to fill the window, which is the point of the
-    // cap; the sweep protection is what this test still pins.
-    let flood: Vec<harness_core::AuditHead> = (1..=64u64)
-        .map(|i| sign_c(1_000_000 + i, u8::try_from(i).unwrap_or(0)))
-        .collect();
-    let mut env = harness_core::AuditSyncEnvelope {
-        source: b.node_id(),
-        assembled_at: 2_000,
-        heads: flood,
-        sig: Signature::from_bytes([0u8; 64]),
-    };
-    env.sign(&b).expect("sign");
-    svc.ingest(b.node_id(), &env, 2_000);
+    // B floods genuine, validly signed positions of C, in as many
+    // full envelopes as it takes to overfill the recent window.
+    let cap = harness_core::MAX_HEADS_PER_ENVELOPE;
+    let needed = crate::executor::PIN_KEEP_RECENT + cap;
+    let mut sent = 0usize;
+    let mut tick = 2_000u64;
+    while sent < needed {
+        let flood: Vec<harness_core::AuditHead> = (0..cap)
+            .map(|j| {
+                let i = u64::try_from(sent + j).unwrap_or(0);
+                sign_c(
+                    1_000_000 + i + 1,
+                    u8::try_from((sent + j) % 251).unwrap_or(0),
+                )
+            })
+            .collect();
+        let mut env = harness_core::AuditSyncEnvelope {
+            source: b.node_id(),
+            assembled_at: tick,
+            heads: flood,
+            sig: Signature::from_bytes([0u8; 64]),
+        };
+        env.sign(&b).expect("sign");
+        svc.ingest(b.node_id(), &env, tick);
+        sent += cap;
+        tick += 1_000;
+    }
+    assert!(
+        store.peer_head_pins(c.node_id()).expect("pins").len() > crate::executor::PIN_KEEP_RECENT,
+        "the flood must actually overfill the recent window, or the sweep is never asked"
+    );
 
     store
         .thin_peer_head_pins(crate::executor::PIN_KEEP_RECENT, 3_600_000)
@@ -1423,185 +1444,47 @@ fn m26_the_ingest_subject_ceiling_matches_the_channel_frame_cap() {
     );
 }
 
-/// A trust store holding `n` third-party identities, for the
-/// saturating honest-traffic case.
-fn many_peers(
-    n: usize,
-) -> (
-    harness_store::Store,
-    std::sync::Arc<harness_core::Identity>,
-    harness_mesh::trust::TrustStore,
-    Vec<harness_core::Identity>,
-    tempfile::TempDir,
-) {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let me = std::sync::Arc::new(harness_mesh::identity::init_or_load(tmp.path()).expect("id"));
-    let trust = harness_mesh::trust::TrustStore::open(tmp.path(), me.node_id()).expect("trust");
-    let mut peers = Vec::with_capacity(n);
-    for i in 0..n {
-        let id = harness_core::Identity::generate();
-        trust
-            .add(harness_mesh::trust::Peer {
-                node_id: id.node_id(),
-                pubkey: *id.public_key(),
-                hostname: format!("node-{i}"),
-                tier: harness_mesh::trust::TrustTier::Default,
-                added_at: 0,
-                added_via: harness_mesh::trust::AddedVia::Static,
-            })
-            .expect("trust add");
-        peers.push(id);
-    }
-    let store = harness_store::Store::open_memory().expect("store");
-    (store, me, trust, peers, tmp)
-}
-
 #[test]
-fn m27_honest_traffic_never_trips_the_new_pin_allowance() {
-    // 5.13c-1b-i. The allowance's whole risk is tripping on honest
-    // traffic, and the first draft of this item's acceptance test
-    // would have PASSED against the previous attempt's wrong number:
-    // it used a 10-node mesh (9 relayed subjects, not the saturating
-    // 16) over 4 ticks at the test build's 200ms interval, which spans
-    // a fraction of one 60s window.
+fn m27_an_oversized_envelope_is_truncated_and_the_cap_covers_an_honest_sender() {
+    // `MAX_HEADS_PER_ENVELOPE` is the ONLY bound on per-envelope
+    // crypto: `ingest` verifies each head before anything downstream
+    // can refuse it, so a sender that ignores the cap must be cut off
+    // by the receiver's own `take()` and not by trusting the count.
     //
-    // So this test: saturates the relay window (`RELAY_HEADS + 1`
-    // subjects), ADVANCES every subject's head between ticks — a
-    // relayed head carries that subject's newest pin, and on a mesh
-    // that is appending entries those are NEW positions, not refreshes,
-    // which is the fact the previous attempt got backwards — and spans
-    // two windows including the boundary.
-    let subjects = crate::audit_sync::RELAY_HEADS + 1;
-    let (store, me, trust, peers, _tmp) = many_peers(subjects + 1);
-    let svc = crate::audit_sync::AuditSyncService::new(store, me, trust);
-    // The relayer is one of the trusted peers; the rest are subjects.
-    let relayer = &peers[0];
-
-    let window = crate::audit_sync::PIN_WINDOW_MS;
-    let ticks_per_window = 2u64; // production: 60s window, 30s push
-    let mut seq = 1u64;
-    // Two full windows plus the boundary tick.
-    for tick in 0..=(ticks_per_window * 2) {
-        // Honest push: the relayer's own head plus one per subject,
-        // every one of them a NEW position.
-        let mut heads = Vec::with_capacity(subjects + 1);
-        for id in &peers {
-            let mut h = harness_core::AuditHead {
-                node_id: id.node_id(),
-                seq,
-                entry_hash: [u8::try_from(seq % 251).unwrap_or(0); 32],
-                at_ms: seq,
-                sig: Signature::from_bytes([0u8; 64]),
-            };
-            h.sign(id).expect("sign");
-            heads.push(h);
-        }
-        seq += 1;
-        let mut env = harness_core::AuditSyncEnvelope {
-            source: relayer.node_id(),
-            assembled_at: tick,
-            heads,
-            sig: Signature::from_bytes([0u8; 64]),
-        };
-        env.sign(relayer).expect("sign");
-
-        // Advance our clock by the production push interval.
-        let now = tick * (window / ticks_per_window);
-        let out = svc.ingest(relayer.node_id(), &env, now);
-        assert!(
-            !out.iter()
-                .any(|(_, o)| *o == harness_store::PinOutcome::BudgetRefused),
-            "tick {tick}: an honest push was refused"
-        );
-        assert_eq!(
-            svc.refused_in_window_for_test(relayer.node_id()),
-            0,
-            "tick {tick}: honest traffic must never be refused (allowance {})",
-            crate::audit_sync::NEW_PINS_PER_PEER_PER_WINDOW
-        );
-    }
-}
-
-#[test]
-fn m28_the_new_pin_allowance_bounds_a_flood_and_then_resets() {
-    // The allowance itself: a peer cannot cause more NEW positions per
-    // window than it is allowed, refusals are COUNTED rather than
-    // logged per head (a flooder would otherwise turn its own refusals
-    // into a log flood), and the window rolls — this is a rate limit,
-    // not a permanent ban.
+    // The cap must also be wide enough for an HONEST envelope
+    // (`1 + RELAY_HEADS`), or the same `take()` discards the tail of a
+    // legitimate relay set. A const assert in `audit_sync` pins that
+    // direction; this pins the truncation itself.
     let (store, me, trust, b, c, _tmp) = trio();
     let svc = crate::audit_sync::AuditSyncService::new(store.clone(), me, trust);
-    let allowance = crate::audit_sync::NEW_PINS_PER_PEER_PER_WINDOW;
-
-    let sign_c = |seq: u64| {
-        let mut h = harness_core::AuditHead {
-            node_id: c.node_id(),
-            seq,
-            entry_hash: [u8::try_from(seq % 251).unwrap_or(0); 32],
-            at_ms: seq,
-            sig: Signature::from_bytes([0u8; 64]),
-        };
-        h.sign(&c).expect("sign");
-        h
-    };
-    // Enough envelopes to exceed the allowance several times over,
-    // all inside one window.
-    let per_envelope = harness_core::MAX_HEADS_PER_ENVELOPE;
-    let envelopes = (allowance as usize / per_envelope) + 3;
-    let mut seq = 1u64;
-    for _ in 0..envelopes {
-        let heads: Vec<harness_core::AuditHead> = (0..per_envelope)
-            .map(|_| {
-                let h = sign_c(seq);
-                seq += 1;
-                h
-            })
-            .collect();
-        let mut env = harness_core::AuditSyncEnvelope {
-            source: b.node_id(),
-            assembled_at: 1_000,
-            heads,
-            sig: Signature::from_bytes([0u8; 64]),
-        };
-        env.sign(&b).expect("sign");
-        svc.ingest(b.node_id(), &env, 1_000);
-    }
-
-    assert_eq!(
-        svc.pins_in_window_for_test(b.node_id()),
-        allowance,
-        "the allowance is the ceiling on new positions per window"
-    );
+    let cap = harness_core::MAX_HEADS_PER_ENVELOPE;
     assert!(
-        svc.refused_in_window_for_test(b.node_id()) > 0,
-        "and the refusals are counted, not silent"
-    );
-    let stored = store.peer_head_pins(c.node_id()).expect("pins").len();
-    assert_eq!(
-        u32::try_from(stored).unwrap_or(0),
-        allowance,
-        "rows actually written match what was charged; have {stored}"
+        cap > 16,
+        "the cap must fit an honest sender's own head plus its relay set"
     );
 
-    // A fresh window lets the peer through again.
-    let heads: Vec<harness_core::AuditHead> = (0..4)
-        .map(|_| {
-            let h = sign_c(seq);
-            seq += 1;
+    let over: Vec<harness_core::AuditHead> = (1..=u64::try_from(cap + 8).unwrap_or(0))
+        .map(|i| {
+            let mut h = harness_core::AuditHead {
+                node_id: c.node_id(),
+                seq: i,
+                entry_hash: [u8::try_from(i % 251).unwrap_or(0); 32],
+                at_ms: i,
+                sig: Signature::from_bytes([0u8; 64]),
+            };
+            h.sign(&c).expect("sign");
             h
         })
         .collect();
-    let mut env = harness_core::AuditSyncEnvelope {
-        source: b.node_id(),
-        assembled_at: 2_000,
-        heads,
-        sig: Signature::from_bytes([0u8; 64]),
-    };
-    env.sign(&b).expect("sign");
-    svc.ingest(b.node_id(), &env, 1_000 + crate::audit_sync::PIN_WINDOW_MS);
+    let outcomes = svc.ingest(b.node_id(), &envelope(&b, over), 2_000);
     assert_eq!(
-        svc.pins_in_window_for_test(b.node_id()),
-        4,
-        "the window reset and the counter restarted"
+        outcomes.len(),
+        cap,
+        "exactly the cap is classified; the tail is ignored, not trusted"
+    );
+    assert_eq!(
+        store.peer_head_pins(c.node_id()).expect("pins").len(),
+        cap,
+        "and nothing past the cap reached the store"
     );
 }
